@@ -1,0 +1,6 @@
+node_modules/
+.hello-cc/
+*.log
+AGENTS.md
+CLAUDE.md
+HCC.md

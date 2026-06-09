@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <defs>
+    <filter id="outerGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <radialGradient id="bgGrad" cx="40%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="#1a2028"/>
+      <stop offset="100%" stop-color="#0a0c0f"/>
+    </radialGradient>
+    <!-- Text gradient: white → teal, connects wordmark to mesh -->
+    <linearGradient id="textGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#eef2f6"/>
+      <stop offset="100%" stop-color="#40c4aa"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Badge -->
+  <circle cx="120" cy="120" r="114" fill="url(#bgGrad)" filter="url(#outerGlow)"/>
+  <circle cx="120" cy="120" r="113" fill="none" stroke="#303640" stroke-width="1.5"/>
+  <circle cx="120" cy="120" r="105" fill="none" stroke="#40c4aa" stroke-width="0.4" opacity="0.25"/>
+
+  <!--
+    Mesh pentagon — center (120, 108), circumradius R=65
+    Shifted down 8px from previous (was 100) for visual balance
+
+    Top:          (120,  43)
+    Upper-right:  (182,  88)
+    Lower-right:  (158, 161)
+    Lower-left:   ( 82, 161)
+    Upper-left:   ( 58,  88)
+  -->
+
+  <!-- Connections -->
+  <g stroke="#40c4aa" stroke-width="1.4" opacity="0.20" fill="none">
+    <line x1="120" y1="43"  x2="182" y2="88"/>
+    <line x1="120" y1="43"  x2="158" y2="161"/>
+    <line x1="120" y1="43"  x2="82"  y2="161"/>
+    <line x1="120" y1="43"  x2="58"  y2="88"/>
+    <line x1="182" y1="88"  x2="158" y2="161"/>
+    <line x1="182" y1="88"  x2="82"  y2="161"/>
+    <line x1="182" y1="88"  x2="58"  y2="88"/>
+    <line x1="158" y1="161" x2="82"  y2="161"/>
+    <line x1="158" y1="161" x2="58"  y2="88"/>
+    <line x1="82"  y1="161" x2="58"  y2="88"/>
+  </g>
+
+  <!-- Spoke lines from center hub -->
+  <g stroke="#40c4aa" stroke-width="0.8" opacity="0.12">
+    <line x1="120" y1="108" x2="120" y2="43"/>
+    <line x1="120" y1="108" x2="182" y2="88"/>
+    <line x1="120" y1="108" x2="158" y2="161"/>
+    <line x1="120" y1="108" x2="82"  y2="161"/>
+    <line x1="120" y1="108" x2="58"  y2="88"/>
+  </g>
+
+  <!-- Node halos — all equal (flat peer mesh, no hierarchy) -->
+  <circle cx="120" cy="43"  r="14" fill="none" stroke="#40c4aa" stroke-width="1" opacity="0.20"/>
+  <circle cx="182" cy="88"  r="14" fill="none" stroke="#40c4aa" stroke-width="1" opacity="0.20"/>
+  <circle cx="158" cy="161" r="14" fill="none" stroke="#40c4aa" stroke-width="1" opacity="0.20"/>
+  <circle cx="82"  cy="161" r="14" fill="none" stroke="#40c4aa" stroke-width="1" opacity="0.20"/>
+  <circle cx="58"  cy="88"  r="14" fill="none" stroke="#40c4aa" stroke-width="1" opacity="0.20"/>
+
+  <!-- All 5 nodes — same size, same style -->
+  <circle cx="120" cy="43"  r="10" fill="#40c4aa" opacity="0.85"/>
+  <circle cx="182" cy="88"  r="10" fill="#40c4aa" opacity="0.85"/>
+  <circle cx="158" cy="161" r="10" fill="#40c4aa" opacity="0.85"/>
+  <circle cx="82"  cy="161" r="10" fill="#40c4aa" opacity="0.85"/>
+  <circle cx="58"  cy="88"  r="10" fill="#40c4aa" opacity="0.85"/>
+
+  <!-- Center hub -->
+  <circle cx="120" cy="108" r="6" fill="#8ee8d8" opacity="1.0"/>
+
+  <!-- "hcc" wordmark -->
+  <text
+    x="120" y="210"
+    font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+    font-size="30"
+    font-weight="700"
+    fill="url(#textGrad)"
+    text-anchor="middle"
+    letter-spacing="5"
+  >hcc</text>
+</svg>

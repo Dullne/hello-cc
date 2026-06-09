@@ -1,0 +1,55 @@
+{
+  "name": "hello-cc",
+  "version": "0.2.0",
+  "description": "Project-local peer mesh for Claude Code, Codex, and other coding CLI sessions.",
+  "type": "module",
+  "bin": {
+    "hcc": "./bin/hcc.mjs",
+    "hello-cc": "./bin/hcc.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "DESIGN.md",
+    "IMPLEMENTATION.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "smoke": "node ./bin/hcc.mjs --help",
+    "test": "node ./scripts/regression.mjs",
+    "test:regression": "node ./scripts/regression.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dullne/hello-cc.git"
+  },
+  "homepage": "https://github.com/Dullne/hello-cc#readme",
+  "bugs": {
+    "url": "https://github.com/Dullne/hello-cc/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "cli",
+    "terminal",
+    "peer-mesh",
+    "coordination",
+    "multi-agent",
+    "session-management",
+    "tmux",
+    "xterm"
+  ],
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.21.0"
+  },
+  "license": "Apache-2.0"
+}
