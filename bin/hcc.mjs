@@ -5,7 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
 import os from 'node:os';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
@@ -368,6 +368,105 @@ function webLogPath(ctx) {
   return path.join(ctx.root, '.hello-cc', 'web.log');
 }
 
+function globalStateDir() {
+  return path.join(os.homedir(), '.hello-cc');
+}
+
+function globalRuntimePath() {
+  return path.join(globalStateDir(), 'runtime.json');
+}
+
+function projectRegistryPath() {
+  return path.join(globalStateDir(), 'projects.json');
+}
+
+function contextForProject(root, dbPath = null, base = {}) {
+  const resolvedRoot = path.resolve(root);
+  return {
+    cwd: base.cwd || resolvedRoot,
+    root: resolvedRoot,
+    dbPath: path.resolve(dbPath || path.join(resolvedRoot, '.hello-cc', 'mesh.db')),
+    json: Boolean(base.json),
+    explicitRoot: true
+  };
+}
+
+function projectRecord(ctx) {
+  return {
+    root: ctx.root,
+    db: ctx.dbPath,
+    name: path.basename(ctx.root) || ctx.root,
+    last_seen_at: now()
+  };
+}
+
+function readProjectRegistry() {
+  const file = projectRegistryPath();
+  if (!fs.existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const rows = Array.isArray(parsed?.projects) ? parsed.projects : [];
+    return rows
+      .filter((p) => p && typeof p.root === 'string')
+      .map((p) => ({
+        root: path.resolve(p.root),
+        db: path.resolve(p.db || path.join(p.root, '.hello-cc', 'mesh.db')),
+        name: String(p.name || path.basename(p.root) || p.root),
+        last_seen_at: Number.parseInt(p.last_seen_at || '0', 10) || 0
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function writeProjectRegistry(projects) {
+  const file = projectRegistryPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const unique = new Map();
+  for (const project of projects) {
+    if (!project?.root) continue;
+    unique.set(path.resolve(project.root), {
+      root: path.resolve(project.root),
+      db: path.resolve(project.db || path.join(project.root, '.hello-cc', 'mesh.db')),
+      name: String(project.name || path.basename(project.root) || project.root),
+      last_seen_at: Number.parseInt(project.last_seen_at || '0', 10) || 0
+    });
+  }
+  const rows = [...unique.values()].sort((a, b) => (b.last_seen_at || 0) - (a.last_seen_at || 0));
+  fs.writeFileSync(file, JSON.stringify({ projects: rows }, null, 2), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return rows;
+}
+
+function registerProject(ctx) {
+  const rows = readProjectRegistry().filter((p) => path.resolve(p.root) !== ctx.root);
+  rows.unshift(projectRecord(ctx));
+  return writeProjectRegistry(rows);
+}
+
+function registerProjectActivity(ctx) {
+  try { registerProject(ctx); } catch {}
+}
+
+function readGlobalRuntimeFile() {
+  const file = globalRuntimePath();
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    try { fs.rmSync(file, { force: true }); } catch {}
+    return null;
+  }
+}
+
+function writeGlobalRuntime(runtime) {
+  const file = globalRuntimePath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(runtime, null, 2), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return file;
+}
+
 function runtimeConnectHost(host) {
   if (host === '0.0.0.0' || host === '::') return '127.0.0.1';
   return host;
@@ -394,20 +493,21 @@ function readRuntime(ctx) {
     };
   }
   const file = runtimePath(ctx);
-  if (!fs.existsSync(file)) {
-    throw new CliError('RUNTIME_NOT_RUNNING',
-      `No running ${PRODUCT_NAME} web runtime found. Start it with:\n  ${CLI_NAME} web`);
+  if (fs.existsSync(file)) {
+    try {
+      const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!runtime.base_url) throw new Error('missing base_url');
+      return { ...runtime, source: file };
+    } catch {
+      try { fs.rmSync(file, { force: true }); } catch {}
+    }
   }
-  try {
-    const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!runtime.base_url) throw new Error('missing base_url');
-    return { ...runtime, source: file };
-  } catch (err) {
-    // Stale runtime file — clean it up
-    try { fs.rmSync(file, { force: true }); } catch {}
-    throw new CliError('RUNTIME_NOT_RUNNING',
-      `Runtime file was stale (cleaned). Restart with:\n  ${CLI_NAME} web`);
+  const global = readGlobalRuntimeFile();
+  if (global?.base_url) {
+    return { ...global, source: globalRuntimePath(), global: true };
   }
+  throw new CliError('RUNTIME_NOT_RUNNING',
+    `No running ${PRODUCT_NAME} web runtime found. Start it with:\n  ${CLI_NAME} web`);
 }
 
 function readRuntimeFile(ctx) {
@@ -432,6 +532,18 @@ async function probeRuntime(runtime) {
 async function readHealthyRuntime(ctx) {
   try {
     const runtime = readRuntimeFile(ctx);
+    if (runtime && await probeRuntime(runtime)) return runtime;
+    const global = readGlobalRuntimeFile();
+    if (global && await probeRuntime(global)) return global;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function readHealthyGlobalRuntime() {
+  try {
+    const runtime = readGlobalRuntimeFile();
     if (!runtime) return null;
     return await probeRuntime(runtime) ? runtime : null;
   } catch {
@@ -441,12 +553,21 @@ async function readHealthyRuntime(ctx) {
 
 function clearRuntime(ctx, pid = process.pid) {
   const file = runtimePath(ctx);
-  if (!fs.existsSync(file)) return;
+  if (fs.existsSync(file)) {
+    try {
+      const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!runtime.pid || runtime.pid === pid) fs.rmSync(file, { force: true });
+    } catch {
+      fs.rmSync(file, { force: true });
+    }
+  }
+  const globalFile = globalRuntimePath();
+  if (!fs.existsSync(globalFile)) return;
   try {
-    const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!runtime.pid || runtime.pid === pid) fs.rmSync(file, { force: true });
+    const runtime = JSON.parse(fs.readFileSync(globalFile, 'utf8'));
+    if (!runtime.pid || runtime.pid === pid) fs.rmSync(globalFile, { force: true });
   } catch {
-    fs.rmSync(file, { force: true });
+    fs.rmSync(globalFile, { force: true });
   }
 }
 
@@ -460,16 +581,23 @@ function shellCommand(args) {
   return args.map(shellQuoteArg).join(' ');
 }
 
-function publicRuntimeUrl(runtime) {
+function runtimeUrlQuery(runtime, projectRoot = null) {
+  const parts = [];
+  if (runtime.token) parts.push(`token=${encodeURIComponent(runtime.token)}`);
+  if (projectRoot) parts.push(`project=${encodeURIComponent(projectRoot)}`);
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
+function publicRuntimeUrl(runtime, projectRoot = null) {
   const host = runtime.host === '0.0.0.0' || runtime.host === '::'
     ? '<machine-ip>'
     : runtime.host || runtimeConnectHost(runtime.host || '127.0.0.1');
-  return `http://${host}:${runtime.port}${runtime.token ? `/?token=${runtime.token}` : ''}`;
+  return `http://${host}:${runtime.port}/${runtimeUrlQuery(runtime, projectRoot)}`;
 }
 
-function localRuntimeUrl(runtime) {
+function localRuntimeUrl(runtime, projectRoot = null) {
   const host = runtimeConnectHost(runtime.host || '127.0.0.1');
-  return `http://${host}:${runtime.port}${runtime.token ? `/?token=${runtime.token}` : ''}`;
+  return `http://${host}:${runtime.port}/${runtimeUrlQuery(runtime, projectRoot)}`;
 }
 
 function tailFile(file, maxBytes = 12000) {
@@ -1031,6 +1159,8 @@ async function runtimeRequest(ctx, method, route, body = null, runtime = null) {
   const rt = runtime || readRuntime(ctx);
   const url = new URL(route, rt.base_url);
   const headers = { 'Content-Type': 'application/json' };
+  headers['X-HCC-Root'] = ctx.root;
+  headers['X-HCC-DB'] = ctx.dbPath;
   if (rt.token) headers.Authorization = `Bearer ${rt.token}`;
   let res;
   try {
@@ -1367,6 +1497,7 @@ function touchPeer(db, id, status = null) {
 }
 
 function touchCurrentPeer(db, ctx, resolved, status = null, kindHint = 'shell') {
+  registerProjectActivity(ctx);
   const identity = typeof resolved === 'string'
     ? { id: resolved, auto: false }
     : resolved;
@@ -1479,12 +1610,32 @@ function formatHookEventName(hookType) {
 function buildHookCoordinationContext(db, peerId) {
   const openTasks = queryOpenTasks(db, 8);
   const unread = queryInbox(db, peerId, false, 5);
+  const t = now();
+  const peers = db.prepare(`
+    SELECT id, kind, status, last_seen_at
+    FROM peers
+    ORDER BY last_seen_at DESC, id ASC
+    LIMIT 8
+  `).all();
   const parts = [
     '[hello-cc coordination]',
     `peer: ${peerId}`,
-    'Use hcc as the source of truth for this project. If the user asks what other sessions are doing, run hcc status, hcc peers, hcc task list, hcc msg inbox, and hcc lock list before answering.',
+    'This is live project coordination context injected by hello-cc.',
+    'You are not isolated for project coordination: hcc is the source of truth for other Claude/Codex/shell sessions in this project.',
+    'If the user asks what other sessions are doing, what tasks exist, or whether you can see other sessions, do not answer from generic model knowledge and do not say sessions are isolated. Run hcc status, hcc peers, hcc task list, hcc msg inbox, and hcc lock list, then answer from those results.',
     'Tasks are project work facts, not read/unread items. Open tasks stay relevant to every session until they are marked done or abandoned. Messages are the unread/ack notification channel.'
   ];
+
+  if (peers.length > 0) {
+    parts.push('[hello-cc known peers]');
+    parts.push(...peers.map((peer) => {
+      const age = Math.max(0, t - Number(peer.last_seen_at || 0));
+      const active = age <= ACTIVE_PEER_TTL ? 'active' : 'stale';
+      return `- ${peer.id} ${peer.kind || 'other'} ${peer.status || 'idle'} ${active}`;
+    }));
+  } else {
+    parts.push('[hello-cc known peers]\n(none)');
+  }
 
   if (openTasks.length > 0) {
     parts.push('[hello-cc open tasks]');
@@ -1656,6 +1807,7 @@ function packageRoot() {
 }
 
 async function cmdInit(ctx, args) {
+  registerProjectActivity(ctx);
   const opts = parseOpts(args, { booleans: ['no-guidance'] });
   const db = connect(ctx);
   const guidance = opts['no-guidance'] ? null : writeGuidance(ctx);
@@ -1669,6 +1821,7 @@ async function cmdInit(ctx, args) {
 }
 
 async function cmdRegister(ctx, args) {
+  registerProjectActivity(ctx);
   const opts = parseOpts(args, { arrays: ['cap'] });
   const id = required(opts, 'peer', 'HCC_PEER');
   const db = connect(ctx);
@@ -1701,6 +1854,7 @@ async function cmdEnv(ctx, args) {
 
 async function cmdJoin(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpJoin();
+  registerProjectActivity(ctx);
   const opts = parseOpts(args, { arrays: ['cap'] });
   const id = required(opts, 'peer', 'HCC_PEER');
   const peer = {
@@ -2542,10 +2696,19 @@ function defaultSessionCommand(kind) {
   return process.env.SHELL || 'bash';
 }
 
-function nextSessionId(sessions, kind) {
-  const prefix = kind || 'shell';
+function nextSessionId(existingIds, kind) {
+  const prefix = sanitizePeerPart(kind || 'shell', 'shell');
+  const ids = new Set();
+  if (existingIds instanceof Map) {
+    for (const value of existingIds.values()) {
+      if (value && typeof value === 'object' && value.id) ids.add(value.id);
+      else if (value) ids.add(String(value));
+    }
+  } else {
+    for (const value of existingIds || []) ids.add(String(value));
+  }
   let i = 1;
-  while (sessions.has(`${prefix}-${i}`)) i += 1;
+  while (ids.has(`${prefix}-${i}`)) i += 1;
   return `${prefix}-${i}`;
 }
 
@@ -2681,13 +2844,19 @@ async function startWebBackground(ctx, args) {
   validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-guidance', 'no-discover']);
   ensureTmuxAvailable({ autoInstall: true });
   const setup = await prepareLocalBus(ctx, { ...opts, installShims: true });
+  registerProject(ctx);
 
-  const existing = await readHealthyRuntime(ctx);
+  const existing = await readHealthyGlobalRuntime();
   if (existing) {
+    try {
+      await runtimeRequest(ctx, 'POST', '/api/projects', { root: ctx.root, db: ctx.dbPath }, existing);
+    } catch {}
+    writeRuntime(ctx, { ...existing, root: ctx.root, db: ctx.dbPath, project_root: ctx.root, global_runtime: true });
     return printWebRuntime(ctx, existing, { already: true, logFile: webLogPath(ctx), setup });
   }
 
   try { fs.rmSync(runtimePath(ctx), { force: true }); } catch {}
+  try { fs.rmSync(globalRuntimePath(), { force: true }); } catch {}
 
   const logFile = webLogPath(ctx);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
@@ -2733,7 +2902,7 @@ async function waitForStartedRuntime(ctx, child, logFile) {
 
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
-    const runtime = await readHealthyRuntime(ctx);
+    const runtime = await readHealthyGlobalRuntime();
     if (runtime) return runtime;
     if (exitInfo) {
       const detail = tailFile(logFile);
@@ -2762,15 +2931,14 @@ function printWebRuntime(ctx, runtime, opts = {}) {
   const data = {
     status: opts.already ? 'already_running' : 'started',
     pid: runtime.pid || null,
-    root: runtime.root || ctx.root,
-    db: runtime.db || ctx.dbPath,
+    root: ctx.root,
+    db: ctx.dbPath,
     host: runtime.host || null,
     port: runtime.port || null,
-    url: publicRuntimeUrl(runtime),
-    local_url: localRuntimeUrl(runtime),
+    url: publicRuntimeUrl(runtime, ctx.root),
+    local_url: localRuntimeUrl(runtime, ctx.root),
     runtime: runtimePath(ctx),
     log: logFile,
-    token_generated: Boolean(runtime.token_generated),
     stop: `${CLI_NAME} down`
   };
   return printResult(ctx, data, (r) => {
@@ -2793,9 +2961,6 @@ function printWebRuntime(ctx, runtime, opts = {}) {
       }
     }
     lines.push(`stop: ${r.stop}`);
-    if (r.token_generated) {
-      lines.push('token was generated for this server process; set HCC_WEB_TOKEN to choose a stable token');
-    }
     return lines.join('\n');
   });
 }
@@ -2944,15 +3109,22 @@ function webIndexHtml() {
     }
     .sidebar, .inspector {
       min-height: 0;
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
       background: var(--panel);
       border-right: 1px solid var(--border);
       display: grid;
-      grid-template-rows: auto auto 1fr;
+      grid-template-rows: auto auto auto auto 1fr;
     }
     .inspector {
       border-right: 0;
       border-left: 1px solid var(--border);
       grid-template-rows: auto 1fr;
+    }
+    .sidebar > *, .inspector > * {
+      min-width: 0;
+      max-width: 100%;
     }
     .brand {
       padding: 14px;
@@ -2962,6 +3134,9 @@ function webIndexHtml() {
       justify-content: space-between;
       gap: 10px;
     }
+    .brand > div {
+      min-width: 0;
+    }
     .brand strong { font-size: 15px; }
     .brand span, .path {
       color: var(--muted);
@@ -2970,6 +3145,11 @@ function webIndexHtml() {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    #connState {
+      flex: 0 0 92px;
+      max-width: 92px;
+      text-align: right;
     }
     .form {
       padding: 12px;
@@ -2982,8 +3162,32 @@ function webIndexHtml() {
       grid-template-columns: 1fr 1fr;
       gap: 8px;
     }
+    .start-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .session-header {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 48px;
+    }
+    .session-header strong {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .session-header label {
+      width: 118px;
+    }
     .sessions, .state {
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-gutter: stable;
       padding: 10px;
       display: grid;
       align-content: start;
@@ -3024,7 +3228,7 @@ function webIndexHtml() {
     .main {
       min-height: 0;
       display: grid;
-      grid-template-rows: auto 1fr auto;
+      grid-template-rows: auto 1fr;
       background: #0b0d10;
     }
     .toolbar {
@@ -3051,14 +3255,6 @@ function webIndexHtml() {
     #terminal {
       min-height: 0;
       padding: 8px;
-    }
-    .commandbar {
-      border-top: 1px solid var(--border);
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      padding: 8px;
-      background: #0f1215;
     }
     .card {
       border: 1px solid var(--border);
@@ -3107,16 +3303,21 @@ function webIndexHtml() {
         </div>
         <span id="connState">offline</span>
       </div>
+      <div class="form" style="padding-top:10px;padding-bottom:10px">
+        <label>Project<select id="projectSelect"></select></label>
+        <label>Project path<input id="projectPath" placeholder="/path/to/project"></label>
+        <button id="addProjectBtn" type="button">Register Project</button>
+      </div>
       <form class="form" id="startForm">
-        <div class="grid2">
-          <label>Peer id<input id="peerId" placeholder="codex-a"></label>
-          <label>Kind<select id="kind"><option value="codex">codex</option><option value="claude">claude</option><option value="shell">shell</option></select></label>
+        <div class="start-row">
+          <label>New session<select id="kind"><option value="codex">codex</option><option value="claude">claude</option><option value="shell">shell</option></select></label>
+          <button class="primary" type="submit">Start</button>
         </div>
-      <label>Role tag<input id="role" placeholder="peer"></label>
-        <label>Command<input id="command" placeholder="codex"></label>
-        <label>Working directory<input id="cwd" placeholder="project root"></label>
-        <button class="primary" type="submit">Start Session</button>
       </form>
+      <div class="session-header">
+        <strong>Sessions</strong>
+        <label>View<select id="sessionKindFilter"><option value="all">all</option><option value="claude">claude</option><option value="codex">codex</option><option value="shell">shell</option><option value="other">other</option></select></label>
+      </div>
       <div class="sessions" id="sessions"></div>
     </aside>
 
@@ -3137,10 +3338,6 @@ function webIndexHtml() {
       </div>
       <div id="terminal" style="min-height:0;flex:1"></div>
       <div id="detectedPanel" style="display:none;overflow:auto;flex:1"></div>
-      <div class="commandbar" id="commandBar">
-        <input id="lineInput" placeholder="Send text to active terminal">
-        <button id="sendLine" type="button">Send</button>
-      </div>
     </main>
 
     <aside class="inspector">
@@ -3154,9 +3351,12 @@ function webIndexHtml() {
 
   <script src="/assets/xterm.js"></script>
   <script>
-    const token = new URLSearchParams(location.search).get('token') || '';
-    const authQuery = token ? '?token=' + encodeURIComponent(token) : '';
+    const initialParams = new URLSearchParams(location.search);
+    const token = initialParams.get('token') || '';
     const headers = token ? { Authorization: 'Bearer ' + token } : {};
+    let currentProject = initialParams.get('project') || initialParams.get('root') || '';
+    let projects = [];
+    let sessionKindFilter = initialParams.get('kind') || 'all';
     let sessions  = [];    // managed (PTY) sessions
     let detected  = [];    // coordination-only peers (from hooks/watcher)
     let active    = null;  // active managed session id
@@ -3165,8 +3365,27 @@ function webIndexHtml() {
     let ws        = null;
     let wsReconnectTimer = null;
 
+    function requestQuery(extra = {}) {
+      const params = new URLSearchParams();
+      if (token) params.set('token', token);
+      if (currentProject) params.set('root', currentProject);
+      for (const [key, value] of Object.entries(extra)) {
+        if (value !== undefined && value !== null && value !== '') params.set(key, value);
+      }
+      const text = params.toString();
+      return text ? '?' + text : '';
+    }
+
+    function updateLocationProject() {
+      const params = new URLSearchParams(location.search);
+      if (token) params.set('token', token);
+      if (currentProject) params.set('project', currentProject);
+      if (sessionKindFilter && sessionKindFilter !== 'all') params.set('kind', sessionKindFilter);
+      history.replaceState(null, '', location.pathname + '?' + params.toString());
+    }
+
     const term = new Terminal({
-      cursorBlink: true,
+      cursorBlink: false,
       convertEol: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 13,
@@ -3204,13 +3423,50 @@ function webIndexHtml() {
     });
 
     async function api(path, options = {}) {
-      const res = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token), {
+      const res = await fetch(path + (path.includes('?') ? '&' : '?') + requestQuery().slice(1), {
         ...options,
         headers: { 'Content-Type': 'application/json', ...headers, ...(options.headers || {}) }
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error?.message || json.message || 'request failed');
       return json;
+    }
+
+    function renderProjects() {
+      const select = document.getElementById('projectSelect');
+      select.innerHTML = projects.map((p) =>
+        '<option value="' + esc(p.root) + '">' + esc((p.name || p.root) + ' · ' + p.root) + '</option>'
+      ).join('');
+      if (currentProject) select.value = currentProject;
+      document.getElementById('sessionKindFilter').value = sessionKindFilter;
+    }
+
+    function kindMatches(item) {
+      const kind = ['claude', 'codex', 'shell'].includes(item.kind) ? item.kind : 'other';
+      return sessionKindFilter === 'all' || kind === sessionKindFilter;
+    }
+
+    async function loadProjects() {
+      const data = await api('/api/projects');
+      projects = data.projects || [];
+      if (!currentProject) currentProject = data.current?.root || projects[0]?.root || '';
+      renderProjects();
+      updateLocationProject();
+    }
+
+    async function switchProject(root) {
+      currentProject = root;
+      updateLocationProject();
+      active = null;
+      activeDetected = null;
+      activeType = 'managed';
+      if (ws) { clearTimeout(wsReconnectTimer); ws.close(); ws = null; }
+      term.reset();
+      document.getElementById('activeTitle').textContent = 'No session selected';
+      document.getElementById('activeMeta').textContent = 'Start or select a session from the left panel';
+      await Promise.all([refreshSessions(), refreshDetected(), refreshState()]);
+      const first = sessions.find(s => s.status === 'running');
+      if (first) connectManaged(first.id);
     }
 
     function esc(text) {
@@ -3222,45 +3478,52 @@ function webIndexHtml() {
       return new Date(ts * 1000).toLocaleTimeString();
     }
 
-    function setKindDefaults() {
-      const kind = document.getElementById('kind').value;
-      const command = document.getElementById('command');
-      const role = document.getElementById('role');
-      const peerId = document.getElementById('peerId');
-      if (!command.value || ['codex', 'claude', 'bash'].includes(command.value)) {
-        command.value = kind === 'claude' ? 'claude' : kind === 'codex' ? 'codex' : 'bash';
-      }
-      if (!role.value) role.value = 'peer';
-      if (!peerId.value) peerId.placeholder = kind + '-a';
-    }
-    document.getElementById('kind').addEventListener('change', setKindDefaults);
-    setKindDefaults();
+    document.getElementById('projectSelect').addEventListener('change', (event) => {
+      switchProject(event.target.value).catch(console.error);
+    });
+    document.getElementById('sessionKindFilter').addEventListener('change', (event) => {
+      sessionKindFilter = event.target.value || 'all';
+      updateLocationProject();
+      renderSections();
+    });
+    document.getElementById('addProjectBtn').addEventListener('click', async () => {
+      const input = document.getElementById('projectPath');
+      const root = input.value.trim();
+      if (!root) return;
+      await api('/api/projects', { method: 'POST', body: JSON.stringify({ root }) });
+      input.value = '';
+      await loadProjects();
+      await switchProject(root);
+    });
 
     // ── Sessions rendering (managed + detected) ──────────────────────────
     function renderSections() {
       const box = document.getElementById('sessions');
-      const manHtml = sessions.length
-        ? sessions.map((s) => \`
+      const visibleSessions = sessions.filter(kindMatches);
+      const visibleDetected = detected.filter(kindMatches);
+      const filterNote = sessionKindFilter === 'all' ? '' : '<br><br>View filter: ' + esc(sessionKindFilter);
+      const manHtml = visibleSessions.length
+        ? visibleSessions.map((s) => \`
           <div class="session \${active === s.id && activeType === 'managed' ? 'active' : ''}" data-id="\${esc(s.id)}" data-type="managed">
             <div class="row"><strong>\${esc(s.id)}</strong><span class="badge \${esc(s.status)}">\${esc(s.status)}</span></div>
             <div class="row"><span class="badge">\${esc(s.kind)}</span><span class="badge \${s.type === 'external' || s.type === 'tmux' ? 'warn' : ''}">\${s.type === 'external' ? 'external' : s.type === 'tmux' ? 'tmux' : 'pty'}</span></div>
             <div class="path">\${esc(s.command)}</div>
           </div>\`).join('')
-        : '<div class="empty">No active sessions.<br>Use Start Session ↑ or run<br><code>hcc peer start X --kind claude -- claude</code></div>';
+        : '<div class="empty">No active sessions.' + filterNote + '<br><br>Start one above<br>or run in any terminal:<br><code>hcc peer start X -- claude</code></div>';
 
-      const detHtml = detected.length
-        ? detected.map((p) => \`
+      const detHtml = visibleDetected.length
+        ? visibleDetected.map((p) => \`
           <div class="session \${activeDetected === p.id && activeType === 'detected' ? 'active' : ''}" data-id="\${esc(p.id)}" data-type="detected">
             <div class="row"><strong>\${esc(p.id)}</strong><span class="badge" style="color:var(--warn);border-color:#6b5a20">detected</span></div>
             <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge">\${esc(p.status)}</span></div>
             <div class="path" title="\${esc(p.worktree || '')}">\${esc((p.worktree || '').split('/').slice(-2).join('/'))}</div>
           </div>\`).join('')
-        : '<div class="empty">No detected peers.</div>';
+        : '<div class="empty">No detected peers.' + filterNote + '</div>';
 
       box.innerHTML = \`
-        <div class="sec-label">Managed <span class="badge">\${sessions.filter(s=>s.status==='running').length} running</span></div>
+        <div class="sec-label">Managed <span class="badge">\${visibleSessions.filter(s=>s.status==='running').length} running</span></div>
         \${manHtml}
-        <div class="sec-label" style="margin-top:10px">Detected <span class="badge" style="color:var(--warn)">\${detected.length}</span></div>
+        <div class="sec-label" style="margin-top:10px">Detected <span class="badge" style="color:var(--warn)">\${visibleDetected.length}</span></div>
         \${detHtml}
       \`;
       box.querySelectorAll('.session[data-type="managed"]').forEach((el) => {
@@ -3338,7 +3601,6 @@ function webIndexHtml() {
       document.getElementById('terminal').style.display = '';
       document.getElementById('detectedPanel').style.display = 'none';
       document.getElementById('quickBar').style.display = '';
-      document.getElementById('commandBar').style.display = '';
 
       if (ws) { clearTimeout(wsReconnectTimer); ws.close(); }
       term.reset();
@@ -3348,7 +3610,7 @@ function webIndexHtml() {
 
     function openWs(id) {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(proto + '://' + location.host + '/ws/terminal/' + encodeURIComponent(id) + authQuery);
+      ws = new WebSocket(proto + '://' + location.host + '/ws/terminal/' + encodeURIComponent(id) + requestQuery());
       ws.onopen = () => {
         resizeTerm();
         document.getElementById('connState').textContent = 'attached';
@@ -3383,7 +3645,6 @@ function webIndexHtml() {
       document.getElementById('terminal').style.display = 'none';
       document.getElementById('detectedPanel').style.display = '';
       document.getElementById('quickBar').style.display = 'none';
-      document.getElementById('commandBar').style.display = 'none';
       document.getElementById('connState').textContent = 'coordination only';
       renderDetectedPanel(peer || { id });
       refreshDetectedState().catch(console.error);
@@ -3435,11 +3696,7 @@ function webIndexHtml() {
     document.getElementById('startForm').addEventListener('submit', async (event) => {
       event.preventDefault();
       const payload = {
-        id: document.getElementById('peerId').value.trim(),
-        kind: document.getElementById('kind').value,
-        role: document.getElementById('role').value.trim(),
-        command: document.getElementById('command').value.trim(),
-        cwd: document.getElementById('cwd').value.trim()
+        kind: document.getElementById('kind').value
       };
       const data = await api('/api/sessions', { method: 'POST', body: JSON.stringify(payload) });
       await refreshSessions();
@@ -3461,14 +3718,6 @@ function webIndexHtml() {
       });
     });
 
-    document.getElementById('sendLine').addEventListener('click', () => {
-      const input = document.getElementById('lineInput');
-      sendLine(input.value);
-      input.value = '';
-    });
-    document.getElementById('lineInput').addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') { event.preventDefault(); document.getElementById('sendLine').click(); }
-    });
     document.getElementById('stopBtn').addEventListener('click', async () => {
       if (!active) return;
       await api('/api/sessions/' + encodeURIComponent(active) + '/stop', { method: 'POST', body: '{}' });
@@ -3478,7 +3727,13 @@ function webIndexHtml() {
       Promise.all([refreshSessions(), refreshDetected(), refreshState()]).catch(console.error);
     });
 
-    Promise.all([refreshSessions(), refreshDetected(), refreshState()]).catch((err) => {
+    loadProjects().then(() => Promise.all([refreshSessions(), refreshDetected(), refreshState()])).then(() => {
+      // Auto-connect to first running managed session on load
+      if (!active && !activeDetected) {
+        const first = sessions.find(s => s.status === 'running');
+        if (first) connectManaged(first.id);
+      }
+    }).catch((err) => {
       document.getElementById('connState').textContent = 'error';
       console.error(err);
     });
@@ -3489,6 +3744,9 @@ function webIndexHtml() {
       if (activeType === 'detected') refreshDetectedState().catch(console.error);
       else if (active) refreshState().catch(console.error);
     }, 3000);
+    setInterval(() => {
+      loadProjects().catch(console.error);
+    }, 8000);
   </script>
 </body>
 </html>`;
@@ -3502,20 +3760,85 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const host = opts.host || (opts.local ? '127.0.0.1' : '0.0.0.0');
   const port = intOpt(opts, 'port', 8787);
   const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
-  const token = explicitToken || (isLoopbackHost(host) ? '' : randomBytes(18).toString('hex'));
+  const token = explicitToken;
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');
   const pty = ptyModule.default || ptyModule;
   const sessions = new Map();
+  const projectContexts = new Map();
   const prepared = await prepareLocalBus(ctx, opts);
+
+  function rememberProject(projectCtx) {
+    const normalized = contextForProject(projectCtx.root, projectCtx.dbPath, { cwd: projectCtx.cwd, json: ctx.json });
+    projectContexts.set(normalized.root, normalized);
+    registerProject(normalized);
+    return normalized;
+  }
+
+  function knownProjects() {
+    const rows = readProjectRegistry();
+    if (!rows.some((p) => p.root === ctx.root)) rows.unshift(projectRecord(ctx));
+    for (const project of rows) {
+      if (!projectContexts.has(project.root)) {
+        projectContexts.set(project.root, contextForProject(project.root, project.db, { json: ctx.json }));
+      }
+    }
+    return rows;
+  }
+
+  function projectFromRequest(req, url) {
+    const root = url.searchParams.get('root') ||
+      url.searchParams.get('project') ||
+      req.headers['x-hcc-root'] ||
+      ctx.root;
+    const db = url.searchParams.get('db') ||
+      req.headers['x-hcc-db'] ||
+      path.join(path.resolve(root), '.hello-cc', 'mesh.db');
+    return rememberProject(contextForProject(root, db, { cwd: path.resolve(root), json: ctx.json }));
+  }
+
+  function sessionKey(projectCtx, id) {
+    return `${projectCtx.root}\u0000${id}`;
+  }
+
+  function sessionsForProject(projectCtx) {
+    return [...sessions.values()].filter((session) => session.root === projectCtx.root);
+  }
+
+  function getSession(projectCtx, id) {
+    return sessions.get(sessionKey(projectCtx, id));
+  }
+
+  function knownPeerIds(projectCtx) {
+    const db = connect(projectCtx);
+    try {
+      return db.prepare('SELECT id FROM peers').all().map((row) => row.id);
+    } finally {
+      db.close();
+    }
+  }
+
+  function nextProjectSessionId(projectCtx, kind) {
+    return nextSessionId([
+      ...sessionsForProject(projectCtx).map((session) => session.id),
+      ...knownPeerIds(projectCtx)
+    ], kind);
+  }
+
+  rememberProject(ctx);
+  for (const project of readProjectRegistry()) {
+    projectContexts.set(project.root, contextForProject(project.root, project.db, { json: ctx.json }));
+  }
 
   // ── Optional external buffer-file session adoption ───────────────────────
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
   fs.mkdirSync(bufsDir, { recursive: true });
 
   function adoptExternalSession(id) {
-    if (sessions.has(id)) return;
+    const pctx = ctx;
+    const key = sessionKey(pctx, id);
+    if (sessions.has(key)) return;
     const outFile  = path.join(bufsDir, `${id}.out`);
     const inFile   = path.join(bufsDir, `${id}.in`);
     const resizeFile = path.join(bufsDir, `${id}.resize`);
@@ -3527,6 +3850,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     const session = {
       id,
+      root: pctx.root,
+      ctx: pctx,
       kind: meta.kind || 'external',
       role: meta.role || 'peer',
       command: meta.command || '(shim)',
@@ -3546,7 +3871,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     };
     // Load existing output as initial snapshot
     try { session.buffer = fs.readFileSync(outFile, 'utf8'); } catch {}
-    sessions.set(id, session);
+    sessions.set(key, session);
 
     // Open a persistent fd for polling output; fstatSync is cheap.
     let outputOffset = 0;
@@ -3582,7 +3907,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
         if (session.outputPoller) clearInterval(session.outputPoller);
         if (session.exitPoller) clearInterval(session.exitPoller);
-        sessions.delete(id);
+        sessions.delete(key);
       }
     }, 2000);
   }
@@ -3609,6 +3934,49 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
   } catch {}
 
+  // ── Auto-attach detected peers that are in tmux panes ─────────────────────
+  function scanAndAttachDetectedPeers() {
+    const db = connect(ctx);
+    try {
+      const rows = db.prepare(`
+        SELECT id, kind, pid FROM peers
+        WHERE status IN ('running', 'working', 'busy')
+          AND pid IS NOT NULL
+          AND last_seen_at >= ? - ?
+        ORDER BY last_seen_at DESC
+      `).all(now(), ACTIVE_PEER_TTL);
+
+      for (const row of rows) {
+        const key = sessionKey(ctx, row.id);
+        if (sessions.has(key)) continue;
+
+        try {
+          const result = runTmux(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}']);
+          for (const line of result.trim().split('\n')) {
+            const [pane, panePid, command, cwd] = line.split('\t');
+            if (parseInt(panePid) === row.pid) {
+              try {
+                attachTmuxSession({
+                  id: row.id,
+                  pane,
+                  kind: row.kind || inferPeerKind(row.id, null, command),
+                  role: 'peer',
+                  cwd: cwd || ctx.root,
+                  force: false,
+                  projectCtx: ctx
+                });
+              } catch {}
+              break;
+            }
+          }
+        } catch {}
+      }
+    } finally { db.close(); }
+  }
+
+  scanAndAttachDetectedPeers();
+  const autoAttachPoller = setInterval(scanAndAttachDetectedPeers, 5000);
+
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
   function serializeSession(session) {
     return {
@@ -3619,6 +3987,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       cwd: session.cwd,
       pid: session.pid,
       pane: session.pane || null,
+      root: session.root || session.ctx?.root || ctx.root,
       status: session.status,
       type: session.type || 'pty',
       created_at: session.createdAt,
@@ -3654,8 +4023,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     session.status = status;
     session.exitedAt = now();
     broadcast(session, { type: 'exit', event: { reason: status } });
-    sessions.delete(session.id);
-    const db = connect(ctx);
+    const pctx = session.ctx || contextForProject(session.root || ctx.root, null, { json: ctx.json });
+    sessions.delete(sessionKey(pctx, session.id));
+    const db = connect(pctx);
     try {
       db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run(status, now(), session.id);
       db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), session.id);
@@ -3675,7 +4045,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       session.pid = info.pid;
-      session.cwd = session.cwd || info.cwd || ctx.root;
+      session.cwd = session.cwd || info.cwd || session.ctx?.root || ctx.root;
       const captured = tmuxCapturePane(session.pane);
       if (captured === session.lastCapture) return;
       if (captured.startsWith(session.lastCapture || '')) {
@@ -3694,6 +4064,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function attachTmuxSession(input) {
+    const pctx = input.projectCtx || ctx;
     const id = input.id;
     if (!id) throw new CliError('BAD_REQUEST', 'id required');
     const info = tmuxPaneInfo(input.pane || null);
@@ -3711,7 +4082,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }
 
-    const existing = sessions.get(id);
+    const key = sessionKey(pctx, id);
+    const existing = sessions.get(key);
     if (existing && existing.status === 'running') {
       if (existing.type === 'tmux' && existing.pane === info.pane) return existing;
       throw new CliError('SESSION_EXISTS', `Session ${id} is already running`);
@@ -3719,11 +4091,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     const kind = inferPeerKind(id, input.kind || null, info.command);
     const role = input.role || 'peer';
-    const cwd = path.resolve(input.cwd || info.cwd || ctx.root);
+    const cwd = path.resolve(input.cwd || info.cwd || pctx.root);
     const command = input.command || `tmux ${info.pane} (${info.command})`;
     const captured = tmuxCapturePane(info.pane);
     const session = {
       id,
+      root: pctx.root,
+      ctx: pctx,
       kind,
       role,
       command,
@@ -3739,10 +4113,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       clients: new Set(),
       capturePoller: null
     };
-    sessions.set(id, session);
+    sessions.set(key, session);
     session.capturePoller = setInterval(() => pollTmuxSession(session), 500);
 
-    const db = connect(ctx);
+    const db = connect(pctx);
     try {
       upsertPeer(db, {
         id,
@@ -3794,18 +4168,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   function startTmuxManagedSession(input) {
     ensureTmuxAvailable({ autoInstall: false });
+    const pctx = input.projectCtx || ctx;
     const kind = input.kind || 'shell';
-    const id = input.id || nextSessionId(sessions, kind);
+    const id = input.id || nextProjectSessionId(pctx, kind);
     const role = input.role || 'peer';
     const command = input.command || defaultSessionCommand(kind);
-    const cwd = path.resolve(input.cwd || ctx.root);
-    const sessionName = tmuxManagedSessionName(ctx, id);
+    const cwd = path.resolve(input.cwd || pctx.root);
+    const sessionName = tmuxManagedSessionName(pctx, id);
     let paneTarget = `${sessionName}:0.0`;
     const callerEnv = input.env && typeof input.env === 'object' ? input.env : process.env;
     const env = childSessionEnv({
       HCC_PEER: id,
-      HCC_ROOT: ctx.root,
-      HCC_DB: ctx.dbPath,
+      HCC_ROOT: pctx.root,
+      HCC_DB: pctx.dbPath,
       TERM: 'xterm-256color'
     }, callerEnv);
     env[LAUNCH_FINGERPRINT_ENV] = launchFingerprint({ command, cwd, env });
@@ -3814,7 +4189,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (hasSession && input.restartOnEnvChange) {
       const existingFingerprint = tmuxSessionEnvironmentValue(sessionName, LAUNCH_FINGERPRINT_ENV);
       if (existingFingerprint !== env[LAUNCH_FINGERPRINT_ENV]) {
-        const existing = sessions.get(id);
+        const existing = getSession(pctx, id);
         const hasWebClients = hasOpenClients(existing);
         const hasTmuxClients = tmuxSessionHasClients(sessionName);
         if (hasWebClients || hasTmuxClients) {
@@ -3826,7 +4201,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         if (existing) detachTmuxSession(existing, 'detached');
         tmuxKillSession(sessionName);
         hasSession = false;
-        const db = connect(ctx);
+        const db = connect(pctx);
         try {
           addEvent(db, 'tmux.session.restarted', id, null, { reason: 'launch_environment_changed' });
         } finally {
@@ -3852,6 +4227,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       cwd,
       command,
       pane,
+      projectCtx: pctx,
       binding: {
         ...(input.binding || {}),
         command: input.binding?.command || command,
@@ -3863,8 +4239,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
   }
 
-  function restoreTmuxManagedSessions() {
-    const db = connect(ctx);
+  function restoreTmuxManagedSessions(projectCtx = ctx) {
+    const db = connect(projectCtx);
     let rows = [];
     try {
       rows = db.prepare(`
@@ -3886,9 +4262,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           id: row.id,
           kind: row.kind,
           role: row.role || 'peer',
-          cwd: row.worktree || ctx.root,
+          cwd: row.worktree || projectCtx.root,
           command: row.command || null,
           pane: row.runtime_target,
+          projectCtx,
           force: true,
           binding: {
             provider: row.provider,
@@ -3907,20 +4284,22 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function startPtySession(input) {
+    const pctx = input.projectCtx || ctx;
     const kind = input.kind || 'shell';
-    const id = input.id || nextSessionId(sessions, kind);
-    if (sessions.has(id) && sessions.get(id).status === 'running') {
-      return sessions.get(id);
+    const id = input.id || nextProjectSessionId(pctx, kind);
+    const key = sessionKey(pctx, id);
+    if (sessions.has(key) && sessions.get(key).status === 'running') {
+      return sessions.get(key);
     }
     const role = input.role || 'peer';
     const command = input.command || defaultSessionCommand(kind);
-    const cwd = path.resolve(input.cwd || ctx.root);
+    const cwd = path.resolve(input.cwd || pctx.root);
     const callerEnv = input.env && typeof input.env === 'object' ? input.env : process.env;
     const shell = callerEnv.SHELL || process.env.SHELL || 'bash';
     const env = childSessionEnv({
       HCC_PEER: id,
-      HCC_ROOT: ctx.root,
-      HCC_DB: ctx.dbPath,
+      HCC_ROOT: pctx.root,
+      HCC_DB: pctx.dbPath,
       TERM: 'xterm-256color'
     }, callerEnv);
     const size = input.size || { cols: 100, rows: 30 };
@@ -3933,6 +4312,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
     const session = {
       id,
+      root: pctx.root,
+      ctx: pctx,
       kind,
       role,
       command,
@@ -3945,8 +4326,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       buffer: '',
       clients: new Set()
     };
-    sessions.set(id, session);
-    const db = connect(ctx);
+    sessions.set(key, session);
+    const db = connect(pctx);
     try {
       upsertPeer(db, {
         id,
@@ -3981,7 +4362,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     child.onExit((event) => {
       session.status = 'exited';
       session.exitedAt = now();
-      const db = connect(ctx);
+      const db = connect(pctx);
       try {
         db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
         addEvent(db, 'web.session.exited', id, null, event);
@@ -3998,7 +4379,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return startTmuxManagedSession(input);
   }
 
-  restoreTmuxManagedSessions();
+  for (const projectCtx of projectContexts.values()) {
+    restoreTmuxManagedSessions(projectCtx);
+  }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -4019,13 +4402,39 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Missing or invalid token' } });
         return;
       }
+      const reqCtx = projectFromRequest(req, url);
+      if (req.method === 'GET' && url.pathname === '/api/projects') {
+        sendJson(res, 200, { projects: knownProjects(), current: projectRecord(reqCtx) });
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/projects') {
+        const input = await readJsonRequest(req);
+        const projectCtx = rememberProject(contextForProject(input.root || reqCtx.root, input.db || reqCtx.dbPath, { json: ctx.json }));
+        const db = connect(projectCtx);
+        db.close();
+        writeRuntime(projectCtx, {
+          product: PRODUCT_NAME,
+          version: VERSION,
+          pid: process.pid,
+          root: projectCtx.root,
+          db: projectCtx.dbPath,
+          host,
+          port: actualPort,
+          base_url: runtimeBaseUrl(host, actualPort),
+          token,
+          global_runtime: true,
+          started_at: now()
+        });
+        sendJson(res, 200, { project: projectRecord(projectCtx), projects: knownProjects() });
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        sendJson(res, 200, statusSnapshot(ctx, url.searchParams.get('peer')));
+        sendJson(res, 200, statusSnapshot(reqCtx, url.searchParams.get('peer')));
         return;
       }
       // Detected sessions: peers registered via hooks/watcher but without PTY
       if (req.method === 'GET' && url.pathname === '/api/detected') {
-        const db = connect(ctx);
+        const db = connect(reqCtx);
         let detected = [];
         try {
           const t = now();
@@ -4033,15 +4442,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             SELECT id, kind, role, status, worktree, branch, pid, capabilities,
                    created_at, last_seen_at, (? - last_seen_at) AS age_sec
             FROM peers
-            WHERE last_seen_at >= ?
             ORDER BY last_seen_at DESC, id ASC
             LIMIT 100
-          `).all(t, t - ACTIVE_PEER_TTL * 2);
+          `).all(t);
         } finally {
           db.close();
         }
         // Exclude peers that are already in the managed sessions Map
-        const managedIds = new Set(sessions.keys());
+        const managedIds = new Set(sessionsForProject(reqCtx).map((s) => s.id));
         sendJson(res, 200, { detected: detected.filter(p => !managedIds.has(p.id)) });
         return;
       }
@@ -4050,9 +4458,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           product: PRODUCT_NAME,
           version: VERSION,
           pid: process.pid,
-          root: ctx.root,
-          db: ctx.dbPath,
-          sessions: sessions.size
+          root: reqCtx.root,
+          db: reqCtx.dbPath,
+          projects: knownProjects(),
+          sessions: sessionsForProject(reqCtx).length
         });
         return;
       }
@@ -4062,25 +4471,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/sessions') {
-        sendJson(res, 200, { sessions: [...sessions.values()].map(serializeSession) });
+        sendJson(res, 200, { sessions: sessionsForProject(reqCtx).map(serializeSession) });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/sessions') {
         const input = await readJsonRequest(req);
-        const session = startSession(input);
+        const session = startSession({ ...input, projectCtx: reqCtx });
         sendJson(res, 200, { session: serializeSession(session) });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/sessions/attach') {
         const input = await readJsonRequest(req);
-        const session = attachTmuxSession(input);
+        const session = attachTmuxSession({ ...input, projectCtx: reqCtx });
         sendJson(res, 200, { session: serializeSession(session) });
         return;
       }
       const inputMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/input$/);
       if (req.method === 'POST' && inputMatch) {
         const id = decodeURIComponent(inputMatch[1]);
-        const session = sessions.get(id);
+        const session = getSession(reqCtx, id);
         if (!session) {
           sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Session not found' } });
           return;
@@ -4093,7 +4502,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const text = String(input.text ?? input.data ?? '');
         const data = input.data !== undefined ? String(input.data) : `${text}${input.enter === false ? '' : '\r'}`;
         writeSessionInput(session, data);
-        const db = connect(ctx);
+        const db = connect(session.ctx || reqCtx);
         try {
           addEvent(db, 'web.session.input', id, null, { bytes: data.length, enter: input.enter !== false });
         } finally {
@@ -4105,7 +4514,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const stopMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/);
       if (req.method === 'POST' && stopMatch) {
         const id = decodeURIComponent(stopMatch[1]);
-        const session = sessions.get(id);
+        const session = getSession(reqCtx, id);
         if (!session) {
           sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Session not found' } });
           return;
@@ -4134,7 +4543,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const sender = String(input.from || 'web');
         const taskId = input.task ? Number(input.task) : null;
         if (!body) { sendJson(res, 400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body required' } }); return; }
-        const db = connect(ctx);
+        const db = connect(reqCtx);
         let msgId;
         try {
           msgId = sendMessage(db, sender, peerId, taskId, 'note', body);
@@ -4165,8 +4574,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       socket.destroy();
       return;
     }
+    const reqCtx = projectFromRequest(req, url);
     const id = decodeURIComponent(match[1]);
-    const session = sessions.get(id);
+    const session = getSession(reqCtx, id);
     if (!session) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();
@@ -4197,6 +4607,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function shutdown() {
     clearRuntime(ctx);
     clearInterval(externalScanPoller);
+    clearInterval(autoAttachPoller);
     for (const session of sessions.values()) {
       if (session.status !== 'running') continue;
       if (session.type === 'external') {
@@ -4215,7 +4626,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   process.once('SIGTERM', shutdown);
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
-  const runtimeFile = writeRuntime(ctx, {
+  const runtime = {
     product: PRODUCT_NAME,
     version: VERSION,
     pid: process.pid,
@@ -4225,9 +4636,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     port: actualPort,
     base_url: runtimeBaseUrl(host, actualPort),
     token,
-    token_generated: Boolean(token && !explicitToken),
     started_at: now()
-  });
+  };
+  const runtimeFile = writeRuntime(ctx, runtime);
+  writeGlobalRuntime(runtime);
+  registerProject(ctx);
   const db = connect(ctx);
   try {
     addEvent(db, startMeta.eventType || 'web.started', 'human', null, {
@@ -4243,18 +4656,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     db.close();
   }
   const shownHost = host === '0.0.0.0' ? '<machine-ip>' : host;
-  const url = `http://${shownHost}:${actualPort}${token ? `/?token=${token}` : ''}`;
+  const url = `http://${shownHost}:${actualPort}/${runtimeUrlQuery(runtime, ctx.root)}`;
   console.log(`${PRODUCT_NAME} web listening on ${host}:${actualPort}`);
   console.log(`project: ${ctx.root}`);
   console.log(`database: ${ctx.dbPath}`);
   console.log(`open: ${url}`);
-  if (host !== '127.0.0.1' && !explicitToken) {
-    console.log('token was generated for this server process; set HCC_WEB_TOKEN to choose a stable token');
-  }
 }
 
 async function cmdRun(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpRun();
+  registerProjectActivity(ctx);
   const sep = args.indexOf('--');
   const optArgs = sep >= 0 ? args.slice(0, sep) : args;
   const cmdArgs = sep >= 0 ? args.slice(sep + 1) : [];
@@ -4316,6 +4727,7 @@ async function cmdRun(ctx, args) {
  * browsers. Input from the browser is written to a .in file that we relay.
  */
 async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs, binding, force = false }) {
+  registerProjectActivity(ctx);
   const ptyModule = await import('node-pty');
   const pty = ptyModule.default || ptyModule;
 
@@ -4512,7 +4924,7 @@ Environment:
   HCC_ROOT               Override project root
   HCC_DB                 Override database path
   HCC_PEER               Default peer id; inferred automatically when absent
-  HCC_WEB_TOKEN          Token for non-local web access
+  HCC_WEB_TOKEN          Optional web access token
 `);
 }
 
@@ -4739,6 +5151,9 @@ installs Claude/Codex hooks and shims, ensures tmux is available, starts the
 browser terminal console as a background runtime, prints the URL, PID, runtime
 file, and log file, then returns the terminal to you.
 
+Web token auth is disabled by default. Pass --token or set HCC_WEB_TOKEN to
+require a token.
+
 After hcc web, plain claude/codex commands started from a new shell are wrapped
 as local tmux-backed terminals. Existing ordinary terminals can communicate
 through the bus, but cannot be visually attached unless they were started under
@@ -4809,6 +5224,7 @@ async function cmdHook(ctx, args) {
     root: hccRoot,
     dbPath: path.join(hccRoot, '.hello-cc', 'mesh.db')
   };
+  registerProjectActivity(hookCtx);
 
   // Derive peer ID: HCC_PEER > resume ID from parent cmdline > session ID > terminal
   let peerId = process.env.HCC_PEER;
@@ -5120,6 +5536,7 @@ async function cmdScan(ctx, args) {
   const results = [...byId.values()];
 
   if (opts.register && results.length) {
+    registerProjectActivity(ctx);
     const db = connect(ctx);
     try {
       for (const s of results) {

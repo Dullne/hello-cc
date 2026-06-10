@@ -63,8 +63,8 @@ hcc web
 6. Adds `~/.hcc-shims` to the shell PATH
 7. Ensures `tmux` is available, with best-effort automatic install and a clear
    install command if that fails
-8. Starts the web console in the background, prints URL/PID/runtime/log, then
-   returns the terminal to you
+8. Starts or reuses the global web console, registers the current project,
+   prints URL/PID/runtime/log, then returns the terminal to you
 
 Example output:
 
@@ -75,12 +75,18 @@ project: /path/to/project
 database: /path/to/project/.hello-cc/mesh.db
 runtime: /path/to/project/.hello-cc/runtime.json
 log: /path/to/project/.hello-cc/web.log
-open: http://<machine-ip>:8787/?token=xxxxx
-local: http://127.0.0.1:8787/?token=xxxxx
+open: http://<machine-ip>:8787/?project=%2Fpath%2Fto%2Fproject
+local: http://127.0.0.1:8787/?project=%2Fpath%2Fto%2Fproject
 shims: installed claude, codex
 PATH updated in ~/.bashrc; open a new terminal or source it
 stop: hcc down
 ```
+
+`hcc web` uses a single global web runtime. Running `hcc web` again from
+another project directory does not open another port; it registers that project
+with the same web console. The frontend Project selector switches between
+registered roots. Each project still keeps its own `.hello-cc/mesh.db`, so
+tasks, messages, locks, and peers stay isolated.
 
 After the first shim install, open a new terminal or run:
 
@@ -185,9 +191,24 @@ If a session still says it cannot know, likely causes are:
 
 - `hcc web` has not been run in the project directory
 - the terminal has not loaded `~/.hcc-shims` into PATH
+- Codex hooks are not enabled or the installed hook has not been trusted in
+  Codex's hook review flow
 - the CLI was started in a different project directory
 - the session was an already-open raw terminal before hello-cc was installed
 - the provider CLI version did not fire the expected hook
+
+To verify Claude Code hook injection directly, run a one-shot debug call from
+the same project:
+
+```bash
+claude -p 'Do you see hello-cc open tasks?' --debug hooks --debug-file /tmp/hcc-claude-hooks.log
+```
+
+The debug log should contain `Hook UserPromptSubmit ... provided
+additionalContext` and the `hello-cc coordination` block. If that is present but
+the model still answers from generic isolation knowledge, restart/resume the
+session through the shim and ask again; hello-cc injects a stronger instruction
+on every new user prompt.
 
 ## Web Console
 
@@ -197,7 +218,7 @@ Start local and LAN-visible control:
 hcc web
 ```
 
-Use a stable token and port:
+Use a token only when you want one:
 
 ```bash
 HCC_WEB_TOKEN='choose-a-long-token' hcc web --host 0.0.0.0 --port 8787
@@ -206,14 +227,20 @@ HCC_WEB_TOKEN='choose-a-long-token' hcc web --host 0.0.0.0 --port 8787
 Open from another machine on the same network:
 
 ```text
-http://<machine-ip>:8787/?token=choose-a-long-token
+http://<machine-ip>:8787/
 ```
 
 The web console can:
 
+- switch between multiple registered project roots on one port
+- register another project path from the browser and switch to it without
+  starting another web server
 - show project state: peers, tasks, messages, locks, handoffs, events
 - operate local terminals: start Claude/Codex/shell, send keyboard input, view
   output, detach runtime control
+- start a new session by choosing only its kind; the browser form generates the
+  next project-local alias, uses the selected Project root as the working
+  directory, and runs the default command for that kind
 
 Browser-controlled sessions are local tmux terminals:
 
@@ -364,10 +391,11 @@ npm test
 
 The regression creates a temporary project, temporary `HOME`, fake
 `claude`/`codex` binaries, a temporary runtime port, and temporary tmux
-sessions. It covers `hcc web` bootstrap, hooks/shims, SQLite coordination,
-tmux-backed `peer start` creation and restore, shim-launched tmux peers, tmux
-attach, WebSocket terminal streaming, terminal injection, runtime shutdown,
-package dry-run, and old-name scanning.
+sessions. It covers `hcc web` bootstrap, single-port multi-project
+registration, hooks/shims, SQLite coordination, tmux-backed `peer start`
+creation and restore, shim-launched tmux peers, tmux attach, WebSocket terminal
+streaming, terminal injection, runtime shutdown, package dry-run, and old-name
+scanning.
 
 ## Architecture
 
@@ -390,7 +418,7 @@ hcc CLI
 | `HCC_PEER` | default peer identity |
 | `HCC_ROOT` | override project root |
 | `HCC_DB` | override database path |
-| `HCC_WEB_TOKEN` | token for non-local web access |
+| `HCC_WEB_TOKEN` | optional token for web access |
 | `HCC_RUNTIME_URL` | direct runtime URL |
 | `HCC_NO_AUTO_INSTALL_TMUX=1` | disable tmux auto-install, mainly for tests |
 
@@ -411,6 +439,14 @@ or run `hcc peer stop <peer>` before starting it again.
 
 When you call `hcc peer start` directly, add `--restart-env` if you want the
 same restart-on-environment-change behavior.
+
+The shims only manage interactive terminal sessions. Metadata and maintenance
+commands pass through to the real provider CLI, including `claude --help`,
+`claude --version`, `claude --print`, `claude --bare`, `claude --safe-mode`,
+`codex --help`, `codex --version`, and non-interactive Codex subcommands such as
+`codex exec`, `codex review`, `codex doctor`, and `codex mcp`. Interactive
+`claude`, `claude --resume ...`, `codex`, `codex resume ...`, and `codex fork
+...` are tmux-backed and visible in the Web console.
 
 ---
 

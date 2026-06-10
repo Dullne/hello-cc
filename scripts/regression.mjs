@@ -88,6 +88,10 @@ function hccFrom(args, cwd, options = {}) {
   return run(process.execPath, [hccBin, ...args], { ...options, cwd });
 }
 
+function hccFromMaybe(args, cwd, options = {}) {
+  return runMaybe(process.execPath, [hccBin, ...args], { ...options, cwd });
+}
+
 function tmuxAvailable() {
   return runMaybe('tmux', ['-V']).status === 0;
 }
@@ -281,11 +285,13 @@ function cleanup() {
 }
 
 async function setupRegression() {
-  log('[1/11] web bootstrap/hooks/shims');
+  log('[1/12] web bootstrap/hooks/shims');
   writeFakeTools();
   fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(home, '.profile'), 'if [ "$BASH" ]; then . "$HOME/.bashrc"; fi\n');
+  fs.writeFileSync(path.join(home, '.bashrc'), '# regression rc\n[ -z "$PS1" ] && return\nexport PATH="/late:$PATH"\n');
   const output = hcc(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance']);
   const match = output.match(/^pid:\s*(\d+)/m);
   if (!match) fail(`hcc web did not print background pid during bootstrap:\n${output}`);
@@ -307,6 +313,16 @@ async function setupRegression() {
   }
   ensureFile(path.join(home, '.hcc-shims', 'claude'));
   ensureFile(path.join(home, '.hcc-shims', 'codex'));
+  const bashrc = fs.readFileSync(path.join(home, '.bashrc'), 'utf8');
+  const shimIndex = bashrc.indexOf('.hcc-shims');
+  const guardIndex = bashrc.indexOf('[ -z "$PS1" ] && return');
+  if (shimIndex < 0 || guardIndex < 0 || shimIndex > guardIndex) {
+    fail(`shim PATH was not installed before bash early return:\n${bashrc}`);
+  }
+  const nonInteractiveCodex = run('bash', ['-lc', 'command -v codex'], { env }).trim();
+  if (nonInteractiveCodex !== path.join(home, '.hcc-shims', 'codex')) {
+    fail(`non-interactive bash did not resolve codex shim: ${nonInteractiveCodex}`);
+  }
   if (!hcc(['install-hooks', '--status']).includes('claude=yes codex=yes')) fail('hooks not installed');
   if (!hcc(['shim', 'status']).includes('shims installed')) fail('shims not installed');
   const staleShim = path.join(home, '.hcc-shims', 'claude');
@@ -319,6 +335,22 @@ async function setupRegression() {
   if (!refreshedShim.includes('shim ensure "claude"') || refreshedShim.includes('stale --web-managed')) {
     fail(`shim ensure did not refresh stale shim:\n${refreshedShim}`);
   }
+  await stopRuntime();
+
+  const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
+  if (!noTokenMatch) fail(`no-token web did not print background pid:\n${noTokenOutput}`);
+  runtimePid = Number.parseInt(noTokenMatch[1], 10);
+  if (noTokenOutput.includes('token=') || noTokenOutput.includes('token was generated')) {
+    fail(`default web output unexpectedly required token:\n${noTokenOutput}`);
+  }
+  await waitRuntime();
+  const noTokenRuntime = JSON.parse(fs.readFileSync(path.join(root, '.hello-cc', 'runtime.json'), 'utf8'));
+  if (noTokenRuntime.token || Object.hasOwn(noTokenRuntime, 'token_generated')) {
+    fail(`default web runtime unexpectedly stored token data:\n${JSON.stringify(noTokenRuntime, null, 2)}`);
+  }
+  const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`);
+  if (!noTokenResponse.ok) fail(`default web API required token: ${noTokenResponse.status}`);
   await stopRuntime();
 
   const childDir = path.join(root, 'packages', 'child');
@@ -336,6 +368,14 @@ async function setupRegression() {
   if (!explicitChildStatus.includes(`root: ${root}`) || !explicitChildStatus.includes(`db: ${path.join(root, '.hello-cc', 'mesh.db')}`)) {
     fail(`explicit child command did not use requested root:\n${explicitChildStatus}`);
   }
+  const childHookPayload = JSON.stringify({ session_id: 'child-hook-session', cwd: childDir, hook_event_name: 'UserPromptSubmit', prompt: 'status?' });
+  hccFrom(['hook', 'userpromptsubmit'], childDir, { input: childHookPayload, env: envWithoutPeer({ CODEX_THREAD_ID: 'child-hook-thread' }) });
+  const registryFile = path.join(home, '.hello-cc', 'projects.json');
+  ensureFile(registryFile);
+  const registry = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+  if (!(registry.projects || []).some((p) => p.root === childDir)) {
+    fail(`hook project was not auto-registered:\n${JSON.stringify(registry, null, 2)}`);
+  }
 
   const joinOut = hcc(['join', '--peer', 'join-a', '--kind', 'codex']);
   if (!joinOut.includes('export HCC_PEER=join-a')) fail(`bad join output: ${joinOut}`);
@@ -350,7 +390,7 @@ async function setupRegression() {
 }
 
 async function dbWorkflow() {
-  log('[3/11] db workflow');
+  log('[3/12] db workflow');
   hcc(['register', '--peer', 'human', '--kind', 'human', '--role', 'operator']);
   const created = hcc(['task', 'create', '--from', 'human', '--to', 'codex-a', '--title', 'full regression task', '--body', 'exercise hcc bus']);
   const taskMatch = created.match(/created task #(\d+):/);
@@ -405,6 +445,9 @@ async function dbWorkflow() {
   if (!firstHook.includes('[hello-cc coordination]') || !firstHook.includes('[hello-cc open tasks]') || !firstHook.includes(`#${hookTaskId} running`)) {
     fail(`UserPromptSubmit hook did not include open task snapshot:\n${firstHook}`);
   }
+  if (!firstHook.includes('[hello-cc known peers]') || !firstHook.includes('do not say sessions are isolated')) {
+    fail(`UserPromptSubmit hook missing strong cross-session instruction:\n${firstHook}`);
+  }
   if (!firstHook.includes('hcc task list') || !firstHook.includes('hook-only-message')) {
     fail(`UserPromptSubmit hook missing instructions or unread message:\n${firstHook}`);
   }
@@ -454,13 +497,83 @@ async function dbWorkflow() {
   }
 }
 
+async function multiProjectWebWorkflow() {
+  log('[4/12] multi-project web');
+  const otherRoot = path.join(root, 'second-project');
+  fs.mkdirSync(otherRoot, { recursive: true });
+  const output = hccFrom(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance'], otherRoot);
+  if (!output.includes('web already running in background')) fail(`second project did not reuse global web:\n${output}`);
+  if (!output.includes(`project: ${otherRoot}`)) fail(`second project output did not show its root:\n${output}`);
+  if (!output.includes(encodeURIComponent(otherRoot))) fail(`second project URL did not include project query:\n${output}`);
+
+  const otherRuntimeFile = path.join(otherRoot, '.hello-cc', 'runtime.json');
+  ensureFile(otherRuntimeFile);
+  const otherRuntime = JSON.parse(fs.readFileSync(otherRuntimeFile, 'utf8'));
+  if (otherRuntime.pid !== runtimePid || otherRuntime.port !== port) {
+    fail(`second project runtime did not point at global runtime:\n${JSON.stringify(otherRuntime, null, 2)}`);
+  }
+
+  const projectsResponse = await fetch(`http://127.0.0.1:${port}/api/projects?root=${encodeURIComponent(otherRoot)}`);
+  const projects = await projectsResponse.json();
+  if (!projectsResponse.ok) fail(`projects API failed: ${JSON.stringify(projects)}`);
+  const roots = new Set((projects.projects || []).map((p) => p.root));
+  if (!roots.has(root) || !roots.has(otherRoot)) {
+    fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
+  }
+
+  const htmlResponse = await fetch(`http://127.0.0.1:${port}/`);
+  const html = await htmlResponse.text();
+  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
+    if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
+  }
+  if (!html.includes('Register Project') || !html.includes('New session') || !html.includes('<strong>Sessions</strong>') || !html.includes('<label>View<select')) {
+    fail('web form missing simplified project/session controls');
+  }
+
+  if (!tmuxAvailable()) return;
+  const started = hccFrom(['peer', 'start', 'other-shell', '--kind', 'shell', '--', 'bash', '--noprofile', '--norc'], otherRoot);
+  parsePane(started);
+  const rootList = hcc(['peer', 'list']);
+  const otherList = hccFrom(['peer', 'list'], otherRoot);
+  if (rootList.includes('other-shell')) fail(`root project saw second project session:\n${rootList}`);
+  if (!otherList.includes('other-shell')) fail(`second project did not see its session:\n${otherList}`);
+
+  const rootSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`)).json();
+  const otherSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(otherRoot)}`)).json();
+  if ((rootSessions.sessions || []).some((s) => s.id === 'other-shell')) {
+    fail(`root API saw second project session:\n${JSON.stringify(rootSessions)}`);
+  }
+  if (!(otherSessions.sessions || []).some((s) => s.id === 'other-shell')) {
+    fail(`second project API did not see its session:\n${JSON.stringify(otherSessions)}`);
+  }
+
+  const startAuto = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(otherRoot)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'shell', command: 'bash --noprofile --norc' })
+    });
+    const json = await response.json();
+    if (!response.ok) fail(`auto web session start failed: ${JSON.stringify(json)}`);
+    return json.session;
+  };
+  const autoOne = await startAuto();
+  const autoTwo = await startAuto();
+  if (!autoOne.id.startsWith('shell-') || !autoTwo.id.startsWith('shell-') || autoOne.id === autoTwo.id) {
+    fail(`auto web session ids were not unique: ${autoOne.id}, ${autoTwo.id}`);
+  }
+  await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(autoOne.id)}/stop?root=${encodeURIComponent(otherRoot)}`, { method: 'POST' });
+  await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(autoTwo.id)}/stop?root=${encodeURIComponent(otherRoot)}`, { method: 'POST' });
+  hccFromMaybe(['peer', 'stop', 'other-shell'], otherRoot);
+}
+
 async function tmuxBackedStartWorkflow() {
   if (!tmuxAvailable()) {
-    log('[4/11] tmux-backed start skipped (tmux not installed)');
+    log('[5/12] tmux-backed start skipped (tmux not installed)');
     return;
   }
 
-  log('[4/11] tmux-backed start + websocket + restore');
+  log('[5/12] tmux-backed start + websocket + restore');
   const file = path.join(outDir, 'pty-ok');
   const started = hcc(['peer', 'start', 'shell-a', '--kind', 'shell', '--', 'bash']);
   const pane = parsePane(started);
@@ -493,12 +606,30 @@ async function tmuxBackedStartWorkflow() {
 
 async function shimTmuxWorkflow() {
   if (!tmuxAvailable()) {
-    log('[5/11] shim tmux-backed launch skipped (tmux not installed)');
+    log('[6/12] shim tmux-backed launch skipped (tmux not installed)');
     return;
   }
 
-  log('[5/11] shim tmux-backed launch');
+  log('[6/12] shim tmux-backed launch');
   const shim = path.join(home, '.hcc-shims', 'claude');
+  const codexShim = path.join(home, '.hcc-shims', 'codex');
+  const claudeVersion = run(shim, ['--version'], { cwd: root, env });
+  if (!claudeVersion.includes('fake-claude --version') || claudeVersion.includes('started ')) {
+    fail(`claude shim did not pass through --version:\n${claudeVersion}`);
+  }
+  const claudePrint = run(shim, ['--print', 'hello'], { cwd: root, env });
+  if (!claudePrint.includes('fake-claude --print hello') || claudePrint.includes('started ')) {
+    fail(`claude shim did not pass through --print:\n${claudePrint}`);
+  }
+  const codexVersion = run(codexShim, ['--version'], { cwd: root, env });
+  if (!codexVersion.includes('fake-codex --version') || codexVersion.includes('started ')) {
+    fail(`codex shim did not pass through --version:\n${codexVersion}`);
+  }
+  const codexExec = run(codexShim, ['exec', 'hello'], { cwd: root, env });
+  if (!codexExec.includes('fake-codex exec hello') || codexExec.includes('started ')) {
+    fail(`codex shim did not pass through exec:\n${codexExec}`);
+  }
+
   const shimEnv = {
     ...env,
     HCC_SHIM_NO_ATTACH: '1',
@@ -538,11 +669,11 @@ async function shimTmuxWorkflow() {
 async function tmuxWorkflow() {
   const tmuxVersion = runMaybe('tmux', ['-V']);
   if (tmuxVersion.status !== 0) {
-    log('[6/11] tmux skipped (tmux not installed)');
+    log('[7/12] tmux skipped (tmux not installed)');
     return;
   }
 
-  log('[6/11] tmux attach + websocket + force');
+  log('[7/12] tmux attach + websocket + force');
   run('tmux', ['new-session', '-d', '-s', tmuxSession, '-c', os.tmpdir(), 'bash --noprofile --norc']);
   tmuxStarted = true;
   const pane = run('tmux', ['display-message', '-p', '-t', `${tmuxSession}:0.0`, '#{pane_id}']).trim();
@@ -563,11 +694,11 @@ async function tmuxWorkflow() {
 
 async function askBroadcastWorkflow() {
   if (!tmuxAvailable()) {
-    log('[7/11] ask/broadcast injection skipped (tmux not installed)');
+    log('[8/12] ask/broadcast injection skipped (tmux not installed)');
     return;
   }
 
-  log('[7/11] ask/broadcast injection');
+  log('[8/12] ask/broadcast injection');
   const askFile = path.join(outDir, 'ask-ok');
   parsePane(hcc(['peer', 'start', 'shell-b', '--kind', 'shell', '--', 'bash']));
   hcc(['ask', 'shell-b', `echo ASK_OK > ${askFile}`, '--from', 'human', '--inject']);
@@ -579,7 +710,7 @@ async function askBroadcastWorkflow() {
 }
 
 async function downGcPackWorkflow() {
-  log('[8/11] down/gc/pack');
+  log('[9/12] down/gc/pack');
   hccMaybe(['peer', 'stop', 'shell-a']);
   hccMaybe(['peer', 'stop', 'shell-b']);
   await stopRuntime();
@@ -589,7 +720,7 @@ async function downGcPackWorkflow() {
 }
 
 function oldNameScan() {
-  log('[9/11] old-name scan');
+  log('[10/12] old-name scan');
   const oldNamePattern = [
     'agent' + 'mesh',
     'Agent' + 'mesh',
@@ -613,7 +744,7 @@ function oldNameScan() {
 }
 
 function syntaxAndHelp() {
-  log('[10/11] syntax/help');
+  log('[11/12] syntax/help');
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'setup.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
@@ -632,7 +763,7 @@ function syntaxAndHelp() {
 }
 
 function uninstallWorkflow() {
-  log('[11/11] maintenance cleanup');
+  log('[12/12] maintenance cleanup');
   const uninstallRoot = path.join(os.tmpdir(), `hcc-reg-uninstall-root-${testId}`);
   const uninstallHome = path.join(os.tmpdir(), `hcc-reg-uninstall-home-${testId}`);
   fs.mkdirSync(uninstallRoot, { recursive: true });
@@ -682,11 +813,12 @@ async function main() {
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
 
   await setupRegression();
-  log('[2/11] runtime');
+  log('[2/12] runtime');
   startRuntime();
   await waitRuntime();
   hcc(['peer', 'list']);
   await dbWorkflow();
+  await multiProjectWebWorkflow();
   await tmuxBackedStartWorkflow();
   await shimTmuxWorkflow();
   await tmuxWorkflow();
