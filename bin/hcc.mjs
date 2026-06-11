@@ -3311,20 +3311,27 @@ function webIndexHtml() {
       width: 118px;
     }
     .sessions, .state {
+      min-height: 0;
       overflow-y: auto;
       overflow-x: hidden;
-      scrollbar-gutter: stable;
-      padding: 10px 18px 10px 10px;
+      padding: 10px;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       align-content: start;
       gap: 8px;
+      scrollbar-width: thin;
+      scrollbar-color: #3a3f4a transparent;
     }
+    .sessions::-webkit-scrollbar, .state::-webkit-scrollbar { width: 8px; }
+    .sessions::-webkit-scrollbar-track, .state::-webkit-scrollbar-track { background: transparent; }
+    .sessions::-webkit-scrollbar-thumb, .state::-webkit-scrollbar-thumb { background: #3a3f4a; border-radius: 4px; }
     .session {
       border: 1px solid var(--border);
       background: #111418;
       border-radius: 8px;
       padding: 9px;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       gap: 7px;
       cursor: pointer;
     }
@@ -3334,6 +3341,7 @@ function webIndexHtml() {
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+      min-width: 0;
     }
     .row strong {
       overflow: hidden;
@@ -3353,6 +3361,8 @@ function webIndexHtml() {
     .badge.exited { color: var(--danger); border-color: #87434a; }
     .main {
       min-height: 0;
+      min-width: 0;
+      overflow: hidden;
       display: grid;
       grid-template-rows: auto 1fr;
       background: #0b0d10;
@@ -3380,6 +3390,7 @@ function webIndexHtml() {
     }
     #terminal {
       min-height: 0;
+      overflow: hidden;
       padding: 8px;
     }
     #terminal .xterm {
@@ -3763,9 +3774,13 @@ function webIndexHtml() {
       };
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
+        // Check before any reset whether the viewport is pinned at the bottom
+        const pinned = (() => {
+          try { const b = term.buffer.active; return b.viewportY >= b.baseY; } catch { return true; }
+        })();
         if (msg.type === 'snapshot') { term.write(msg.data || '', () => { term.scrollToBottom(); }); }
-        if (msg.type === 'data') term.write(msg.data || '');
-        if (msg.type === 'replace') { term.reset(); term.write(msg.data || '', () => { term.scrollToBottom(); }); }
+        if (msg.type === 'data') { term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
+        if (msg.type === 'replace') { term.reset(); term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
         if (msg.type === 'exit') { refreshSessions().catch(console.error); }
       };
       ws.onclose = () => {
