@@ -1499,7 +1499,6 @@ function initSchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority, id);
     CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner);
-    CREATE INDEX IF NOT EXISTS idx_peer_bindings_provider_session ON peer_bindings(provider, provider_session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_recipient_id ON messages(recipient, id);
     CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
     CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks(expires_at);
@@ -1512,6 +1511,111 @@ function initSchema(db) {
   const peerBindingColumns = new Set(db.prepare('PRAGMA table_info(peer_bindings)').all().map((col) => col.name));
   if (!peerBindingColumns.has('runtime_target')) {
     db.exec('ALTER TABLE peer_bindings ADD COLUMN runtime_target TEXT');
+  }
+  dedupePeerBindings(db);
+  execWithBusyRetry(db, `
+    CREATE INDEX IF NOT EXISTS idx_peer_bindings_provider_session ON peer_bindings(provider, provider_session_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_id_unique
+      ON peer_bindings(provider, provider_session_id)
+      WHERE provider_session_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_name_unique
+      ON peer_bindings(provider, provider_session_name)
+      WHERE provider_session_name IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_runtime_target_unique
+      ON peer_bindings(runtime_target)
+      WHERE runtime_target IS NOT NULL;
+  `);
+}
+
+function peerBindingRuntimeRank(row) {
+  if (row?.runtime_target && row.transport === 'tmux') return 50;
+  if (row?.runtime_target) return 40;
+  if (['tmux', 'web-pty'].includes(row?.transport)) return 30;
+  if (row?.transport === 'hcc-run') return 20;
+  if (row?.transport === 'hook') return 10;
+  if (row?.transport === 'detected') return 5;
+  return 0;
+}
+
+function comparePeerBindings(a, b) {
+  return peerBindingRuntimeRank(b) - peerBindingRuntimeRank(a) ||
+    Number(b.updated_at || 0) - Number(a.updated_at || 0) ||
+    Number(b.created_at || 0) - Number(a.created_at || 0) ||
+    String(a.peer || '').localeCompare(String(b.peer || ''));
+}
+
+function dedupePeerBindingRows(db, rows, eventType, payload = {}) {
+  if (!rows || rows.length < 2) return 0;
+  const ordered = [...rows].sort(comparePeerBindings);
+  const survivor = ordered[0];
+  let deleted = 0;
+  for (const row of ordered.slice(1)) {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(row.peer);
+    deleted += 1;
+    addEvent(db, eventType, survivor.peer, null, {
+      ...payload,
+      kept_peer: survivor.peer,
+      removed_peer: row.peer,
+      removed_transport: row.transport || null,
+      removed_runtime_target: row.runtime_target || null
+    });
+  }
+  return deleted;
+}
+
+function dedupeProviderSessionColumn(db, column) {
+  const groups = db.prepare(`
+    SELECT provider, ${column} AS session_value
+    FROM peer_bindings
+    WHERE ${column} IS NOT NULL
+    GROUP BY provider, ${column}
+    HAVING COUNT(*) > 1
+  `).all();
+  let deleted = 0;
+  for (const group of groups) {
+    const rows = db.prepare(`
+      SELECT *
+      FROM peer_bindings
+      WHERE provider = ? AND ${column} = ?
+    `).all(group.provider, group.session_value);
+    deleted += dedupePeerBindingRows(db, rows, 'provider.session.deduped', {
+      provider: group.provider,
+      provider_session: group.session_value,
+      provider_session_column: column
+    });
+  }
+  return deleted;
+}
+
+function dedupeRuntimeTargets(db) {
+  const groups = db.prepare(`
+    SELECT runtime_target
+    FROM peer_bindings
+    WHERE runtime_target IS NOT NULL
+    GROUP BY runtime_target
+    HAVING COUNT(*) > 1
+  `).all();
+  let deleted = 0;
+  for (const group of groups) {
+    const rows = db.prepare(`
+      SELECT *
+      FROM peer_bindings
+      WHERE runtime_target = ?
+    `).all(group.runtime_target);
+    deleted += dedupePeerBindingRows(db, rows, 'runtime.target.deduped', {
+      runtime_target: group.runtime_target
+    });
+  }
+  return deleted;
+}
+
+function dedupePeerBindings(db) {
+  for (let i = 0; i < 5; i += 1) {
+    const deleted =
+      dedupeProviderSessionColumn(db, 'provider_session_id') +
+      dedupeProviderSessionColumn(db, 'provider_session_name') +
+      dedupeRuntimeTargets(db);
+    if (!deleted) return;
   }
 }
 
@@ -1575,29 +1679,108 @@ function providerSessionParts(value) {
     : { provider_session_id: null, provider_session_name: text };
 }
 
+function bindingHasProviderSession(binding) {
+  return Boolean(binding?.provider_session_id || binding?.provider_session_name);
+}
+
+function bindingProviderSessionValue(binding) {
+  return binding?.provider_session_id || binding?.provider_session_name || null;
+}
+
+function bindingHasRuntime(binding) {
+  return Boolean(binding?.runtime_target) || ['tmux', 'web-pty'].includes(binding?.transport);
+}
+
+function mergeRuntimeBinding(existing, binding) {
+  if (!existing || !bindingHasRuntime(existing) || bindingHasRuntime(binding)) return binding;
+  return {
+    ...binding,
+    command: existing.command || binding.command || null,
+    transport: existing.transport,
+    runtime_session_id: existing.runtime_session_id || binding.runtime_session_id || binding.peer,
+    runtime_target: existing.runtime_target || null
+  };
+}
+
+function findProviderSessionBinding(db, binding) {
+  if (!bindingHasProviderSession(binding)) return null;
+  return db.prepare(`
+    SELECT *
+    FROM peer_bindings
+    WHERE provider = ?
+      AND peer <> ?
+      AND (
+        (? IS NOT NULL AND provider_session_id = ?)
+        OR (? IS NOT NULL AND provider_session_name = ?)
+      )
+    LIMIT 1
+  `).get(
+    binding.provider,
+    binding.peer,
+    binding.provider_session_id || null,
+    binding.provider_session_id || null,
+    binding.provider_session_name || null,
+    binding.provider_session_name || null
+  ) || null;
+}
+
+function canonicalizePeerBinding(db, binding, options = {}) {
+  const existing = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(binding.peer);
+  let next = mergeRuntimeBinding(existing, binding);
+  const conflict = findProviderSessionBinding(db, next);
+  if (!conflict) return { peer: next.peer, binding: next, merged_from: null };
+
+  const incomingRuntime = bindingHasRuntime(next);
+  const conflictRuntime = bindingHasRuntime(conflict);
+  const providerSession = bindingProviderSessionValue(next);
+  const override = Boolean(options.override);
+
+  if (override && incomingRuntime) {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(conflict.peer);
+    return { peer: next.peer, binding: next, merged_from: conflict.peer };
+  }
+
+  if (conflictRuntime && !incomingRuntime) {
+    next = mergeRuntimeBinding(conflict, { ...next, peer: conflict.peer });
+    return { peer: conflict.peer, binding: next, merged_from: binding.peer };
+  }
+
+  if (!conflictRuntime && incomingRuntime) {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(conflict.peer);
+    return { peer: next.peer, binding: next, merged_from: conflict.peer };
+  }
+
+  if (!conflictRuntime && !incomingRuntime) {
+    next = {
+      ...next,
+      peer: conflict.peer,
+      command: conflict.command || next.command || null,
+      runtime_session_id: conflict.runtime_session_id || next.runtime_session_id || conflict.peer
+    };
+    return { peer: conflict.peer, binding: next, merged_from: binding.peer };
+  }
+
+  if (conflict.runtime_target && next.runtime_target && conflict.runtime_target === next.runtime_target) {
+    next = mergeRuntimeBinding(conflict, { ...next, peer: conflict.peer });
+    return { peer: conflict.peer, binding: next, merged_from: binding.peer };
+  }
+
+  throw new CliError('PROVIDER_SESSION_IN_USE', `${next.provider} session ${providerSession} is already bound to ${conflict.peer}`, {
+    peer: conflict.peer,
+    provider: conflict.provider,
+    provider_session: providerSession,
+    runtime_target: conflict.runtime_target || null
+  });
+}
+
 function upsertPeerBinding(db, binding, force = false) {
   const t = now();
+  const existing = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(binding.peer);
+  binding = mergeRuntimeBinding(existing, binding);
   if ((binding.provider_session_id || binding.provider_session_name) && !force) {
-    const conflict = db.prepare(`
-      SELECT peer, provider, provider_session_id, provider_session_name
-      FROM peer_bindings
-      WHERE provider = ?
-        AND peer <> ?
-        AND (
-          (? IS NOT NULL AND provider_session_id = ?)
-          OR (? IS NOT NULL AND provider_session_name = ?)
-        )
-      LIMIT 1
-    `).get(
-      binding.provider,
-      binding.peer,
-      binding.provider_session_id || null,
-      binding.provider_session_id || null,
-      binding.provider_session_name || null,
-      binding.provider_session_name || null
-    );
+    const conflict = findProviderSessionBinding(db, binding);
     if (conflict) {
-      const providerSession = conflict.provider_session_id || conflict.provider_session_name;
+      const providerSession = bindingProviderSessionValue(conflict);
       throw new CliError('PROVIDER_SESSION_IN_USE', `${binding.provider} session ${providerSession} is already bound to ${conflict.peer}`, {
         peer: conflict.peer,
         provider: conflict.provider,
@@ -1638,21 +1821,10 @@ function upsertPeerBinding(db, binding, force = false) {
   );
 }
 
-function mergeHookPeerBinding(db, binding) {
-  const existing = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(binding.peer);
-  if (!existing) return binding;
-
-  const hasRuntimeBinding = Boolean(existing.runtime_target) ||
-    ['tmux', 'web-pty'].includes(existing.transport);
-  if (!hasRuntimeBinding) return binding;
-
-  return {
-    ...binding,
-    command: existing.command || binding.command || null,
-    transport: existing.transport,
-    runtime_session_id: existing.runtime_session_id || binding.runtime_session_id || binding.peer,
-    runtime_target: existing.runtime_target || null
-  };
+function upsertCanonicalPeerBinding(db, binding, force = false, options = {}) {
+  const result = canonicalizePeerBinding(db, binding, options);
+  upsertPeerBinding(db, result.binding, force);
+  return result;
 }
 
 function touchPeer(db, id, status = null) {
@@ -1702,7 +1874,7 @@ function touchCurrentPeer(db, ctx, resolved, status = null, kindHint = 'shell') 
     id: identity.id,
     ...autoPeerDefaults(ctx, kindHint, status || 'idle')
   });
-  upsertPeerBinding(db, {
+  upsertCanonicalPeerBinding(db, {
     peer: identity.id,
     provider: kind,
     ...providerSessionParts(resumeId || sessionId),
@@ -2052,7 +2224,7 @@ async function cmdJoin(ctx, args) {
   const db = connect(ctx);
   try {
     upsertPeer(db, peer);
-    upsertPeerBinding(db, {
+    upsertCanonicalPeerBinding(db, {
       peer: id,
       provider: peer.kind,
       provider_session_id: null,
@@ -2503,7 +2675,7 @@ async function peerStart(ctx, args) {
         status: 'starting',
         capabilities: 'tmux'
       });
-      upsertPeerBinding(db, binding, Boolean(opts.force));
+      upsertCanonicalPeerBinding(db, binding, Boolean(opts.force), { override: Boolean(opts.force) });
     });
   } finally {
     db.close();
@@ -3002,7 +3174,7 @@ async function prepareLocalBus(ctx, opts = {}) {
               status: 'running',
               capabilities: 'detected'
             });
-            upsertPeerBinding(db2, bindingFromDetected(s, s.transport || 'detected'), true);
+            upsertCanonicalPeerBinding(db2, bindingFromDetected(s, s.transport || 'detected'), true);
           }
         } finally {
           db2.close();
@@ -3414,6 +3586,8 @@ function webIndexHtml() {
       white-space: nowrap;
     }
     .badge.running { color: var(--ok); border-color: #3b7b44; }
+    .badge.working, .badge.busy { color: var(--warn); border-color: #6b5a20; }
+    .badge.stale, .badge.detached, .badge.idle { color: var(--muted); border-color: var(--border); }
     .badge.exited { color: var(--danger); border-color: #87434a; }
     .main {
       min-height: 0;
@@ -3470,6 +3644,12 @@ function webIndexHtml() {
       background: #111418;
       overflow: hidden;
     }
+    .card.state-card {
+      min-height: 0;
+      max-height: min(34vh, 280px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
     .card h2 {
       margin: 0;
       padding: 8px 10px;
@@ -3478,6 +3658,7 @@ function webIndexHtml() {
       font-weight: 600;
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 8px;
     }
     .card .body {
@@ -3485,6 +3666,18 @@ function webIndexHtml() {
       display: grid;
       gap: 6px;
     }
+    .state-card .body {
+      min-height: 0;
+      max-height: min(28vh, 228px);
+      overflow-y: auto;
+      overflow-x: hidden;
+      align-content: start;
+      scrollbar-width: thin;
+      scrollbar-color: #3a3f4a transparent;
+    }
+    .state-card .body::-webkit-scrollbar { width: 8px; }
+    .state-card .body::-webkit-scrollbar-track { background: transparent; }
+    .state-card .body::-webkit-scrollbar-thumb { background: #3a3f4a; border-radius: 4px; }
     .item {
       display: grid;
       gap: 2px;
@@ -3495,6 +3688,7 @@ function webIndexHtml() {
     }
     .item:last-child { border-bottom: 0; padding-bottom: 0; }
     .item strong { color: var(--text); font-size: 12px; }
+    .item span { overflow-wrap: anywhere; }
     .mono { font-family: var(--mono); }
     .empty { color: var(--muted); font-size: 12px; }
     .sec-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding: 6px 10px 2px; display: flex; align-items: center; gap: 6px; }
@@ -3570,6 +3764,8 @@ function webIndexHtml() {
     let active    = null;  // active managed session id
     let activeDetected = null; // active detected peer id
     let activeType = 'managed'; // 'managed' | 'detected'
+    let activePeerTtl = 600;
+    let lastStateNow = 0;
     let ws        = null;
     let wsReconnectTimer = null;
 
@@ -3688,6 +3884,46 @@ function webIndexHtml() {
       return new Date(ts * 1000).toLocaleTimeString();
     }
 
+    function badgeClass(status) {
+      return String(status || '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    }
+
+    function fmtAge(age) {
+      const n = Number(age);
+      return Number.isFinite(n) ? Math.max(0, Math.round(n)) + 's' : '?';
+    }
+
+    function peerIsActive(peer, basisNow = lastStateNow) {
+      const age = Number(peer?.age_sec);
+      if (Number.isFinite(age)) return age <= activePeerTtl;
+      const seen = Number(peer?.last_seen_at || 0);
+      const t = Number(basisNow || 0) || Math.floor(Date.now() / 1000);
+      return seen > 0 && (t - seen) <= activePeerTtl;
+    }
+
+    function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
+      const activity = peer?.status || 'unknown';
+      const liveness = peerIsActive(peer, basisNow) ? 'active' : 'stale';
+      const age = fmtAge(peer?.age_sec);
+      const branch = peer?.branch ? ' branch=' + peer.branch : '';
+      if (runtime) {
+        return {
+          label: runtime.status || 'running',
+          detail: 'peer=' + activity + ' ' + liveness + ' age=' + age + branch
+        };
+      }
+      if (liveness === 'stale') {
+        return {
+          label: 'stale',
+          detail: 'last=' + activity + ' age=' + age + branch
+        };
+      }
+      return {
+        label: activity,
+        detail: liveness + ' age=' + age + branch
+      };
+    }
+
     document.getElementById('projectSelect').addEventListener('change', (event) => {
       switchProject(event.target.value).catch(console.error);
     });
@@ -3722,12 +3958,15 @@ function webIndexHtml() {
         : '<div class="empty">No active sessions.' + filterNote + '<br><br>Start one above<br>or run in any terminal:<br><code>hcc peer start X -- claude</code></div>';
 
       const detHtml = visibleDetected.length
-        ? visibleDetected.map((p) => \`
+        ? visibleDetected.map((p) => {
+          const state = peerStateView(p);
+          return \`
           <div class="session \${activeDetected === p.id && activeType === 'detected' ? 'active' : ''}" data-id="\${esc(p.id)}" data-type="detected">
             <div class="row"><strong>\${esc(p.id)}</strong><span class="badge" style="color:var(--warn);border-color:#6b5a20">detected</span></div>
-            <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge">\${esc(p.status)}</span></div>
+            <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge \${badgeClass(state.label)}" title="\${esc(state.detail)}">\${esc(state.label)}</span></div>
             <div class="path" title="\${esc(p.worktree || '')}">\${esc((p.worktree || '').split('/').slice(-2).join('/'))}</div>
-          </div>\`).join('')
+          </div>\`;
+        }).join('')
         : '<div class="empty">No detected peers.' + filterNote + '</div>';
 
       const savedScroll = box.scrollTop;
@@ -3756,6 +3995,8 @@ function webIndexHtml() {
     async function refreshDetected() {
       try {
         const data = await api('/api/detected');
+        activePeerTtl = Number(data.active_peer_ttl || activePeerTtl);
+        lastStateNow = Number(data.now || lastStateNow);
         detected = data.detected || [];
         renderSections();
       } catch {}
@@ -3764,28 +4005,40 @@ function webIndexHtml() {
     // ── Project state panel ───────────────────────────────────────────────
     function renderState(data) {
       document.getElementById('rootPath').textContent = data.root || '';
+      activePeerTtl = Number(data.active_peer_ttl || activePeerTtl);
+      lastStateNow = Number(data.now || lastStateNow);
       const state = document.getElementById('state');
-      const tasks = (data.tasks || []).slice(0, 8).map((t) => \`
+      const runtimeById = new Map((sessions || []).map((s) => [s.id, s]));
+      const tasksData = data.tasks || [];
+      const peersData = data.peers || [];
+      const locksData = data.locks || [];
+      const messagesData = data.messages || [];
+      const eventsData = data.events || [];
+      const tasks = tasksData.map((t) => \`
         <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(t.status)} owner=\${esc(t.owner || '')} assignee=\${esc(t.assignee || '')}</span></div>
       \`).join('') || '<div class="empty">No tasks.</div>';
-      const peers = (data.peers || []).slice(0, 8).map((a) => \`
-        <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span></strong><span>\${esc(a.status)} age=\${esc(a.age_sec)}s branch=\${esc(a.branch || '')}</span></div>
-      \`).join('') || '<div class="empty">No peers.</div>';
-      const locks = (data.locks || []).slice(0, 8).map((l) => \`
+      const peers = peersData.map((a) => {
+        const peerRuntime = runtimeById.get(a.id);
+        const peerState = peerStateView(a, peerRuntime, data.now);
+        return \`
+        <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span> <span class="badge \${badgeClass(peerState.label)}">\${esc(peerState.label)}</span></strong><span>\${esc(peerState.detail)}</span></div>
+      \`;
+      }).join('') || '<div class="empty">No peers.</div>';
+      const locks = locksData.map((l) => \`
         <div class="item"><strong>\${esc(l.resource)}</strong><span>owner=\${esc(l.owner)} task=\${l.task_id ? '#' + l.task_id : ''}</span></div>
       \`).join('') || '<div class="empty">No active locks.</div>';
-      const messages = (data.messages || []).slice(-8).map((m) => \`
+      const messages = messagesData.map((m) => \`
         <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || 'all')}</strong><span>\${esc(m.body)}</span></div>
       \`).join('') || '<div class="empty">No messages.</div>';
-      const events = (data.events || []).slice(-10).map((e) => \`
+      const events = eventsData.map((e) => \`
         <div class="item"><strong>#\${e.id} \${esc(e.type)}</strong><span>\${esc(e.actor || '')} \${e.task_id ? '#' + e.task_id : ''} \${fmtTime(e.created_at)}</span></div>
       \`).join('') || '<div class="empty">No events.</div>';
       state.innerHTML = \`
-        <div class="card"><h2>Peers</h2><div class="body">\${peers}</div></div>
-        <div class="card"><h2>Tasks</h2><div class="body">\${tasks}</div></div>
-        <div class="card"><h2>Locks</h2><div class="body">\${locks}</div></div>
-        <div class="card"><h2>Messages</h2><div class="body">\${messages}</div></div>
-        <div class="card"><h2>Events</h2><div class="body">\${events}</div></div>
+        <div class="card state-card"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
+        <div class="card state-card"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
+        <div class="card state-card"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
+        <div class="card state-card"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
+        <div class="card state-card"><h2>Events <span class="badge">\${eventsData.length}</span></h2><div class="body">\${events}</div></div>
       \`;
     }
 
@@ -4433,7 +4686,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         capabilities: 'tmux'
       });
       const binding = input.binding || {};
-      upsertPeerBinding(db, {
+      upsertCanonicalPeerBinding(db, {
         peer: id,
         provider: binding.provider || kind,
         provider_session_id: binding.provider_session_id || null,
@@ -4682,7 +4935,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         status: 'running',
         capabilities: 'web-pty'
       });
-      upsertPeerBinding(db, {
+      upsertCanonicalPeerBinding(db, {
         peer: id,
         provider: input.binding?.provider || kind,
         provider_session_id: input.binding?.provider_session_id || null,
@@ -4779,8 +5032,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       if (req.method === 'GET' && url.pathname === '/api/detected') {
         const db = connect(reqCtx);
         let detected = [];
+        const t = now();
         try {
-          const t = now();
           detected = db.prepare(`
             SELECT id, kind, role, status, worktree, branch, pid, capabilities,
                    created_at, last_seen_at, (? - last_seen_at) AS age_sec
@@ -4793,7 +5046,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         }
         // Exclude peers that are already in the managed sessions Map
         const managedIds = new Set(sessionsForProject(reqCtx).map((s) => s.id));
-        sendJson(res, 200, { detected: detected.filter(p => !managedIds.has(p.id)) });
+        sendJson(res, 200, {
+          now: t,
+          active_peer_ttl: ACTIVE_PEER_TTL,
+          detected: detected.filter(p => !managedIds.has(p.id))
+        });
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/runtime') {
@@ -5033,7 +5290,7 @@ async function cmdRun(ctx, args) {
       status: 'running',
       capabilities: 'run-wrapper'
     });
-    upsertPeerBinding(db, binding, Boolean(opts.force));
+    upsertCanonicalPeerBinding(db, binding, Boolean(opts.force));
     addEvent(db, 'run.session.started', id, null, { command: [command, ...commandArgs].join(' '), cwd });
   } finally {
     db.close();
@@ -5096,7 +5353,7 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
       status: 'running',
       capabilities: 'run-pty'
     });
-    upsertPeerBinding(db, binding, force);
+    upsertCanonicalPeerBinding(db, binding, force);
     addEvent(db, 'run.session.started', id, null, { command: [command, ...commandArgs].join(' '), cwd, webManaged: true });
   } finally {
     db.close();
@@ -5605,7 +5862,7 @@ async function cmdHook(ctx, args) {
         WHERE id = ?
       `).run(now(), status, peerId);
     }
-    const hookBinding = mergeHookPeerBinding(db, {
+    const hookBinding = {
       peer: peerId,
       provider: kind,
       ...providerSessionParts(resumeId || sessionId),
@@ -5614,8 +5871,22 @@ async function cmdHook(ctx, args) {
       command: null,
       transport: 'hook',
       runtime_session_id: peerId
-    });
-    upsertPeerBinding(db, hookBinding, true);
+    };
+    const canonical = upsertCanonicalPeerBinding(db, hookBinding, true);
+    if (canonical.peer !== peerId) {
+      const previousPeer = peerId;
+      peerId = canonical.peer;
+      db.prepare(`
+        UPDATE peers
+        SET last_seen_at = ?, status = COALESCE(?, status)
+        WHERE id = ?
+      `).run(now(), status, peerId);
+      addEvent(db, 'provider.session.merged', peerId, null, {
+        from_peer: previousPeer,
+        provider: kind,
+        session_id: sessionId || resumeId || null
+      });
+    }
     addEvent(db, `hook.${hookKey}`, peerId, null, { session_id: sessionId, cwd: hookCwd });
 
     if (['sessionstart', 'userpromptsubmit'].includes(hookKey)) {
@@ -5893,7 +6164,7 @@ async function cmdScan(ctx, args) {
           status: s.status || 'running',
           capabilities: 'detected'
         });
-        upsertPeerBinding(db, bindingFromDetected(s, s.transport || 'detected'), true);
+        upsertCanonicalPeerBinding(db, bindingFromDetected(s, s.transport || 'detected'), true);
       }
     } finally {
       db.close();

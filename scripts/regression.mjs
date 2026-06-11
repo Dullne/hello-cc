@@ -6,6 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { DatabaseSync } from 'node:sqlite';
 import WebSocket from 'ws';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -93,6 +94,228 @@ function hccFrom(args, cwd, options = {}) {
 
 function hccFromMaybe(args, cwd, options = {}) {
   return runMaybe(process.execPath, [hccBin, ...args], { ...options, cwd });
+}
+
+function withMeshDb(fn) {
+  const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'));
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+function providerBindingRows(provider, sessionName) {
+  return withMeshDb((db) => db.prepare(`
+    SELECT peer, provider, provider_session_id, provider_session_name, transport, runtime_target
+    FROM peer_bindings
+    WHERE provider = ? AND provider_session_name = ?
+    ORDER BY peer
+  `).all(provider, sessionName));
+}
+
+function peerBindingIndexNames(dbPath = path.join(root, '.hello-cc', 'mesh.db')) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return new Set(db.prepare(`
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'peer_bindings'
+    `).all().map((row) => row.name));
+  } finally {
+    db.close();
+  }
+}
+
+function assertPeerBindingIndexes(dbPath) {
+  const indexes = peerBindingIndexNames(dbPath);
+  for (const name of [
+    'idx_peer_bindings_provider_session_id_unique',
+    'idx_peer_bindings_provider_session_name_unique',
+    'idx_peer_bindings_runtime_target_unique'
+  ]) {
+    if (!indexes.has(name)) fail(`missing peer binding uniqueness index: ${name}`);
+  }
+}
+
+function insertStaleProviderBinding(peer, provider, sessionName) {
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000) - 3600;
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES (?, ?, 'peer', ?, '', NULL, 'idle', 'regression-stale', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+    `).run(peer, provider, root, t, t);
+    db.prepare(`
+      INSERT INTO peer_bindings(
+        peer, provider, provider_session_id, provider_session_name, resume_mode,
+        resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at
+      )
+      VALUES (?, ?, NULL, ?, 'detected', NULL, NULL, 'detected', ?, NULL, ?, ?)
+      ON CONFLICT(peer) DO UPDATE SET
+        provider = excluded.provider,
+        provider_session_name = excluded.provider_session_name,
+        transport = excluded.transport,
+        runtime_target = excluded.runtime_target,
+        updated_at = excluded.updated_at
+    `).run(peer, provider, sessionName, peer, t, t);
+  });
+}
+
+function insertRuntimeTargetBinding(peer, provider, sessionName, runtimeTarget) {
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000) - 3600;
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES (?, ?, 'peer', ?, '', NULL, 'idle', 'regression-runtime', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+    `).run(peer, provider, root, t, t);
+    db.prepare(`
+      INSERT INTO peer_bindings(
+        peer, provider, provider_session_id, provider_session_name, resume_mode,
+        resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at
+      )
+      VALUES (?, ?, NULL, ?, 'resume', ?, ?, 'tmux', ?, ?, ?, ?)
+    `).run(peer, provider, sessionName, sessionName, `${provider} resume ${sessionName}`, peer, runtimeTarget, t, t);
+  });
+}
+
+function assertSqliteUniqueFailure(label, fn) {
+  try {
+    fn();
+  } catch (err) {
+    if (String(err?.message || err).includes('UNIQUE constraint failed')) return;
+    throw err;
+  }
+  fail(`${label} did not fail with a SQLite UNIQUE constraint`);
+}
+
+function cleanupBindingPeers(prefix) {
+  withMeshDb((db) => {
+    db.prepare('DELETE FROM peer_bindings WHERE peer LIKE ?').run(`${prefix}%`);
+    db.prepare('DELETE FROM peers WHERE id LIKE ?').run(`${prefix}%`);
+  });
+}
+
+function assertPeerBindingUniqueConstraints() {
+  assertPeerBindingIndexes();
+  const providerPrefix = 'unique-provider-';
+  const runtimePrefix = 'unique-runtime-';
+  cleanupBindingPeers(providerPrefix);
+  cleanupBindingPeers(runtimePrefix);
+
+  insertStaleProviderBinding(`${providerPrefix}a`, 'codex', 'unique-provider-session');
+  assertSqliteUniqueFailure('duplicate provider session binding', () => {
+    insertStaleProviderBinding(`${providerPrefix}b`, 'codex', 'unique-provider-session');
+  });
+  const providerRows = providerBindingRows('codex', 'unique-provider-session');
+  if (providerRows.length !== 1 || providerRows[0].peer !== `${providerPrefix}a`) {
+    fail(`provider session unique constraint left unexpected rows:\n${JSON.stringify(providerRows, null, 2)}`);
+  }
+
+  insertRuntimeTargetBinding(`${runtimePrefix}a`, 'claude', 'unique-runtime-session-a', '%unique-runtime-target');
+  assertSqliteUniqueFailure('duplicate runtime target binding', () => {
+    insertRuntimeTargetBinding(`${runtimePrefix}b`, 'codex', 'unique-runtime-session-b', '%unique-runtime-target');
+  });
+  const runtimeRows = withMeshDb((db) => db.prepare(`
+    SELECT peer, provider, provider_session_name, transport, runtime_target
+    FROM peer_bindings
+    WHERE runtime_target = '%unique-runtime-target'
+    ORDER BY peer
+  `).all());
+  if (runtimeRows.length !== 1 || runtimeRows[0].peer !== `${runtimePrefix}a`) {
+    fail(`runtime target unique constraint left unexpected rows:\n${JSON.stringify(runtimeRows, null, 2)}`);
+  }
+
+  cleanupBindingPeers(providerPrefix);
+  cleanupBindingPeers(runtimePrefix);
+}
+
+function createLegacyBindingDb(dbPath) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    const oldTime = Math.floor(Date.now() / 1000) - 3600;
+    const newTime = oldTime + 60;
+    db.exec(`
+      CREATE TABLE peer_bindings (
+        peer TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_session_id TEXT,
+        provider_session_name TEXT,
+        resume_mode TEXT NOT NULL DEFAULT 'new',
+        resume_arg TEXT,
+        command TEXT,
+        transport TEXT NOT NULL,
+        runtime_session_id TEXT,
+        runtime_target TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    const insert = db.prepare(`
+      INSERT INTO peer_bindings(
+        peer, provider, provider_session_id, provider_session_name, resume_mode,
+        resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at
+      )
+      VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run(
+      'legacy-provider-detected', 'claude', 'legacy-provider-session', 'detected',
+      null, null, 'detected', 'legacy-provider-detected', null, oldTime, oldTime
+    );
+    insert.run(
+      'legacy-provider-live', 'claude', 'legacy-provider-session', 'resume',
+      'legacy-provider-session', 'claude --resume legacy-provider-session', 'tmux',
+      'legacy-provider-live', '%legacy-provider-pane', oldTime, newTime
+    );
+    insert.run(
+      'legacy-runtime-old', 'codex', 'legacy-runtime-old-session', 'resume',
+      'legacy-runtime-old-session', 'codex resume legacy-runtime-old-session', 'tmux',
+      'legacy-runtime-old', '%legacy-runtime-pane', oldTime, oldTime
+    );
+    insert.run(
+      'legacy-runtime-new', 'shell', 'legacy-runtime-new-session', 'command',
+      null, 'bash', 'tmux', 'legacy-runtime-new', '%legacy-runtime-pane', oldTime, newTime
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function assertLegacyBindingRepair() {
+  const legacyRoot = path.join(os.tmpdir(), `hcc-reg-legacy-root-${testId}`);
+  const legacyDb = path.join(legacyRoot, '.hello-cc', 'mesh.db');
+  try {
+    createLegacyBindingDb(legacyDb);
+    run(process.execPath, [hccBin, '--root', legacyRoot, 'status', '--peer', 'legacy-check'], { env });
+    assertPeerBindingIndexes(legacyDb);
+    const db = new DatabaseSync(legacyDb);
+    try {
+      const providerRows = db.prepare(`
+        SELECT peer, transport, runtime_target
+        FROM peer_bindings
+        WHERE provider = 'claude' AND provider_session_name = 'legacy-provider-session'
+        ORDER BY peer
+      `).all();
+      if (providerRows.length !== 1 || providerRows[0].peer !== 'legacy-provider-live') {
+        fail(`legacy provider duplicate was not repaired:\n${JSON.stringify(providerRows, null, 2)}`);
+      }
+      const runtimeRows = db.prepare(`
+        SELECT peer, transport, runtime_target
+        FROM peer_bindings
+        WHERE runtime_target = '%legacy-runtime-pane'
+        ORDER BY peer
+      `).all();
+      if (runtimeRows.length !== 1 || runtimeRows[0].peer !== 'legacy-runtime-new') {
+        fail(`legacy runtime duplicate was not repaired:\n${JSON.stringify(runtimeRows, null, 2)}`);
+      }
+    } finally {
+      db.close();
+    }
+  } finally {
+    try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch {}
+  }
 }
 
 function tmuxAvailable() {
@@ -391,6 +614,8 @@ async function setupRegression() {
     fail(`shim ensure did not refresh stale shim:\n${refreshedShim}`);
   }
   await stopRuntime();
+  assertPeerBindingUniqueConstraints();
+  assertLegacyBindingRepair();
 
   const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
@@ -576,6 +801,12 @@ async function multiProjectWebWorkflow() {
     fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
   }
 
+  const detectedResponse = await fetch(`http://127.0.0.1:${port}/api/detected?root=${encodeURIComponent(root)}`);
+  const detectedJson = await detectedResponse.json();
+  if (!detectedResponse.ok || typeof detectedJson.active_peer_ttl !== 'number' || typeof detectedJson.now !== 'number' || !Array.isArray(detectedJson.detected)) {
+    fail(`detected API did not return liveness metadata:\n${JSON.stringify(detectedJson, null, 2)}`);
+  }
+
   const htmlResponse = await fetch(`http://127.0.0.1:${port}/`);
   const html = await htmlResponse.text();
   for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
@@ -583,6 +814,9 @@ async function multiProjectWebWorkflow() {
   }
   if (!html.includes('Register Project') || !html.includes('New session') || !html.includes('<strong>Sessions</strong>') || !html.includes('<label>View<select')) {
     fail('web form missing simplified project/session controls');
+  }
+  if (!html.includes('state-card') || !html.includes('peerStateView')) {
+    fail('web state panel missing scrollable peer state UI');
   }
 
   if (!tmuxAvailable()) return;
@@ -647,6 +881,46 @@ async function tmuxBackedStartWorkflow() {
   const restoredFile = path.join(outDir, 'pty-restored-ok');
   hcc(['inject', 'shell-a', `echo PTY_RESTORED_OK > ${restoredFile}`]);
   await waitForFile(restoredFile, 'PTY_RESTORED_OK', 'tmux restore injection');
+
+  const canonicalSession = 'canonical-session';
+  insertStaleProviderBinding('claude-stale-canonical', 'claude', canonicalSession);
+  const canonicalStarted = hcc(['peer', 'start', 'claude-live-canonical', '--kind', 'claude', '--resume', canonicalSession], {
+    env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
+  });
+  const canonicalPane = parsePane(canonicalStarted);
+  const canonicalRows = providerBindingRows('claude', canonicalSession);
+  if (canonicalRows.length !== 1 ||
+      canonicalRows[0].peer !== 'claude-live-canonical' ||
+      canonicalRows[0].transport !== 'tmux' ||
+      canonicalRows[0].runtime_target !== canonicalPane) {
+    fail(`stale provider binding was not migrated to live tmux peer:\n${JSON.stringify(canonicalRows, null, 2)}`);
+  }
+  hcc(['peer', 'stop', 'claude-live-canonical']);
+
+  const forceSession = 'force-canonical-session';
+  const forceFirst = hcc(['peer', 'start', 'claude-force-a', '--kind', 'claude', '--resume', forceSession], {
+    env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
+  });
+  parsePane(forceFirst);
+  const forceConflict = hccMaybe(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession], {
+    env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
+  });
+  if (forceConflict.status === 0 || !String(forceConflict.stderr || forceConflict.stdout).includes('already bound to claude-force-a')) {
+    fail(`provider session duplicate start was not rejected:\n${forceConflict.stdout}\n${forceConflict.stderr}`);
+  }
+  const forceSecond = hcc(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession, '--force'], {
+    env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
+  });
+  const forcePane = parsePane(forceSecond);
+  const forceRows = providerBindingRows('claude', forceSession);
+  if (forceRows.length !== 1 ||
+      forceRows[0].peer !== 'claude-force-b' ||
+      forceRows[0].transport !== 'tmux' ||
+      forceRows[0].runtime_target !== forcePane) {
+    fail(`--force did not move provider binding to replacement tmux peer:\n${JSON.stringify(forceRows, null, 2)}`);
+  }
+  hccMaybe(['peer', 'stop', 'claude-force-a']);
+  hcc(['peer', 'stop', 'claude-force-b']);
 
   await stopRuntime();
   startRuntime({ env: envWithoutProvider({ HCC_REG_VALUE: 'runtime-old', ANTHROPIC_BASE_URL: 'runtime-old-url' }) });
@@ -716,6 +990,17 @@ async function shimTmuxWorkflow() {
   const afterHookPeer = afterHookRows.find((row) => row.id === peer);
   if (!afterHookPeer?.binding || afterHookPeer.binding.transport !== 'tmux' || afterHookPeer.binding.runtime_target !== pane) {
     fail(`Claude hook overwrote tmux binding:\n${JSON.stringify(afterHookPeer, null, 2)}`);
+  }
+  hcc(['hook', 'userpromptsubmit'], {
+    env: envWithoutPeer({ CLAUDE_CODE_SESSION_ID: 'hook-preserve-session' }),
+    input: hookPreservePayload
+  });
+  const hookBindingRows = providerBindingRows('claude', 'hook-preserve-session');
+  if (hookBindingRows.length !== 1 ||
+      hookBindingRows[0].peer !== peer ||
+      hookBindingRows[0].transport !== 'tmux' ||
+      hookBindingRows[0].runtime_target !== pane) {
+    fail(`Claude hook did not canonicalize provider session to tmux peer:\n${JSON.stringify(hookBindingRows, null, 2)}`);
   }
   const file = path.join(outDir, 'shim-ok');
   hcc(['inject', peer, `echo SHIM_OK > ${file}`]);
