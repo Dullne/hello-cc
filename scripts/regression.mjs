@@ -250,6 +250,33 @@ async function expectWebSocketMarker(peer, marker) {
   });
 }
 
+function tmuxStreamNodes() {
+  const dir = path.join(root, '.hello-cc', 'bufs');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((name) => name.startsWith('tmux-') && name.endsWith('.pipe'))
+    .map((name) => path.join(dir, name));
+}
+
+async function expectBoundedTmuxStream(label) {
+  let nodes = [];
+  await waitFor(() => {
+    nodes = tmuxStreamNodes();
+    return nodes.some((file) => {
+      try { return fs.lstatSync(file).isFIFO(); } catch { return false; }
+    });
+  }, label);
+  const bad = nodes.filter((file) => {
+    try {
+      const stat = fs.lstatSync(file);
+      return !stat.isFIFO() || stat.size !== 0;
+    } catch {
+      return true;
+    }
+  });
+  if (bad.length) fail(`tmux stream used growable regular files:\n${bad.join('\n')}`);
+}
+
 function writeFakeTools() {
   fs.mkdirSync(fakeBin, { recursive: true });
   for (const name of ['claude', 'codex']) {
@@ -338,9 +365,18 @@ async function setupRegression() {
   if (shimIndex < 0 || guardIndex < 0 || shimIndex > guardIndex) {
     fail(`shim PATH was not installed before bash early return:\n${bashrc}`);
   }
+  const latePathIndex = bashrc.indexOf('export PATH="/late:$PATH"');
+  const lastShimIndex = bashrc.lastIndexOf('.hcc-shims');
+  if (latePathIndex < 0 || lastShimIndex < latePathIndex) {
+    fail(`shim PATH was not reasserted after late PATH edits:\n${bashrc}`);
+  }
   const nonInteractiveCodex = run('bash', ['-lc', 'command -v codex'], { env }).trim();
   if (nonInteractiveCodex !== path.join(home, '.hcc-shims', 'codex')) {
     fail(`non-interactive bash did not resolve codex shim: ${nonInteractiveCodex}`);
+  }
+  const interactiveCodex = run('bash', ['-ic', 'command -v codex'], { env }).trim();
+  if (interactiveCodex !== path.join(home, '.hcc-shims', 'codex')) {
+    fail(`interactive bash did not keep codex shim first: ${interactiveCodex}`);
   }
   if (!hcc(['install-hooks', '--status']).includes('claude=yes codex=yes')) fail('hooks not installed');
   if (!hcc(['shim', 'status']).includes('shims installed')) fail('shims not installed');
@@ -601,6 +637,7 @@ async function tmuxBackedStartWorkflow() {
   hcc(['inject', 'shell-a', `echo PTY_OK > ${file}`]);
   await waitForFile(file, 'PTY_OK', 'pty injection');
   await expectWebSocketMarker('shell-a', 'WS_PTY_OK');
+  await expectBoundedTmuxStream('tmux-backed FIFO stream');
 
   await stopRuntime();
   run('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}']);
@@ -665,10 +702,26 @@ async function shimTmuxWorkflow() {
   if (!list.includes(peer) || !list.includes('tmux') || !list.includes(pane)) {
     fail(`shim peer missing from list:\n${list}`);
   }
+  const hookPreservePayload = JSON.stringify({
+    session_id: 'hook-preserve-session',
+    cwd: root,
+    hook_event_name: 'UserPromptSubmit',
+    prompt: 'keep tmux binding'
+  });
+  hcc(['hook', 'userpromptsubmit'], {
+    env: { ...env, HCC_PEER: peer, CLAUDE_CODE_SESSION_ID: 'hook-preserve-session' },
+    input: hookPreservePayload
+  });
+  const afterHookRows = hccJson(['peer', 'list']);
+  const afterHookPeer = afterHookRows.find((row) => row.id === peer);
+  if (!afterHookPeer?.binding || afterHookPeer.binding.transport !== 'tmux' || afterHookPeer.binding.runtime_target !== pane) {
+    fail(`Claude hook overwrote tmux binding:\n${JSON.stringify(afterHookPeer, null, 2)}`);
+  }
   const file = path.join(outDir, 'shim-ok');
   hcc(['inject', peer, `echo SHIM_OK > ${file}`]);
   await waitForFile(file, 'SHIM_OK', 'shim tmux injection');
   await expectWebSocketMarker(peer, 'WS_SHIM_OK');
+  await expectBoundedTmuxStream('shim tmux FIFO stream');
 
   const firstEnvFile = path.join(outDir, 'shim-env-first');
   hcc(['inject', peer, `printf '%s\\n' "$HCC_REG_VALUE" > ${firstEnvFile}`]);
@@ -725,6 +778,7 @@ async function tmuxWorkflow() {
   hcc(['inject', 'tmux-a', `echo TMUX_OK > ${file}`]);
   await waitForFile(file, 'TMUX_OK', 'tmux injection');
   await expectWebSocketMarker('tmux-a', 'WS_TMUX_OK');
+  await expectBoundedTmuxStream('attached tmux FIFO stream');
   const conflict = hccMaybe(['peer', 'attach', 'tmux-b', '--kind', 'shell', '--pane', pane]);
   if (conflict.status === 0 || !String(conflict.stderr || conflict.stdout).includes('already attached to tmux-a')) {
     fail('tmux duplicate attach did not fail as expected');

@@ -857,7 +857,46 @@ function tmuxPaneInfo(targetPane = null) {
 }
 
 function tmuxCapturePane(pane) {
-  return runTmux(['capture-pane', '-p', '-e', '-J', '-S', '-2000', '-t', pane]);
+  // No -J (join): keep one captured line per physical pane row so the web
+  // terminal's row count matches tmux exactly, which is required for accurate
+  // cursor placement. Strip the single trailing newline tmux appends so the
+  // line count is exactly scrollback+height (no phantom bottom row in xterm).
+  const out = runTmux(['capture-pane', '-p', '-e', '-S', '-2000', '-t', pane]);
+  return out.endsWith('\n') ? out.slice(0, -1) : out;
+}
+
+// Read the real cursor cell + screen geometry from tmux so the browser mirror
+// can draw the input cursor at the right place. Returns null if unavailable.
+function tmuxCursorInfo(pane) {
+  try {
+    const out = runTmux(['display-message', '-p', '-t', pane,
+      '#{cursor_x},#{cursor_y},#{cursor_flag},#{history_size},#{pane_height}']);
+    const [x, y, flag, hist, height] = out.trim().split(',').map((n) => Number.parseInt(n, 10));
+    return {
+      x: Number.isFinite(x) ? x : 0,
+      y: Number.isFinite(y) ? y : 0,
+      visible: flag !== 0,
+      history: Number.isFinite(hist) ? hist : 0,
+      height: Number.isFinite(height) && height > 0 ? height : 1
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Map tmux's cursor (relative to the visible pane) onto the web terminal's
+// viewport row, accounting for captured scrollback and capture-pane's trailing
+// blank-line stripping. Returns { row, col, visible } in viewport coordinates.
+function tmuxCursorPayload(captured, info) {
+  if (!info) return null;
+  const height = info.height;
+  const scrollback = Math.min(2000, info.history);
+  const lineCount = captured ? captured.split('\n').length : 0;
+  const viewportTop = Math.max(0, lineCount - height);
+  let row = scrollback + info.y - viewportTop;
+  if (row < 0) row = 0;
+  if (row > height - 1) row = height - 1;
+  return { row, col: info.x, visible: info.visible };
 }
 
 function tmuxSendKeys(pane, keys) {
@@ -1597,6 +1636,23 @@ function upsertPeerBinding(db, binding, force = false) {
     t,
     t
   );
+}
+
+function mergeHookPeerBinding(db, binding) {
+  const existing = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(binding.peer);
+  if (!existing) return binding;
+
+  const hasRuntimeBinding = Boolean(existing.runtime_target) ||
+    ['tmux', 'web-pty'].includes(existing.transport);
+  if (!hasRuntimeBinding) return binding;
+
+  return {
+    ...binding,
+    command: existing.command || binding.command || null,
+    transport: existing.transport,
+    runtime_session_id: existing.runtime_session_id || binding.runtime_session_id || binding.peer,
+    runtime_target: existing.runtime_target || null
+  };
 }
 
 function touchPeer(db, id, status = null) {
@@ -3396,9 +3452,8 @@ function webIndexHtml() {
     #terminal .xterm {
       cursor: default;
     }
-    #terminal .xterm-cursor {
-      display: none !important;
-    }
+    /* The terminal mirrors a tmux pane; keep xterm's own hidden helper textarea
+       off-screen, but DO show the rendered block cursor (positioned from tmux). */
     #terminal .xterm-helper-textarea {
       caret-color: transparent !important;
       color: transparent !important;
@@ -3538,13 +3593,13 @@ function webIndexHtml() {
     }
 
     const term = new Terminal({
-      cursorBlink: false,
-      cursorInactiveStyle: 'none',
+      cursorBlink: true,
+      cursorInactiveStyle: 'outline',
       cursorStyle: 'bar',
       convertEol: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 13,
-      theme: { background: '#0b0d10', foreground: '#eef2f6', cursor: '#00000000', cursorAccent: '#00000000' }
+      theme: { background: '#0b0d10', foreground: '#eef2f6', cursor: '#7dd3fc', cursorAccent: '#0b0d10' }
     });
     term.open(document.getElementById('terminal'));
 
@@ -3778,6 +3833,9 @@ function webIndexHtml() {
         const pinned = (() => {
           try { const b = term.buffer.active; return b.viewportY >= b.baseY; } catch { return true; }
         })();
+        // The server streams the tmux pane's raw output, so xterm renders
+        // incrementally (no reset/redraw → no flicker) and the program's own
+        // escape sequences carry the cursor.
         if (msg.type === 'snapshot') { term.write(msg.data || '', () => { term.scrollToBottom(); }); }
         if (msg.type === 'data') { term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
         if (msg.type === 'replace') { term.reset(); term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
@@ -4178,7 +4236,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function detachTmuxSession(session, status = 'detached') {
-    if (session.capturePoller) { clearInterval(session.capturePoller); session.capturePoller = null; }
+    stopTmuxStream(session);
     if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
 
     session.status = status;
@@ -4198,30 +4256,98 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
   }
 
-  function pollTmuxSession(session) {
+  // Build the escape that places + shows/hides the cursor at a viewport cell,
+  // used only to seed the initial snapshot (live output carries its own cursor).
+  function cursorEscape(payload) {
+    if (!payload) return '';
+    return '[' + (payload.row + 1) + ';' + (payload.col + 1) + 'H' +
+      (payload.visible ? '[?25h' : '[?25l');
+  }
+
+  // Stream the tmux pane's RAW output (escape sequences and all) into the
+  // browser via `tmux pipe-pane`, so xterm.js renders incrementally — no
+  // screenshot-poll, no full-screen reset, no flicker — and the program's own
+  // cursor sequences are mirrored verbatim (works for bash, codex, claude, vim).
+  function startTmuxStream(session) {
+    const safePane = String(session.pane).replace(/[^A-Za-z0-9_-]/g, '');
+    const safeId = String(session.id).replace(/[^A-Za-z0-9_.-]/g, '_');
+    const pipeFile = path.join(bufsDir, `tmux-${safePane}-${safeId}.pipe`);
+    session.pipeFile = pipeFile;
+    // Capture the existing screen once for the initial paint; pipe-pane only
+    // forwards output produced after it is enabled.
     try {
-      const info = tmuxPaneInfo(session.pane);
-      if (info.dead) {
-        detachTmuxSession(session, 'exited');
-        return;
-      }
-      session.pid = info.pid;
-      session.cwd = session.cwd || info.cwd || session.ctx?.root || ctx.root;
       const captured = tmuxCapturePane(session.pane);
-      if (captured === session.lastCapture) return;
-      if (captured.startsWith(session.lastCapture || '')) {
-        const data = captured.slice((session.lastCapture || '').length);
-        session.buffer = captured;
-        session.lastCapture = captured;
-        if (data) broadcast(session, { type: 'data', data });
-      } else {
-        session.buffer = captured;
-        session.lastCapture = captured;
-        broadcast(session, { type: 'replace', data: captured });
+      session.buffer = captured + cursorEscape(tmuxCursorPayload(captured, tmuxCursorInfo(session.pane)));
+    } catch {}
+
+    // Use a FIFO rather than an append-only regular file. The old file-backed
+    // implementation capped session.buffer but let .hello-cc/bufs grow forever
+    // for long-lived tmux panes.
+    try {
+      fs.rmSync(pipeFile, { force: true });
+      const mkfifo = spawnSync('mkfifo', [pipeFile], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      if (mkfifo.status !== 0) {
+        const message = (mkfifo.stderr || mkfifo.stdout || '').trim() || 'mkfifo failed';
+        throw new CliError('TMUX_STREAM_ERROR', message);
       }
+      try { fs.chmodSync(pipeFile, 0o600); } catch {}
+      session.streamFd = fs.openSync(pipeFile, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
     } catch {
-      detachTmuxSession(session, 'exited');
+      session.streamFd = null;
+      return;
     }
+
+    // Enable raw output piping after the read end is open. This avoids the
+    // old "enable pipe, then seek to EOF" window that could skip early output.
+    try {
+      runTmux(['pipe-pane', '-t', session.pane, `cat > ${shellQuoteArg(pipeFile)}`]);
+    } catch {
+      stopTmuxStream(session);
+      return;
+    }
+    session.streamPoller = setInterval(() => {
+      try {
+        if (session.streamFd === null || session.streamFd === undefined) return;
+        const chunks = [];
+        for (;;) {
+          const buf = Buffer.alloc(65536);
+          let bytes = 0;
+          try {
+            bytes = fs.readSync(session.streamFd, buf, 0, buf.length, null);
+          } catch (err) {
+            if (['EAGAIN', 'EWOULDBLOCK'].includes(err?.code)) break;
+            throw err;
+          }
+          if (bytes <= 0) break;
+          chunks.push(buf.subarray(0, bytes));
+          if (bytes < buf.length) break;
+        }
+        if (!chunks.length) return;
+        const data = Buffer.concat(chunks).toString();
+        session.buffer += data;
+        if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
+        broadcast(session, { type: 'data', data });
+      } catch {
+        if (session.streamFd !== null && session.streamFd !== undefined) {
+          try { fs.closeSync(session.streamFd); } catch {}
+          session.streamFd = null;
+        }
+      }
+    }, 40);
+  }
+
+  function stopTmuxStream(session) {
+    if (session.streamPoller) { clearInterval(session.streamPoller); session.streamPoller = null; }
+    // Turn piping back off for this pane (no command toggles it off).
+    try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
+    if (session.streamFd !== null && session.streamFd !== undefined) {
+      try { fs.closeSync(session.streamFd); } catch {}
+      session.streamFd = null;
+    }
+    if (session.pipeFile) { try { fs.unlinkSync(session.pipeFile); } catch {} session.pipeFile = null; }
   }
 
   function attachTmuxSession(input) {
@@ -4271,13 +4397,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       createdAt: now(),
       exitedAt: null,
       buffer: captured,
-      lastCapture: captured,
       clients: new Set(),
-      capturePoller: null,
+      streamPoller: null,
+      streamFd: null,
+      pipeFile: null,
       exitPoller: null
     };
     sessions.set(key, session);
-    session.capturePoller = setInterval(() => pollTmuxSession(session), 200);
+    startTmuxStream(session);
 
     // Detect pane death (retry 3 times before detaching — handles Ctrl+C transient states)
     let deadCount = 0;
@@ -4338,7 +4465,22 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function resizeSession(session, cols, rows) {
     if (session.type === 'external') {
       try { fs.appendFileSync(session.resizeFile, JSON.stringify({ cols, rows }) + '\n'); } catch {}
-    } else if (session.type !== 'tmux' && session.pty) {
+    } else if (session.type === 'tmux') {
+      // Resize the tmux window to match the browser terminal so the captured
+      // mirror has identical geometry — a prerequisite for accurate cursor
+      // placement. Older tmux without resize-window simply keeps native size.
+      session.cols = cols;
+      session.rows = rows;
+      try {
+        if (!session.windowSizeManual) {
+          runTmux(['set-window-option', '-t', session.pane, 'window-size', 'manual']);
+          session.windowSizeManual = true;
+        }
+        runTmux(['resize-window', '-t', session.pane, '-x', String(cols), '-y', String(rows)]);
+      } catch {
+        // tmux too old or pane gone; keep mirroring at the native pane size.
+      }
+    } else if (session.pty) {
       session.pty.resize(cols, rows);
     }
   }
@@ -4816,7 +4958,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         try { if (session.outputPoller) clearInterval(session.outputPoller); } catch {}
         try { if (session.exitPoller) clearInterval(session.exitPoller); } catch {}
       } else if (session.type === 'tmux') {
-        try { if (session.capturePoller) clearInterval(session.capturePoller); } catch {}
+        try { stopTmuxStream(session); } catch {}
         try { if (session.exitPoller) clearInterval(session.exitPoller); } catch {}
       } else {
         try { session.pty.kill(); } catch {}
@@ -5463,7 +5605,7 @@ async function cmdHook(ctx, args) {
         WHERE id = ?
       `).run(now(), status, peerId);
     }
-    upsertPeerBinding(db, {
+    const hookBinding = mergeHookPeerBinding(db, {
       peer: peerId,
       provider: kind,
       ...providerSessionParts(resumeId || sessionId),
@@ -5472,7 +5614,8 @@ async function cmdHook(ctx, args) {
       command: null,
       transport: 'hook',
       runtime_session_id: peerId
-    }, true);
+    });
+    upsertPeerBinding(db, hookBinding, true);
     addEvent(db, `hook.${hookKey}`, peerId, null, { session_id: sessionId, cwd: hookCwd });
 
     if (['sessionstart', 'userpromptsubmit'].includes(hookKey)) {
