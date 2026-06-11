@@ -27,6 +27,9 @@ const env = {
   HOME: home,
   PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`
 };
+for (const key of Object.keys(env)) {
+  if (key.startsWith('HCC_')) delete env[key];
+}
 
 function log(message) {
   process.stdout.write(`${message}\n`);
@@ -191,6 +194,22 @@ async function waitForFile(file, expected, label = file) {
   ensureFile(file, expected);
 }
 
+async function waitForFileContent(file, expected, label = file) {
+  await waitFor(() => {
+    if (!fs.existsSync(file)) return false;
+    return fs.readFileSync(file, 'utf8').trim() === expected;
+  }, label);
+  ensureFile(file, expected);
+}
+
+async function waitForFileLineCount(file, expected, label = file) {
+  await waitFor(() => {
+    if (!fs.existsSync(file)) return false;
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    return lines.length === expected;
+  }, label);
+}
+
 async function waitRuntime() {
   const runtimeFile = path.join(root, '.hello-cc', 'runtime.json');
   await waitFor(async () => {
@@ -235,7 +254,7 @@ function writeFakeTools() {
   fs.mkdirSync(fakeBin, { recursive: true });
   for (const name of ['claude', 'codex']) {
     const file = path.join(fakeBin, name);
-    fs.writeFileSync(file, `#!/usr/bin/env bash\necho fake-${name} "$@"\nif [ "\${HCC_FAKE_STAY_ALIVE:-}" = "1" ]; then exec bash --noprofile --norc; fi\n`, { mode: 0o755 });
+    fs.writeFileSync(file, `#!/usr/bin/env bash\necho fake-${name} "$@"\nif [ -n "\${HCC_FAKE_LOG:-}" ]; then echo fake-${name} "$@" >> "$HCC_FAKE_LOG"; fi\nif [ "\${HCC_FAKE_STAY_ALIVE:-}" = "1" ]; then exec bash --noprofile --norc; fi\n`, { mode: 0o755 });
   }
 }
 
@@ -663,7 +682,31 @@ async function shimTmuxWorkflow() {
   const secondEnvFile = path.join(outDir, 'shim-env-second');
   hcc(['inject', peer, `printf '%s\\n' "$HCC_REG_VALUE" > ${secondEnvFile}`]);
   await waitForFile(secondEnvFile, 'shim-second', 'shim env restart');
+  const reentryFile = path.join(outDir, 'shim-reentry');
+  hcc(['inject', peer, `HCC_FAKE_STAY_ALIVE=0 HCC_REG_VALUE=shim-third ${sh(shim)} --resume shim-regression-session > ${sh(reentryFile)} 2>&1`]);
+  await waitForFileContent(reentryFile, 'fake-claude --resume shim-regression-session', 'shim tmux pane re-entry');
   hcc(['peer', 'stop', peer]);
+
+  const exitedResume = 'shim-exited-session';
+  const exitedLog = path.join(outDir, 'shim-exited-log');
+  const exitedEnv = {
+    ...shimEnv,
+    HCC_FAKE_STAY_ALIVE: '0',
+    HCC_FAKE_LOG: exitedLog
+  };
+  const exitedFirst = run(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  const exitedPeerMatch = exitedFirst.match(/started\s+(\S+)\s+\(/);
+  if (!exitedPeerMatch) fail(`exited shim did not start a peer:\n${exitedFirst}`);
+  const exitedPeer = exitedPeerMatch[1];
+  parsePane(exitedFirst);
+  await waitForFileLineCount(exitedLog, 1, 'shim exited first provider launch');
+  const fallbackFile = path.join(outDir, 'shim-exited-fallback');
+  hcc(['inject', exitedPeer, `printf '%s\\n' fallback > ${sh(fallbackFile)}`]);
+  await waitForFile(fallbackFile, 'fallback', 'shim exited fallback shell');
+  const exitedSecond = run(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  parsePane(exitedSecond);
+  await waitForFileLineCount(exitedLog, 2, 'shim exited resume relaunch');
+  hcc(['peer', 'stop', exitedPeer]);
 }
 
 async function tmuxWorkflow() {

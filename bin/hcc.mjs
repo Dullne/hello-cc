@@ -624,6 +624,7 @@ function childSessionEnv(extra = {}, baseEnv = process.env) {
 }
 
 const LAUNCH_FINGERPRINT_ENV = 'HCC_LAUNCH_FINGERPRINT';
+const PROVIDER_STATE_ENV = 'HCC_PROVIDER_STATE';
 
 const LAUNCH_ENV_IGNORED_KEYS = new Set([
   '_',
@@ -632,6 +633,7 @@ const LAUNCH_ENV_IGNORED_KEYS = new Set([
   'HCC_NO_AUTO_INSTALL_TMUX',
   'HCC_PEER',
   'HCC_ROOT',
+  PROVIDER_STATE_ENV,
   'HCC_SHIM_ENSURED',
   'HCC_SHIM_NO_ATTACH',
   'HCC_WEB_TOKEN',
@@ -791,6 +793,25 @@ function tmuxSessionEnvironmentValue(sessionName, key) {
   return line.startsWith(prefix) ? line.slice(prefix.length) : null;
 }
 
+function isLikelyShellCommand(command) {
+  const base = path.basename(String(command || '')).replace(/^-/, '');
+  return new Set(['bash', 'dash', 'fish', 'ksh', 'mksh', 'sh', 'zsh']).has(base);
+}
+
+function isProviderFallbackWrapper(command) {
+  const text = String(command || '');
+  return text.includes(PROVIDER_STATE_ENV) || /\bexec\s+(?:bash|dash|fish|ksh|mksh|sh|zsh)\b/.test(text);
+}
+
+function isRelaunchableProviderSession(kind, command, binding = {}) {
+  const provider = binding.provider || kind;
+  return ['claude', 'codex'].includes(provider) && isProviderFallbackWrapper(command);
+}
+
+function tmuxProviderState(sessionName) {
+  return tmuxSessionEnvironmentValue(sessionName, PROVIDER_STATE_ENV);
+}
+
 function tmuxManagedSessionName(ctx, peerId) {
   const name = `hcc-${shortHash(ctx.root)}-${sanitizePeerPart(peerId, 'peer')}`;
   return name.slice(0, 80);
@@ -844,36 +865,141 @@ function tmuxSendKeys(pane, keys) {
   runTmux(['send-keys', '-t', pane, ...keys]);
 }
 
+function tmuxSendRawLiteral(pane, text) {
+  if (!text) return;
+  runTmux(['send-keys', '-t', pane, '-l', '--', text]);
+}
+
+function tmuxInCopyMode(pane) {
+  try {
+    const out = runTmux(['display-message', '-p', '-t', pane, '#{pane_in_mode}']);
+    return out.trim() === '1';
+  } catch { return false; }
+}
+
+function tmuxExitCopyMode(pane) {
+  try {
+    runTmux(['send-keys', '-t', pane, '-X', 'cancel']);
+  } catch {}
+}
+
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+
+function tmuxPasteBuffer(pane, text, opts = {}) {
+  if (!text) return;
+
+  // Cancel copy-mode so input isn't swallowed
+  if (tmuxInCopyMode(pane)) {
+    tmuxExitCopyMode(pane);
+  }
+
+  // paste-buffer handles all special characters safely (including $ ` " ' \ | ; ~ # and multi-byte UTF-8)
+  const bufferName = `hcc-tmux-${pane.replace(/[%\\/]/g, '')}-${Date.now()}`;
+  try {
+    runTmux(['load-buffer', '-b', bufferName, '-'], { input: text });
+    const args = ['paste-buffer'];
+    if (opts.bracketed) args.push('-p');
+    if (opts.raw) args.push('-r');
+    args.push('-t', pane, '-b', bufferName);
+    runTmux(args);
+  } finally {
+    try { runTmux(['delete-buffer', '-b', bufferName], { silent: true }); } catch {}
+  }
+}
+
+function readTmuxEscapeSequence(text, start) {
+  let i = start + 1;
+  if (i >= text.length) return text.slice(start, i);
+  const marker = text[i];
+  if (marker === '[') {
+    i += 1;
+    while (i < text.length) {
+      const code = text.charCodeAt(i);
+      i += 1;
+      if (code >= 0x40 && code <= 0x7e) break;
+    }
+    return text.slice(start, i);
+  }
+  if (marker === 'O') {
+    return text.slice(start, Math.min(text.length, start + 3));
+  }
+  if (marker === ']') {
+    i += 1;
+    while (i < text.length) {
+      if (text.charCodeAt(i) === 0x07) return text.slice(start, i + 1);
+      if (text.charCodeAt(i) === 0x1b && text[i + 1] === '\\') return text.slice(start, i + 2);
+      i += 1;
+    }
+    return text.slice(start, i);
+  }
+  return text.slice(start, Math.min(text.length, start + 2));
+}
+
+function isTmuxRawControlChar(ch) {
+  const code = ch.charCodeAt(0);
+  return (code < 0x20 && ch !== '\r' && ch !== '\n' && ch !== '\b') ||
+    (code >= 0x80 && code <= 0x9f);
+}
+
 function tmuxSendLiteral(pane, text) {
   if (!text) return;
   const chunks = [];
   let current = '';
-  for (const ch of text) {
+  for (let i = 0; i < text.length;) {
+    const codePoint = text.codePointAt(i);
+    const ch = String.fromCodePoint(codePoint);
+    const width = ch.length;
     if (ch === '\r' || ch === '\n') {
-      if (current) {
-        chunks.push({ type: 'literal', text: current });
-        current = '';
-      }
+      if (current) { chunks.push({ type: 'literal', text: current }); current = ''; }
       chunks.push({ type: 'key', key: 'Enter' });
+      i += width;
     } else if (ch === '\x7f' || ch === '\b') {
-      if (current) {
-        chunks.push({ type: 'literal', text: current });
-        current = '';
-      }
+      if (current) { chunks.push({ type: 'literal', text: current }); current = ''; }
       chunks.push({ type: 'key', key: 'BSpace' });
+      i += width;
+    } else if (text.startsWith(BRACKETED_PASTE_START, i)) {
+      if (current) { chunks.push({ type: 'literal', text: current }); current = ''; }
+      const end = text.indexOf(BRACKETED_PASTE_END, i + BRACKETED_PASTE_START.length);
+      if (end >= 0) {
+        chunks.push({
+          type: 'paste',
+          text: text.slice(i + BRACKETED_PASTE_START.length, end)
+        });
+        i = end + BRACKETED_PASTE_END.length;
+      } else {
+        const sequence = readTmuxEscapeSequence(text, i);
+        chunks.push({ type: 'raw', text: sequence });
+        i += sequence.length;
+      }
+    } else if (ch === '\x1b') {
+      if (current) { chunks.push({ type: 'literal', text: current }); current = ''; }
+      const sequence = readTmuxEscapeSequence(text, i);
+      chunks.push({ type: 'raw', text: sequence });
+      i += sequence.length;
+    } else if (isTmuxRawControlChar(ch)) {
+      if (current) { chunks.push({ type: 'literal', text: current }); current = ''; }
+      chunks.push({ type: 'raw', text: ch });
+      i += width;
     } else {
       current += ch;
+      i += width;
     }
   }
   if (current) chunks.push({ type: 'literal', text: current });
 
+  let pendingText = '';
   for (const chunk of chunks) {
     if (chunk.type === 'literal') {
-      runTmux(['send-keys', '-t', pane, '-l', '--', chunk.text]);
+      pendingText += chunk.text;
     } else {
-      tmuxSendKeys(pane, [chunk.key]);
+      if (pendingText) { tmuxPasteBuffer(pane, pendingText, { raw: true }); pendingText = ''; }
+      if (chunk.type === 'key') tmuxSendKeys(pane, [chunk.key]);
+      else if (chunk.type === 'paste') tmuxPasteBuffer(pane, chunk.text, { bracketed: true, raw: true });
+      else tmuxSendRawLiteral(pane, chunk.text);
     }
   }
+  if (pendingText) tmuxPasteBuffer(pane, pendingText, { raw: true });
 }
 
 function inferPeerKind(id, explicitKind, firstCommand) {
@@ -3188,7 +3314,7 @@ function webIndexHtml() {
       overflow-y: auto;
       overflow-x: hidden;
       scrollbar-gutter: stable;
-      padding: 10px;
+      padding: 10px 18px 10px 10px;
       display: grid;
       align-content: start;
       gap: 8px;
@@ -3255,6 +3381,22 @@ function webIndexHtml() {
     #terminal {
       min-height: 0;
       padding: 8px;
+    }
+    #terminal .xterm {
+      cursor: default;
+    }
+    #terminal .xterm-cursor {
+      display: none !important;
+    }
+    #terminal .xterm-helper-textarea {
+      caret-color: transparent !important;
+      color: transparent !important;
+      background: transparent !important;
+      left: -10000px !important;
+      top: 0 !important;
+      width: 1px !important;
+      height: 1px !important;
+      opacity: 0 !important;
     }
     .card {
       border: 1px solid var(--border);
@@ -3386,10 +3528,12 @@ function webIndexHtml() {
 
     const term = new Terminal({
       cursorBlink: false,
+      cursorInactiveStyle: 'none',
+      cursorStyle: 'bar',
       convertEol: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 13,
-      theme: { background: '#0b0d10', foreground: '#eef2f6', cursor: '#40c4aa' }
+      theme: { background: '#0b0d10', foreground: '#eef2f6', cursor: '#00000000', cursorAccent: '#00000000' }
     });
     term.open(document.getElementById('terminal'));
 
@@ -3520,12 +3664,14 @@ function webIndexHtml() {
           </div>\`).join('')
         : '<div class="empty">No detected peers.' + filterNote + '</div>';
 
+      const savedScroll = box.scrollTop;
       box.innerHTML = \`
         <div class="sec-label">Managed <span class="badge">\${visibleSessions.filter(s=>s.status==='running').length} running</span></div>
         \${manHtml}
         <div class="sec-label" style="margin-top:10px">Detected <span class="badge" style="color:var(--warn)">\${visibleDetected.length}</span></div>
         \${detHtml}
       \`;
+      box.scrollTop = savedScroll;
       box.querySelectorAll('.session[data-type="managed"]').forEach((el) => {
         el.addEventListener('click', () => connectManaged(el.dataset.id));
       });
@@ -3617,8 +3763,9 @@ function webIndexHtml() {
       };
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'snapshot' || msg.type === 'data') term.write(msg.data || '');
-        if (msg.type === 'replace') { term.reset(); term.write(msg.data || ''); }
+        if (msg.type === 'snapshot') { term.write(msg.data || '', () => { term.scrollToBottom(); }); }
+        if (msg.type === 'data') term.write(msg.data || '');
+        if (msg.type === 'replace') { term.reset(); term.write(msg.data || '', () => { term.scrollToBottom(); }); }
         if (msg.type === 'exit') { refreshSessions().catch(console.error); }
       };
       ws.onclose = () => {
@@ -4016,10 +4163,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function detachTmuxSession(session, status = 'detached') {
-    if (session.capturePoller) {
-      clearInterval(session.capturePoller);
-      session.capturePoller = null;
-    }
+    if (session.capturePoller) { clearInterval(session.capturePoller); session.capturePoller = null; }
+    if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
+
     session.status = status;
     session.exitedAt = now();
     broadcast(session, { type: 'exit', event: { reason: status } });
@@ -4093,6 +4239,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const role = input.role || 'peer';
     const cwd = path.resolve(input.cwd || info.cwd || pctx.root);
     const command = input.command || `tmux ${info.pane} (${info.command})`;
+
     const captured = tmuxCapturePane(info.pane);
     const session = {
       id,
@@ -4111,10 +4258,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       buffer: captured,
       lastCapture: captured,
       clients: new Set(),
-      capturePoller: null
+      capturePoller: null,
+      exitPoller: null
     };
     sessions.set(key, session);
-    session.capturePoller = setInterval(() => pollTmuxSession(session), 500);
+    session.capturePoller = setInterval(() => pollTmuxSession(session), 200);
+
+    // Detect pane death (retry 3 times before detaching — handles Ctrl+C transient states)
+    let deadCount = 0;
+    session.exitPoller = setInterval(() => {
+      try {
+        const fresh = tmuxPaneInfo(session.pane);
+        if (fresh.dead) {
+          deadCount++;
+          if (deadCount >= 3) detachTmuxSession(session, 'exited');
+        } else {
+          deadCount = 0;
+        }
+      } catch { deadCount++; if (deadCount >= 3) detachTmuxSession(session, 'exited'); }
+    }, 3000);
 
     const db = connect(pctx);
     try {
@@ -4185,27 +4347,51 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }, callerEnv);
     env[LAUNCH_FINGERPRINT_ENV] = launchFingerprint({ command, cwd, env });
     let hasSession = tmuxHasSession(sessionName);
+    const relaunchableProvider = isRelaunchableProviderSession(kind, command, input.binding || {});
+
+    function restartExistingTmuxSession(reason) {
+      const existing = getSession(pctx, id);
+      const hasWebClients = hasOpenClients(existing);
+      const hasTmuxClients = tmuxSessionHasClients(sessionName);
+      if (hasWebClients || hasTmuxClients) {
+        const isEnvChange = reason === 'launch_environment_changed';
+        throw new CliError(
+          isEnvChange ? 'SESSION_ENV_CHANGED' : 'SESSION_IN_USE',
+          isEnvChange
+            ? `Session ${id} is already running with a different launch environment. Detach/close existing clients or run ${CLI_NAME} peer stop ${id}, then start it again.`
+            : `Session ${id} is still attached. Detach/close existing clients or run ${CLI_NAME} peer stop ${id}, then start it again.`,
+          {
+            peer: id,
+            tmux_session: sessionName,
+            reason
+          });
+      }
+      if (existing) detachTmuxSession(existing, 'detached');
+      tmuxKillSession(sessionName);
+      hasSession = false;
+      const db = connect(pctx);
+      try {
+        addEvent(db, 'tmux.session.restarted', id, null, { reason });
+      } finally {
+        db.close();
+      }
+    }
 
     if (hasSession && input.restartOnEnvChange) {
       const existingFingerprint = tmuxSessionEnvironmentValue(sessionName, LAUNCH_FINGERPRINT_ENV);
       if (existingFingerprint !== env[LAUNCH_FINGERPRINT_ENV]) {
-        const existing = getSession(pctx, id);
-        const hasWebClients = hasOpenClients(existing);
-        const hasTmuxClients = tmuxSessionHasClients(sessionName);
-        if (hasWebClients || hasTmuxClients) {
-          throw new CliError('SESSION_ENV_CHANGED', `Session ${id} is already running with a different launch environment. Detach/close existing clients or run ${CLI_NAME} peer stop ${id}, then start it again.`, {
-            peer: id,
-            tmux_session: sessionName
-          });
-        }
-        if (existing) detachTmuxSession(existing, 'detached');
-        tmuxKillSession(sessionName);
-        hasSession = false;
-        const db = connect(pctx);
-        try {
-          addEvent(db, 'tmux.session.restarted', id, null, { reason: 'launch_environment_changed' });
-        } finally {
-          db.close();
+        restartExistingTmuxSession('launch_environment_changed');
+      }
+    }
+
+    if (hasSession && relaunchableProvider) {
+      const providerState = tmuxProviderState(sessionName);
+      if (providerState === 'exited') {
+        restartExistingTmuxSession('provider_exited');
+      } else if (!providerState) {
+        const info = tmuxPaneInfo(paneTarget);
+        if (isLikelyShellCommand(info.command)) {
+          restartExistingTmuxSession('provider_fallback_shell');
         }
       }
     }
@@ -4213,9 +4399,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (!hasSession) {
       const shell = callerEnv.SHELL || process.env.SHELL || 'bash';
       const launch = shellCommand([...isolatedEnvCommandArgs(env), shell, '-c', command]);
-      runTmux(['new-session', '-d', '-s', sessionName, '-c', cwd, ...tmuxEnvironmentArgs({
-        [LAUNCH_FINGERPRINT_ENV]: env[LAUNCH_FINGERPRINT_ENV]
-      }), launch]);
+      const tmuxEnv = { [LAUNCH_FINGERPRINT_ENV]: env[LAUNCH_FINGERPRINT_ENV] };
+      if (relaunchableProvider) tmuxEnv[PROVIDER_STATE_ENV] = 'starting';
+      runTmux(['new-session', '-d', '-s', sessionName, '-c', cwd, ...tmuxEnvironmentArgs(tmuxEnv), launch]);
     }
 
     const pane = tmuxPaneInfo(paneTarget).pane;
@@ -4616,6 +4802,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         try { if (session.exitPoller) clearInterval(session.exitPoller); } catch {}
       } else if (session.type === 'tmux') {
         try { if (session.capturePoller) clearInterval(session.capturePoller); } catch {}
+        try { if (session.exitPoller) clearInterval(session.exitPoller); } catch {}
       } else {
         try { session.pty.kill(); } catch {}
       }
