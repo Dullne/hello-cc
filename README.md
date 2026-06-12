@@ -28,23 +28,26 @@ web console.
 
 **Node 24+ is required** because hello-cc uses built-in `node:sqlite`.
 
-This package is not published to npm yet. Install the current checkout globally:
+Install the CLI globally from npm:
 
 ```bash
-git clone https://github.com/Dullne/hello-cc.git
-cd hello-cc
-npm install
-npm install -g .
+npm install -g @logicseek/hello-cc
 ```
 
-Or run the CLI directly from the checkout:
+Or run it without a global install:
+
+```bash
+npx @logicseek/hello-cc web
+```
+
+For local development, run the CLI directly from the checkout:
 
 ```bash
 node ./bin/hcc.mjs web
 ```
 
-After a global install from the checkout, both `hcc` and `hello-cc` are
-available. The examples below use `hcc`.
+After a global install, both `hcc` and `hello-cc` are available. The examples
+below use `hcc`.
 
 ## Default Entry
 

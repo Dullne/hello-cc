@@ -16,7 +16,7 @@ const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
 async function loadDiscover() { return import(path.join(_libDir, 'discover.mjs')); }
 async function loadSetup()    { return import(path.join(_libDir, 'setup.mjs')); }
 
-const VERSION = '0.2.0';
+const VERSION = '0.1.0';
 const PRODUCT_NAME = 'hello-cc';
 const CLI_NAME = 'hcc';
 const DEFAULT_LOCK_TTL = 900;
