@@ -815,7 +815,7 @@ async function multiProjectWebWorkflow() {
   if (!html.includes('Register Project') || !html.includes('New session') || !html.includes('<strong>Sessions</strong>') || !html.includes('<label>View<select')) {
     fail('web form missing simplified project/session controls');
   }
-  if (!html.includes('state-card') || !html.includes('peerStateView')) {
+  if (!html.includes('state-card') || !html.includes('peerStateView') || !html.includes('savedCardScroll') || !html.includes('lastStateRoot') || !html.includes('data-section="peers"')) {
     fail('web state panel missing scrollable peer state UI');
   }
 

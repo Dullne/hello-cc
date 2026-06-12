@@ -14,8 +14,7 @@
     "README.md",
     "README.zh-CN.md",
     "LICENSE",
-    "DESIGN.md",
-    "IMPLEMENTATION.md"
+    "docs/"
   ],
   "engines": {
     "node": ">=24.0.0"

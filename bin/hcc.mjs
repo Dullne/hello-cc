@@ -3766,6 +3766,7 @@ function webIndexHtml() {
     let activeType = 'managed'; // 'managed' | 'detected'
     let activePeerTtl = 600;
     let lastStateNow = 0;
+    let lastStateRoot = '';
     let ws        = null;
     let wsReconnectTimer = null;
 
@@ -4004,10 +4005,21 @@ function webIndexHtml() {
 
     // ── Project state panel ───────────────────────────────────────────────
     function renderState(data) {
-      document.getElementById('rootPath').textContent = data.root || '';
+      const stateRoot = data.root || '';
+      document.getElementById('rootPath').textContent = stateRoot;
       activePeerTtl = Number(data.active_peer_ttl || activePeerTtl);
       lastStateNow = Number(data.now || lastStateNow);
       const state = document.getElementById('state');
+      const preserveScroll = lastStateRoot === stateRoot;
+      const savedStateScroll = preserveScroll ? state.scrollTop : 0;
+      const savedCardScroll = preserveScroll
+        ? new Map(
+          [...state.querySelectorAll('.state-card[data-section]')].map((card) => [
+            card.dataset.section,
+            card.querySelector('.body')?.scrollTop || 0
+          ])
+        )
+        : new Map();
       const runtimeById = new Map((sessions || []).map((s) => [s.id, s]));
       const tasksData = data.tasks || [];
       const peersData = data.peers || [];
@@ -4034,12 +4046,18 @@ function webIndexHtml() {
         <div class="item"><strong>#\${e.id} \${esc(e.type)}</strong><span>\${esc(e.actor || '')} \${e.task_id ? '#' + e.task_id : ''} \${fmtTime(e.created_at)}</span></div>
       \`).join('') || '<div class="empty">No events.</div>';
       state.innerHTML = \`
-        <div class="card state-card"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
-        <div class="card state-card"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
-        <div class="card state-card"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
-        <div class="card state-card"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
-        <div class="card state-card"><h2>Events <span class="badge">\${eventsData.length}</span></h2><div class="body">\${events}</div></div>
+        <div class="card state-card" data-section="peers"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
+        <div class="card state-card" data-section="tasks"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
+        <div class="card state-card" data-section="locks"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
+        <div class="card state-card" data-section="messages"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
+        <div class="card state-card" data-section="events"><h2>Events <span class="badge">\${eventsData.length}</span></h2><div class="body">\${events}</div></div>
       \`;
+      state.scrollTop = savedStateScroll;
+      for (const [section, top] of savedCardScroll) {
+        const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
+        if (body) body.scrollTop = top;
+      }
+      lastStateRoot = stateRoot;
     }
 
     async function refreshState() {

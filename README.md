@@ -6,7 +6,6 @@
 
 <p align="center">
   <a href="https://github.com/Dullne/hello-cc"><img src="https://img.shields.io/github/stars/Dullne/hello-cc?style=flat-square&color=40c4aa" alt="GitHub stars"></a>
-  <a href="https://www.npmjs.com/package/hello-cc"><img src="https://img.shields.io/npm/v/hello-cc?style=flat-square&color=40c4aa" alt="npm version"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen?style=flat-square" alt="node >=24"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="license Apache 2.0"></a>
 </p>
@@ -29,20 +28,23 @@ web console.
 
 **Node 24+ is required** because hello-cc uses built-in `node:sqlite`.
 
-Install the package globally:
+This package is not published to npm yet. Install the current checkout globally:
 
 ```bash
-npm install -g hello-cc
+git clone https://github.com/Dullne/hello-cc.git
+cd hello-cc
+npm install
+npm install -g .
 ```
 
-Or run it once through npm:
+Or run the CLI directly from the checkout:
 
 ```bash
-npx hello-cc web
+node ./bin/hcc.mjs web
 ```
 
-After a global install, both `hcc` and `hello-cc` are available. The examples
-below use `hcc`.
+After a global install from the checkout, both `hcc` and `hello-cc` are
+available. The examples below use `hcc`.
 
 ## Default Entry
 
