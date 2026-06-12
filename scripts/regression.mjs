@@ -1956,17 +1956,31 @@ async function downGcPackWorkflow() {
   hcc(['gc', '--older-than', '0', '--yes']);
   const pack = JSON.parse(run('npm', ['pack', '--dry-run', '--json']));
   const files = new Set(pack[0]?.files?.map((entry) => entry.path) || []);
-  for (const file of ['assets/logo.svg', 'CHANGELOG.md', 'docs/commands.md', 'docs/commands.zh-CN.md', 'scripts/github-release.mjs']) {
+  for (const file of [
+    'assets/logo.svg',
+    'CHANGELOG.md',
+    'docs/commands.md',
+    'docs/commands.zh-CN.md',
+    'lib/guidance.mjs',
+    'lib/package-meta.mjs',
+    'lib/release-notes.mjs',
+    'scripts/github-release.mjs'
+  ]) {
     if (!files.has(file)) fail(`npm package missing ${file}`);
   }
+  const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
   const releaseCheck = run('npm', ['run', 'release:check']);
-  if (!releaseCheck.includes('release notes ok: 0.1.3')) fail(`release check output wrong:\n${releaseCheck}`);
+  if (!releaseCheck.includes(`release notes ok: ${packageVersion}`)) fail(`release check output wrong:\n${releaseCheck}`);
   const releaseNotes = run('npm', ['run', 'release:notes']);
-  if (!releaseNotes.includes('## 0.1.3') || !releaseNotes.includes('### Summary')) {
+  if (!releaseNotes.includes(`## ${packageVersion}`) || !releaseNotes.includes('### Summary')) {
     fail(`release notes output wrong:\n${releaseNotes}`);
   }
-  const githubRelease = JSON.parse(run(process.execPath, [path.join(repoRoot, 'scripts', 'github-release.mjs'), '--dry-run', '--version', '0.1.3']));
-  if (!githubRelease.ok || !githubRelease.dry_run || githubRelease.repo !== 'Dullne/hello-cc' || githubRelease.tag !== 'v0.1.3' || githubRelease.body_length < 100) {
+  const releaseNotesWithV = run(process.execPath, [path.join(repoRoot, 'scripts', 'release-notes.mjs'), '--version', `v${packageVersion}`]);
+  if (!releaseNotesWithV.includes(`## ${packageVersion}`) || releaseNotesWithV.includes(`## v${packageVersion}`)) {
+    fail(`release notes v-prefixed version output wrong:\n${releaseNotesWithV}`);
+  }
+  const githubRelease = JSON.parse(run(process.execPath, [path.join(repoRoot, 'scripts', 'github-release.mjs'), '--dry-run', '--version', packageVersion]));
+  if (!githubRelease.ok || !githubRelease.dry_run || githubRelease.repo !== 'Dullne/hello-cc' || githubRelease.tag !== `v${packageVersion}` || githubRelease.body_length < 100) {
     fail(`github release dry run output wrong:\n${JSON.stringify(githubRelease, null, 2)}`);
   }
   const docsIndex = fs.readFileSync(path.join(repoRoot, 'docs', 'README.md'), 'utf8');
@@ -2021,6 +2035,9 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'setup.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'guidance.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'package-meta.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'release-notes.mjs')]);
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
@@ -2047,6 +2064,11 @@ function syntaxAndHelp() {
   const cliVersion = run(process.execPath, [hccBin, '--version']).trim();
   if (cliVersion !== packageVersion) {
     fail(`CLI version ${cliVersion} does not match package.json ${packageVersion}`);
+  }
+  if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
+      !hccSource.includes('const VERSION = PACKAGE_META.version') ||
+      !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
+    fail('CLI still has duplicated package metadata or guidance wiring');
   }
   const mainHelp = run(process.execPath, [hccBin, '--help']);
   if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {

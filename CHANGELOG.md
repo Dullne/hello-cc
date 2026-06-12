@@ -16,6 +16,65 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.4
+
+### Summary
+
+hello-cc 0.1.4 publishes the latest Web coordination fixes and a small internal
+module split. The Web console now uses structured peer action APIs instead of
+injecting routine action commands into the terminal, keeps Project State card
+scroll positions stable through refreshes, and refreshes restored tmux panes
+after browser input. Release and guidance helpers are now shared from `lib/`,
+so CLI metadata, release-note parsing, GitHub release publishing, and generated
+coordination guidance have one source of truth.
+
+### Highlights
+
+- Added `/api/peers/:peer/actions/:action` for Web status, state, inbox,
+  task-claim, heartbeat, and registration actions, with an action-result panel
+  in the browser UI.
+- Kept explicit terminal command injection available only for the advanced
+  terminal status action, so normal Web toolbar actions no longer modify the
+  selected session's terminal input.
+- Added collapsible Project State cards for automation, timeline, messages,
+  peers, tasks, and locks, with persisted collapsed state and restored per-card
+  scroll positions after polling refreshes.
+- Refreshed tmux snapshots shortly after WebSocket input so restored tmux
+  sessions show typed input promptly without unsafe browser-side local echo.
+- Disabled stale tmux `pipe-pane` writers before restoring FIFO streaming, so
+  restarted Web runtimes can attach to existing panes reliably.
+- Moved package metadata, changelog release helpers, and generated coordination
+  guidance into reusable `lib/` modules used by the CLI and release scripts.
+- Expanded regression coverage for Web peer actions, state-card behavior,
+  tmux input visibility, packaged helper modules, v-prefixed release-note
+  versions, and CLI/package version consistency.
+
+### Validation
+
+The 0.1.4 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+node --check lib/guidance.mjs
+node --check lib/package-meta.mjs
+node --check lib/release-notes.mjs
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.4
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.3
 
 ### Summary

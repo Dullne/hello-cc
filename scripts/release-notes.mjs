@@ -3,8 +3,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { packageRoot, readPackageJson } from '../lib/package-meta.mjs';
+import { normalizeVersion, releaseSection, validateReleaseSection } from '../lib/release-notes.mjs';
 
-const repoRoot = path.resolve(import.meta.dirname, '..');
+const repoRoot = packageRoot(import.meta.url);
 
 function usage() {
   console.log(`release-notes
@@ -22,10 +24,6 @@ Keep one top-level CHANGELOG.md file. For each release, add a new section:
 The printed section is the source for GitHub Release notes and detailed npm
 package release descriptions.
 `);
-}
-
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
 function parseArgs(argv) {
@@ -48,36 +46,6 @@ function parseArgs(argv) {
   return opts;
 }
 
-function releaseSection(markdown, version) {
-  const lines = markdown.split(/\r?\n/);
-  const heading = `## ${version}`;
-  const start = lines.findIndex((line) => line.trim() === heading);
-  if (start < 0) return null;
-
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i += 1) {
-    if (/^##\s+/.test(lines[i])) {
-      end = i;
-      break;
-    }
-  }
-  return lines.slice(start, end).join('\n').trimEnd();
-}
-
-function validateSection(section, version) {
-  const problems = [];
-  if (!section) {
-    problems.push(`CHANGELOG.md is missing section ## ${version}`);
-    return problems;
-  }
-  if (!section.includes('### Summary')) problems.push(`## ${version} is missing ### Summary`);
-  if (!section.includes('### Highlights')) problems.push(`## ${version} is missing ### Highlights`);
-  if (section.includes('TODO') || section.includes('TBD')) problems.push(`## ${version} still contains TODO/TBD text`);
-  const bulletCount = (section.match(/^- /gm) || []).length;
-  if (bulletCount < 2) problems.push(`## ${version} should include at least two release-note bullets`);
-  return problems;
-}
-
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
@@ -85,11 +53,11 @@ function main() {
     return;
   }
 
-  const pkg = readJson(path.join(repoRoot, 'package.json'));
-  const version = opts.version || pkg.version;
+  const pkg = readPackageJson(repoRoot);
+  const version = normalizeVersion(opts.version || pkg.version);
   const changelog = fs.readFileSync(path.join(repoRoot, 'CHANGELOG.md'), 'utf8');
   const section = releaseSection(changelog, version);
-  const problems = validateSection(section, version);
+  const problems = validateReleaseSection(section, version);
 
   if (opts.check) {
     if (problems.length) {
