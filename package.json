@@ -1,7 +1,7 @@
 {
   "name": "@logicseek/hello-cc",
-  "version": "0.1.0",
-  "description": "Project-local peer mesh for Claude Code, Codex, and other coding CLI sessions.",
+  "version": "0.1.1",
+  "description": "Local control plane for coordinating Claude Code, Codex, and other coding CLI sessions.",
   "type": "module",
   "bin": {
     "hcc": "bin/hcc.mjs",
