@@ -662,6 +662,27 @@ function ensureFile(file, expected = null) {
   }
 }
 
+function assertGuidanceLockPolicy(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  for (const expected of [
+    'Read-only work:',
+    'do not require locks',
+    'For read-only review, do not acquire file locks',
+    'not a final commit-ready verdict',
+    'Review and monitoring:',
+    "Reviewing another peer's work is a read-only activity",
+    'proactively send that',
+    'affected file or behavior',
+    'Do not silently treat a snapshot review as final approval',
+    'Before mutating work:',
+    'Before editing or mutating shared resources:',
+    'Commit-readiness checks are read-only until staging begins',
+    'lock `.git/index` only while staging and'
+  ]) {
+    if (!text.includes(expected)) fail(`guidance lock policy missing ${expected} in ${file}`);
+  }
+}
+
 function runtimeUrl(runtime, route, params = {}) {
   const url = new URL(route, runtime.base_url || `http://127.0.0.1:${port}`);
   if (runtime.token) url.searchParams.set('token', runtime.token);
@@ -1344,11 +1365,76 @@ async function multiProjectWebWorkflow() {
   for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
     if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
   }
-  if (!html.includes('Register Project') || !html.includes('New session') || !html.includes('<strong>Sessions</strong>') || !html.includes('<label>View<select')) {
-    fail('web form missing simplified project/session controls');
+  for (const expected of [
+    'id="projectSelect"',
+    'id="projectPath"',
+    'id="addProjectBtn"',
+    'id="startForm"',
+    'id="kind"',
+    'id="sessionKindFilter"',
+    'id="sessions"'
+  ]) {
+    if (!html.includes(expected)) fail(`web form missing simplified project/session control: ${expected}`);
+  }
+  for (const expected of [
+    'id="langSelect"',
+    "localStorage.getItem('hcc.lang')",
+    "localStorage.setItem('hcc.lang', lang)",
+    "document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en'",
+    "zh: {",
+    "language: '语言'",
+    "projectState: '项目状态'",
+    "noSessionSelected: '未选择会话'",
+    "sendMessage: '发送消息'",
+    "peers: '协作方'",
+    "noPeers: '没有协作方。'",
+    "'status.active': '活跃'",
+    "data-i18n=\"language\"",
+    "data-i18n-placeholder=\"projectPathPlaceholder\"",
+    "data-i18n-title=\"collapseSidebar\"",
+    "function applyLanguage()",
+    "function tr(key",
+    "function statusText(status)",
+    "function sessionMetaText(session)",
+    "connText('attached')",
+    "connText('coordinationOnly')",
+    "tr('noActiveSessions')",
+    "tr('nextAction')",
+    "tr('detectedSession')",
+    "tr('messageBodyPlaceholder')",
+    "activeType === 'detected' && activeDetected",
+    "const draft = document.getElementById('detMsg')?.value || ''",
+    "statusText(state.label)",
+    "statusText(automation.phase || 'idle')",
+    "tr('runtime')"
+  ]) {
+    if (!html.includes(expected)) fail(`web UI missing i18n support: ${expected}`);
   }
   if (!html.includes('id="startMode"') || !html.includes('id="resumeArg"') || !html.includes('syncStartModeOptions') || !html.includes("mode === 'resume'")) {
     fail('web form missing provider resume controls');
+  }
+  for (const expected of [
+    '--left-width',
+    '--right-width',
+    'hcc.sidebar.left.width',
+    'hcc.sidebar.right.width',
+    'class="edge-resizer edge-resizer-left"',
+    'class="edge-resizer edge-resizer-right"',
+    'id="resizeLeft"',
+    'id="resizeRight"',
+    'role="separator"',
+    'aria-orientation="vertical"',
+    'bindSideHandle(resizeLeftHandle',
+    'bindSideHandle(resizeRightHandle',
+    'bindSideHandle(toggleLeftBtn',
+    'bindSideHandle(toggleRightBtn',
+    'setPointerCapture',
+    'sideIsCollapsed(opposite) ? 0',
+    'Math.abs(delta) <= 3',
+    "localStorage.setItem('hcc.collapse.' + side, on ? '1' : '0');\n      applySideWidths();",
+    'cursor: col-resize'
+  ]) {
+    if (!html.includes(expected)) fail(`web layout missing resizable sidebar support: ${expected}`);
   }
   if (!html.includes('state-card') || !html.includes('peerStateView') || !html.includes('savedCardScroll') || !html.includes('lastStateRoot') || !html.includes('data-section="peers"')) {
     fail('web state panel missing scrollable peer state UI');
@@ -1356,7 +1442,7 @@ async function multiProjectWebWorkflow() {
   if (!html.includes('data-section="timeline"') || !html.includes('renderTimelineItem') || !html.includes('bodyPinned') || !html.includes('refreshCurrentState')) {
     fail('web state panel missing collaboration timeline or refresh routing');
   }
-  if (!html.includes('data-section="messages"') || !html.includes('Messages <span class="badge">')) {
+  if (!html.includes('data-section="messages"') || !html.includes('messagesData.length')) {
     fail('web state panel missing dedicated messages card');
   }
 
@@ -1759,14 +1845,39 @@ async function downGcPackWorkflow() {
   hcc(['gc', '--older-than', '0', '--yes']);
   const pack = JSON.parse(run('npm', ['pack', '--dry-run', '--json']));
   const files = new Set(pack[0]?.files?.map((entry) => entry.path) || []);
-  for (const file of ['assets/logo.svg', 'CHANGELOG.md', 'docs/commands.md', 'docs/commands.zh-CN.md']) {
+  for (const file of ['assets/logo.svg', 'CHANGELOG.md', 'docs/commands.md', 'docs/commands.zh-CN.md', 'scripts/github-release.mjs']) {
     if (!files.has(file)) fail(`npm package missing ${file}`);
   }
   const releaseCheck = run('npm', ['run', 'release:check']);
-  if (!releaseCheck.includes('release notes ok: 0.1.2')) fail(`release check output wrong:\n${releaseCheck}`);
+  if (!releaseCheck.includes('release notes ok: 0.1.3')) fail(`release check output wrong:\n${releaseCheck}`);
   const releaseNotes = run('npm', ['run', 'release:notes']);
-  if (!releaseNotes.includes('## 0.1.2') || !releaseNotes.includes('### Summary')) {
+  if (!releaseNotes.includes('## 0.1.3') || !releaseNotes.includes('### Summary')) {
     fail(`release notes output wrong:\n${releaseNotes}`);
+  }
+  const githubRelease = JSON.parse(run(process.execPath, [path.join(repoRoot, 'scripts', 'github-release.mjs'), '--dry-run', '--version', '0.1.3']));
+  if (!githubRelease.ok || !githubRelease.dry_run || githubRelease.repo !== 'Dullne/hello-cc' || githubRelease.tag !== 'v0.1.3' || githubRelease.body_length < 100) {
+    fail(`github release dry run output wrong:\n${JSON.stringify(githubRelease, null, 2)}`);
+  }
+  const docsIndex = fs.readFileSync(path.join(repoRoot, 'docs', 'README.md'), 'utf8');
+  const docsIndexZh = fs.readFileSync(path.join(repoRoot, 'docs', 'README.zh-CN.md'), 'utf8');
+  if (!docsIndex.includes('github-release.yml') || !docsIndex.includes('workflow_dispatch') || !docsIndexZh.includes('github-release.yml') || !docsIndexZh.includes('workflow_dispatch')) {
+    fail('docs index missing GitHub Release publishing command');
+  }
+  const workflow = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'github-release.yml'), 'utf8');
+  for (const expected of [
+    'Publish GitHub Release',
+    "tags:\n      - 'v*'",
+    'workflow_dispatch:',
+    'contents: write',
+    'actions/checkout@v4',
+    'actions/setup-node@v4',
+    'node-version: 24',
+    'npm run release:check',
+    'npm run release:github:dry-run',
+    'npm run release:github',
+    'GITHUB_TOKEN: ${{ github.token }}'
+  ]) {
+    if (!workflow.includes(expected)) fail(`github release workflow missing ${expected}`);
   }
 }
 
@@ -1890,8 +2001,12 @@ function uninstallWorkflow() {
 
   run(process.execPath, [hccBin, '--root', uninstallRoot, 'setup', '--quiet'], { env: uninstallEnv });
   ensureFile(path.join(uninstallRoot, '.hello-cc', 'mesh.db'));
+  ensureFile(path.join(uninstallRoot, '.hello-cc', 'HCC.md'));
   ensureFile(path.join(uninstallRoot, 'CLAUDE.md'));
   ensureFile(path.join(uninstallRoot, 'AGENTS.md'));
+  assertGuidanceLockPolicy(path.join(uninstallRoot, '.hello-cc', 'HCC.md'));
+  assertGuidanceLockPolicy(path.join(uninstallRoot, 'CLAUDE.md'));
+  assertGuidanceLockPolicy(path.join(uninstallRoot, 'AGENTS.md'));
   ensureFile(path.join(uninstallHome, '.claude', 'settings.json'));
   ensureFile(path.join(uninstallHome, '.codex', 'hooks.json'));
   ensureFile(path.join(uninstallHome, '.hcc-shims', 'claude'));

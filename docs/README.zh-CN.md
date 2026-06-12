@@ -9,9 +9,11 @@
   peer 身份和环境变量行为。
 - [命令参考](commands.zh-CN.md)：公共命令的紧凑清单，以及每组命令的用途。
 - [更新日志](../CHANGELOG.md)：已发布版本的 release notes。
-- 发行说明：发布前运行 `npm run release:check`，用
-  `npm run release:notes` 输出当前版本的 changelog 小节，作为 GitHub
-  Release 描述。
+- 发行说明：发布前运行 `npm run release:check` 和
+  `npm run release:github:dry-run`。推送 `v*` tag 会触发
+  `.github/workflows/github-release.yml`，根据当前 changelog 小节创建或更新
+  GitHub Release 描述。旧版本可用 `workflow_dispatch` 补写描述，不需要个人
+  token。
 
 ## 设计和实现
 

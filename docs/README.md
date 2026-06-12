@@ -10,9 +10,11 @@ summary and first command. Use these docs when you need more detail.
 - [Command Reference](commands.md): compact list of public commands and the
   intended use of each command group.
 - [Changelog](../CHANGELOG.md): release notes for published versions.
-- Release notes: run `npm run release:check` before publishing, and use
-  `npm run release:notes` to print the current changelog section for GitHub
-  Release notes.
+- Release notes: run `npm run release:check` and
+  `npm run release:github:dry-run` before publishing. Pushing a `v*` tag runs
+  `.github/workflows/github-release.yml`, which creates or updates the GitHub
+  Release description from the current changelog section. Use
+  `workflow_dispatch` to backfill older releases without a personal token.
 
 ## Design And Implementation
 

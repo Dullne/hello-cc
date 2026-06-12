@@ -2816,18 +2816,47 @@ Status checks:
 - \`hcc status\` summarizes peers, tasks, locks, inbox, and recent events.
 - \`hcc team status --task N\` summarizes explicit subtasks for a parent task.
 
-Before work:
+Read-only work:
+- Reading files, searching, inspecting \`git diff\` / \`git status\`, reviewing
+  uncommitted changes, and running non-mutating checks such as \`node --check\`
+  do not require locks.
+- For read-only review, do not acquire file locks. If another live peer already
+  holds write locks on changed files, report that the review is only a current
+  snapshot and not a final commit-ready verdict.
+- Use tasks, messages, events, or handoffs to make read-only review visible;
+  do not use advisory locks to reserve files you are only reading.
+
+Review and monitoring:
+- Reviewing another peer's work is a read-only activity. You may inspect current
+  diffs, task state, messages, handoffs, and non-mutating checks while that peer
+  keeps its write locks.
+- If you find a concrete issue in another peer's task, proactively send that
+  peer an \`hcc msg\` with the task id, affected file or behavior, why it is a
+  problem, and a suggested fix or verification step.
+- Continue monitoring until the peer fixes the issue, records a follow-up task,
+  or hands off. Do not silently treat a snapshot review as final approval.
+
+Before mutating work:
 - Register with hcc.
 - Read current status with \`hcc status\`, \`hcc state\`, \`hcc task list\`, and \`hcc msg inbox\`.
 - If \`hcc state\` shows a current task for this peer, continue that task until
   handoff, done, or blocked instead of claiming a new task.
-- Claim one task before editing when this peer has no current task.
+- Claim one task before editing or mutating shared state when this peer has no
+  current task.
 - If work needs multiple peers, use \`hcc team plan\` and \`hcc team start\`
   explicitly; do not create or claim hidden extra tasks.
 
-Before editing:
+Before editing or mutating shared resources:
 - Acquire an advisory lock for the file, directory, module, or shared resource.
 - If another live peer holds the lock, message that peer instead of editing.
+- Acquire locks only before writes or shared-resource mutation, including file
+  edits, formatting, staging/committing through \`.git/index\`, intentional DB
+  data/schema changes, starting/stopping/restarting shared runtimes, or taking
+  over tmux/session/port resources.
+- Commit-readiness checks are read-only until staging begins. Do not lock source
+  files for review. Before committing, ensure no live peer holds write locks on
+  the files to be committed, then lock \`.git/index\` only while staging and
+  committing.
 
 During work:
 - Keep changes scoped to the claimed task.
@@ -4517,16 +4546,40 @@ function webIndexHtml() {
       position: relative;
       height: 100vh;
       display: grid;
-      grid-template-columns: 320px 1fr 360px;
+      --left-width: 320px;
+      --right-width: 360px;
+      grid-template-columns: var(--left-width) minmax(0, 1fr) var(--right-width);
       min-width: 640px;
       transition: grid-template-columns .18s ease;
     }
-    .app.left-collapsed  { grid-template-columns: 0 1fr 360px; }
-    .app.right-collapsed { grid-template-columns: 320px 1fr 0; }
-    .app.left-collapsed.right-collapsed { grid-template-columns: 0 1fr 0; }
+    .app.resizing { transition: none; }
+    .app.left-collapsed  { grid-template-columns: 0 minmax(0, 1fr) var(--right-width); }
+    .app.right-collapsed { grid-template-columns: var(--left-width) minmax(0, 1fr) 0; }
+    .app.left-collapsed.right-collapsed { grid-template-columns: 0 minmax(0, 1fr) 0; }
     /* Hide sidebar borders when collapsed so no 1px seam remains. */
     .app.left-collapsed .sidebar { border-right-width: 0; }
     .app.right-collapsed .inspector { border-left-width: 0; }
+    .edge-resizer {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      z-index: 55;
+      width: 12px;
+      cursor: col-resize;
+      touch-action: none;
+      user-select: none;
+      background: transparent;
+      transition: left .18s ease, right .18s ease, background .12s;
+    }
+    .edge-resizer:hover,
+    .app.resizing .edge-resizer {
+      background: rgba(126, 231, 215, .08);
+    }
+    .app.resizing .edge-resizer { transition: none; }
+    .edge-resizer-left  { left: var(--left-width); transform: translateX(-50%); }
+    .edge-resizer-right { right: var(--right-width); transform: translateX(50%); }
+    .app.left-collapsed  .edge-resizer-left  { left: 0; }
+    .app.right-collapsed .edge-resizer-right { right: 0; }
     /* Small collapse handles centered vertically on each divider border.
        They are children of .app (no overflow clip) and track the column edge. */
     .edge-toggle {
@@ -4545,12 +4598,15 @@ function webIndexHtml() {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 6px;
-      cursor: pointer;
+      cursor: col-resize;
+      touch-action: none;
+      user-select: none;
       transition: left .18s ease, right .18s ease, color .12s, border-color .12s, background .12s;
     }
+    .app.resizing .edge-toggle { transition: none; }
     .edge-toggle:hover { color: var(--text); border-color: var(--accent); background: #1b1f26; }
-    .edge-left  { left: 320px; transform: translate(-50%, -50%); }
-    .edge-right { right: 360px; transform: translate(50%, -50%); }
+    .edge-left  { left: var(--left-width); transform: translate(-50%, -50%); }
+    .edge-right { right: var(--right-width); transform: translate(50%, -50%); }
     .app.left-collapsed  .edge-left  { left: 0;  transform: translate(0, -50%); }
     .app.right-collapsed .edge-right { right: 0; transform: translate(0, -50%); }
     .sidebar, .inspector {
@@ -4853,27 +4909,30 @@ function webIndexHtml() {
           <strong>hello-cc</strong>
           <div class="path" id="rootPath"></div>
         </div>
-        <span id="connState">offline</span>
+        <span id="connState" data-i18n="conn.offline">offline</span>
       </div>
       <div class="form" style="padding-top:10px;padding-bottom:10px">
-        <label>Project<select id="projectSelect"></select></label>
-        <label>Project path<input id="projectPath" placeholder="/path/to/project"></label>
-        <button id="addProjectBtn" type="button">Register Project</button>
+        <div class="grid2">
+          <label><span data-i18n="project">Project</span><select id="projectSelect"></select></label>
+          <label><span data-i18n="language">Language</span><select id="langSelect"><option value="en">English</option><option value="zh">中文</option></select></label>
+        </div>
+        <label><span data-i18n="projectPath">Project path</span><input id="projectPath" data-i18n-placeholder="projectPathPlaceholder" placeholder="/path/to/project"></label>
+        <button id="addProjectBtn" type="button" data-i18n="registerProject">Register Project</button>
       </div>
       <form class="form" id="startForm">
         <div class="start-row">
-          <label>New session<select id="kind"><option value="codex">codex</option><option value="claude">claude</option><option value="shell">shell</option></select></label>
-          <button class="primary" type="submit">Start</button>
+          <label><span data-i18n="newSession">New session</span><select id="kind"><option value="codex">codex</option><option value="claude">claude</option><option value="shell" data-i18n="kind.shell">shell</option></select></label>
+          <button class="primary" type="submit" data-i18n="start">Start</button>
         </div>
         <div class="start-options">
-          <label>Mode<select id="startMode"><option value="new">new</option><option value="resume">resume</option><option value="last">last</option><option value="continue">continue</option></select></label>
-          <label data-resume-field>Session<select id="resumeSelect"></select></label>
-          <label data-resume-field data-resume-custom style="display:none">Session id<input id="resumeArg" placeholder="session id or name"></label>
+          <label><span data-i18n="mode">Mode</span><select id="startMode"><option value="new" data-i18n="mode.new">new</option><option value="resume" data-i18n="mode.resume">resume</option><option value="last" data-i18n="mode.last">last</option><option value="continue" data-i18n="mode.continue">continue</option></select></label>
+          <label data-resume-field><span data-i18n="session">Session</span><select id="resumeSelect"></select></label>
+          <label data-resume-field data-resume-custom style="display:none"><span data-i18n="sessionId">Session id</span><input id="resumeArg" data-i18n-placeholder="sessionIdPlaceholder" placeholder="session id or name"></label>
         </div>
       </form>
       <div class="session-header">
-        <strong>Sessions</strong>
-        <label>View<select id="sessionKindFilter"><option value="all">all</option><option value="claude">claude</option><option value="codex">codex</option><option value="shell">shell</option><option value="other">other</option></select></label>
+        <strong data-i18n="sessions">Sessions</strong>
+        <label><span data-i18n="view">View</span><select id="sessionKindFilter"><option value="all" data-i18n="kind.all">all</option><option value="claude">claude</option><option value="codex">codex</option><option value="shell" data-i18n="kind.shell">shell</option><option value="other" data-i18n="kind.other">other</option></select></label>
       </div>
       <div class="sessions" id="sessions"></div>
     </aside>
@@ -4881,21 +4940,21 @@ function webIndexHtml() {
     <main class="main">
       <div class="toolbar">
         <div class="title">
-          <strong id="activeTitle">No session selected</strong>
-          <span class="path" id="activeMeta">Start or select a session from the left panel</span>
+          <strong id="activeTitle" data-i18n="noSessionSelected">No session selected</strong>
+          <span class="path" id="activeMeta" data-i18n="startOrSelect">Start or select a session from the left panel</span>
         </div>
         <div class="quick" id="quickBar">
           <div class="menu-wrap">
-            <button class="menu-btn" id="actionsBtn" type="button" aria-haspopup="true" aria-expanded="false">Actions ▾</button>
+            <button class="menu-btn" id="actionsBtn" type="button" aria-haspopup="true" aria-expanded="false"><span data-i18n="actions">Actions</span> ▾</button>
             <div class="menu" id="actionsMenu" hidden>
-              <button data-send="register">register</button>
-              <button data-send="inbox">inbox</button>
-              <button data-send="next">next task</button>
-              <button data-send="status">status</button>
-              <button data-send="heartbeat">heartbeat</button>
+              <button data-send="register" data-i18n="action.register">register</button>
+              <button data-send="inbox" data-i18n="action.inbox">inbox</button>
+              <button data-send="next" data-i18n="action.nextTask">next task</button>
+              <button data-send="status" data-i18n="action.status">status</button>
+              <button data-send="heartbeat" data-i18n="action.heartbeat">heartbeat</button>
             </div>
           </div>
-          <button class="danger" id="stopBtn" type="button">stop</button>
+          <button class="danger" id="stopBtn" type="button" data-i18n="stop">stop</button>
         </div>
       </div>
       <div id="terminal" style="min-height:0;flex:1"></div>
@@ -4904,14 +4963,16 @@ function webIndexHtml() {
 
     <aside class="inspector">
       <div class="brand">
-        <strong>Project State</strong>
-        <button id="refreshBtn" type="button">Refresh</button>
+        <strong data-i18n="projectState">Project State</strong>
+        <button id="refreshBtn" type="button" data-i18n="refresh">Refresh</button>
       </div>
       <div class="state" id="state"></div>
     </aside>
 
-    <button class="edge-toggle edge-left" id="toggleLeft" type="button" title="Collapse sidebar" aria-label="Toggle left sidebar">⟨</button>
-    <button class="edge-toggle edge-right" id="toggleRight" type="button" title="Collapse state panel" aria-label="Toggle right panel">⟩</button>
+    <button class="edge-toggle edge-left" id="toggleLeft" type="button" data-i18n-title="collapseSidebar" data-i18n-aria="toggleLeftSidebar" title="Collapse sidebar" aria-label="Toggle left sidebar">⟨</button>
+    <button class="edge-toggle edge-right" id="toggleRight" type="button" data-i18n-title="collapseStatePanel" data-i18n-aria="toggleRightPanel" title="Collapse state panel" aria-label="Toggle right panel">⟩</button>
+    <div class="edge-resizer edge-resizer-left" id="resizeLeft" role="separator" aria-orientation="vertical" data-i18n-aria="resizeLeftSidebar" data-i18n-title="resizeLeftSidebar" aria-label="Resize left sidebar" title="Resize left sidebar"></div>
+    <div class="edge-resizer edge-resizer-right" id="resizeRight" role="separator" aria-orientation="vertical" data-i18n-aria="resizeRightPanel" data-i18n-title="resizeRightPanel" aria-label="Resize right panel" title="Resize right panel"></div>
   </div>
 
   <script src="/assets/xterm.js"></script>
@@ -4933,6 +4994,278 @@ function webIndexHtml() {
     let lastStateRoot = '';
     let ws        = null;
     let wsReconnectTimer = null;
+    const i18n = {
+      en: {
+        language: 'Language',
+        project: 'Project',
+        projectPath: 'Project path',
+        projectPathPlaceholder: '/path/to/project',
+        registerProject: 'Register Project',
+        newSession: 'New session',
+        start: 'Start',
+        mode: 'Mode',
+        'mode.new': 'new',
+        'mode.resume': 'resume',
+        'mode.last': 'last',
+        'mode.continue': 'continue',
+        session: 'Session',
+        sessionId: 'Session id',
+        sessionIdPlaceholder: 'session id or name',
+        sessions: 'Sessions',
+        view: 'View',
+        'kind.all': 'all',
+        'kind.shell': 'shell',
+        'kind.other': 'other',
+        noSessionSelected: 'No session selected',
+        startOrSelect: 'Start or select a session from the left panel',
+        actions: 'Actions',
+        'action.register': 'register',
+        'action.inbox': 'inbox',
+        'action.nextTask': 'next task',
+        'action.status': 'status',
+        'action.heartbeat': 'heartbeat',
+        stop: 'stop',
+        projectState: 'Project State',
+        refresh: 'Refresh',
+        managed: 'Managed',
+        detected: 'Detected',
+        running: 'running',
+        noActiveSessions: 'No active sessions.',
+        startOneAbove: 'Start one above',
+        orRunTerminal: 'or run in any terminal:',
+        noDetectedPeers: 'No detected peers.',
+        viewFilter: 'View filter',
+        noTasks: 'No tasks.',
+        noPeers: 'No peers.',
+        noActiveLocks: 'No active locks.',
+        noMessages: 'No messages.',
+        noTimelineItems: 'No timeline items.',
+        nextAction: 'Next Action',
+        timeline: 'Timeline',
+        messages: 'Messages',
+        peers: 'Peers',
+        tasks: 'Tasks',
+        locks: 'Locks',
+        owner: 'owner',
+        assignee: 'assignee',
+        task: 'task',
+        all: 'all',
+        next: 'next',
+        finish: 'finish',
+        warnings: 'warnings',
+        noImmediateAction: 'No immediate coordination action',
+        detectedSession: 'Detected Session',
+        sendMessage: 'Send Message',
+        messageHelp: "Message will appear in the peer's <code>hcc msg inbox</code> and be injected on next hook fire.",
+        messageBodyPlaceholder: 'Message body...',
+        send: 'Send',
+        peer: 'peer',
+        kind: 'kind',
+        status: 'status',
+        cwd: 'cwd',
+        pid: 'pid',
+        unknown: 'unknown',
+        lastSeen: 'last seen',
+        secondsAgo: 's ago',
+        age: 'age',
+        branch: 'branch',
+        runtime: 'runtime',
+        thread: 'thread',
+        reply: 'reply',
+        'status.active': 'active',
+        'status.stale': 'stale',
+        'status.unknown': 'unknown',
+        'status.running': 'running',
+        'status.idle': 'idle',
+        'status.exited': 'exited',
+        'status.claimed': 'claimed',
+        'status.review': 'review',
+        'status.blocked': 'blocked',
+        'status.done': 'done',
+        'status.abandoned': 'abandoned',
+        'status.pending': 'pending',
+        'conn.offline': 'offline',
+        'conn.online': 'online',
+        'conn.attached': 'attached',
+        'conn.reconnecting': 'reconnecting...',
+        'conn.coordinationOnly': 'coordination only',
+        'conn.error': 'error',
+        show: 'Show',
+        collapse: 'Collapse',
+        sidebar: 'sidebar',
+        statePanel: 'state panel',
+        dragToResize: 'drag to resize',
+        collapseSidebar: 'Collapse sidebar',
+        collapseStatePanel: 'Collapse state panel',
+        toggleLeftSidebar: 'Toggle left sidebar',
+        toggleRightPanel: 'Toggle right panel',
+        resizeLeftSidebar: 'Resize left sidebar',
+        resizeRightPanel: 'Resize right panel',
+        customSession: 'custom session id...'
+      },
+      zh: {
+        language: '语言',
+        project: '项目',
+        projectPath: '项目路径',
+        projectPathPlaceholder: '/项目/路径',
+        registerProject: '注册项目',
+        newSession: '新会话',
+        start: '启动',
+        mode: '模式',
+        'mode.new': '新建',
+        'mode.resume': '恢复',
+        'mode.last': '最近',
+        'mode.continue': '继续',
+        session: '会话',
+        sessionId: '会话 ID',
+        sessionIdPlaceholder: '会话 ID 或名称',
+        sessions: '会话',
+        view: '视图',
+        'kind.all': '全部',
+        'kind.shell': 'shell',
+        'kind.other': '其他',
+        noSessionSelected: '未选择会话',
+        startOrSelect: '从左侧面板启动或选择一个会话',
+        actions: '操作',
+        'action.register': '注册',
+        'action.inbox': '收件箱',
+        'action.nextTask': '下个任务',
+        'action.status': '状态',
+        'action.heartbeat': '心跳',
+        stop: '停止',
+        projectState: '项目状态',
+        refresh: '刷新',
+        managed: '托管',
+        detected: '检测到',
+        running: '运行中',
+        noActiveSessions: '没有活动会话。',
+        startOneAbove: '在上方启动一个会话',
+        orRunTerminal: '或在任意终端运行：',
+        noDetectedPeers: '没有检测到的协作方。',
+        viewFilter: '视图过滤',
+        noTasks: '没有任务。',
+        noPeers: '没有协作方。',
+        noActiveLocks: '没有活动锁。',
+        noMessages: '没有消息。',
+        noTimelineItems: '没有时间线条目。',
+        nextAction: '下一步',
+        timeline: '时间线',
+        messages: '消息',
+        peers: '协作方',
+        tasks: '任务',
+        locks: '锁',
+        owner: '负责人',
+        assignee: '执行者',
+        task: '任务',
+        all: '全部',
+        next: '下一步',
+        finish: '收尾',
+        warnings: '警告',
+        noImmediateAction: '当前没有需要立即处理的协作动作',
+        detectedSession: '检测到的会话',
+        sendMessage: '发送消息',
+        messageHelp: '消息会出现在该 peer 的 <code>hcc msg inbox</code> 中，并在下一次 hook 触发时注入。',
+        messageBodyPlaceholder: '消息内容...',
+        send: '发送',
+        peer: '协作方',
+        kind: '类型',
+        status: '状态',
+        cwd: '工作目录',
+        pid: 'PID',
+        unknown: '未知',
+        lastSeen: '最后出现',
+        secondsAgo: ' 秒前',
+        age: '时长',
+        branch: '分支',
+        runtime: '运行时',
+        thread: '线程',
+        reply: '回复',
+        'status.active': '活跃',
+        'status.stale': '过期',
+        'status.unknown': '未知',
+        'status.running': '运行中',
+        'status.idle': '空闲',
+        'status.exited': '已退出',
+        'status.claimed': '已认领',
+        'status.review': '审查中',
+        'status.blocked': '阻塞',
+        'status.done': '完成',
+        'status.abandoned': '已放弃',
+        'status.pending': '待处理',
+        'conn.offline': '离线',
+        'conn.online': '在线',
+        'conn.attached': '已连接',
+        'conn.reconnecting': '重连中...',
+        'conn.coordinationOnly': '仅协作',
+        'conn.error': '错误',
+        show: '显示',
+        collapse: '折叠',
+        sidebar: '侧栏',
+        statePanel: '状态面板',
+        dragToResize: '拖动调整大小',
+        collapseSidebar: '折叠侧栏',
+        collapseStatePanel: '折叠状态面板',
+        toggleLeftSidebar: '切换左侧栏',
+        toggleRightPanel: '切换右侧面板',
+        resizeLeftSidebar: '调整左侧栏宽度',
+        resizeRightPanel: '调整右侧面板宽度',
+        customSession: '自定义会话 ID...'
+      }
+    };
+    let lang = localStorage.getItem('hcc.lang') || ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+    if (!i18n[lang]) lang = 'en';
+
+    function tr(key, fallback = '') {
+      return i18n[lang]?.[key] || i18n.en[key] || fallback || key;
+    }
+
+    function setText(id, key) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = tr(key);
+    }
+
+    function connText(key) {
+      const el = document.getElementById('connState');
+      if (el) {
+        el.dataset.stateKey = key;
+        el.textContent = tr('conn.' + key);
+      }
+    }
+
+    function applyLanguage() {
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      localStorage.setItem('hcc.lang', lang);
+      const sel = document.getElementById('langSelect');
+      if (sel) sel.value = lang;
+      document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = tr(el.dataset.i18n); });
+      document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => { el.placeholder = tr(el.dataset.i18nPlaceholder); });
+      document.querySelectorAll('[data-i18n-title]').forEach((el) => { el.title = tr(el.dataset.i18nTitle); });
+      document.querySelectorAll('[data-i18n-aria]').forEach((el) => { el.setAttribute('aria-label', tr(el.dataset.i18nAria)); });
+      if (!active && !activeDetected) {
+        setText('activeTitle', 'noSessionSelected');
+        setText('activeMeta', 'startOrSelect');
+      }
+      const stateKey = document.getElementById('connState')?.dataset.stateKey || 'offline';
+      connText(stateKey);
+      syncStartModeOptions();
+      renderSections();
+      if (activeType === 'detected' && activeDetected) {
+        const draft = document.getElementById('detMsg')?.value || '';
+        const peer = detected.find((p) => p.id === activeDetected) || { id: activeDetected };
+        document.getElementById('activeTitle').textContent = activeDetected + ' (' + tr('detected') + ')';
+        renderDetectedPanel(peer);
+        const detMsg = document.getElementById('detMsg');
+        if (detMsg && draft) detMsg.value = draft;
+      } else if (activeType === 'managed' && active) {
+        const meta = sessions.find((s) => s.id === active);
+        if (meta) {
+          document.getElementById('activeTitle').textContent = sessionPeerId(meta) || active;
+          document.getElementById('activeMeta').textContent = sessionMetaText(meta);
+        }
+      }
+      if (lastStateRoot) refreshCurrentState().catch(console.error);
+      syncToggleIcons();
+    }
 
     function requestQuery(extra = {}) {
       const params = new URLSearchParams();
@@ -5026,7 +5359,7 @@ function webIndexHtml() {
         : kind === 'codex'
           ? [['new', 'new'], ['resume', 'resume'], ['last', 'last']]
           : [['new', 'new']];
-      modeSelect.innerHTML = modes.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('');
+      modeSelect.innerHTML = modes.map(([value]) => '<option value="' + value + '">' + tr('mode.' + value, value) + '</option>').join('');
       modeSelect.value = modes.some(([value]) => value === current) ? current : 'new';
       const isResume = modeSelect.value === 'resume';
       document.querySelector('[data-resume-field]:not([data-resume-custom])').style.display = isResume ? '' : 'none';
@@ -5051,7 +5384,7 @@ function webIndexHtml() {
         const label = (r.name && r.name !== resume ? r.name + ' · ' : '') + shortResume + ' (' + r.peer + ')';
         return '<option value="' + esc(resume) + '">' + esc(label) + '</option>';
       });
-      opts.push('<option value="__custom__">custom session id…</option>');
+      opts.push('<option value="__custom__">' + esc(tr('customSession')) + '</option>');
       sel.innerHTML = opts.join('');
       if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
       toggleResumeCustom();
@@ -5077,8 +5410,8 @@ function webIndexHtml() {
       activeType = 'managed';
       if (ws) { clearTimeout(wsReconnectTimer); ws.close(); ws = null; }
       term.reset();
-      document.getElementById('activeTitle').textContent = 'No session selected';
-      document.getElementById('activeMeta').textContent = 'Start or select a session from the left panel';
+      document.getElementById('activeTitle').textContent = tr('noSessionSelected');
+      document.getElementById('activeMeta').textContent = tr('startOrSelect');
       await Promise.all([refreshSessions(), refreshDetected(), refreshState()]);
       const first = sessions.find(s => s.status === 'running');
       if (first) connectManaged(first.id);
@@ -5099,7 +5432,8 @@ function webIndexHtml() {
 
     function fmtAge(age) {
       const n = Number(age);
-      return Number.isFinite(n) ? Math.max(0, Math.round(n)) + 's' : '?';
+      if (!Number.isFinite(n)) return '?';
+      return Math.max(0, Math.round(n)) + (lang === 'zh' ? '秒' : 's');
     }
 
     function sessionPeerId(session) {
@@ -5108,7 +5442,16 @@ function webIndexHtml() {
 
     function sessionRuntimeNote(session) {
       const peerId = sessionPeerId(session);
-      return session?.id && peerId && session.id !== peerId ? 'runtime=' + session.id + ' · ' : '';
+      return session?.id && peerId && session.id !== peerId ? tr('runtime') + '=' + session.id + ' · ' : '';
+    }
+
+    function sessionMetaText(session) {
+      return sessionRuntimeNote(session) + (session.command || '') + (session.pane ? ' · ' + session.pane : '') + ' · ' + (session.cwd || '');
+    }
+
+    function statusText(status) {
+      const value = String(status || 'unknown');
+      return tr('status.' + value.toLowerCase(), value);
     }
 
     function managedPeerId(id) {
@@ -5127,22 +5470,22 @@ function webIndexHtml() {
       const activity = peer?.status || 'unknown';
       const liveness = peerIsActive(peer, basisNow) ? 'active' : 'stale';
       const age = fmtAge(peer?.age_sec);
-      const branch = peer?.branch ? ' branch=' + peer.branch : '';
+      const branch = peer?.branch ? ' ' + tr('branch') + '=' + peer.branch : '';
       if (runtime) {
         return {
           label: runtime.status || 'running',
-          detail: 'peer=' + activity + ' ' + liveness + ' age=' + age + branch
+          detail: tr('peer') + '=' + statusText(activity) + ' ' + statusText(liveness) + ' ' + tr('age') + '=' + age + branch
         };
       }
       if (liveness === 'stale') {
         return {
           label: 'stale',
-          detail: 'last=' + activity + ' age=' + age + branch
+          detail: tr('lastSeen') + '=' + statusText(activity) + ' ' + tr('age') + '=' + age + branch
         };
       }
         return {
           label: activity,
-          detail: liveness + ' age=' + age + branch
+          detail: statusText(liveness) + ' ' + tr('age') + '=' + age + branch
         };
       }
 
@@ -5154,8 +5497,8 @@ function webIndexHtml() {
       function renderTimelineItem(item) {
         const meta = [
           item.source + ':' + item.source_id,
-          item.task_id ? 'task #' + item.task_id : '',
-          item.thread_id ? 'thread #' + item.thread_id : '',
+          item.task_id ? tr('task') + ' #' + item.task_id : '',
+          item.thread_id ? tr('thread') + ' #' + item.thread_id : '',
           item.direction || '',
           fmtTime(item.ts)
         ].filter(Boolean).join(' · ');
@@ -5167,8 +5510,12 @@ function webIndexHtml() {
           </div>\`;
       }
 
-      document.getElementById('projectSelect').addEventListener('change', (event) => {
+    document.getElementById('projectSelect').addEventListener('change', (event) => {
       switchProject(event.target.value).catch(console.error);
+    });
+    document.getElementById('langSelect').addEventListener('change', (event) => {
+      lang = event.target.value === 'zh' ? 'zh' : 'en';
+      applyLanguage();
     });
     document.getElementById('sessionKindFilter').addEventListener('change', (event) => {
       sessionKindFilter = event.target.value || 'all';
@@ -5190,36 +5537,36 @@ function webIndexHtml() {
       const box = document.getElementById('sessions');
       const visibleSessions = sessions.filter(kindMatches);
       const visibleDetected = detected.filter(kindMatches);
-      const filterNote = sessionKindFilter === 'all' ? '' : '<br><br>View filter: ' + esc(sessionKindFilter);
+      const filterNote = sessionKindFilter === 'all' ? '' : '<br><br>' + esc(tr('viewFilter')) + ': ' + esc(sessionKindFilter);
       const manHtml = visibleSessions.length
         ? visibleSessions.map((s) => {
           const peerId = sessionPeerId(s);
           return \`
           <div class="session \${active === s.id && activeType === 'managed' ? 'active' : ''}" data-id="\${esc(s.id)}" data-type="managed">
-            <div class="row"><strong>\${esc(peerId)}</strong><span class="badge \${esc(s.status)}">\${esc(s.status)}</span></div>
+            <div class="row"><strong>\${esc(peerId)}</strong><span class="badge \${badgeClass(s.status)}">\${esc(statusText(s.status))}</span></div>
             <div class="row"><span class="badge">\${esc(s.kind)}</span><span class="badge \${s.type === 'external' || s.type === 'tmux' ? 'warn' : ''}">\${s.type === 'external' ? 'external' : s.type === 'tmux' ? 'tmux' : 'pty'}</span></div>
             <div class="path">\${esc(sessionRuntimeNote(s) + (s.command || ''))}</div>
           </div>\`;
         }).join('')
-        : '<div class="empty">No active sessions.' + filterNote + '<br><br>Start one above<br>or run in any terminal:<br><code>hcc peer start X -- claude</code></div>';
+        : '<div class="empty">' + esc(tr('noActiveSessions')) + filterNote + '<br><br>' + esc(tr('startOneAbove')) + '<br>' + esc(tr('orRunTerminal')) + '<br><code>hcc peer start X -- claude</code></div>';
 
       const detHtml = visibleDetected.length
         ? visibleDetected.map((p) => {
           const state = peerStateView(p);
           return \`
           <div class="session \${activeDetected === p.id && activeType === 'detected' ? 'active' : ''}" data-id="\${esc(p.id)}" data-type="detected">
-            <div class="row"><strong>\${esc(p.id)}</strong><span class="badge" style="color:var(--warn);border-color:#6b5a20">detected</span></div>
-            <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge \${badgeClass(state.label)}" title="\${esc(state.detail)}">\${esc(state.label)}</span></div>
+            <div class="row"><strong>\${esc(p.id)}</strong><span class="badge" style="color:var(--warn);border-color:#6b5a20">\${esc(tr('detected'))}</span></div>
+            <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge \${badgeClass(state.label)}" title="\${esc(state.detail)}">\${esc(statusText(state.label))}</span></div>
             <div class="path" title="\${esc(p.worktree || '')}">\${esc((p.worktree || '').split('/').slice(-2).join('/'))}</div>
           </div>\`;
         }).join('')
-        : '<div class="empty">No detected peers.' + filterNote + '</div>';
+        : '<div class="empty">' + esc(tr('noDetectedPeers')) + filterNote + '</div>';
 
       const savedScroll = box.scrollTop;
       box.innerHTML = \`
-        <div class="sec-label">Managed <span class="badge">\${visibleSessions.filter(s=>s.status==='running').length} running</span></div>
+        <div class="sec-label">\${esc(tr('managed'))} <span class="badge">\${visibleSessions.filter(s=>s.status==='running').length} \${esc(tr('running'))}</span></div>
         \${manHtml}
-        <div class="sec-label" style="margin-top:10px">Detected <span class="badge" style="color:var(--warn)">\${visibleDetected.length}</span></div>
+        <div class="sec-label" style="margin-top:10px">\${esc(tr('detected'))} <span class="badge" style="color:var(--warn)">\${visibleDetected.length}</span></div>
         \${detHtml}
       \`;
       box.scrollTop = savedScroll;
@@ -5239,10 +5586,10 @@ function webIndexHtml() {
         const meta = sessions.find((s) => s.id === active);
         if (meta) {
           document.getElementById('activeTitle').textContent = sessionPeerId(meta) || active;
-          document.getElementById('activeMeta').textContent = sessionRuntimeNote(meta) + meta.command + (meta.pane ? ' · ' + meta.pane : '') + ' · ' + (meta.cwd || '');
+          document.getElementById('activeMeta').textContent = sessionMetaText(meta);
         }
       }
-      document.getElementById('connState').textContent = 'online';
+      connText('online');
     }
 
     async function refreshDetected() {
@@ -5288,37 +5635,37 @@ function webIndexHtml() {
 	        const timelineData = data.timeline || [];
 	        const automation = data.automation || {};
 	        const nextAction = automation.next_action || {};
-        const tasks = tasksData.map((t) => \`
-          <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(t.status)} owner=\${esc(t.owner || '')} assignee=\${esc(t.assignee || '')}</span></div>
-        \`).join('') || '<div class="empty">No tasks.</div>';
+      const tasks = tasksData.map((t) => \`
+          <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(statusText(t.status))} \${esc(tr('owner'))}=\${esc(t.owner || '')} \${esc(tr('assignee'))}=\${esc(t.assignee || '')}</span></div>
+        \`).join('') || '<div class="empty">' + esc(tr('noTasks')) + '</div>';
         const peers = peersData.map((a) => {
         const peerRuntime = runtimeById.get(a.id);
         const peerState = peerStateView(a, peerRuntime, data.now);
         return \`
-        <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span> <span class="badge \${badgeClass(peerState.label)}">\${esc(peerState.label)}</span></strong><span>\${esc(peerState.detail)}</span></div>
+        <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span> <span class="badge \${badgeClass(peerState.label)}">\${esc(statusText(peerState.label))}</span></strong><span>\${esc(peerState.detail)}</span></div>
       \`;
-        }).join('') || '<div class="empty">No peers.</div>';
-	        const locks = locksData.map((l) => \`
-	          <div class="item"><strong>\${esc(l.resource)}</strong><span>owner=\${esc(l.owner)} task=\${l.task_id ? '#' + l.task_id : ''}</span></div>
-	        \`).join('') || '<div class="empty">No active locks.</div>';
-	        const messages = messagesData.map((m) => \`
-	          <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || 'all')}\${m.reply_to ? ' reply #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
-	        \`).join('') || '<div class="empty">No messages.</div>';
-	        const timeline = timelineData.map(renderTimelineItem).join('') || '<div class="empty">No timeline items.</div>';
+        }).join('') || '<div class="empty">' + esc(tr('noPeers')) + '</div>';
+		        const locks = locksData.map((l) => \`
+		          <div class="item"><strong>\${esc(l.resource)}</strong><span>\${esc(tr('owner'))}=\${esc(l.owner)} \${esc(tr('task'))}=\${l.task_id ? '#' + l.task_id : ''}</span></div>
+		        \`).join('') || '<div class="empty">' + esc(tr('noActiveLocks')) + '</div>';
+		        const messages = messagesData.map((m) => \`
+			          <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || tr('all'))}\${m.reply_to ? ' ' + esc(tr('reply')) + ' #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
+			        \`).join('') || '<div class="empty">' + esc(tr('noMessages')) + '</div>';
+			        const timeline = timelineData.map(renderTimelineItem).join('') || '<div class="empty">' + esc(tr('noTimelineItems')) + '</div>';
         const actionLines = [
-          '<div class="item"><strong>' + esc(automation.phase || 'idle') + '</strong><span>' + esc(nextAction.reason || 'No immediate coordination action') + '</span></div>',
-          nextAction.command ? '<div class="item"><strong>next</strong><span class="mono">' + esc(nextAction.command) + '</span></div>' : '',
-          (automation.finish_actions || []).length ? '<div class="item"><strong>finish</strong><span>' + esc(automation.finish_actions.map((a) => a.command).join(' | ')) + '</span></div>' : '',
-          (automation.warnings || []).length ? '<div class="item"><strong>warnings</strong><span>' + esc(automation.warnings.join(' | ')) + '</span></div>' : ''
+          '<div class="item"><strong>' + esc(statusText(automation.phase || 'idle')) + '</strong><span>' + esc(nextAction.reason || tr('noImmediateAction')) + '</span></div>',
+          nextAction.command ? '<div class="item"><strong>' + esc(tr('next')) + '</strong><span class="mono">' + esc(nextAction.command) + '</span></div>' : '',
+          (automation.finish_actions || []).length ? '<div class="item"><strong>' + esc(tr('finish')) + '</strong><span>' + esc(automation.finish_actions.map((a) => a.command).join(' | ')) + '</span></div>' : '',
+          (automation.warnings || []).length ? '<div class="item"><strong>' + esc(tr('warnings')) + '</strong><span>' + esc(automation.warnings.join(' | ')) + '</span></div>' : ''
         ].filter(Boolean).join('');
         state.innerHTML = \`
-	          <div class="card state-card" data-section="automation"><h2>Next Action <span class="badge">\${esc(automation.phase || 'idle')}</span></h2><div class="body">\${actionLines}</div></div>
-	          <div class="card state-card" data-section="timeline"><h2>Timeline <span class="badge">\${timelineData.length}</span></h2><div class="body">\${timeline}</div></div>
-	          <div class="card state-card" data-section="messages"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
-	          <div class="card state-card" data-section="peers"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
-          <div class="card state-card" data-section="tasks"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
-          <div class="card state-card" data-section="locks"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
-        \`;
+		          <div class="card state-card" data-section="automation"><h2>\${esc(tr('nextAction'))} <span class="badge">\${esc(statusText(automation.phase || 'idle'))}</span></h2><div class="body">\${actionLines}</div></div>
+		          <div class="card state-card" data-section="timeline"><h2>\${esc(tr('timeline'))} <span class="badge">\${timelineData.length}</span></h2><div class="body">\${timeline}</div></div>
+		          <div class="card state-card" data-section="messages"><h2>\${esc(tr('messages'))} <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
+		          <div class="card state-card" data-section="peers"><h2>\${esc(tr('peers'))} <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
+          <div class="card state-card" data-section="tasks"><h2>\${esc(tr('tasks'))} <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
+          <div class="card state-card" data-section="locks"><h2>\${esc(tr('locks'))} <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
+      \`;
         state.scrollTop = savedStateScroll;
         for (const [section, saved] of savedCardScroll) {
           const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
@@ -5356,7 +5703,7 @@ function webIndexHtml() {
       activeType = 'managed';
       renderSections();
       document.getElementById('activeTitle').textContent = peerId;
-      document.getElementById('activeMeta').textContent = meta ? sessionRuntimeNote(meta) + meta.command + (meta.pane ? ' · ' + meta.pane : '') + ' · ' + (meta.cwd || '') : '';
+      document.getElementById('activeMeta').textContent = meta ? sessionMetaText(meta) : '';
       document.getElementById('terminal').style.display = '';
       document.getElementById('detectedPanel').style.display = 'none';
       document.getElementById('quickBar').style.display = '';
@@ -5372,7 +5719,7 @@ function webIndexHtml() {
       ws = new WebSocket(proto + '://' + location.host + '/ws/terminal/' + encodeURIComponent(id) + requestQuery());
       ws.onopen = () => {
         resizeTerm();
-        document.getElementById('connState').textContent = 'attached';
+        connText('attached');
       };
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
@@ -5389,12 +5736,12 @@ function webIndexHtml() {
         if (msg.type === 'exit') { refreshSessions().catch(console.error); }
       };
       ws.onclose = () => {
-        document.getElementById('connState').textContent = 'reconnecting...';
+        connText('reconnecting');
         // Auto-reconnect if session is still in the list and running
         wsReconnectTimer = setTimeout(() => {
           const s = sessions.find((s) => s.id === id);
           if (s && s.status === 'running' && active === id) openWs(id);
-          else document.getElementById('connState').textContent = 'online';
+          else connText('online');
         }, 2000);
       };
     }
@@ -5407,12 +5754,12 @@ function webIndexHtml() {
       activeType = 'detected';
       if (ws) { clearTimeout(wsReconnectTimer); ws.close(); ws = null; }
       renderSections();
-      document.getElementById('activeTitle').textContent = id + ' (detected)';
+      document.getElementById('activeTitle').textContent = id + ' (' + tr('detected') + ')';
       document.getElementById('activeMeta').textContent = peer ? peer.kind + ' · ' + (peer.worktree || '') : '';
       document.getElementById('terminal').style.display = 'none';
       document.getElementById('detectedPanel').style.display = '';
       document.getElementById('quickBar').style.display = 'none';
-      document.getElementById('connState').textContent = 'coordination only';
+      connText('coordinationOnly');
       renderDetectedPanel(peer || { id });
       refreshDetectedState().catch(console.error);
     }
@@ -5422,22 +5769,22 @@ function webIndexHtml() {
       dp.innerHTML = \`
         <div style="padding:16px;display:grid;gap:12px">
           <div class="card">
-            <h2>Detected Session</h2>
+            <h2>\${esc(tr('detectedSession'))}</h2>
             <div class="body">
-              <div class="item"><strong>peer</strong><span class="mono">\${esc(peer.id)}</span></div>
-              <div class="item"><strong>kind</strong><span>\${esc(peer.kind || '')}</span></div>
-              <div class="item"><strong>status</strong><span>\${esc(peer.status || '')}</span></div>
-              <div class="item"><strong>cwd</strong><span class="mono" style="font-size:11px">\${esc(peer.worktree || '')}</span></div>
-              <div class="item"><strong>pid</strong><span>\${esc(peer.pid || 'unknown')}</span></div>
-              <div class="item"><strong>last seen</strong><span>\${peer.age_sec != null ? peer.age_sec + 's ago' : ''}</span></div>
+              <div class="item"><strong>\${esc(tr('peer'))}</strong><span class="mono">\${esc(peer.id)}</span></div>
+              <div class="item"><strong>\${esc(tr('kind'))}</strong><span>\${esc(peer.kind || '')}</span></div>
+              <div class="item"><strong>\${esc(tr('status'))}</strong><span>\${esc(peer.status || '')}</span></div>
+              <div class="item"><strong>\${esc(tr('cwd'))}</strong><span class="mono" style="font-size:11px">\${esc(peer.worktree || '')}</span></div>
+              <div class="item"><strong>\${esc(tr('pid'))}</strong><span>\${esc(peer.pid || tr('unknown'))}</span></div>
+              <div class="item"><strong>\${esc(tr('lastSeen'))}</strong><span>\${peer.age_sec != null ? esc(peer.age_sec + tr('secondsAgo')) : ''}</span></div>
             </div>
           </div>
           <div class="card">
-            <h2>Send Message</h2>
+            <h2>\${esc(tr('sendMessage'))}</h2>
             <div class="body" style="gap:8px">
-              <div style="font-size:12px;color:var(--muted)">Message will appear in the peer's <code>hcc msg inbox</code> and be injected on next hook fire.</div>
-              <textarea id="detMsg" rows="3" style="width:100%;background:#0d0f12;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px;font:inherit;resize:vertical" placeholder="Message body..."></textarea>
-              <button class="primary" id="sendDetMsg">Send</button>
+              <div style="font-size:12px;color:var(--muted)">\${tr('messageHelp')}</div>
+              <textarea id="detMsg" rows="3" style="width:100%;background:#0d0f12;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px;font:inherit;resize:vertical" placeholder="\${esc(tr('messageBodyPlaceholder'))}"></textarea>
+              <button class="primary" id="sendDetMsg">\${esc(tr('send'))}</button>
             </div>
           </div>
         </div>
@@ -5527,29 +5874,127 @@ function webIndexHtml() {
     const appEl = document.querySelector('.app');
     const toggleLeftBtn = document.getElementById('toggleLeft');
     const toggleRightBtn = document.getElementById('toggleRight');
+    const resizeLeftHandle = document.getElementById('resizeLeft');
+    const resizeRightHandle = document.getElementById('resizeRight');
+    const sideDefaults = { left: 320, right: 360 };
+    const sideMin = { left: 220, right: 240 };
+    const sideMax = { left: 560, right: 640 };
+    const sideWidthKey = { left: 'hcc.sidebar.left.width', right: 'hcc.sidebar.right.width' };
+    const dragState = { side: null, startX: 0, startWidth: 0, moved: false, suppressClick: false };
+    function sideIsCollapsed(side) {
+      return appEl.classList.contains(side + '-collapsed') || localStorage.getItem('hcc.collapse.' + side) === '1';
+    }
+    function storedSideWidth(side) {
+      const raw = Number(localStorage.getItem(sideWidthKey[side]));
+      return Number.isFinite(raw) && raw > 0 ? raw : sideDefaults[side];
+    }
+    function effectiveOppositeWidth(side) {
+      const opposite = side === 'left' ? 'right' : 'left';
+      return sideIsCollapsed(opposite) ? 0 : storedSideWidth(opposite);
+    }
+    function clampSideWidth(side, width) {
+      const viewport = Math.max(640, window.innerWidth || appEl.clientWidth || 0);
+      const opposite = effectiveOppositeWidth(side);
+      const maxByViewport = Math.max(sideMin[side], viewport - opposite - 280);
+      return Math.max(sideMin[side], Math.min(sideMax[side], maxByViewport, Math.round(width)));
+    }
+    function readSideWidth(side) {
+      return clampSideWidth(side, storedSideWidth(side));
+    }
+    function setSideWidth(side, width, persist = true) {
+      const value = clampSideWidth(side, width);
+      appEl.style.setProperty('--' + side + '-width', value + 'px');
+      if (persist) localStorage.setItem(sideWidthKey[side], String(value));
+      return value;
+    }
+    function applySideWidths() {
+      setSideWidth('left', readSideWidth('left'), false);
+      setSideWidth('right', readSideWidth('right'), false);
+    }
     function syncToggleIcons() {
       const l = appEl.classList.contains('left-collapsed');
       const r = appEl.classList.contains('right-collapsed');
       toggleLeftBtn.textContent = l ? '⟩' : '⟨';
-      toggleLeftBtn.title = (l ? 'Show' : 'Collapse') + ' sidebar';
+      toggleLeftBtn.title = (l ? tr('show') : tr('collapse')) + ' ' + tr('sidebar') + '; ' + tr('dragToResize');
       toggleRightBtn.textContent = r ? '⟨' : '⟩';
-      toggleRightBtn.title = (r ? 'Show' : 'Collapse') + ' state panel';
+      toggleRightBtn.title = (r ? tr('show') : tr('collapse')) + ' ' + tr('statePanel') + '; ' + tr('dragToResize');
     }
     function applyCollapseState() {
       appEl.classList.toggle('left-collapsed', localStorage.getItem('hcc.collapse.left') === '1');
       appEl.classList.toggle('right-collapsed', localStorage.getItem('hcc.collapse.right') === '1');
+      applySideWidths();
       syncToggleIcons();
     }
     function toggleSide(side) {
       const cls = side + '-collapsed';
       const on = appEl.classList.toggle(cls);
       localStorage.setItem('hcc.collapse.' + side, on ? '1' : '0');
+      applySideWidths();
       syncToggleIcons();
       // Refit the terminal after the grid transition so xterm uses the new width.
       setTimeout(() => { try { resizeTerm(); } catch {} }, 200);
     }
-    toggleLeftBtn.addEventListener('click', () => toggleSide('left'));
-    toggleRightBtn.addEventListener('click', () => toggleSide('right'));
+    function beginSideDrag(side, event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      dragState.side = side;
+      dragState.startX = event.clientX;
+      dragState.startWidth = readSideWidth(side);
+      dragState.moved = false;
+      dragState.suppressClick = false;
+      appEl.classList.add('resizing');
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    }
+    function moveSideDrag(event) {
+      if (!dragState.side) return;
+      const delta = event.clientX - dragState.startX;
+      if (!dragState.moved && Math.abs(delta) <= 3) return;
+      dragState.moved = true;
+      const width = dragState.side === 'left'
+        ? dragState.startWidth + delta
+        : dragState.startWidth - delta;
+      setSideWidth(dragState.side, width);
+      if (dragState.side === 'left') {
+        appEl.classList.remove('left-collapsed');
+        localStorage.setItem('hcc.collapse.left', '0');
+      } else {
+        appEl.classList.remove('right-collapsed');
+        localStorage.setItem('hcc.collapse.right', '0');
+      }
+      syncToggleIcons();
+      try { resizeTerm(); } catch {}
+      event.preventDefault();
+    }
+    function endSideDrag(event) {
+      if (!dragState.side) return;
+      dragState.suppressClick = dragState.moved;
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+      dragState.side = null;
+      appEl.classList.remove('resizing');
+      setTimeout(() => { dragState.suppressClick = false; }, 0);
+      try { resizeTerm(); } catch {}
+    }
+    function bindSideHandle(handle, side, clickAction = null) {
+      handle.addEventListener('pointerdown', (event) => beginSideDrag(side, event));
+      handle.addEventListener('pointermove', moveSideDrag);
+      handle.addEventListener('pointerup', endSideDrag);
+      handle.addEventListener('pointercancel', endSideDrag);
+      handle.addEventListener('click', (event) => {
+        if (dragState.suppressClick) {
+          event.preventDefault();
+          return;
+        }
+        if (clickAction) clickAction(side);
+      });
+    }
+    bindSideHandle(resizeLeftHandle, 'left');
+    bindSideHandle(resizeRightHandle, 'right');
+    bindSideHandle(toggleLeftBtn, 'left', toggleSide);
+    bindSideHandle(toggleRightBtn, 'right', toggleSide);
+    window.addEventListener('resize', () => {
+      applySideWidths();
+      setTimeout(() => { try { resizeTerm(); } catch {} }, 50);
+    });
     applyCollapseState();
 
     document.getElementById('stopBtn').addEventListener('click', async () => {
@@ -5561,6 +6006,7 @@ function webIndexHtml() {
         Promise.all([refreshSessions(), refreshDetected(), refreshCurrentState()]).catch(console.error);
       });
 
+    applyLanguage();
     loadProjects().then(() => Promise.all([refreshSessions(), refreshDetected(), refreshState()])).then(() => {
       // Auto-connect to first running managed session on load
       if (!active && !activeDetected) {
@@ -5568,7 +6014,7 @@ function webIndexHtml() {
         if (first) connectManaged(first.id);
       }
     }).catch((err) => {
-      document.getElementById('connState').textContent = 'error';
+      connText('error');
       console.error(err);
     });
     // ── Auto-poll state ──────────────────────────────────────────────────
