@@ -37,7 +37,7 @@ doing.
 - **One console, many projects**: one local Web runtime can switch between
   registered project roots.
 
-## Install
+## Install And Manage
 
 Node.js 24 or newer is required.
 
@@ -48,13 +48,25 @@ npm install -g @logicseek/hello-cc
 Update an existing global install:
 
 ```bash
-npm install -g @logicseek/hello-cc@latest
+hcc update
 ```
 
 Or run it without a global install:
 
 ```bash
 npx @logicseek/hello-cc web
+```
+
+Remove hooks and shims from this machine:
+
+```bash
+hcc uninstall
+```
+
+Remove the global npm package:
+
+```bash
+npm uninstall -g @logicseek/hello-cc
 ```
 
 ## Quick Start
@@ -110,12 +122,14 @@ generic session-isolation assumptions.
 
 ## Documentation
 
-- [User Guide](docs/guide.md): setup, Web console, commands, workflows, and
-  environment behavior.
+- [Documentation Index](docs/README.md): all user and implementation docs.
+- [User Guide](docs/guide.md): setup, Web console, workflows, coordination
+  semantics, and environment behavior.
+- [Command Reference](docs/commands.md): compact public command list.
+- [Changelog](CHANGELOG.md): release notes for published versions.
 - [Design Notes](docs/design.md): product boundaries and coordination model.
 - [Implementation Notes](docs/implementation.md): architecture and internal
   protocol.
-- [中文用户指南](docs/guide.zh-CN.md)
 
 ## Testing
 
@@ -129,3 +143,11 @@ temporary tmux sessions, and a temporary Web runtime to test the main flows.
 ## License
 
 [Apache-2.0](LICENSE)
+
+---
+
+<p align="center">
+  <a href="https://star-history.com/#Dullne/hello-cc&Date">
+    <img src="https://api.star-history.com/svg?repos=Dullne/hello-cc&type=Date" width="600" alt="Star History Chart">
+  </a>
+</p>

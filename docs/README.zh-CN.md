@@ -1,0 +1,22 @@
+# hello-cc 文档
+
+只需要项目简介和第一条命令时，先看[仓库 README](../README.zh-CN.md)。
+需要更多细节时，再看下面的文档。
+
+## 用户文档
+
+- [用户指南](guide.zh-CN.md)：安装、启动、Web 控制台、协作语义、工作流、稳定
+  peer 身份和环境变量行为。
+- [命令参考](commands.zh-CN.md)：公共命令的紧凑清单，以及每组命令的用途。
+- [更新日志](../CHANGELOG.md)：已发布版本的 release notes。
+- 发行说明：发布前运行 `npm run release:check`，用
+  `npm run release:notes` 输出当前版本的 changelog 小节，作为 GitHub
+  Release 描述。
+
+## 设计和实现
+
+- [设计说明](design.md)：产品边界、项目边界、能力层级、协作语义和 provider
+  session 绑定。
+- [实现说明](implementation.md)：架构、协议、命令面、技术栈、shim 行为和实现计划。
+
+设计和实现文档目前只有英文版。

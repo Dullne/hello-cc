@@ -26,7 +26,7 @@
 - **resume 友好的稳定身份**：当 provider 暴露 session id 时，恢复会话会映射回稳定 peer。
 - **一个控制台管理多个项目**：单个本地 Web runtime 可以在多个 project root 之间切换。
 
-## 安装
+## 安装和维护
 
 需要 Node.js 24 或更新版本。
 
@@ -37,13 +37,25 @@ npm install -g @logicseek/hello-cc
 更新已有的全局安装：
 
 ```bash
-npm install -g @logicseek/hello-cc@latest
+hcc update
 ```
 
 也可以不全局安装，直接运行：
 
 ```bash
 npx @logicseek/hello-cc web
+```
+
+移除本机 hooks 和 shims：
+
+```bash
+hcc uninstall
+```
+
+移除全局 npm 包：
+
+```bash
+npm uninstall -g @logicseek/hello-cc
 ```
 
 ## 快速开始
@@ -95,10 +107,10 @@ hcc task done --id 1 --summary "Done"
 
 ## 文档
 
-- [用户指南](docs/guide.zh-CN.md)：安装、Web 控制台、常用命令、协作流程和环境变量行为。
-- [设计说明](docs/design.md)：产品边界和协作模型。
-- [实现说明](docs/implementation.md)：架构和内部协议。
-- [English User Guide](docs/guide.md)
+- [文档目录](docs/README.zh-CN.md)：全部用户文档和实现文档入口。
+- [用户指南](docs/guide.zh-CN.md)：安装、Web 控制台、协作流程、协作语义和环境变量行为。
+- [命令参考](docs/commands.zh-CN.md)：紧凑公共命令清单。
+- [更新日志](CHANGELOG.md)：已发布版本的 release notes。
 
 ## 测试
 
@@ -111,3 +123,11 @@ npm test
 ## License
 
 [Apache-2.0](LICENSE)
+
+---
+
+<p align="center">
+  <a href="https://star-history.com/#Dullne/hello-cc&Date">
+    <img src="https://api.star-history.com/svg?repos=Dullne/hello-cc&type=Date" width="600" alt="Star History Chart">
+  </a>
+</p>

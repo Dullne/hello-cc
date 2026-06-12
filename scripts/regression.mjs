@@ -1124,7 +1124,17 @@ async function downGcPackWorkflow() {
   await stopRuntime();
   await waitFor(() => !fs.existsSync(path.join(root, '.hello-cc', 'runtime.json')), 'runtime cleanup', 5000);
   hcc(['gc', '--older-than', '0', '--yes']);
-  run('npm', ['pack', '--dry-run']);
+  const pack = JSON.parse(run('npm', ['pack', '--dry-run', '--json']));
+  const files = new Set(pack[0]?.files?.map((entry) => entry.path) || []);
+  for (const file of ['assets/logo.svg', 'CHANGELOG.md', 'docs/commands.md', 'docs/commands.zh-CN.md']) {
+    if (!files.has(file)) fail(`npm package missing ${file}`);
+  }
+  const releaseCheck = run('npm', ['run', 'release:check']);
+  if (!releaseCheck.includes('release notes ok: 0.1.2')) fail(`release check output wrong:\n${releaseCheck}`);
+  const releaseNotes = run('npm', ['run', 'release:notes']);
+  if (!releaseNotes.includes('## 0.1.2') || !releaseNotes.includes('### Summary')) {
+    fail(`release notes output wrong:\n${releaseNotes}`);
+  }
 }
 
 function oldNameScan() {
@@ -1157,12 +1167,51 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'setup.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
   const mainHelp = run(process.execPath, [hccBin, '--help']);
-  if (mainHelp.includes('setup') || mainHelp.includes('uninstall') || mainHelp.includes('--web-managed')) {
+  if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {
     fail(`public help exposes maintenance or removed commands:\n${mainHelp}`);
+  }
+  if (!mainHelp.includes('  update                       Update the global npm install of hello-cc')) {
+    fail(`main help missing update command:\n${mainHelp}`);
+  }
+  if (!mainHelp.includes('  uninstall                    Remove hooks, shims, and optional project data')) {
+    fail(`main help missing uninstall command:\n${mainHelp}`);
+  }
+  const updateHelp = run(process.execPath, [hccBin, 'update', '--help']);
+  if (!updateHelp.includes('hcc update') || !updateHelp.includes('npm install -g @logicseek/hello-cc@TAG')) {
+    fail(`update help missing expected content:\n${updateHelp}`);
+  }
+  const uninstallHelp = run(process.execPath, [hccBin, 'uninstall', '--help']);
+  if (!uninstallHelp.includes('hcc uninstall') || !uninstallHelp.includes('hcc uninstall [--purge --yes]')) {
+    fail(`uninstall help missing expected content:\n${uninstallHelp}`);
+  }
+  const updateDryRun = run(process.execPath, [hccBin, 'update', '--dry-run']);
+  if (!updateDryRun.includes('would run: npm install -g @logicseek/hello-cc@latest')) {
+    fail(`update dry-run output wrong:\n${updateDryRun}`);
+  }
+  const updateJson = JSON.parse(run(process.execPath, [hccBin, '--json', 'update', '--dry-run', '--tag', '0.1.2']));
+  if (!updateJson.ok || updateJson.data.command !== 'npm install -g @logicseek/hello-cc@0.1.2') {
+    fail(`update json dry-run output wrong:\n${JSON.stringify(updateJson)}`);
+  }
+  const updateBuildJson = JSON.parse(run(process.execPath, [hccBin, '--json', 'update', '--dry-run', '--tag', '1.2.3+build.1']));
+  if (!updateBuildJson.ok || updateBuildJson.data.command !== 'npm install -g @logicseek/hello-cc@1.2.3+build.1') {
+    fail(`update build-metadata dry-run output wrong:\n${JSON.stringify(updateBuildJson)}`);
   }
   const runHelp = run(process.execPath, [hccBin, 'run', '--help']);
   if (runHelp.includes('--web-managed')) fail(`run help exposes removed --web-managed:\n${runHelp}`);
-  if (!run(process.execPath, [hccBin, 'peer', '--help']).includes('peer attach')) fail('peer attach missing from help');
+  const subcommandHelpCases = [
+    ['task', 'done', 'hcc task done'],
+    ['msg', 'ack', 'hcc msg ack'],
+    ['peer', 'attach', 'peer attach'],
+    ['lock', 'release', 'hcc lock release'],
+    ['handoff', 'create', 'hcc handoff create'],
+    ['event', 'tail', 'hcc event tail']
+  ];
+  for (const [group, subcommand, expected] of subcommandHelpCases) {
+    const help = run(process.execPath, [hccBin, group, subcommand, '--help']);
+    if (!help.includes(expected)) {
+      fail(`${group} ${subcommand} help missing expected content:\n${help}`);
+    }
+  }
   const removed = runMaybe(process.execPath, [hccBin, '--root', root, 'run', '--peer', 'bad', '--kind', 'shell', '--web-managed', '--', 'bash']);
   if (removed.status === 0 || !String(removed.stderr || removed.stdout).includes('unknown option --web-managed')) {
     fail(`run --web-managed was not rejected:\n${removed.stdout}\n${removed.stderr}`);

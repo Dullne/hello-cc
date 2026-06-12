@@ -16,9 +16,10 @@ const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
 async function loadDiscover() { return import(path.join(_libDir, 'discover.mjs')); }
 async function loadSetup()    { return import(path.join(_libDir, 'setup.mjs')); }
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 const PRODUCT_NAME = 'hello-cc';
 const CLI_NAME = 'hcc';
+const NPM_PACKAGE_NAME = '@logicseek/hello-cc';
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
 // Directory under .hello-cc/ for optional external PTY buffer files.
@@ -126,6 +127,14 @@ function parseOpts(args, spec = {}) {
     }
   }
   return opts;
+}
+
+function wantsHelp(args) {
+  const stop = args.indexOf('--');
+  const scan = stop >= 0 ? args.slice(0, stop) : args;
+  const index = scan.findIndex((arg) => arg === '--help' || arg === '-h');
+  if (index < 0) return false;
+  return index <= 1 || !String(scan[index - 1] || '').startsWith('--');
 }
 
 function validateOpts(command, opts, allowed = []) {
@@ -2289,7 +2298,7 @@ async function cmdPeers(ctx, args) {
 
 async function cmdTask(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpTask();
+  if (!sub || wantsHelp(args)) return helpTask();
   if (sub === 'create') return taskCreate(ctx, args.slice(1));
   if (sub === 'list') return taskList(ctx, args.slice(1));
   if (sub === 'claim') return taskClaim(ctx, args.slice(1));
@@ -2467,7 +2476,7 @@ async function taskDone(ctx, args) {
 
 async function cmdMsg(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpMsg();
+  if (!sub || wantsHelp(args)) return helpMsg();
   if (sub === 'send') return msgSend(ctx, args.slice(1));
   if (sub === 'inbox') return msgInbox(ctx, args.slice(1));
   if (sub === 'ack') return msgAck(ctx, args.slice(1));
@@ -2598,7 +2607,7 @@ async function cmdInject(ctx, args) {
 
 async function cmdPeer(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpPeer();
+  if (!sub || wantsHelp(args)) return helpPeer();
   if (sub === 'list') return peerList(ctx, args.slice(1));
   if (sub === 'start') return peerStart(ctx, args.slice(1));
   if (sub === 'attach') return peerAttach(ctx, args.slice(1));
@@ -2748,7 +2757,7 @@ async function peerStop(ctx, args) {
 
 async function cmdLock(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpLock();
+  if (!sub || wantsHelp(args)) return helpLock();
   if (sub === 'acquire') return lockAcquire(ctx, args.slice(1));
   if (sub === 'release') return lockRelease(ctx, args.slice(1));
   if (sub === 'renew') return lockRenew(ctx, args.slice(1));
@@ -2847,7 +2856,7 @@ async function lockList(ctx, args) {
 
 async function cmdHandoff(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpHandoff();
+  if (!sub || wantsHelp(args)) return helpHandoff();
   if (sub === 'create') return handoffCreate(ctx, args.slice(1));
   if (sub === 'list') return handoffList(ctx, args.slice(1));
   throw new CliError('BAD_ARGS', `Unknown handoff command: ${sub}`);
@@ -2900,7 +2909,7 @@ async function handoffList(ctx, args) {
 
 async function cmdEvent(ctx, args) {
   const sub = args[0];
-  if (!sub || sub === '--help' || sub === '-h') return helpEvent();
+  if (!sub || wantsHelp(args)) return helpEvent();
   if (sub === 'tail') return eventTail(ctx, args.slice(1));
   throw new CliError('BAD_ARGS', `Unknown event command: ${sub}`);
 }
@@ -5539,6 +5548,8 @@ Commands:
   web                          Start coordination, shims, tmux, and browser console
   up                           Initialize local coordination only
   down                         Stop the running hello-cc web runtime
+  update                       Update the global npm install of hello-cc
+  uninstall                    Remove hooks, shims, and optional project data
   init                         Initialize .hello-cc/mesh.db and guidance
   register --peer ID           Register or update a peer session identity
   join --peer ID               Register this shell and print eval-able env
@@ -5777,6 +5788,24 @@ Usage:
   ${CLI_NAME} down
 
 Stops the web runtime started by hcc web for this project.
+`);
+}
+
+function helpUpdate() {
+  console.log(`${CLI_NAME} update
+
+Usage:
+  ${CLI_NAME} update [--tag TAG] [--registry URL] [--dry-run]
+
+Examples:
+  ${CLI_NAME} update
+  ${CLI_NAME} update --tag latest
+  ${CLI_NAME} update --dry-run
+
+Updates the global npm install by running:
+  npm install -g ${NPM_PACKAGE_NAME}@TAG
+
+The default TAG is latest.
 `);
 }
 
@@ -6103,6 +6132,46 @@ async function cmdSetup(ctx, args) {
   log('\nDone. Run `hcc web` for the default coordinated terminal experience.');
 }
 
+// ─── hcc update ──────────────────────────────────────────────────────────────
+
+async function cmdUpdate(ctx, args) {
+  if (args[0] === '--help' || args[0] === '-h') return helpUpdate();
+
+  const opts = parseOpts(args, { booleans: ['dry-run'] });
+  validateOpts('update', opts, ['tag', 'registry', 'dry-run']);
+  const tag = opts.tag || 'latest';
+  if (!/^[A-Za-z0-9._+-]+$/.test(tag)) {
+    throw new CliError('BAD_ARGS', '--tag must be an npm dist-tag or version');
+  }
+
+  const packageSpec = `${NPM_PACKAGE_NAME}@${tag}`;
+  const npmArgs = ['install', '-g', packageSpec];
+  if (opts.registry) npmArgs.push('--registry', opts.registry);
+  const command = shellCommand(['npm', ...npmArgs]);
+  const data = { package: NPM_PACKAGE_NAME, tag, registry: opts.registry || null, command, dry_run: Boolean(opts['dry-run']) };
+
+  if (opts['dry-run']) {
+    printResult(ctx, data, () => `would run: ${command}`);
+    return;
+  }
+
+  const result = spawnSync('npm', npmArgs, {
+    encoding: ctx.json ? 'utf8' : undefined,
+    stdio: ctx.json ? ['ignore', 'pipe', 'pipe'] : 'inherit'
+  });
+  if (result.error) {
+    throw new CliError('UPDATE_FAILED', `npm update command failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const output = ctx.json
+      ? [result.stdout, result.stderr].filter(Boolean).join('\n').trim()
+      : '';
+    throw new CliError('UPDATE_FAILED', output || `npm exited with status ${result.status}`);
+  }
+
+  printResult(ctx, data, () => `updated ${packageSpec}`);
+}
+
 // ─── hcc uninstall ───────────────────────────────────────────────────────────
 
 async function cmdUninstall(ctx, args) {
@@ -6326,6 +6395,7 @@ async function dispatch(ctx, rest) {
   if (command === '--version' || command === 'version') return console.log(VERSION);
   if (command === 'up') return cmdUp(ctx, args);
   if (command === 'down') return cmdDown(ctx, args);
+  if (command === 'update') return cmdUpdate(ctx, args);
   if (command === 'uninstall') return cmdUninstall(ctx, args);
   if (command === 'init') return cmdInit(ctx, args);
   if (command === 'register') return cmdRegister(ctx, args);

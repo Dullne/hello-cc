@@ -1,6 +1,6 @@
 {
   "name": "@logicseek/hello-cc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local control plane for coordinating Claude Code, Codex, and other coding CLI sessions.",
   "type": "module",
   "bin": {
@@ -11,8 +11,10 @@
     "bin/",
     "lib/",
     "scripts/",
+    "assets/",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE",
     "docs/"
   ],
@@ -20,6 +22,8 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "release:notes": "node ./scripts/release-notes.mjs",
+    "release:check": "node ./scripts/release-notes.mjs --check",
     "smoke": "node ./bin/hcc.mjs --help",
     "test": "node ./scripts/regression.mjs",
     "test:regression": "node ./scripts/regression.mjs"

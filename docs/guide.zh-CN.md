@@ -1,8 +1,9 @@
 # hello-cc 用户指南
 
-这份文档保存详细使用说明，README 只保留项目入口和快速开始。
+这份文档说明安装、启动和日常使用流程。紧凑命令清单见
+[命令参考](commands.zh-CN.md)。
 
-## 安装和更新
+## 安装、更新和卸载
 
 全局安装 hello-cc：
 
@@ -13,10 +14,29 @@ npm install -g @logicseek/hello-cc
 更新已有的全局安装：
 
 ```bash
-npm install -g @logicseek/hello-cc@latest
+hcc update
 ```
 
-`hcc` 没有自更新命令。`hcc task update` 更新的是协作任务状态，不是安装包版本。
+`hcc update` 会执行 `npm install -g @logicseek/hello-cc@latest`。使用
+`hcc update --help` 可以查看更新选项。`hcc task update` 更新的是协作任务状态，不是安装包版本。
+
+移除本机 hooks 和 shims：
+
+```bash
+hcc uninstall
+```
+
+同时移除当前项目的 `.hello-cc` 数据和指导块：
+
+```bash
+hcc uninstall --purge --yes
+```
+
+移除全局 npm 包：
+
+```bash
+npm uninstall -g @logicseek/hello-cc
+```
 
 ## 默认入口
 
@@ -194,62 +214,10 @@ Web 操作的是 hello-cc 管理的本机 tmux 终端：
 
 已经打开的普通 raw 终端不能被无条件捕获或控制，除非它原本就在 tmux、screen 或 hello-cc shim 之下。它仍然可以通过 hooks 和 `hcc` 命令参与任务、消息和锁。
 
-## 常用命令
+## 命令参考
 
-```text
-# 默认入口
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-discover] [--no-guidance]
-hcc down
-
-# 本地协调，无 Web
-hcc up [--no-discover] [--no-guidance]
-
-# 对等节点和状态
-hcc peers
-hcc status [--peer ID]
-hcc scan [--register]
-hcc prompt --peer ID [--kind codex|claude|shell|other] [--role ROLE]
-hcc join --peer ID [--kind codex|claude|shell|other] [--role ROLE]
-hcc env --peer ID
-hcc heartbeat [--peer ID] [--renew-locks --ttl 900]
-hcc run --peer ID --kind codex|claude|shell --role ROLE -- COMMAND [ARGS...]
-
-# Web 可控终端
-hcc peer list
-hcc peer start PEER [--kind K] [--role R] [--cwd DIR] [--restart-env] -- COMMAND [ARGS...]
-hcc peer start PEER --kind codex --resume SESSION_ID [--restart-env]
-hcc peer start PEER --kind codex --last
-hcc peer start PEER --kind claude --resume SESSION_ID [--restart-env]
-hcc peer start PEER --kind claude --continue
-hcc peer attach PEER [--pane PANE] [--kind K] [--role R] [--cwd DIR]
-hcc peer stop PEER
-hcc inject PEER TEXT [--no-enter]
-
-# 消息
-hcc msg send [--from ID] [--to ID|all] --body TEXT [--task N] [--kind note|task|handoff]
-hcc msg inbox [--peer ID] [--wait SEC] [--all] [--limit N]
-hcc msg ack [--peer ID] --id N
-hcc ask PEER MESSAGE [--from ID] [--task N] [--inject]
-hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
-
-# 任务
-hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
-hcc task list [--status S] [--peer ID] [--all]
-hcc task claim [--peer ID] --id N
-hcc task next [--peer ID]
-hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
-hcc task done [--peer ID] --id N --summary TEXT
-
-# 锁和交接
-hcc lock acquire [--peer ID] --resource PATH [--task N] [--ttl SEC] [--reason TEXT]
-hcc lock renew [--peer ID] --resource PATH [--ttl SEC]
-hcc lock release [--peer ID] --resource PATH [--force]
-hcc lock list [--all]
-hcc handoff create [--from ID] --summary TEXT [--task N] [--to ID] [--changed-files JSON_OR_CSV] [--tests TEXT] [--risks TEXT]
-hcc handoff list [--task N] [--limit N]
-hcc event tail [--limit N]
-hcc gc [--older-than DAYS] [--yes]
-```
+使用 `hcc --help` 查看命令列表，使用 `hcc <command> --help` 查看单个命令。
+维护中的命令摘要见 [命令参考](commands.zh-CN.md)。
 
 ## 稳定 peer 身份
 

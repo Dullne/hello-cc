@@ -1,9 +1,9 @@
 # hello-cc User Guide
 
-This guide contains the detailed usage notes that are intentionally kept out of
-the short project README.
+This guide covers the practical workflow for installing, starting, and using
+hello-cc. For a compact command list, use the [Command Reference](commands.md).
 
-## Install And Update
+## Install, Update, And Uninstall
 
 Install hello-cc globally:
 
@@ -14,11 +14,30 @@ npm install -g @logicseek/hello-cc
 Update an existing global install:
 
 ```bash
-npm install -g @logicseek/hello-cc@latest
+hcc update
 ```
 
-`hcc` does not have a self-update command. `hcc task update` updates a
-coordination task, not the installed package.
+`hcc update` runs `npm install -g @logicseek/hello-cc@latest`. Use
+`hcc update --help` to see the available update options. `hcc task update`
+updates a coordination task, not the installed package.
+
+Remove hooks and shims from this machine:
+
+```bash
+hcc uninstall
+```
+
+Remove the current project's `.hello-cc` data and guidance blocks too:
+
+```bash
+hcc uninstall --purge --yes
+```
+
+Remove the global npm package:
+
+```bash
+npm uninstall -g @logicseek/hello-cc
+```
 
 ## Default Entry
 
@@ -222,62 +241,10 @@ Already-open raw terminals cannot be captured or controlled unconditionally
 unless they started under tmux, screen, or a hello-cc shim. They can still
 participate in tasks, messages, and locks through hooks and `hcc` commands.
 
-## Common Commands
+## Command Reference
 
-```text
-# Default entry
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-discover] [--no-guidance]
-hcc down
-
-# Local coordination without Web
-hcc up [--no-discover] [--no-guidance]
-
-# Peers and status
-hcc peers
-hcc status [--peer ID]
-hcc scan [--register]
-hcc prompt --peer ID [--kind codex|claude|shell|other] [--role ROLE]
-hcc join --peer ID [--kind codex|claude|shell|other] [--role ROLE]
-hcc env --peer ID
-hcc heartbeat [--peer ID] [--renew-locks --ttl 900]
-hcc run --peer ID --kind codex|claude|shell --role ROLE -- COMMAND [ARGS...]
-
-# Browser-controllable terminals
-hcc peer list
-hcc peer start PEER [--kind K] [--role R] [--cwd DIR] [--restart-env] -- COMMAND [ARGS...]
-hcc peer start PEER --kind codex --resume SESSION_ID [--restart-env]
-hcc peer start PEER --kind codex --last
-hcc peer start PEER --kind claude --resume SESSION_ID [--restart-env]
-hcc peer start PEER --kind claude --continue
-hcc peer attach PEER [--pane PANE] [--kind K] [--role R] [--cwd DIR]
-hcc peer stop PEER
-hcc inject PEER TEXT [--no-enter]
-
-# Messages
-hcc msg send [--from ID] [--to ID|all] --body TEXT [--task N] [--kind note|task|handoff]
-hcc msg inbox [--peer ID] [--wait SEC] [--all] [--limit N]
-hcc msg ack [--peer ID] --id N
-hcc ask PEER MESSAGE [--from ID] [--task N] [--inject]
-hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
-
-# Tasks
-hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
-hcc task list [--status S] [--peer ID] [--all]
-hcc task claim [--peer ID] --id N
-hcc task next [--peer ID]
-hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
-hcc task done [--peer ID] --id N --summary TEXT
-
-# Locks and handoffs
-hcc lock acquire [--peer ID] --resource PATH [--task N] [--ttl SEC] [--reason TEXT]
-hcc lock renew [--peer ID] --resource PATH [--ttl SEC]
-hcc lock release [--peer ID] --resource PATH [--force]
-hcc lock list [--all]
-hcc handoff create [--from ID] --summary TEXT [--task N] [--to ID] [--changed-files JSON_OR_CSV] [--tests TEXT] [--risks TEXT]
-hcc handoff list [--task N] [--limit N]
-hcc event tail [--limit N]
-hcc gc [--older-than DAYS] [--yes]
-```
+Use `hcc --help` for the command list and `hcc <command> --help` for a specific
+command. The maintained summary lives in the [Command Reference](commands.md).
 
 ## Stable Peer Identity
 
