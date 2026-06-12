@@ -69,7 +69,9 @@ cd /path/to/project
 hcc web
 ```
 
-然后打开命令输出里的本地 URL。`hcc web` 会初始化项目总线，安装 Claude/Codex hooks 和 shims，启动或复用 Web 控制台，然后把终端还给你。
+然后打开命令输出里的 URL。默认情况下，`hcc web` 会监听内网地址，并在 URL
+里附带固定 token；首次使用时自动生成并保存，之后默认复用。它会初始化项目总线，
+安装 Claude/Codex hooks 和 shims，启动或复用 Web 控制台，然后把终端还给你。
 
 第一次安装 shim 后，打开新终端或重新加载 shell：
 

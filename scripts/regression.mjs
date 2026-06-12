@@ -662,6 +662,38 @@ function ensureFile(file, expected = null) {
   }
 }
 
+function runtimeUrl(runtime, route, params = {}) {
+  const url = new URL(route, runtime.base_url || `http://127.0.0.1:${port}`);
+  if (runtime.token) url.searchParams.set('token', runtime.token);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return url.toString();
+}
+
+function currentRuntime() {
+  return JSON.parse(fs.readFileSync(path.join(root, '.hello-cc', 'runtime.json'), 'utf8'));
+}
+
+function currentRuntimeUrl(route, params = {}) {
+  return runtimeUrl(currentRuntime(), route, params);
+}
+
+function runtimeFetch(route, options = {}, params = {}) {
+  const runtime = currentRuntime();
+  const headers = { ...(options.headers || {}) };
+  if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
+  return fetch(runtimeUrl(runtime, route, params), { ...options, headers });
+}
+
+function runtimeWsUrl(peer) {
+  const runtime = currentRuntime();
+  const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, runtime.base_url || `http://127.0.0.1:${port}`);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (runtime.token) url.searchParams.set('token', runtime.token);
+  return url.toString();
+}
+
 async function waitFor(check, label, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -697,8 +729,7 @@ async function waitRuntime() {
   await waitFor(async () => {
     if (!fs.existsSync(runtimeFile)) return false;
     try {
-      const runtime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
-      const response = await fetch(`${runtime.base_url}/api/runtime`);
+      const response = await runtimeFetch('/api/runtime');
       return response.ok;
     } catch {
       return false;
@@ -710,7 +741,7 @@ async function expectWebSocketMarker(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
     let sawMarker = false;
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal/${encodeURIComponent(peer)}`);
+    const ws = new WebSocket(runtimeWsUrl(peer));
     const timer = setTimeout(() => reject(new Error(`${peer} websocket timeout`)), 5000);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
@@ -735,7 +766,7 @@ async function expectWebSocketMarker(peer, marker) {
 async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal/${encodeURIComponent(peer)}`);
+    const ws = new WebSocket(runtimeWsUrl(peer));
     const timer = setTimeout(() => reject(new Error(`${peer} resize replace timeout`)), 5000);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
@@ -904,21 +935,86 @@ async function setupRegression() {
   assertFutureSchemaMigrationHistoryRejected();
   assertLegacyBindingRepair();
 
-  const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
-  const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
-  if (!noTokenMatch) fail(`no-token web did not print background pid:\n${noTokenOutput}`);
-  runtimePid = Number.parseInt(noTokenMatch[1], 10);
-  if (noTokenOutput.includes('token=') || noTokenOutput.includes('token was generated')) {
-    fail(`default web output unexpectedly required token:\n${noTokenOutput}`);
+  const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const tokenMatch = tokenOutput.match(/^pid:\s*(\d+)/m);
+  if (!tokenMatch) fail(`token web did not print background pid:\n${tokenOutput}`);
+  runtimePid = Number.parseInt(tokenMatch[1], 10);
+  if (!tokenOutput.includes('token=') || !tokenOutput.includes('open: http://<machine-ip>:')) {
+    fail(`default web output did not include remote token URL:\n${tokenOutput}`);
   }
   await waitRuntime();
-  const noTokenRuntime = JSON.parse(fs.readFileSync(path.join(root, '.hello-cc', 'runtime.json'), 'utf8'));
-  if (noTokenRuntime.token || Object.hasOwn(noTokenRuntime, 'token_generated')) {
-    fail(`default web runtime unexpectedly stored token data:\n${JSON.stringify(noTokenRuntime, null, 2)}`);
+  const tokenRuntime = currentRuntime();
+  if (tokenRuntime.host !== '0.0.0.0' || !tokenRuntime.token || tokenRuntime.token.length < 24) {
+    fail(`default web runtime did not store remote token data:\n${JSON.stringify(tokenRuntime, null, 2)}`);
   }
-  const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`);
-  if (!noTokenResponse.ok) fail(`default web API required token: ${noTokenResponse.status}`);
+  const unauthorizedResponse = await fetch(`${tokenRuntime.base_url}/api/runtime`);
+  if (unauthorizedResponse.status !== 401) fail(`default web API allowed missing token: ${unauthorizedResponse.status}`);
+  const tokenResponse = await runtimeFetch('/api/runtime');
+  if (!tokenResponse.ok) fail(`default web API rejected runtime token: ${tokenResponse.status}`);
+  const tokenFile = path.join(home, '.hello-cc', 'web-token');
+  ensureFile(tokenFile, tokenRuntime.token);
+  fs.rmSync(tokenFile, { force: true });
+  const existingTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  if (!existingTokenOutput.includes('web already running in background')) {
+    fail(`web did not reuse existing token runtime:\n${existingTokenOutput}`);
+  }
+  ensureFile(tokenFile, tokenRuntime.token);
   await stopRuntime();
+
+  const stableTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const stableTokenMatch = stableTokenOutput.match(/^pid:\s*(\d+)/m);
+  if (!stableTokenMatch) fail(`stable-token web did not print background pid:\n${stableTokenOutput}`);
+  runtimePid = Number.parseInt(stableTokenMatch[1], 10);
+  await waitRuntime();
+  const stableTokenRuntime = currentRuntime();
+  if (stableTokenRuntime.token !== tokenRuntime.token) {
+    fail(`default web token changed across restart:\nfirst=${tokenRuntime.token}\nsecond=${stableTokenRuntime.token}`);
+  }
+  await stopRuntime();
+
+  const fixedToken = `fixed-token-${testId}`;
+  const fixedTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance'], {
+    env: { ...env, HCC_WEB_TOKEN: fixedToken }
+  });
+  const fixedTokenMatch = fixedTokenOutput.match(/^pid:\s*(\d+)/m);
+  if (!fixedTokenMatch) fail(`fixed-token web did not print background pid:\n${fixedTokenOutput}`);
+  runtimePid = Number.parseInt(fixedTokenMatch[1], 10);
+  await waitRuntime();
+  const fixedTokenRuntime = currentRuntime();
+  if (fixedTokenRuntime.token !== fixedToken || !fixedTokenOutput.includes(`token=${encodeURIComponent(fixedToken)}`)) {
+    fail(`explicit stable token was not used:\n${fixedTokenOutput}\n${JSON.stringify(fixedTokenRuntime, null, 2)}`);
+  }
+  await stopRuntime();
+
+  const persistedFixedOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const persistedFixedMatch = persistedFixedOutput.match(/^pid:\s*(\d+)/m);
+  if (!persistedFixedMatch) fail(`persisted fixed-token web did not print background pid:\n${persistedFixedOutput}`);
+  runtimePid = Number.parseInt(persistedFixedMatch[1], 10);
+  await waitRuntime();
+  const persistedFixedRuntime = currentRuntime();
+  if (persistedFixedRuntime.token !== fixedToken) {
+    fail(`explicit stable token was not persisted:\n${JSON.stringify(persistedFixedRuntime, null, 2)}`);
+  }
+  await stopRuntime();
+
+  const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-token', '--no-discover', '--no-guidance']);
+  const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
+  if (!noTokenMatch) fail(`explicit no-token web did not print background pid:\n${noTokenOutput}`);
+  runtimePid = Number.parseInt(noTokenMatch[1], 10);
+  if (noTokenOutput.includes('token=')) {
+    fail(`explicit no-token web output included token:\n${noTokenOutput}`);
+  }
+  await waitRuntime();
+  const noTokenRuntime = currentRuntime();
+  if (noTokenRuntime.token) fail(`explicit no-token runtime stored token:\n${JSON.stringify(noTokenRuntime, null, 2)}`);
+  const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`);
+  if (!noTokenResponse.ok) fail(`explicit no-token web API required token: ${noTokenResponse.status}`);
+  await stopRuntime();
+
+  const conflictingToken = hccMaybe(['web', '--local', '--port', String(port), '--token', 'abc', '--no-token', '--no-discover', '--no-guidance']);
+  if (conflictingToken.status === 0 || !String(conflictingToken.stderr || conflictingToken.stdout).includes('--no-token cannot be combined')) {
+    fail(`web accepted conflicting --token and --no-token:\n${conflictingToken.stdout}\n${conflictingToken.stderr}`);
+  }
 
   const childDir = path.join(root, 'packages', 'child');
   fs.mkdirSync(childDir, { recursive: true });
@@ -1229,7 +1325,7 @@ async function multiProjectWebWorkflow() {
     fail(`second project runtime did not point at global runtime:\n${JSON.stringify(otherRuntime, null, 2)}`);
   }
 
-  const projectsResponse = await fetch(`http://127.0.0.1:${port}/api/projects?root=${encodeURIComponent(otherRoot)}`);
+  const projectsResponse = await runtimeFetch('/api/projects', {}, { root: otherRoot });
   const projects = await projectsResponse.json();
   if (!projectsResponse.ok) fail(`projects API failed: ${JSON.stringify(projects)}`);
   const roots = new Set((projects.projects || []).map((p) => p.root));
@@ -1237,13 +1333,13 @@ async function multiProjectWebWorkflow() {
     fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
   }
 
-  const detectedResponse = await fetch(`http://127.0.0.1:${port}/api/detected?root=${encodeURIComponent(root)}`);
+  const detectedResponse = await runtimeFetch('/api/detected', {}, { root });
   const detectedJson = await detectedResponse.json();
   if (!detectedResponse.ok || typeof detectedJson.active_peer_ttl !== 'number' || typeof detectedJson.now !== 'number' || !Array.isArray(detectedJson.detected)) {
     fail(`detected API did not return liveness metadata:\n${JSON.stringify(detectedJson, null, 2)}`);
   }
 
-  const htmlResponse = await fetch(`http://127.0.0.1:${port}/`);
+  const htmlResponse = await fetch(currentRuntimeUrl('/'));
   const html = await htmlResponse.text();
   for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
     if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
@@ -1272,8 +1368,8 @@ async function multiProjectWebWorkflow() {
   if (rootList.includes('other-shell')) fail(`root project saw second project session:\n${rootList}`);
   if (!otherList.includes('other-shell')) fail(`second project did not see its session:\n${otherList}`);
 
-  const rootSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`)).json();
-  const otherSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(otherRoot)}`)).json();
+  const rootSessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+  const otherSessions = await (await runtimeFetch('/api/sessions', {}, { root: otherRoot })).json();
   if ((rootSessions.sessions || []).some((s) => s.id === 'other-shell')) {
     fail(`root API saw second project session:\n${JSON.stringify(rootSessions)}`);
   }
@@ -1282,7 +1378,7 @@ async function multiProjectWebWorkflow() {
   }
 
   const startProvider = async (payload) => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`, {
+    const response = await runtimeFetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1294,13 +1390,13 @@ async function multiProjectWebWorkflow() {
         },
         ...payload
       })
-    });
+    }, { root });
     const json = await response.json();
     if (!response.ok) fail(`web provider session start failed: ${JSON.stringify(json)}`);
     return json.session;
   };
   const stopSession = async (id) => {
-    await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(id)}/stop?root=${encodeURIComponent(root)}`, { method: 'POST' });
+    await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' }, { root });
   };
 
   const claudeResumeName = `web-claude-resume-${testId}`;
@@ -1347,6 +1443,19 @@ async function multiProjectWebWorkflow() {
     fail(`web codex resume binding was not stable after stop:\n${JSON.stringify(codexRowsAfterStop, null, 2)}`);
   }
 
+  const resumableResponse = await runtimeFetch('/api/resumable', {}, { root });
+  const resumableJson = await resumableResponse.json();
+  if (!resumableResponse.ok) fail(`resumable API failed: ${JSON.stringify(resumableJson)}`);
+  const resumableRows = resumableJson.resumable || [];
+  const claudeResumable = resumableRows.find((row) => row.provider === 'claude' && row.resume === claudeResumeName);
+  const codexResumable = resumableRows.find((row) => row.provider === 'codex' && row.resume === codexResumeName);
+  if (!claudeResumable || claudeResumable.session_name !== claudeResumeName || claudeResumable.session_id !== null) {
+    fail(`resumable API omitted named claude resume session:\n${JSON.stringify(resumableRows, null, 2)}`);
+  }
+  if (!codexResumable || codexResumable.session_name !== codexResumeName || codexResumable.session_id !== null) {
+    fail(`resumable API omitted named codex resume session:\n${JSON.stringify(resumableRows, null, 2)}`);
+  }
+
   const codexLast = await startProvider({ kind: 'codex', mode: 'last' });
   if (codexLast.command !== 'codex resume --last') {
     fail(`web codex last command wrong:\n${JSON.stringify(codexLast, null, 2)}`);
@@ -1359,21 +1468,21 @@ async function multiProjectWebWorkflow() {
   }
   await stopSession(claudeContinue.id);
 
-  const badShellResume = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`, {
+  const badShellResume = await runtimeFetch('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind: 'shell', mode: 'resume', resume: 'not-supported' })
-  });
+  }, { root });
   if (badShellResume.ok) {
     fail('web shell resume was accepted');
   }
 
   const startAuto = async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(otherRoot)}`, {
+    const response = await runtimeFetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'shell', command: 'bash --noprofile --norc' })
-    });
+    }, { root: otherRoot });
     const json = await response.json();
     if (!response.ok) fail(`auto web session start failed: ${JSON.stringify(json)}`);
     return json.session;
@@ -1383,8 +1492,8 @@ async function multiProjectWebWorkflow() {
   if (!autoOne.id.startsWith('shell-') || !autoTwo.id.startsWith('shell-') || autoOne.id === autoTwo.id) {
     fail(`auto web session ids were not unique: ${autoOne.id}, ${autoTwo.id}`);
   }
-  await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(autoOne.id)}/stop?root=${encodeURIComponent(otherRoot)}`, { method: 'POST' });
-  await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(autoTwo.id)}/stop?root=${encodeURIComponent(otherRoot)}`, { method: 'POST' });
+  await runtimeFetch(`/api/sessions/${encodeURIComponent(autoOne.id)}/stop`, { method: 'POST' }, { root: otherRoot });
+  await runtimeFetch(`/api/sessions/${encodeURIComponent(autoTwo.id)}/stop`, { method: 'POST' }, { root: otherRoot });
   hccFromMaybe(['peer', 'stop', 'other-shell'], otherRoot);
 }
 
@@ -1418,12 +1527,12 @@ async function tmuxBackedStartWorkflow() {
   const aliasPeer = 'shell-canonical-alias';
   parsePane(hcc(['peer', 'start', 'shell-runtime-alias', '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
   moveRuntimeBindingPeer('shell-runtime-alias', aliasPeer);
-  const aliasSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`)).json();
+  const aliasSessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
   const aliasSession = (aliasSessions.sessions || []).find((session) => session.id === 'shell-runtime-alias');
   if (!aliasSession || aliasSession.peer_id !== aliasPeer) {
     fail(`sessions API did not expose canonical peer id for runtime alias:\n${JSON.stringify(aliasSessions, null, 2)}`);
   }
-  const aliasDetected = await (await fetch(`http://127.0.0.1:${port}/api/detected?root=${encodeURIComponent(root)}`)).json();
+  const aliasDetected = await (await runtimeFetch('/api/detected', {}, { root })).json();
   if ((aliasDetected.detected || []).some((peer) => peer.id === aliasPeer || peer.id === 'shell-runtime-alias')) {
     fail(`detected API showed managed runtime/canonical duplicate:\n${JSON.stringify(aliasDetected, null, 2)}`);
   }

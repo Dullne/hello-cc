@@ -67,8 +67,8 @@ project: /path/to/project
 database: /path/to/project/.hello-cc/mesh.db
 runtime: /path/to/project/.hello-cc/runtime.json
 log: /path/to/project/.hello-cc/web.log
-open: http://<machine-ip>:8787/?project=%2Fpath%2Fto%2Fproject
-local: http://127.0.0.1:8787/?project=%2Fpath%2Fto%2Fproject
+open: http://<machine-ip>:8787/?token=<token>&project=%2Fpath%2Fto%2Fproject
+local: http://127.0.0.1:8787/?token=<token>&project=%2Fpath%2Fto%2Fproject
 shims: installed claude, codex
 PATH updated in ~/.bashrc; open a new terminal or source it
 stop: hcc down
@@ -190,23 +190,26 @@ debug 日志里应该出现 `Hook UserPromptSubmit ... provided additionalContex
 
 ## Web 控制台
 
-默认本机和内网访问：
+默认开启本机和内网访问，并启用 token 认证：
 
 ```bash
 hcc web
 ```
 
-需要令牌时再显式开启：
+裸 `hcc web` 会保存自动生成的 token，并在重启后复用。需要替换保存值时可显式设置：
 
 ```bash
-HCC_WEB_TOKEN='choose-a-long-token' hcc web --host 0.0.0.0 --port 8787
+HCC_WEB_TOKEN='choose-a-long-token' hcc web --port 8787
 ```
 
 同一内网机器打开：
 
 ```text
-http://<machine-ip>:8787/
+http://<machine-ip>:8787/?token=<token>
 ```
+
+使用 `hcc web --local` 可只监听 `127.0.0.1`。只有在可信本地/测试环境才使用
+`hcc web --no-token`。
 
 Web 控制台能做这些事：
 
@@ -314,7 +317,7 @@ hcc lock release --resource vllm/router
 | `HCC_PEER` | 默认 peer 身份 |
 | `HCC_ROOT` | 覆盖项目根目录 |
 | `HCC_DB` | 覆盖数据库路径 |
-| `HCC_WEB_TOKEN` | 可选 Web 访问令牌 |
+| `HCC_WEB_TOKEN` | 替换并保存固定 Web 访问令牌 |
 | `HCC_RUNTIME_URL` | 直接指定 runtime URL |
 | `HCC_NO_AUTO_INSTALL_TMUX=1` | 禁用 tmux 自动安装，主要用于测试 |
 

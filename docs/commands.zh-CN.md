@@ -17,14 +17,16 @@ hcc uninstall [--purge --yes]
 ## 启动和停止
 
 ```text
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-discover] [--no-guidance]
+hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
 hcc down
 hcc up [--no-discover] [--no-guidance]
 ```
 
 `hcc web` 是默认入口。它会初始化协作状态，安装 hooks 和 shims，启动或复用
-Web 控制台，然后把终端还给你。只想使用本地协作、不需要 Web 或 shims 时，
-再使用 `hcc up`。
+Web 控制台，然后把终端还给你。裸 `hcc web` 会监听 `0.0.0.0` 并使用固定
+URL token；首次使用时自动生成并保存。用 `--local` 可只绑定 `127.0.0.1`，
+用 `--token` 或 `HCC_WEB_TOKEN` 可替换保存的 token，只有在可信本地/测试环境才使用 `--no-token`。
+只想使用本地协作、不需要 Web 或 shims 时，再使用 `hcc up`。
 
 ## Peers 和状态
 

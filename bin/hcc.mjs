@@ -5,7 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
 import os from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
@@ -390,6 +390,10 @@ function globalRuntimePath() {
   return path.join(globalStateDir(), 'runtime.json');
 }
 
+function globalWebTokenPath() {
+  return path.join(globalStateDir(), 'web-token');
+}
+
 function projectRegistryPath() {
   return path.join(globalStateDir(), 'projects.json');
 }
@@ -600,6 +604,70 @@ function runtimeUrlQuery(runtime, projectRoot = null) {
   if (runtime.token) parts.push(`token=${encodeURIComponent(runtime.token)}`);
   if (projectRoot) parts.push(`project=${encodeURIComponent(projectRoot)}`);
   return parts.length ? `?${parts.join('&')}` : '';
+}
+
+function readStoredWebToken() {
+  const file = globalWebTokenPath();
+  if (!fs.existsSync(file)) return '';
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+function writeStoredWebToken(token) {
+  if (!token) return '';
+  const file = globalWebTokenPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${token}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return file;
+}
+
+function makeWebToken(opts) {
+  validateWebTokenOpts(opts);
+  if (opts['no-token']) return '';
+  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
+  if (explicitToken) {
+    writeStoredWebToken(explicitToken);
+    return explicitToken;
+  }
+  const stored = readStoredWebToken();
+  if (stored) return stored;
+  const generated = randomBytes(24).toString('base64url');
+  writeStoredWebToken(generated);
+  return generated;
+}
+
+function validateWebTokenOpts(opts) {
+  if (opts['no-token'] && (opts.token || process.env.HCC_WEB_TOKEN)) {
+    throw new CliError('BAD_ARGS', '--no-token cannot be combined with --token or HCC_WEB_TOKEN');
+  }
+}
+
+function expectedWebHost(opts) {
+  return opts.host || (opts.local ? '127.0.0.1' : '0.0.0.0');
+}
+
+function webRuntimeMatchesRequest(runtime, opts) {
+  if (!runtime) return false;
+  if (opts['no-token'] && (opts.token || process.env.HCC_WEB_TOKEN)) return false;
+  const expectedHost = expectedWebHost(opts);
+  if (runtime.host !== expectedHost) return false;
+  const expectedPort = intOpt(opts, 'port', 8787);
+  if (opts.port !== undefined && runtime.port !== expectedPort) return false;
+  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
+  if (opts['no-token']) return !runtime.token;
+  if (explicitToken) return runtime.token === explicitToken;
+  return Boolean(runtime.token);
+}
+
+function rememberRuntimeToken(runtime, opts) {
+  if (!runtime?.token || opts['no-token']) return;
+  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
+  if (explicitToken && runtime.token !== explicitToken) return;
+  writeStoredWebToken(runtime.token);
 }
 
 function publicRuntimeUrl(runtime, projectRoot = null) {
@@ -920,6 +988,13 @@ function tmuxSendKeys(pane, keys) {
 
 function tmuxSendRawLiteral(pane, text) {
   if (!text) return;
+  // A tmux argument consisting solely of ';' is swallowed as a command
+  // separator even after '--', so a typed lone semicolon would vanish. Paste
+  // such runs through a buffer (which is parsed as data, not command args).
+  if (/^;+$/.test(text)) {
+    tmuxPasteBuffer(pane, text, { raw: true });
+    return;
+  }
   runTmux(['send-keys', '-t', pane, '-l', '--', text]);
 }
 
@@ -1041,18 +1116,26 @@ function tmuxSendLiteral(pane, text) {
   }
   if (current) chunks.push({ type: 'literal', text: current });
 
+  // Typed characters must arrive as real key presses, not clipboard pastes:
+  // send-keys -l is ~3x cheaper than the load-buffer/paste-buffer/delete-buffer
+  // cycle (one tmux spawn vs three) and the target program sees keystrokes
+  // rather than paste events — which bracketed-paste-aware TUIs (claude, codex)
+  // otherwise mishandle. paste-buffer is reserved for genuine bracketed pastes.
+  // Exit copy-mode once up front so send-keys isn't interpreted as copy commands.
+  if (tmuxInCopyMode(pane)) tmuxExitCopyMode(pane);
+
   let pendingText = '';
   for (const chunk of chunks) {
     if (chunk.type === 'literal') {
       pendingText += chunk.text;
     } else {
-      if (pendingText) { tmuxPasteBuffer(pane, pendingText, { raw: true }); pendingText = ''; }
+      if (pendingText) { tmuxSendRawLiteral(pane, pendingText); pendingText = ''; }
       if (chunk.type === 'key') tmuxSendKeys(pane, [chunk.key]);
       else if (chunk.type === 'paste') tmuxPasteBuffer(pane, chunk.text, { bracketed: true, raw: true });
       else tmuxSendRawLiteral(pane, chunk.text);
     }
   }
-  if (pendingText) tmuxPasteBuffer(pane, pendingText, { raw: true });
+  if (pendingText) tmuxSendRawLiteral(pane, pendingText);
 }
 
 function inferPeerKind(id, explicitKind, firstCommand) {
@@ -4210,19 +4293,25 @@ async function prepareLocalBus(ctx, opts = {}) {
 }
 
 async function startWebBackground(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['local', 'no-guidance', 'no-discover'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-guidance', 'no-discover']);
+  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
+  validateWebTokenOpts(opts);
   ensureTmuxAvailable({ autoInstall: true });
   const setup = await prepareLocalBus(ctx, { ...opts, installShims: true });
   registerProject(ctx);
 
   const existing = await readHealthyGlobalRuntime();
   if (existing) {
-    try {
-      await runtimeRequest(ctx, 'POST', '/api/projects', { root: ctx.root, db: ctx.dbPath }, existing);
-    } catch {}
-    writeRuntime(ctx, { ...existing, root: ctx.root, db: ctx.dbPath, project_root: ctx.root, global_runtime: true });
-    return printWebRuntime(ctx, existing, { already: true, logFile: webLogPath(ctx), setup });
+    if (webRuntimeMatchesRequest(existing, opts)) {
+      rememberRuntimeToken(existing, opts);
+      try {
+        await runtimeRequest(ctx, 'POST', '/api/projects', { root: ctx.root, db: ctx.dbPath }, existing);
+      } catch {}
+      writeRuntime(ctx, { ...existing, root: ctx.root, db: ctx.dbPath, project_root: ctx.root, global_runtime: true });
+      return printWebRuntime(ctx, existing, { already: true, logFile: webLogPath(ctx), setup });
+    }
+    try { await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, existing); } catch {}
+    await sleep(250);
   }
 
   try { fs.rmSync(runtimePath(ctx), { force: true }); } catch {}
@@ -4425,11 +4514,45 @@ function webIndexHtml() {
       font-size: 12px;
     }
     .app {
+      position: relative;
       height: 100vh;
       display: grid;
       grid-template-columns: 320px 1fr 360px;
-      min-width: 980px;
+      min-width: 640px;
+      transition: grid-template-columns .18s ease;
     }
+    .app.left-collapsed  { grid-template-columns: 0 1fr 360px; }
+    .app.right-collapsed { grid-template-columns: 320px 1fr 0; }
+    .app.left-collapsed.right-collapsed { grid-template-columns: 0 1fr 0; }
+    /* Hide sidebar borders when collapsed so no 1px seam remains. */
+    .app.left-collapsed .sidebar { border-right-width: 0; }
+    .app.right-collapsed .inspector { border-left-width: 0; }
+    /* Small collapse handles centered vertically on each divider border.
+       They are children of .app (no overflow clip) and track the column edge. */
+    .edge-toggle {
+      position: absolute;
+      top: 50%;
+      z-index: 60;
+      width: 16px;
+      height: 44px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      line-height: 1;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: left .18s ease, right .18s ease, color .12s, border-color .12s, background .12s;
+    }
+    .edge-toggle:hover { color: var(--text); border-color: var(--accent); background: #1b1f26; }
+    .edge-left  { left: 320px; transform: translate(-50%, -50%); }
+    .edge-right { right: 360px; transform: translate(50%, -50%); }
+    .app.left-collapsed  .edge-left  { left: 0;  transform: translate(0, -50%); }
+    .app.right-collapsed .edge-right { right: 0; transform: translate(0, -50%); }
     .sidebar, .inspector {
       min-height: 0;
       min-width: 0;
@@ -4584,17 +4707,67 @@ function webIndexHtml() {
       overflow: hidden;
     }
     .toolbar .title {
-      min-width: 180px;
+      flex: 1 1 auto;
+      min-width: 0;
       display: grid;
       gap: 2px;
     }
+    .toolbar .title strong {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .quick {
       display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      width: 100%;
+      gap: 8px;
+      flex-wrap: nowrap;
+      align-items: center;
+      flex: 0 0 auto;
     }
+    /* Toolbar edge toggles for collapsing the side panels. */
+    .icon-btn {
+      flex: 0 0 auto;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      line-height: 1;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      cursor: pointer;
+    }
+    .icon-btn:hover { color: var(--text); border-color: var(--accent); }
+    /* Compact actions dropdown so the top bar stays a single tidy row. */
+    .menu-wrap { position: relative; display: inline-flex; }
+    .menu-btn { white-space: nowrap; }
+    .menu {
+      position: fixed;
+      z-index: 1000;
+      min-width: 150px;
+      padding: 5px;
+      display: grid;
+      gap: 2px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.45);
+    }
+    .menu[hidden] { display: none; }
+    .menu button {
+      width: 100%;
+      text-align: left;
+      border: 0;
+      background: transparent;
+      padding: 7px 9px;
+      border-radius: 6px;
+      color: var(--text);
+    }
+    .menu button:hover { background: #1b1f26; }
     #terminal {
       min-height: 0;
       overflow: hidden;
@@ -4694,7 +4867,8 @@ function webIndexHtml() {
         </div>
         <div class="start-options">
           <label>Mode<select id="startMode"><option value="new">new</option><option value="resume">resume</option><option value="last">last</option><option value="continue">continue</option></select></label>
-          <label data-resume-field>Session<input id="resumeArg" placeholder="session id or name"></label>
+          <label data-resume-field>Session<select id="resumeSelect"></select></label>
+          <label data-resume-field data-resume-custom style="display:none">Session id<input id="resumeArg" placeholder="session id or name"></label>
         </div>
       </form>
       <div class="session-header">
@@ -4711,11 +4885,16 @@ function webIndexHtml() {
           <span class="path" id="activeMeta">Start or select a session from the left panel</span>
         </div>
         <div class="quick" id="quickBar">
-          <button data-send="register">register</button>
-          <button data-send="inbox">inbox</button>
-          <button data-send="next">next task</button>
-          <button data-send="status">status</button>
-          <button data-send="heartbeat">heartbeat</button>
+          <div class="menu-wrap">
+            <button class="menu-btn" id="actionsBtn" type="button" aria-haspopup="true" aria-expanded="false">Actions ▾</button>
+            <div class="menu" id="actionsMenu" hidden>
+              <button data-send="register">register</button>
+              <button data-send="inbox">inbox</button>
+              <button data-send="next">next task</button>
+              <button data-send="status">status</button>
+              <button data-send="heartbeat">heartbeat</button>
+            </div>
+          </div>
           <button class="danger" id="stopBtn" type="button">stop</button>
         </div>
       </div>
@@ -4730,6 +4909,9 @@ function webIndexHtml() {
       </div>
       <div class="state" id="state"></div>
     </aside>
+
+    <button class="edge-toggle edge-left" id="toggleLeft" type="button" title="Collapse sidebar" aria-label="Toggle left sidebar">⟨</button>
+    <button class="edge-toggle edge-right" id="toggleRight" type="button" title="Collapse state panel" aria-label="Toggle right panel">⟩</button>
   </div>
 
   <script src="/assets/xterm.js"></script>
@@ -4742,6 +4924,7 @@ function webIndexHtml() {
     let sessionKindFilter = initialParams.get('kind') || 'all';
     let sessions  = [];    // managed (PTY) sessions
     let detected  = [];    // coordination-only peers (from hooks/watcher)
+    let resumableCache = []; // provider sessions available to resume (from /api/resumable)
     let active    = null;  // active managed session id
     let activeDetected = null; // active detected peer id
     let activeType = 'managed'; // 'managed' | 'detected'
@@ -4845,7 +5028,37 @@ function webIndexHtml() {
           : [['new', 'new']];
       modeSelect.innerHTML = modes.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('');
       modeSelect.value = modes.some(([value]) => value === current) ? current : 'new';
-      document.querySelector('[data-resume-field]').style.display = modeSelect.value === 'resume' ? '' : 'none';
+      const isResume = modeSelect.value === 'resume';
+      document.querySelector('[data-resume-field]:not([data-resume-custom])').style.display = isResume ? '' : 'none';
+      if (isResume) loadResumable();
+      else document.querySelector('[data-resume-custom]').style.display = 'none';
+    }
+
+    // Fetch provider sessions hcc knows about and fill the resume dropdown.
+    async function loadResumable() {
+      try { const d = await api('/api/resumable'); resumableCache = d.resumable || []; }
+      catch { resumableCache = []; }
+      populateResumeSelect();
+    }
+    function populateResumeSelect() {
+      const kind = document.getElementById('kind').value;
+      const sel = document.getElementById('resumeSelect');
+      const prev = sel.value;
+      const items = resumableCache.filter((r) => r.provider === kind);
+      const opts = items.map((r) => {
+        const resume = r.resume || r.session_id || r.session_name || '';
+        const shortResume = resume.length > 14 ? resume.slice(0, 10) + '…' : resume;
+        const label = (r.name && r.name !== resume ? r.name + ' · ' : '') + shortResume + ' (' + r.peer + ')';
+        return '<option value="' + esc(resume) + '">' + esc(label) + '</option>';
+      });
+      opts.push('<option value="__custom__">custom session id…</option>');
+      sel.innerHTML = opts.join('');
+      if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+      toggleResumeCustom();
+    }
+    function toggleResumeCustom() {
+      const sel = document.getElementById('resumeSelect');
+      document.querySelector('[data-resume-custom]').style.display = sel.value === '__custom__' ? '' : 'none';
     }
 
     async function loadProjects() {
@@ -5250,13 +5463,17 @@ function webIndexHtml() {
     // ── Start session form ────────────────────────────────────────────────
     document.getElementById('kind').addEventListener('change', syncStartModeOptions);
     document.getElementById('startMode').addEventListener('change', syncStartModeOptions);
+    document.getElementById('resumeSelect').addEventListener('change', toggleResumeCustom);
     syncStartModeOptions();
 
     document.getElementById('startForm').addEventListener('submit', async (event) => {
       event.preventDefault();
       const kind = document.getElementById('kind').value;
       const mode = document.getElementById('startMode').value;
-      const resume = document.getElementById('resumeArg').value.trim();
+      const sel = document.getElementById('resumeSelect');
+      const resume = (sel.value && sel.value !== '__custom__')
+        ? sel.value
+        : document.getElementById('resumeArg').value.trim();
       if (mode === 'resume' && !resume) return;
       const payload = { kind, mode };
       if (mode === 'resume') payload.resume = resume;
@@ -5278,8 +5495,62 @@ function webIndexHtml() {
           heartbeat:\`hcc heartbeat --peer \${peerId} --renew-locks\`
         };
         sendLine(lines[button.dataset.send]);
+        closeActionsMenu();
       });
     });
+
+    // ── Actions dropdown (declutters the toolbar) ─────────────────────────
+    const actionsBtn = document.getElementById('actionsBtn');
+    const actionsMenu = document.getElementById('actionsMenu');
+    function closeActionsMenu() {
+      actionsMenu.hidden = true;
+      actionsBtn.setAttribute('aria-expanded', 'false');
+    }
+    actionsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = actionsMenu.hidden;
+      actionsMenu.hidden = !open;
+      actionsBtn.setAttribute('aria-expanded', String(open));
+      if (open) {
+        // Position as a fixed layer so it escapes the toolbar/main overflow clip.
+        const r = actionsBtn.getBoundingClientRect();
+        actionsMenu.style.top = (r.bottom + 6) + 'px';
+        actionsMenu.style.left = Math.max(8, r.right - actionsMenu.offsetWidth) + 'px';
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (!actionsMenu.hidden && !e.target.closest('.menu-wrap')) closeActionsMenu();
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeActionsMenu(); });
+
+    // ── Collapsible side panels ───────────────────────────────────────────
+    const appEl = document.querySelector('.app');
+    const toggleLeftBtn = document.getElementById('toggleLeft');
+    const toggleRightBtn = document.getElementById('toggleRight');
+    function syncToggleIcons() {
+      const l = appEl.classList.contains('left-collapsed');
+      const r = appEl.classList.contains('right-collapsed');
+      toggleLeftBtn.textContent = l ? '⟩' : '⟨';
+      toggleLeftBtn.title = (l ? 'Show' : 'Collapse') + ' sidebar';
+      toggleRightBtn.textContent = r ? '⟨' : '⟩';
+      toggleRightBtn.title = (r ? 'Show' : 'Collapse') + ' state panel';
+    }
+    function applyCollapseState() {
+      appEl.classList.toggle('left-collapsed', localStorage.getItem('hcc.collapse.left') === '1');
+      appEl.classList.toggle('right-collapsed', localStorage.getItem('hcc.collapse.right') === '1');
+      syncToggleIcons();
+    }
+    function toggleSide(side) {
+      const cls = side + '-collapsed';
+      const on = appEl.classList.toggle(cls);
+      localStorage.setItem('hcc.collapse.' + side, on ? '1' : '0');
+      syncToggleIcons();
+      // Refit the terminal after the grid transition so xterm uses the new width.
+      setTimeout(() => { try { resizeTerm(); } catch {} }, 200);
+    }
+    toggleLeftBtn.addEventListener('click', () => toggleSide('left'));
+    toggleRightBtn.addEventListener('click', () => toggleSide('right'));
+    applyCollapseState();
 
     document.getElementById('stopBtn').addEventListener('click', async () => {
       if (!active) return;
@@ -5318,12 +5589,12 @@ function webIndexHtml() {
 async function cmdWeb(ctx, args, startMeta = {}) {
   if (args[0] === '--help' || args[0] === '-h') return helpWeb();
   if (process.env[WEB_CHILD_ENV] !== '1') return startWebBackground(ctx, args);
-  const opts = parseOpts(args, { booleans: ['local', 'no-guidance', 'no-discover'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-guidance', 'no-discover']);
-  const host = opts.host || (opts.local ? '127.0.0.1' : '0.0.0.0');
+  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
+  validateWebTokenOpts(opts);
+  const host = expectedWebHost(opts);
   const port = intOpt(opts, 'port', 8787);
-  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
-  const token = explicitToken;
+  const token = makeWebToken(opts);
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');
@@ -6303,6 +6574,44 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         });
         return;
       }
+      if (req.method === 'GET' && url.pathname === '/api/resumable') {
+        // Provider sessions hcc has seen (via hooks/detection) that carry a real
+        // provider session id or resumable provider session name.
+        const db = connect(reqCtx);
+        let rows = [];
+        try {
+          rows = db.prepare(`
+            SELECT b.provider, b.provider_session_id, b.provider_session_name, b.peer,
+                   p.last_seen_at
+            FROM peer_bindings b
+            LEFT JOIN peers p ON p.id = b.peer
+            WHERE (b.provider_session_id IS NOT NULL AND b.provider_session_id != '')
+               OR (b.provider_session_name IS NOT NULL AND b.provider_session_name != '')
+            ORDER BY p.last_seen_at DESC, b.updated_at DESC
+          `).all();
+        } finally {
+          db.close();
+        }
+        const seen = new Set();
+        const resumable = [];
+        for (const r of rows) {
+          const resumeValue = r.provider_session_id || r.provider_session_name || '';
+          if (!resumeValue) continue;
+          const key = `${r.provider}:${resumeValue}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          resumable.push({
+            provider: r.provider,
+            session_id: r.provider_session_id,
+            session_name: r.provider_session_name || null,
+            resume: resumeValue,
+            name: r.provider_session_name || null,
+            peer: r.peer
+          });
+        }
+        sendJson(res, 200, { resumable });
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/api/runtime') {
         sendJson(res, 200, {
           product: PRODUCT_NAME,
@@ -6805,7 +7114,7 @@ Environment:
   HCC_ROOT               Override project root
   HCC_DB                 Override database path
   HCC_PEER               Default peer id; inferred automatically when absent
-  HCC_WEB_TOKEN          Optional web access token
+  HCC_WEB_TOKEN          Replace and save the stable web access token
 `);
 }
 
@@ -7081,19 +7390,22 @@ function helpWeb() {
   console.log(`${CLI_NAME} web
 
 Usage:
-  ${CLI_NAME} web [--host HOST] [--port N] [--token TEXT] [--local] [--no-discover] [--no-guidance]
+  ${CLI_NAME} web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
 
 Examples:
   ${CLI_NAME} web
-  HCC_WEB_TOKEN='long-token' ${CLI_NAME} web --host 0.0.0.0 --port 8787
+  HCC_WEB_TOKEN='long-token' ${CLI_NAME} web --port 8787
+  ${CLI_NAME} web --local
 
 This is the default one-command entrypoint. It prepares local coordination,
 installs Claude/Codex hooks and shims, ensures tmux is available, starts the
 browser terminal console as a background runtime, prints the URL, PID, runtime
 file, and log file, then returns the terminal to you.
 
-Web token auth is disabled by default. Pass --token or set HCC_WEB_TOKEN to
-require a token.
+By default, the web runtime listens on 0.0.0.0 and uses a saved token,
+generating one on first use. Use HCC_WEB_TOKEN or --token to replace the saved
+token, --local to bind only to 127.0.0.1, or --no-token only for a trusted
+local/test environment.
 
 After hcc web, plain claude/codex commands started from a new shell are wrapped
 as local tmux-backed terminals. Existing ordinary terminals can communicate

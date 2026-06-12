@@ -42,6 +42,10 @@ registered project databases.
   normal task/state/timeline surfaces.
 - Extended schema migration startup so registered project databases are migrated
   alongside the current project database when the CLI opens state.
+- Changed bare `hcc web` to listen on `0.0.0.0` with a saved URL token by
+  default. The token is generated on first use and reused across restarts; use
+  `--local` for loopback-only access or `--no-token` only in trusted local/test
+  environments.
 - Restored the Star History chart at the bottom of both README files.
 - Included README-linked package assets in the npm tarball so the package page
   renders the project logo correctly.

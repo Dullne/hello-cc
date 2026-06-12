@@ -18,14 +18,18 @@ current project's `.hello-cc` data and guidance blocks.
 ## Start And Stop
 
 ```text
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-discover] [--no-guidance]
+hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
 hcc down
 hcc up [--no-discover] [--no-guidance]
 ```
 
 `hcc web` is the default entry. It initializes coordination, installs hooks and
-shims, starts or reuses the Web console, and returns the terminal to you. Use
-`hcc up` only when you want coordination without the Web console or shims.
+shims, starts or reuses the Web console, and returns the terminal to you. Bare
+`hcc web` listens on `0.0.0.0` and uses a saved URL token, generating one on
+first use. Use `--local` to bind only `127.0.0.1`, `--token` or `HCC_WEB_TOKEN`
+to replace the saved token, and
+`--no-token` only in trusted local/test environments. Use `hcc up` only when you
+want coordination without the Web console or shims.
 
 ## Peers And Status
 

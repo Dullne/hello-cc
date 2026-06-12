@@ -80,7 +80,8 @@ cd /path/to/project
 hcc web
 ```
 
-Then open the printed local URL. `hcc web` initializes the project bus, installs
+Then open the printed URL. By default, `hcc web` listens on LAN interfaces and
+uses a saved URL token, generating one on first use. It initializes the project bus, installs
 Claude/Codex hooks and shims, starts or reuses the Web console, and returns the
 terminal to you.
 

@@ -70,8 +70,8 @@ project: /path/to/project
 database: /path/to/project/.hello-cc/mesh.db
 runtime: /path/to/project/.hello-cc/runtime.json
 log: /path/to/project/.hello-cc/web.log
-open: http://<machine-ip>:8787/?project=%2Fpath%2Fto%2Fproject
-local: http://127.0.0.1:8787/?project=%2Fpath%2Fto%2Fproject
+open: http://<machine-ip>:8787/?token=<token>&project=%2Fpath%2Fto%2Fproject
+local: http://127.0.0.1:8787/?token=<token>&project=%2Fpath%2Fto%2Fproject
 shims: installed claude, codex
 PATH updated in ~/.bashrc; open a new terminal or source it
 stop: hcc down
@@ -218,23 +218,27 @@ blocked.
 
 ## Web Console
 
-Start local and LAN-visible control:
+Start local and LAN-visible control with token authentication:
 
 ```bash
 hcc web
 ```
 
-Use a token only when you want one:
+Bare `hcc web` stores its generated token and reuses it across restarts. Set a
+token explicitly when you want to replace the saved value:
 
 ```bash
-HCC_WEB_TOKEN='choose-a-long-token' hcc web --host 0.0.0.0 --port 8787
+HCC_WEB_TOKEN='choose-a-long-token' hcc web --port 8787
 ```
 
 Open from another machine on the same network:
 
 ```text
-http://<machine-ip>:8787/
+http://<machine-ip>:8787/?token=<token>
 ```
+
+Use `hcc web --local` to bind only `127.0.0.1`. Use `hcc web --no-token` only
+in a trusted local/test environment.
 
 The web console can:
 
@@ -349,7 +353,7 @@ hcc lock release --resource vllm/router
 | `HCC_PEER` | default peer identity |
 | `HCC_ROOT` | override project root |
 | `HCC_DB` | override database path |
-| `HCC_WEB_TOKEN` | optional token for web access |
+| `HCC_WEB_TOKEN` | replace and save the stable web access token |
 | `HCC_RUNTIME_URL` | direct runtime URL |
 | `HCC_NO_AUTO_INSTALL_TMUX=1` | disable tmux auto-install, mainly for tests |
 
