@@ -170,12 +170,13 @@ Server polls/captures tmux pane output and broadcasts it to browsers.
 ```text
 peers         stable terminal identities and heartbeat
 peer_bindings provider session binding and runtime transport metadata
-tasks         task assignment, ownership, and lifecycle
-messages      direct or broadcast messages
+tasks         task assignment, ownership, hierarchy, and lifecycle
+messages      direct, broadcast, or threaded messages
 message_reads per-peer ack state
 locks         advisory exclusive locks with TTL
 handoffs      durable cross-session handoff summaries
 events        audit trail for observability
+schema_migrations applied SQLite schema version history
 ```
 
 ## Coordination Semantics
@@ -185,10 +186,17 @@ events        audit trail for observability
 - SQLite runs with WAL and `busy_timeout=5000`.
 - Tasks are project facts. They remain visible to all peers until status becomes
   `done` or `abandoned`.
+- Tasks can form explicit parent/child hierarchies for team splits. Team commands
+  create auditable child tasks; they do not silently spawn model processes.
 - Messages are addressed mailbox items. Read state is tracked per peer.
+- Message replies keep `reply_to` and `thread_id` so peer-visible collaboration
+  history can be reconstructed without terminal capture.
 - Broadcast messages use per-peer acknowledgement, so one peer cannot consume a
   message for everyone else.
 - Locks are advisory and TTL-based. Peers must follow the protocol.
+- `hcc state` and `/api/state` expose a derived timeline plus
+  `automation.next_action.argv`; the command is advisory and does not execute
+  coordination actions itself.
 
 ## Hook Path
 
@@ -196,8 +204,8 @@ The primary model-facing path is hook context injection, not project markdown.
 
 `hcc web` installs hooks that register sessions and inject hello-cc snapshots at
 session start and before model answers. The injected snapshot contains current
-peer identity, active peers, open tasks, unread messages, active locks, and the
-commands the model should use to inspect state.
+peer identity, active peers, open tasks, unread messages, active locks, the
+current task when one exists, and the next auditable coordination action.
 
 `CLAUDE.md`, `AGENTS.md`, and `.hello-cc/HCC.md` are fallback instruction
 layers. Existing root files are updated only inside a bounded hello-cc block.

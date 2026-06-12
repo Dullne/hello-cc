@@ -20,7 +20,9 @@ the current `package.json` version.
 hello-cc 0.1.2 tightens the public release surface after the first scoped npm
 publish. It adds a first-class update command, makes uninstall discoverable in
 top-level help, and reorganizes the documentation so the npm package page and
-GitHub release notes have a clear, detailed description of what changed.
+GitHub release notes have a clear, detailed description of what changed. It also
+adds explicit team task orchestration and makes schema migrations cover
+registered project databases.
 
 ### Highlights
 
@@ -34,6 +36,12 @@ GitHub release notes have a clear, detailed description of what changed.
   shims, while `hcc uninstall --purge --yes` is required to remove project data.
 - Split documentation into a short README, a user guide, command reference, and
   documentation index in both English and Chinese.
+- Added `hcc team plan`, `hcc team start`, and `hcc team status` for explicit
+  parent-task splits into auditable child tasks.
+- Added task hierarchy metadata so team subtasks remain visible through the
+  normal task/state/timeline surfaces.
+- Extended schema migration startup so registered project databases are migrated
+  alongside the current project database when the CLI opens state.
 - Restored the Star History chart at the bottom of both README files.
 - Included README-linked package assets in the npm tarball so the package page
   renders the project logo correctly.

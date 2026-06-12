@@ -22,6 +22,7 @@ const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = '@logicseek/hello-cc';
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
+const DB_SCHEMA_VERSION = 4;
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
 const WEB_CHILD_ENV = 'HCC_WEB_CHILD';
@@ -161,6 +162,10 @@ function sanitizePeerPart(value, fallback = 'peer') {
 
 function shortHash(value) {
   return createHash('sha1').update(String(value)).digest('hex').slice(0, 8);
+}
+
+function providerSessionPeerId(kind, providerId) {
+  return `${kind}-${sanitizePeerPart(String(providerId || '').slice(0, 8), shortHash(providerId))}`;
 }
 
 function currentTtyName() {
@@ -1397,6 +1402,9 @@ function execWithBusyRetry(db, sql, { attempts = 30, delayMs = 100, ignoreBusy =
   return false;
 }
 
+let projectMigrationFanoutDepth = 0;
+const migratedRegisteredProjectDbs = new Set();
+
 function connect(ctx) {
   fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
   const db = new DatabaseSync(ctx.dbPath, { timeout: 5000 });
@@ -1404,14 +1412,82 @@ function connect(ctx) {
   execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
   db.exec('PRAGMA foreign_keys = ON;');
   initSchema(db);
+  migrateRegisteredProjectDbs(ctx);
   return db;
 }
 
+function migrateRegisteredProjectDbs(ctx) {
+  if (projectMigrationFanoutDepth > 0) return;
+  projectMigrationFanoutDepth += 1;
+  try {
+    const currentDb = path.resolve(ctx.dbPath);
+    const seen = new Set([currentDb]);
+    for (const project of readProjectRegistry()) {
+      const root = path.resolve(project.root);
+      const dbPath = path.resolve(project.db || path.join(root, '.hello-cc', 'mesh.db'));
+      if (seen.has(dbPath)) continue;
+      seen.add(dbPath);
+      const cacheKey = `${dbPath}:${DB_SCHEMA_VERSION}`;
+      if (migratedRegisteredProjectDbs.has(cacheKey)) continue;
+      if (!fs.existsSync(root) || !fs.existsSync(dbPath)) continue;
+      let db = null;
+      try {
+        db = new DatabaseSync(dbPath, { timeout: 5000 });
+        db.exec('PRAGMA busy_timeout = 5000;');
+        execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
+        db.exec('PRAGMA foreign_keys = ON;');
+        initSchema(db);
+        migratedRegisteredProjectDbs.add(cacheKey);
+      } catch (err) {
+        throw new CliError('REGISTERED_DB_MIGRATION_FAILED', `Failed to migrate registered project database ${dbPath}: ${err?.message || err}`, {
+          db: dbPath,
+          code: err instanceof CliError ? err.code : undefined
+        });
+      } finally {
+        try { db?.close(); } catch {}
+      }
+    }
+  } finally {
+    projectMigrationFanoutDepth -= 1;
+  }
+}
+
 function initSchema(db) {
+  const existingVersion = readSchemaVersion(db);
+  if (existingVersion > DB_SCHEMA_VERSION) {
+    throw new CliError('DB_SCHEMA_TOO_NEW', `Database schema version ${existingVersion} is newer than this hcc (${DB_SCHEMA_VERSION})`, {
+      db_schema_version: existingVersion,
+      supported_schema_version: DB_SCHEMA_VERSION
+    });
+  }
+  createBaseSchema(db);
+  runSchemaMigrations(db);
+  dedupePeerBindings(db);
+  execWithBusyRetry(db, `
+    CREATE INDEX IF NOT EXISTS idx_peer_bindings_provider_session ON peer_bindings(provider, provider_session_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_id_unique
+      ON peer_bindings(provider, provider_session_id)
+      WHERE provider_session_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_name_unique
+      ON peer_bindings(provider, provider_session_name)
+      WHERE provider_session_name IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_runtime_target_unique
+      ON peer_bindings(runtime_target)
+      WHERE runtime_target IS NOT NULL;
+  `);
+}
+
+function createBaseSchema(db) {
   execWithBusyRetry(db, `
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS peers (
@@ -1450,6 +1526,8 @@ function initSchema(db) {
       status TEXT NOT NULL DEFAULT 'pending',
       assignee TEXT,
       owner TEXT,
+      parent_id INTEGER,
+      team_role TEXT,
       priority INTEGER NOT NULL DEFAULT 100,
       created_by TEXT,
       claimed_at INTEGER,
@@ -1465,6 +1543,8 @@ function initSchema(db) {
       task_id INTEGER,
       kind TEXT NOT NULL DEFAULT 'note',
       body TEXT NOT NULL,
+      reply_to INTEGER,
+      thread_id INTEGER,
       created_at INTEGER NOT NULL
     );
 
@@ -1512,28 +1592,110 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_events_id ON events(id);
     CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks(expires_at);
   `);
-  db.prepare(`
-    INSERT INTO meta(key, value) VALUES ('schema_version', '1')
-    ON CONFLICT(key) DO NOTHING
-  `).run();
+}
 
-  const peerBindingColumns = new Set(db.prepare('PRAGMA table_info(peer_bindings)').all().map((col) => col.name));
-  if (!peerBindingColumns.has('runtime_target')) {
-    db.exec('ALTER TABLE peer_bindings ADD COLUMN runtime_target TEXT');
+function tableColumns(db, tableName) {
+  return new Set(db.prepare(`PRAGMA table_info(${tableName})`).all().map((col) => col.name));
+}
+
+function tableExists(db, tableName) {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(tableName));
+}
+
+function readSchemaVersion(db) {
+  const metaExists = tableExists(db, 'meta');
+  const metaVersion = metaExists ? Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value || 0) : 0;
+  const pragmaVersion = Number(db.prepare('PRAGMA user_version').get()?.user_version || 0);
+  const migrationVersion = tableExists(db, 'schema_migrations')
+    ? Number(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()?.version || 0)
+    : 0;
+  return Math.max(metaVersion, pragmaVersion, migrationVersion);
+}
+
+function writeSchemaVersion(db, version) {
+  db.prepare(`
+    INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(String(version));
+  db.exec(`PRAGMA user_version = ${Number(version)}`);
+}
+
+function recordSchemaMigration(db, version, name) {
+  db.prepare(`
+    INSERT INTO schema_migrations(version, name, applied_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(version) DO NOTHING
+  `).run(version, name, now());
+}
+
+function addColumnIfMissing(db, tableName, columnName, ddl) {
+  const columns = tableColumns(db, tableName);
+  if (!columns.has(columnName)) db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${ddl}`);
+}
+
+function runSchemaMigrations(db) {
+  const migrations = [
+    {
+      version: 1,
+      name: 'baseline',
+      up() {
+        // createBaseSchema already created the baseline tables.
+      }
+    },
+    {
+      version: 2,
+      name: 'peer binding runtime targets',
+      up(database) {
+        addColumnIfMissing(database, 'peer_bindings', 'runtime_target', 'runtime_target TEXT');
+      }
+    },
+    {
+      version: 3,
+      name: 'threaded messages',
+      up(database) {
+        addColumnIfMissing(database, 'messages', 'reply_to', 'reply_to INTEGER');
+        addColumnIfMissing(database, 'messages', 'thread_id', 'thread_id INTEGER');
+        database.exec(`
+          UPDATE messages SET thread_id = id WHERE thread_id IS NULL;
+          CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id, id);
+        `);
+      }
+    },
+    {
+      version: 4,
+      name: 'team task hierarchy',
+      up(database) {
+        addColumnIfMissing(database, 'tasks', 'parent_id', 'parent_id INTEGER');
+        addColumnIfMissing(database, 'tasks', 'team_role', 'team_role TEXT');
+        database.exec('CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id, priority, id);');
+      }
+    }
+  ];
+  let version = readSchemaVersion(db);
+  if (version > DB_SCHEMA_VERSION) {
+    throw new CliError('DB_SCHEMA_TOO_NEW', `Database schema version ${version} is newer than this hcc (${DB_SCHEMA_VERSION})`, {
+      db_schema_version: version,
+      supported_schema_version: DB_SCHEMA_VERSION
+    });
   }
-  dedupePeerBindings(db);
-  execWithBusyRetry(db, `
-    CREATE INDEX IF NOT EXISTS idx_peer_bindings_provider_session ON peer_bindings(provider, provider_session_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_id_unique
-      ON peer_bindings(provider, provider_session_id)
-      WHERE provider_session_id IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_provider_session_name_unique
-      ON peer_bindings(provider, provider_session_name)
-      WHERE provider_session_name IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_bindings_runtime_target_unique
-      ON peer_bindings(runtime_target)
-      WHERE runtime_target IS NOT NULL;
-  `);
+  const applied = new Set(db.prepare('SELECT version FROM schema_migrations').all().map((row) => Number(row.version)));
+  tx(db, () => {
+    for (const migration of migrations) {
+      if (version >= migration.version && applied.has(migration.version)) continue;
+      migration.up(db);
+      recordSchemaMigration(db, migration.version, migration.name);
+      applied.add(migration.version);
+      version = migration.version;
+      writeSchemaVersion(db, version);
+    }
+    if (version === 0) {
+      version = DB_SCHEMA_VERSION;
+    }
+    for (const migration of migrations) {
+      if (migration.version <= version) recordSchemaMigration(db, migration.version, migration.name);
+    }
+    writeSchemaVersion(db, version);
+  });
 }
 
 function peerBindingRuntimeRank(row) {
@@ -1900,23 +2062,32 @@ function touchCurrentPeer(db, ctx, resolved, status = null, kindHint = 'shell') 
   });
 }
 
-function sendMessage(db, sender, recipient, taskId, kind, body) {
+function sendMessage(db, sender, recipient, taskId, kind, body, meta = {}) {
+  const replyTo = meta.reply_to || null;
+  const threadId = meta.thread_id || null;
   const info = db.prepare(`
-    INSERT INTO messages(sender, recipient, task_id, kind, body, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(sender, recipient || 'all', taskId || null, kind || 'note', body, now());
+    INSERT INTO messages(sender, recipient, task_id, kind, body, reply_to, thread_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(sender, recipient || 'all', taskId || null, kind || 'note', body, replyTo, threadId, now());
+  const messageId = Number(info.lastInsertRowid);
+  if (!threadId) {
+    db.prepare('UPDATE messages SET thread_id = ? WHERE id = ?').run(messageId, messageId);
+  }
   addEvent(db, 'message.sent', sender, taskId || null, {
-    message_id: Number(info.lastInsertRowid),
+    message_id: messageId,
     recipient: recipient || 'all',
-    kind: kind || 'note'
+    kind: kind || 'note',
+    reply_to: replyTo,
+    thread_id: threadId || messageId
   });
-  return Number(info.lastInsertRowid);
+  return messageId;
 }
 
 function queryInbox(db, peer, includeAll, limit) {
   return db.prepare(`
     SELECT
-      m.id, m.sender, m.recipient, m.task_id, m.kind, m.body, m.created_at, r.read_at
+      m.id, m.sender, m.recipient, m.task_id, m.kind, m.body,
+      m.reply_to, m.thread_id, m.created_at, r.read_at
     FROM messages m
     LEFT JOIN message_reads r
       ON r.message_id = m.id AND r.peer = ?
@@ -1926,6 +2097,417 @@ function queryInbox(db, peer, includeAll, limit) {
     ORDER BY m.id ASC
     LIMIT ?
   `).all(peer, peer, includeAll ? 1 : 0, limit);
+}
+
+function queryTimelineMessages(db, peer, limit) {
+  if (!peer) {
+    return db.prepare(`
+      SELECT id, sender, recipient, task_id, kind, body, reply_to, thread_id, created_at
+      FROM messages
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit).reverse();
+  }
+  return db.prepare(`
+    SELECT
+      m.id, m.sender, m.recipient, m.task_id, m.kind, m.body,
+      m.reply_to, m.thread_id, m.created_at, r.read_at
+    FROM messages m
+    LEFT JOIN message_reads r
+      ON r.message_id = m.id AND r.peer = ?
+    WHERE
+      m.sender = ?
+      OR m.recipient IS NULL
+      OR m.recipient = ''
+      OR m.recipient = 'all'
+      OR m.recipient = ?
+    ORDER BY m.id DESC
+    LIMIT ?
+  `).all(peer, peer, peer, limit).reverse();
+}
+
+function getMessage(db, id) {
+  return db.prepare(`
+    SELECT id, sender, recipient, task_id, kind, body, reply_to, thread_id, created_at
+    FROM messages
+    WHERE id = ?
+  `).get(id);
+}
+
+function queryMessageThread(db, messageId, limit) {
+  const message = getMessage(db, messageId);
+  if (!message) throw new CliError('NOT_FOUND', `Message #${messageId} does not exist`);
+  const threadId = message.thread_id || message.id;
+  const rows = db.prepare(`
+    SELECT id, sender, recipient, task_id, kind, body, reply_to, thread_id, created_at
+    FROM messages
+    WHERE id = ? OR thread_id = ?
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(message.id, threadId, limit);
+  return { message, thread_id: threadId, messages: rows };
+}
+
+function parseEventPayload(row) {
+  try {
+    return row?.payload ? JSON.parse(row.payload) : {};
+  } catch {
+    return {};
+  }
+}
+
+function compactText(value, limit = 160) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function uniqueList(values) {
+  return [...new Set(values.filter(Boolean).map(String))];
+}
+
+function messageParticipants(message) {
+  const participants = [message.sender];
+  if (message.recipient && !['all', ''].includes(message.recipient)) participants.push(message.recipient);
+  return uniqueList(participants);
+}
+
+function taskParticipants(task) {
+  return uniqueList([task.created_by, task.owner, task.assignee]);
+}
+
+function payloadParticipants(payload) {
+  const values = [];
+  for (const key of ['peer', 'from_peer', 'to_peer', 'assignee', 'owner', 'recipient', 'kept_peer', 'removed_peer', 'previous_owner']) {
+    if (payload?.[key] && payload[key] !== 'all') values.push(payload[key]);
+  }
+  return uniqueList(values);
+}
+
+function peerMatchesTimelineItem(item, peer) {
+  if (!peer) return true;
+  if (item.broadcast) return true;
+  return (item.peers || []).includes(peer);
+}
+
+function shouldHideTimelineMessage(message) {
+  if (message.kind === 'task' && /^Task #\d+ assigned: /.test(message.body || '')) return true;
+  if (message.kind === 'handoff' && /^Handoff #\d+: /.test(message.body || '')) return true;
+  return false;
+}
+
+const TIMELINE_EVENT_ALLOW = new Set([
+  'task.created',
+  'task.claimed',
+  'task.pending',
+  'task.running',
+  'task.review',
+  'task.blocked',
+  'task.done',
+  'task.abandoned',
+  'team.started',
+  'lock.acquired',
+  'lock.released',
+  'peer.registered',
+  'peer.joined',
+  'peer.auto_joined',
+  'peer.stopped',
+  'provider.session.merged',
+  'web.session.started',
+  'web.session.exited',
+  'tmux.session.attached',
+  'tmux.session.detached',
+  'tmux.session.exited',
+  'run.session.started',
+  'run.session.exited'
+]);
+
+function shouldHideTimelineEvent(event) {
+  if (['message.sent', 'message.ack', 'handoff.created', 'lock.renewed'].includes(event.type)) return true;
+  if (event.type && event.type.startsWith('hook.')) return true;
+  if (event.type && event.type.startsWith('web.session.input')) return true;
+  return !TIMELINE_EVENT_ALLOW.has(event.type);
+}
+
+function timelineDirection(message, peer) {
+  if (!peer) return message.recipient === 'all' ? 'broadcast' : 'project';
+  if (message.sender === peer && message.recipient === peer) return 'self';
+  if (message.sender === peer) return 'out';
+  if (message.recipient === 'all') return 'broadcast';
+  if (message.recipient === peer) return 'in';
+  return 'project';
+}
+
+function timelineFromRows({ messages = [], handoffs = [], tasks = [], locks = [], events = [] }, peer = null) {
+  const items = [];
+  for (const message of messages) {
+    if (shouldHideTimelineMessage(message)) continue;
+    const item = {
+      id: `message:${message.id}`,
+      source: 'message',
+      source_id: message.id,
+      ts: message.created_at,
+      actor: message.sender,
+      peers: messageParticipants(message),
+      task_id: message.task_id || null,
+      kind: message.kind || 'note',
+      title: `${message.sender} -> ${message.recipient || 'all'}`,
+      text: compactText(message.body),
+      unread: message.read_at === null || message.read_at === undefined,
+      direction: timelineDirection(message, peer),
+      thread_id: message.thread_id || message.id,
+      reply_to: message.reply_to || null,
+      broadcast: !message.recipient || message.recipient === 'all'
+    };
+    if (peerMatchesTimelineItem(item, peer)) items.push(item);
+  }
+  for (const handoff of handoffs) {
+    const item = {
+      id: `handoff:${handoff.id}`,
+      source: 'handoff',
+      source_id: handoff.id,
+      ts: handoff.created_at,
+      actor: handoff.from_peer,
+      peers: uniqueList([handoff.from_peer, handoff.to_peer]),
+      task_id: handoff.task_id || null,
+      kind: 'handoff',
+      title: `handoff ${handoff.from_peer}${handoff.to_peer ? ` -> ${handoff.to_peer}` : ''}`,
+      text: compactText(handoff.summary),
+      direction: 'project',
+      broadcast: !handoff.to_peer,
+      tests: handoff.tests || '',
+      risks: handoff.risks || ''
+    };
+    if (peerMatchesTimelineItem(item, peer)) items.push(item);
+  }
+  for (const task of tasks) {
+    const item = {
+      id: `task:${task.id}`,
+      source: 'task',
+      source_id: task.id,
+      ts: task.updated_at || task.created_at,
+      actor: task.owner || task.created_by || task.assignee || '',
+      peers: taskParticipants(task),
+      task_id: task.id,
+      kind: task.status,
+      title: `task #${task.id} ${task.status}${task.parent_id ? ` child of #${task.parent_id}` : ''}`,
+      text: compactText(task.title),
+      direction: 'project'
+    };
+    if (peerMatchesTimelineItem(item, peer)) items.push(item);
+  }
+  for (const lock of locks) {
+    const item = {
+      id: `lock:${lock.resource}`,
+      source: 'lock',
+      source_id: lock.resource,
+      ts: lock.created_at,
+      actor: lock.owner,
+      peers: uniqueList([lock.owner]),
+      task_id: lock.task_id || null,
+      kind: 'active',
+      title: `lock ${lock.resource}`,
+      text: compactText(lock.reason || `owner=${lock.owner}`),
+      direction: 'project'
+    };
+    if (peerMatchesTimelineItem(item, peer)) items.push(item);
+  }
+  for (const event of events) {
+    if (shouldHideTimelineEvent(event)) continue;
+    const payload = parseEventPayload(event);
+    const item = {
+      id: `event:${event.id}`,
+      source: 'event',
+      source_id: event.id,
+      ts: event.created_at,
+      actor: event.actor || '',
+      peers: uniqueList([event.actor, ...payloadParticipants(payload)]),
+      task_id: event.task_id || null,
+      kind: event.type,
+      title: event.type,
+      text: compactText(payload.summary || payload.reason || payload.title || payload.resource || payload.peer || ''),
+      direction: 'project'
+    };
+    if (peerMatchesTimelineItem(item, peer)) items.push(item);
+  }
+  const order = { message: 10, handoff: 20, task: 30, lock: 40, event: 50 };
+  items.sort((a, b) =>
+    (a.ts || 0) - (b.ts || 0) ||
+    (order[a.source] || 99) - (order[b.source] || 99) ||
+    String(a.source_id).localeCompare(String(b.source_id), undefined, { numeric: true }));
+  return items.slice(-120);
+}
+
+function actionCommand(argv) {
+  if (!argv?.length) return '';
+  return [CLI_NAME, ...argv].map(shellQuoteArg).join(' ');
+}
+
+function makeAction(kind, argv, reason, mutates = true, extra = {}) {
+  return {
+    kind,
+    reason,
+    mutates,
+    argv,
+    command: actionCommand(argv),
+    ...extra
+  };
+}
+
+function looksLikeMultiTask(task) {
+  if (!task) return false;
+  const text = `${task.title || ''}\n${task.body || ''}`;
+  const bullets = text.split('\n').filter((line) => /^\s*(?:[-*]|\d+[.)])\s+\S+/.test(line)).length;
+  const separators = (text.match(/[,，;；、]/g) || []).length;
+  return bullets >= 2 || separators >= 3 || /多任务|并行|团队|分工|several tasks|multiple tasks|parallel|team/i.test(text);
+}
+
+function selectCurrentTask(tasks, peerId) {
+  if (!peerId) return null;
+  const statusRank = { running: 0, claimed: 1, review: 2, blocked: 3 };
+  const openTasks = (tasks || []).filter((task) => !['done', 'abandoned'].includes(task.status));
+  const ownedTasks = openTasks
+    .filter((task) => task.owner === peerId)
+    .sort((a, b) =>
+      (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
+      Number(a.priority || 0) - Number(b.priority || 0) ||
+      Number(a.id || 0) - Number(b.id || 0));
+  return ownedTasks.find((task) => ['running', 'claimed', 'review', 'blocked'].includes(task.status)) || ownedTasks[0] || null;
+}
+
+function summarizeTask(task) {
+  if (!task) return null;
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    owner: task.owner || null,
+    assignee: task.assignee || null,
+    parent_id: task.parent_id || null,
+    team_role: task.team_role || null,
+    priority: task.priority
+  };
+}
+
+function deriveAutomation(snapshot, peer = null, opts = {}) {
+  const peerId = peer || '';
+  const t = Number(snapshot.now || now());
+  const peerRow = peerId ? snapshot.peers.find((row) => row.id === peerId) : null;
+  const openTasks = (snapshot.tasks || []).filter((task) => !['done', 'abandoned'].includes(task.status));
+  const assignedTasks = peerId ? openTasks.filter((task) => !task.owner && task.assignee === peerId) : [];
+  const availableTasks = openTasks.filter((task) => !task.owner && !task.assignee);
+  const ownedTask = selectCurrentTask(openTasks, peerId);
+  const resources = uniqueList(Array.isArray(opts.resources) ? opts.resources : (opts.resource ? [opts.resource] : []));
+  const ownLocks = peerId ? (snapshot.locks || []).filter((lock) => lock.owner === peerId) : [];
+  const requestedLocks = resources.map((resource) => {
+    const lock = (snapshot.locks || []).find((row) => row.resource === resource && Number(row.expires_at || 0) > t);
+    return { resource, lock };
+  });
+  const conflict = requestedLocks.find((entry) => entry.lock && entry.lock.owner !== peerId);
+  const missingLock = requestedLocks.find((entry) => !entry.lock);
+  const unread = peerId ? (snapshot.messages || []).filter((message) =>
+    message.read_at === null || message.read_at === undefined) : [];
+  const warnings = [];
+  if (peerId && !peerRow) warnings.push(`peer ${peerId} is not registered in this project`);
+  const lockActions = [];
+  const messageActions = [];
+  const taskActions = [];
+  const automation = {
+    schema_version: 1,
+    peer: peerId ? {
+      id: peerId,
+      known: Boolean(peerRow),
+      active: Boolean(peerRow && Number(peerRow.age_sec || 0) <= ACTIVE_PEER_TTL),
+      age_sec: peerRow ? Number(peerRow.age_sec || 0) : null
+      } : null,
+      current_task: summarizeTask(ownedTask),
+      phase: 'idle',
+      next_action: makeAction('none', [], 'no immediate coordination action', false),
+      actions: [],
+      finish_actions: [],
+      warnings
+    };
+
+  const orderedUnread = unread
+    .filter((message) => message.sender !== peerId)
+    .filter((message) => !shouldHideTimelineMessage(message))
+    .sort((a, b) => (a.kind === 'task' ? 1 : 0) - (b.kind === 'task' ? 1 : 0) || a.id - b.id);
+  for (const message of orderedUnread) {
+    if (ownedTask && message.kind === 'task') continue;
+    const kind = message.kind === 'task' ? 'msg.inbox' : 'msg.reply';
+    const argv = kind === 'msg.reply'
+      ? ['msg', 'reply', '--from', peerId, '--id', String(message.id), '--body', '<answer>']
+      : ['msg', 'inbox', '--peer', peerId];
+    messageActions.push(makeAction(kind, argv, `unread message #${message.id} from ${message.sender}`, kind !== 'msg.inbox', {
+      message_id: message.id,
+      task_id: message.task_id || null
+    }));
+  }
+
+  if (!ownedTask && assignedTasks.length) {
+    const task = assignedTasks[0];
+    taskActions.push(makeAction('task.claim', ['task', 'claim', '--peer', peerId, '--id', String(task.id)], `assigned task #${task.id}`, true, { task_id: task.id }));
+  } else if (!ownedTask && availableTasks.length) {
+    taskActions.push(makeAction('task.next', ['task', 'next', '--peer', peerId], 'available pending task exists', true));
+  }
+
+  if (ownedTask) {
+    if (conflict) {
+      lockActions.push(makeAction('msg.send', ['msg', 'send', '--from', peerId, '--to', conflict.lock.owner, '--task', String(ownedTask.id), '--body', `Please coordinate ${conflict.resource}; it is locked by ${conflict.lock.owner}.`], `${conflict.resource} is locked by ${conflict.lock.owner}`, true, { task_id: ownedTask.id, resource: conflict.resource, lock_owner: conflict.lock.owner }));
+    } else if (missingLock) {
+      lockActions.push(makeAction('lock.acquire', ['lock', 'acquire', '--peer', peerId, '--task', String(ownedTask.id), '--resource', missingLock.resource, '--ttl', String(DEFAULT_LOCK_TTL), '--reason', '<work>'], `task #${ownedTask.id} needs lock for ${missingLock.resource}`, true, { task_id: ownedTask.id, resource: missingLock.resource }));
+    }
+    if (ownedTask.status === 'claimed') {
+      taskActions.push(makeAction('task.update', ['task', 'update', '--peer', peerId, '--id', String(ownedTask.id), '--status', 'running', '--summary', '<started>'], `task #${ownedTask.id} is claimed but not running`, true, { task_id: ownedTask.id }));
+    }
+    if (!ownedTask.parent_id && looksLikeMultiTask(ownedTask)) {
+      const childCount = openTasks.filter((task) => task.parent_id === ownedTask.id && !['done', 'abandoned'].includes(task.status)).length;
+      if (!childCount) {
+        taskActions.push(makeAction('team.plan', ['team', 'plan', '--from-task', String(ownedTask.id)], `task #${ownedTask.id} looks splittable; plan explicit team subtasks`, false, { task_id: ownedTask.id }));
+      }
+    }
+    automation.finish_actions.push(makeAction('handoff.create', ['handoff', 'create', '--from', peerId, '--task', String(ownedTask.id), '--summary', '<summary>', '--tests', '<tests>', '--risks', '<risks>'], `handoff task #${ownedTask.id} before stopping`, true, { task_id: ownedTask.id }));
+    automation.finish_actions.push(makeAction('task.done', ['task', 'done', '--peer', peerId, '--id', String(ownedTask.id), '--summary', '<summary>'], `mark task #${ownedTask.id} done after handoff`, true, { task_id: ownedTask.id }));
+    for (const lock of ownLocks) {
+      automation.finish_actions.push(makeAction('lock.release', ['lock', 'release', '--peer', peerId, '--resource', lock.resource], `release ${lock.resource}`, true, { task_id: lock.task_id || null, resource: lock.resource }));
+    }
+  }
+  automation.actions.push(...lockActions, ...messageActions, ...taskActions);
+
+  if (opts.intent === 'finish' || opts.intent === 'stop') {
+    automation.phase = ownedTask ? 'handoff' : 'idle';
+    automation.next_action = automation.finish_actions[0] || automation.next_action;
+    return automation;
+  }
+  automation.next_action = automation.actions[0] || (ownedTask
+    ? makeAction('none', [], `continue task #${ownedTask.id}`, false, { task_id: ownedTask.id })
+    : automation.next_action);
+  if (automation.next_action.kind === 'msg.reply' || automation.next_action.kind === 'msg.inbox') automation.phase = 'reply_message';
+  else if (automation.next_action.kind === 'task.claim' || automation.next_action.kind === 'task.next') automation.phase = 'claim_task';
+  else if (automation.next_action.kind === 'lock.acquire') automation.phase = 'acquire_lock';
+  else if (automation.next_action.kind === 'msg.send') automation.phase = 'coordinate_lock';
+  else if (automation.next_action.kind === 'team.plan') automation.phase = 'team_plan';
+  else if (ownedTask) automation.phase = ownedTask.status === 'review' ? 'handoff' : 'work';
+  return automation;
+}
+
+function renderAutomationContext(automation) {
+  if (!automation) return '';
+  const lines = [
+    '[hello-cc next action]',
+    `phase: ${automation.phase}`,
+    automation.current_task ? `current_task: #${automation.current_task.id} ${automation.current_task.status} ${automation.current_task.title}` : null,
+    `next: ${automation.next_action.command || automation.next_action.kind}`,
+    `why: ${automation.next_action.reason}`
+  ].filter(Boolean);
+  if (automation.finish_actions?.length) {
+    lines.push('finish:');
+    for (const action of automation.finish_actions.slice(0, 4)) lines.push(`- ${action.command}`);
+  }
+  if (automation.warnings?.length) {
+    lines.push('warnings:');
+    for (const warning of automation.warnings.slice(0, 4)) lines.push(`- ${warning}`);
+  }
+  return lines.join('\n');
 }
 
 function queryOpenTasks(db, limit, peer = null) {
@@ -1970,34 +2552,92 @@ function formatHookEventName(hookType) {
   return known[compact] || String(hookType || 'unknown');
 }
 
-function buildHookCoordinationContext(db, peerId) {
-  const openTasks = queryOpenTasks(db, 8);
-  const unread = queryInbox(db, peerId, false, 5);
+function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
   const t = now();
   const peers = db.prepare(`
-    SELECT id, kind, status, last_seen_at
+    SELECT id, kind, role, status, worktree, branch, pid, capabilities,
+           created_at, last_seen_at, (? - last_seen_at) AS age_sec
     FROM peers
     ORDER BY last_seen_at DESC, id ASC
-    LIMIT 8
-  `).all();
+    LIMIT 200
+  `).all(t);
+  const tasks = queryOpenTasks(db, 200);
+  const locks = db.prepare(`
+    SELECT resource, owner, task_id, reason, expires_at, created_at
+    FROM locks
+    WHERE expires_at > ?
+    ORDER BY resource ASC
+    LIMIT 200
+  `).all(t);
+  const messages = peer
+    ? queryInbox(db, peer, false, 50)
+    : db.prepare(`
+        SELECT id, sender, recipient, task_id, kind, body, reply_to, thread_id, created_at
+        FROM messages
+        ORDER BY id DESC
+        LIMIT 50
+      `).all().reverse();
+  const timelineMessages = queryTimelineMessages(db, peer, 80);
+  const handoffs = db.prepare(`
+    SELECT id, task_id, from_peer, to_peer, summary, changed_files, tests, risks, created_at
+    FROM handoffs
+    ORDER BY id DESC
+    LIMIT 50
+  `).all().reverse();
+  const events = db.prepare(`
+    SELECT id, type, actor, task_id, payload, created_at
+    FROM events
+    ORDER BY id DESC
+    LIMIT 80
+  `).all().reverse();
+  const snapshot = {
+    root: ctx.root,
+    db: ctx.dbPath,
+    now: t,
+    active_peer_ttl: ACTIVE_PEER_TTL,
+    peers,
+    tasks,
+    locks,
+    messages,
+    handoffs,
+    events
+  };
+  snapshot.timeline = timelineFromRows({ messages: timelineMessages, handoffs, tasks, locks, events }, peer);
+  snapshot.automation = deriveAutomation(snapshot, peer, opts);
+  return snapshot;
+}
+
+function buildHookCoordinationContext(db, ctx, peerId) {
+  const snapshot = collectStateSnapshot(db, ctx, peerId);
+  const openTasks = snapshot.tasks.slice(0, 8);
+  const unread = snapshot.messages.slice(0, 5);
+  const peers = snapshot.peers.slice(0, 8);
   const parts = [
     '[hello-cc coordination]',
     `peer: ${peerId}`,
     'This is live project coordination context injected by hello-cc.',
     'You are not isolated for project coordination: hcc is the source of truth for other Claude/Codex/shell sessions in this project.',
-    'If the user asks what other sessions are doing, what tasks exist, or whether you can see other sessions, do not answer from generic model knowledge and do not say sessions are isolated. Run hcc status, hcc peers, hcc task list, hcc msg inbox, and hcc lock list, then answer from those results.',
-    'Tasks are project work facts, not read/unread items. Open tasks stay relevant to every session until they are marked done or abandoned. Messages are the unread/ack notification channel.'
+    'If the user asks what other sessions are doing, what tasks exist, or whether you can see other sessions, do not answer from generic model knowledge and do not say sessions are isolated. Run hcc status, hcc state, hcc peers, hcc task list, hcc msg inbox, and hcc lock list, then answer from those results.',
+    'Tasks are project work facts, not read/unread items. Open tasks stay relevant to every session until they are marked done or abandoned. Messages are the unread/ack notification channel.',
+    'If you already own a current task, continue that task until handoff/done/blocked; do not claim a different task just because a new prompt arrived.',
+    'When a hello-cc message asks for a response, reply with hcc msg reply --id <message-id> --body "<answer>" so the answer stays in the same thread.'
   ];
 
   if (peers.length > 0) {
     parts.push('[hello-cc known peers]');
     parts.push(...peers.map((peer) => {
-      const age = Math.max(0, t - Number(peer.last_seen_at || 0));
+      const age = Math.max(0, snapshot.now - Number(peer.last_seen_at || 0));
       const active = age <= ACTIVE_PEER_TTL ? 'active' : 'stale';
       return `- ${peer.id} ${peer.kind || 'other'} ${peer.status || 'idle'} ${active}`;
     }));
   } else {
     parts.push('[hello-cc known peers]\n(none)');
+  }
+
+  if (snapshot.automation.current_task) {
+    const task = snapshot.automation.current_task;
+    parts.push('[hello-cc current task]');
+    parts.push(`#${task.id} ${task.status}: ${task.title}`);
   }
 
   if (openTasks.length > 0) {
@@ -2010,11 +2650,21 @@ function buildHookCoordinationContext(db, peerId) {
   if (unread.length > 0) {
     parts.push('[hello-cc unread messages]');
     parts.push(...unread.map((m) =>
-      `- #${m.id} from ${m.sender}${m.task_id ? ` task #${m.task_id}` : ''}: ${m.body}`
+      `- #${m.id} from ${m.sender}${m.task_id ? ` task #${m.task_id}` : ''}${m.reply_to ? ` reply #${m.reply_to}` : ''}: ${m.body}`
     ));
   } else {
     parts.push('[hello-cc unread messages]\n(none)');
   }
+
+  if (snapshot.locks.length > 0) {
+    parts.push('[hello-cc active locks]');
+    parts.push(...snapshot.locks.slice(0, 8).map((lock) =>
+      `- ${lock.resource} owner=${lock.owner}${lock.task_id ? ` task #${lock.task_id}` : ''}`));
+  } else {
+    parts.push('[hello-cc active locks]\n(none)');
+  }
+
+  parts.push(renderAutomationContext(snapshot.automation));
 
   return { text: parts.join('\n'), messages: unread };
 }
@@ -2081,11 +2731,16 @@ Status checks:
 - \`hcc msg inbox\` shows unread messages for this session.
 - \`hcc lock list\` shows active advisory locks.
 - \`hcc status\` summarizes peers, tasks, locks, inbox, and recent events.
+- \`hcc team status --task N\` summarizes explicit subtasks for a parent task.
 
 Before work:
 - Register with hcc.
-- Read current status with \`hcc status\`, \`hcc task list\`, and \`hcc msg inbox\`.
-- Claim one task before editing.
+- Read current status with \`hcc status\`, \`hcc state\`, \`hcc task list\`, and \`hcc msg inbox\`.
+- If \`hcc state\` shows a current task for this peer, continue that task until
+  handoff, done, or blocked instead of claiming a new task.
+- Claim one task before editing when this peer has no current task.
+- If work needs multiple peers, use \`hcc team plan\` and \`hcc team start\`
+  explicitly; do not create or claim hidden extra tasks.
 
 Before editing:
 - Acquire an advisory lock for the file, directory, module, or shared resource.
@@ -2316,22 +2971,28 @@ async function taskCreate(ctx, args) {
   const createdBy = identity.id;
   const assignee = opts.to || opts.assignee || null;
   const priority = intOpt(opts, 'priority', 100);
+  const parentId = intOpt(opts, 'parent', null);
+  const teamRole = opts.role || opts['team-role'] || null;
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, null, 'shell');
   const t = now();
   const id = tx(db, () => {
+    if (parentId && !db.prepare('SELECT id FROM tasks WHERE id = ?').get(parentId)) {
+      throw new CliError('NOT_FOUND', `Parent task #${parentId} does not exist`);
+    }
     const info = db.prepare(`
-      INSERT INTO tasks(title, body, status, assignee, owner, priority, created_by, created_at, updated_at)
-      VALUES (?, ?, 'pending', ?, NULL, ?, ?, ?, ?)
-    `).run(title, body, assignee, priority, createdBy, t, t);
+      INSERT INTO tasks(title, body, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
+      VALUES (?, ?, 'pending', ?, NULL, ?, ?, ?, ?, ?, ?)
+    `).run(title, body, assignee, parentId, teamRole, priority, createdBy, t, t);
     const taskId = Number(info.lastInsertRowid);
-    addEvent(db, 'task.created', createdBy, taskId, { title, assignee, priority });
+    addEvent(db, 'task.created', createdBy, taskId, { title, assignee, priority, parent_id: parentId, team_role: teamRole });
     if (assignee) {
       sendMessage(db, createdBy, assignee, taskId, 'task', `Task #${taskId} assigned: ${title}`);
     }
     return taskId;
   });
-  printResult(ctx, { id, title, assignee, priority }, (data) => `created task #${data.id}: ${data.title}${data.assignee ? ` -> ${data.assignee}` : ''}`);
+  printResult(ctx, { id, title, assignee, priority, parent_id: parentId, team_role: teamRole },
+    (data) => `created task #${data.id}: ${data.title}${data.assignee ? ` -> ${data.assignee}` : ''}${data.parent_id ? ` (child of #${data.parent_id})` : ''}`);
 }
 
 async function taskList(ctx, args) {
@@ -2369,6 +3030,8 @@ async function taskList(ctx, args) {
     { label: 'prio', value: (r) => r.priority },
     { label: 'assignee', value: (r) => r.assignee || '' },
     { label: 'owner', value: (r) => r.owner || '' },
+    { label: 'parent', value: (r) => r.parent_id ? `#${r.parent_id}` : '' },
+    { label: 'role', value: (r) => r.team_role || '' },
     { label: 'title', value: (r) => r.title }
   ]));
 }
@@ -2406,12 +3069,31 @@ async function taskClaim(ctx, args) {
 }
 
 async function taskNext(ctx, args) {
-  const opts = parseOpts(args);
+  const opts = parseOpts(args, { booleans: ['force'] });
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   const task = tx(db, () => {
+    if (!opts.force) {
+      const current = db.prepare(`
+        SELECT * FROM tasks
+        WHERE owner = ?
+          AND status IN ('claimed', 'running', 'review', 'blocked')
+        ORDER BY
+          CASE status
+            WHEN 'running' THEN 0
+            WHEN 'claimed' THEN 1
+            WHEN 'review' THEN 2
+            WHEN 'blocked' THEN 3
+            ELSE 4
+          END,
+          priority ASC,
+          id ASC
+        LIMIT 1
+      `).get(peer);
+      if (current) return { ...current, current: true };
+    }
     const row = db.prepare(`
       SELECT * FROM tasks
       WHERE status = 'pending'
@@ -2430,7 +3112,12 @@ async function taskNext(ctx, args) {
     addEvent(db, 'task.claimed', peer, row.id, { next: true });
     return db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
   });
-  printResult(ctx, task, (data) => data ? `claimed task #${data.id}: ${data.title}` : 'no pending task');
+  printResult(ctx, task, (data) => {
+    if (!data) return 'no pending task';
+    return data.current
+      ? `current task #${data.id}: ${data.title} (${data.status})`
+      : `claimed task #${data.id}: ${data.title}`;
+  });
 }
 
 async function taskUpdate(ctx, args) {
@@ -2474,12 +3161,223 @@ async function taskDone(ctx, args) {
   return taskUpdate(ctx, args.concat(['--status', 'done']));
 }
 
+function splitCsvList(value) {
+  if (Array.isArray(value)) return value.flatMap((item) => splitCsvList(item));
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function parseTeamItems(opts) {
+  const rawItems = [
+    ...splitCsvList(opts.item || []),
+    ...splitCsvList(opts.items || [])
+  ];
+  return rawItems.map((raw, index) => {
+    const parts = String(raw).split(':').map((part) => part.trim());
+    let assignee = null;
+    let role = null;
+    let title = raw.trim();
+    if (parts.length >= 3) {
+      assignee = parts.shift() || null;
+      role = parts.shift() || null;
+      title = parts.join(':').trim();
+    } else if (parts.length === 2) {
+      role = parts[0] || null;
+      title = parts[1] || title;
+    }
+    if (!title) title = `subtask ${index + 1}`;
+    return { title, role: role || `worker-${index + 1}`, assignee };
+  });
+}
+
+function inferTeamItems(task, opts) {
+  const explicit = parseTeamItems(opts);
+  if (explicit.length) return explicit;
+  const count = Math.max(1, intOpt(opts, 'count', 3));
+  const baseTitle = task?.title || 'team task';
+  return Array.from({ length: count }, (_, index) => ({
+    title: `${baseTitle} / subtask ${index + 1}`,
+    role: `worker-${index + 1}`,
+    assignee: null
+  }));
+}
+
+function expandTeamWorkers(workers, parentId) {
+  const expanded = [];
+  for (const token of splitCsvList(workers || [])) {
+    const match = token.match(/^([A-Za-z][A-Za-z0-9._-]*):([1-9][0-9]*)$/);
+    if (!match) {
+      expanded.push(token);
+      continue;
+    }
+    const kind = sanitizePeerPart(match[1], 'peer');
+    const count = Number.parseInt(match[2], 10);
+    for (let i = 1; i <= count; i += 1) expanded.push(`${kind}-team-${parentId}-${i}`);
+  }
+  return expanded;
+}
+
+function assignTeamWorkers(items, workers, parentId) {
+  const workerList = expandTeamWorkers(workers, parentId);
+  if (!workerList.length) return items;
+  return items.map((item, index) => ({
+    ...item,
+    assignee: item.assignee || workerList[index % workerList.length]
+  }));
+}
+
+function teamChildren(db, parentId) {
+  return db.prepare(`
+    SELECT *
+    FROM tasks
+    WHERE parent_id = ?
+    ORDER BY priority ASC, id ASC
+  `).all(parentId);
+}
+
+function taskById(db, id) {
+  return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+}
+
+function teamSummary(db, parentId) {
+  const parent = taskById(db, parentId);
+  if (!parent) throw new CliError('NOT_FOUND', `Task #${parentId} does not exist`);
+  const children = teamChildren(db, parentId);
+  const handoffs = db.prepare(`
+    SELECT *
+    FROM handoffs
+    WHERE task_id = ? OR task_id IN (SELECT id FROM tasks WHERE parent_id = ?)
+    ORDER BY id ASC
+  `).all(parentId, parentId);
+  const counts = {};
+  for (const child of children) counts[child.status] = (counts[child.status] || 0) + 1;
+  return { parent, children, handoffs, counts };
+}
+
+async function cmdTeam(ctx, args) {
+  const sub = args[0];
+  if (!sub || wantsHelp(args)) return helpTeam();
+  if (sub === 'plan') return teamPlan(ctx, args.slice(1));
+  if (sub === 'start') return teamStart(ctx, args.slice(1));
+  if (sub === 'status') return teamStatus(ctx, args.slice(1));
+  throw new CliError('BAD_ARGS', `Unknown team command: ${sub}`);
+}
+
+async function teamPlan(ctx, args) {
+  const opts = parseOpts(args, { arrays: ['item'] });
+  const parentId = intOpt(opts, 'from-task', intOpt(opts, 'task', intOpt({ task: opts._[0] }, 'task')));
+  if (!parentId) throw new CliError('BAD_ARGS', 'Missing --from-task');
+  const db = connect(ctx);
+  const parent = taskById(db, parentId);
+  if (!parent) throw new CliError('NOT_FOUND', `Task #${parentId} does not exist`);
+  const items = assignTeamWorkers(inferTeamItems(parent, opts), opts.workers, parentId);
+  const data = { parent, items };
+  printResult(ctx, data, (plan) => {
+    const lines = [`team plan for task #${plan.parent.id}: ${plan.parent.title}`];
+    plan.items.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.role}: ${item.title}${item.assignee ? ` -> ${item.assignee}` : ''}`);
+    });
+    lines.push('', `start: ${CLI_NAME} team start --from-task ${plan.parent.id} ${plan.items.map((item) => `--item ${shellQuoteArg(`${item.assignee ? `${item.assignee}:` : ''}${item.role}:${item.title}`)}`).join(' ')}`.trim());
+    return lines.join('\n');
+  });
+}
+
+async function teamStart(ctx, args) {
+  const opts = parseOpts(args, { arrays: ['item'], booleans: ['force'] });
+  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
+  const actor = identity.id;
+  const parentId = intOpt(opts, 'from-task', intOpt(opts, 'task', intOpt({ task: opts._[0] }, 'task')));
+  if (!parentId) throw new CliError('BAD_ARGS', 'Missing --from-task');
+  const priorityBase = intOpt(opts, 'priority', 100);
+  const db = connect(ctx);
+  touchCurrentPeer(db, ctx, identity, null, 'shell');
+  const result = tx(db, () => {
+    const parent = taskById(db, parentId);
+    if (!parent) throw new CliError('NOT_FOUND', `Task #${parentId} does not exist`);
+    const existing = teamChildren(db, parentId);
+    if (existing.length && !opts.force) {
+      throw new CliError('TEAM_EXISTS', `Task #${parentId} already has ${existing.length} team subtask(s); use --force to add more`, {
+        parent_id: parentId,
+        children: existing.map((task) => task.id)
+      });
+    }
+    const items = assignTeamWorkers(inferTeamItems(parent, opts), opts.workers, parentId);
+    const t = now();
+    const children = [];
+    items.forEach((item, index) => {
+      const info = db.prepare(`
+        INSERT INTO tasks(title, body, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
+        VALUES (?, ?, 'pending', ?, NULL, ?, ?, ?, ?, ?, ?)
+      `).run(
+        item.title,
+        opts.body || `Subtask for #${parentId}: ${parent.title}`,
+        item.assignee || null,
+        parentId,
+        item.role || `worker-${index + 1}`,
+        priorityBase + index,
+        actor,
+        t,
+        t
+      );
+      const taskId = Number(info.lastInsertRowid);
+      addEvent(db, 'task.created', actor, taskId, {
+        title: item.title,
+        assignee: item.assignee || null,
+        priority: priorityBase + index,
+        parent_id: parentId,
+        team_role: item.role || null
+      });
+      if (item.assignee) sendMessage(db, actor, item.assignee, taskId, 'task', `Task #${taskId} assigned: ${item.title}`);
+      children.push(taskById(db, taskId));
+    });
+    addEvent(db, 'team.started', actor, parentId, {
+      child_tasks: children.map((task) => task.id),
+      workers: expandTeamWorkers(opts.workers || [], parentId)
+    });
+    return { parent, children };
+  });
+  printResult(ctx, result, (data) => {
+    const lines = [`started team for task #${data.parent.id}: ${data.children.length} subtask${data.children.length === 1 ? '' : 's'}`];
+    for (const child of data.children) {
+      lines.push(`- #${child.id} ${child.team_role || 'worker'}${child.assignee ? ` -> ${child.assignee}` : ''}: ${child.title}`);
+    }
+    return lines.join('\n');
+  });
+}
+
+async function teamStatus(ctx, args) {
+  const opts = parseOpts(args);
+  const parentId = intOpt(opts, 'task', intOpt(opts, 'from-task', intOpt({ task: opts._[0] }, 'task')));
+  if (!parentId) throw new CliError('BAD_ARGS', 'Missing --task');
+  const db = connect(ctx);
+  const data = teamSummary(db, parentId);
+  printResult(ctx, data, (summary) => {
+    const countText = Object.entries(summary.counts).map(([status, count]) => `${status}:${count}`).join(', ') || 'none';
+    const lines = [
+      `team task #${summary.parent.id}: ${summary.parent.title}`,
+      `parent status: ${summary.parent.status}`,
+      `subtasks: ${summary.children.length} (${countText})`
+    ];
+    for (const child of summary.children) {
+      lines.push(`- #${child.id} ${child.status} ${child.team_role || 'worker'}${child.owner ? ` owner=${child.owner}` : ''}${child.assignee ? ` assignee=${child.assignee}` : ''}: ${child.title}`);
+    }
+    if (summary.handoffs.length) {
+      lines.push('handoffs:');
+      for (const handoff of summary.handoffs.slice(-8)) {
+        lines.push(`- #${handoff.id} task #${handoff.task_id || ''} ${handoff.from_peer}${handoff.to_peer ? ` -> ${handoff.to_peer}` : ''}: ${handoff.summary}`);
+      }
+    }
+    return lines.join('\n');
+  });
+}
+
 async function cmdMsg(ctx, args) {
   const sub = args[0];
   if (!sub || wantsHelp(args)) return helpMsg();
   if (sub === 'send') return msgSend(ctx, args.slice(1));
   if (sub === 'inbox') return msgInbox(ctx, args.slice(1));
   if (sub === 'ack') return msgAck(ctx, args.slice(1));
+  if (sub === 'reply') return msgReply(ctx, args.slice(1));
+  if (sub === 'thread') return msgThread(ctx, args.slice(1));
   throw new CliError('BAD_ARGS', `Unknown msg command: ${sub}`);
 }
 
@@ -2494,7 +3392,8 @@ async function msgSend(ctx, args) {
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, null, 'shell');
   const id = sendMessage(db, sender, recipient, taskId, kind, body);
-  printResult(ctx, { id, sender, recipient, task_id: taskId, kind, body }, (data) => `sent message #${data.id} ${data.sender} -> ${data.recipient}`);
+  printResult(ctx, { id, sender, recipient, task_id: taskId, kind, body, reply_to: null, thread_id: id },
+    (data) => `sent message #${data.id} ${data.sender} -> ${data.recipient}`);
 }
 
 async function msgInbox(ctx, args) {
@@ -2517,6 +3416,8 @@ async function msgInbox(ctx, args) {
     { label: 'from', value: (r) => r.sender },
     { label: 'kind', value: (r) => r.kind },
     { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
+    { label: 'reply', value: (r) => r.reply_to ? `#${r.reply_to}` : '' },
+    { label: 'thread', value: (r) => r.thread_id ? `#${r.thread_id}` : '' },
     { label: 'time', value: (r) => iso(r.created_at) },
     { label: 'body', value: (r) => r.body }
   ]));
@@ -2532,13 +3433,73 @@ async function msgAck(ctx, args) {
   touchCurrentPeer(db, ctx, identity, null, 'shell');
   const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
   if (!message) throw new CliError('NOT_FOUND', `Message #${id} does not exist`);
+  ackMessage(db, peer, message);
+  printResult(ctx, { id, peer }, (data) => `acknowledged message #${data.id} for ${data.peer}`);
+}
+
+function ackMessage(db, peer, message) {
   db.prepare(`
     INSERT INTO message_reads(message_id, peer, read_at)
     VALUES (?, ?, ?)
     ON CONFLICT(message_id, peer) DO UPDATE SET read_at = excluded.read_at
-  `).run(id, peer, now());
-  addEvent(db, 'message.ack', peer, message.task_id || null, { message_id: id });
-  printResult(ctx, { id, peer }, (data) => `acknowledged message #${data.id} for ${data.peer}`);
+  `).run(message.id, peer, now());
+  addEvent(db, 'message.ack', peer, message.task_id || null, { message_id: message.id });
+}
+
+async function msgReply(ctx, args) {
+  const opts = parseOpts(args);
+  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
+  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
+  const body = required(opts, 'body');
+  const db = connect(ctx);
+  const original = getMessage(db, id);
+  if (!original) throw new CliError('NOT_FOUND', `Message #${id} does not exist`);
+  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
+  const sender = identity.id;
+  touchCurrentPeer(db, ctx, identity, null, 'shell');
+  const recipient = opts.to || original.sender;
+  const taskId = intOpt(opts, 'task', original.task_id || null);
+  const kind = opts.kind || 'reply';
+  const threadId = original.thread_id || original.id;
+  const replyId = sendMessage(db, sender, recipient, taskId, kind, body, {
+    reply_to: original.id,
+    thread_id: threadId
+  });
+  ackMessage(db, sender, original);
+  printResult(ctx, {
+    id: replyId,
+    sender,
+    recipient,
+    task_id: taskId,
+    kind,
+    body,
+    reply_to: original.id,
+    thread_id: threadId
+  }, (data) => `sent reply #${data.id} to #${data.reply_to} ${data.sender} -> ${data.recipient}`);
+}
+
+async function msgThread(ctx, args) {
+  const opts = parseOpts(args);
+  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
+  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
+  const limit = intOpt(opts, 'limit', 50);
+  const db = connect(ctx);
+  const data = queryMessageThread(db, id, limit);
+  printResult(ctx, data, (thread) => {
+    const lines = [`thread #${thread.thread_id} (${thread.messages.length} message${thread.messages.length === 1 ? '' : 's'})`];
+    for (const message of thread.messages) {
+      const parts = [
+        `#${message.id}`,
+        `${message.sender} -> ${message.recipient || 'all'}`,
+        message.task_id ? `task #${message.task_id}` : '',
+        message.reply_to ? `reply #${message.reply_to}` : '',
+        message.kind || 'note',
+        iso(message.created_at)
+      ].filter(Boolean).join(' ');
+      lines.push(`${parts}\n  ${message.body}`);
+    }
+    return lines.join('\n');
+  });
 }
 
 async function cmdAsk(ctx, args) {
@@ -2626,9 +3587,13 @@ async function peerList(ctx, args) {
     } finally {
       db.close();
     }
-    const rows = (data.sessions || []).map((session) => ({ ...session, binding: bindings.get(session.id) || null }));
+    const rows = (data.sessions || []).map((session) => ({
+      ...session,
+      binding: bindings.get(session.peer_id || session.id) || bindings.get(session.id) || null
+    }));
     printResult(ctx, rows, (items) => table(items, [
       { label: 'id', value: (r) => r.id },
+      { label: 'peer', value: (r) => r.peer_id && r.peer_id !== r.id ? r.peer_id : '' },
       { label: 'kind', value: (r) => r.kind },
       { label: 'role', value: (r) => r.role || '' },
       { label: 'status', value: (r) => r.status },
@@ -2964,6 +3929,46 @@ async function cmdStatus(ctx, args) {
   });
 }
 
+function normalizeStateResources(values) {
+  const list = Array.isArray(values) ? values : [values];
+  return uniqueList(list.flatMap((value) => String(value || '').split(',').map((part) => part.trim())));
+}
+
+async function cmdState(ctx, args) {
+  if (wantsHelp(args)) return helpState();
+  const opts = parseOpts(args, { arrays: ['resource'] });
+  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
+  const peer = identity.id;
+  const resources = normalizeStateResources(opts.resource || opts.resources || []);
+  const snapshot = statusSnapshot(ctx, peer, { resources, intent: opts.intent || null });
+  printResult(ctx, snapshot, (data) => {
+    const automation = data.automation;
+    const lines = [
+      `root: ${data.root}`,
+      `peer: ${peer}`,
+      automation.current_task ? `current task: #${automation.current_task.id} ${automation.current_task.status} ${automation.current_task.title}` : null,
+      `phase: ${automation.phase}`,
+      `next: ${automation.next_action.command || automation.next_action.kind}`,
+      `why: ${automation.next_action.reason}`
+    ].filter(Boolean);
+    if (automation.finish_actions.length) {
+      lines.push('', 'finish actions:');
+      lines.push(...automation.finish_actions.map((action) => `- ${action.command}`));
+    }
+    if (automation.warnings.length) {
+      lines.push('', 'warnings:');
+      lines.push(...automation.warnings.map((warning) => `- ${warning}`));
+    }
+    if (data.timeline.length) {
+      lines.push('', 'timeline:');
+      for (const item of data.timeline.slice(-8)) {
+        lines.push(`- ${iso(item.ts)} ${item.source}:${item.source_id} ${item.title}${item.text ? ` — ${item.text}` : ''}`);
+      }
+    }
+    return lines.join('\n');
+  });
+}
+
 async function cmdPrompt(ctx, args) {
   const opts = parseOpts(args);
   const peer = required(opts, 'peer', 'HCC_PEER');
@@ -2978,11 +3983,13 @@ project uses a flat peer mesh: there is no required main/worker hierarchy.
 Run these commands before changing files:
 
 ${cmd} register --peer ${peer} --kind ${kind} --role ${role}
+${cmd} state --peer ${peer}
 ${cmd} msg inbox --peer ${peer}
 ${cmd} task next --peer ${peer}
 
 Coordination rules:
 - Claim exactly one task before editing.
+- If state shows a current task for ${peer}, continue that task before claiming another pending task.
 - Before editing a file, directory, module, or shared test resource, run:
   ${cmd} lock acquire --peer ${peer} --resource <path-or-module> --task <task-id>
 - If a lock is held by another peer, message that peer instead of editing:
@@ -3340,57 +4347,10 @@ async function cmdDown(ctx, args) {
   printResult(ctx, { runtime: runtime.source || runtime.base_url }, () => `${PRODUCT_NAME} runtime stopped`);
 }
 
-function statusSnapshot(ctx, peer = null) {
+function statusSnapshot(ctx, peer = null, opts = {}) {
   const db = connect(ctx);
   try {
-    const t = now();
-    const peers = db.prepare(`
-      SELECT id, kind, role, status, worktree, branch, pid, capabilities,
-             created_at, last_seen_at, (? - last_seen_at) AS age_sec
-      FROM peers
-      ORDER BY last_seen_at DESC, id ASC
-      LIMIT 200
-    `).all(t);
-    const tasks = queryOpenTasks(db, 200);
-    const locks = db.prepare(`
-      SELECT resource, owner, task_id, reason, expires_at, created_at
-      FROM locks
-      WHERE expires_at > ?
-      ORDER BY resource ASC
-      LIMIT 200
-    `).all(t);
-    const messages = peer
-      ? queryInbox(db, peer, false, 50)
-      : db.prepare(`
-          SELECT id, sender, recipient, task_id, kind, body, created_at
-          FROM messages
-          ORDER BY id DESC
-          LIMIT 50
-        `).all().reverse();
-    const handoffs = db.prepare(`
-      SELECT id, task_id, from_peer, to_peer, summary, changed_files, tests, risks, created_at
-      FROM handoffs
-      ORDER BY id DESC
-      LIMIT 50
-    `).all().reverse();
-    const events = db.prepare(`
-      SELECT id, type, actor, task_id, payload, created_at
-      FROM events
-      ORDER BY id DESC
-      LIMIT 80
-    `).all().reverse();
-    return {
-      root: ctx.root,
-      db: ctx.dbPath,
-      now: t,
-      active_peer_ttl: ACTIVE_PEER_TTL,
-      peers,
-      tasks,
-      locks,
-      messages,
-      handoffs,
-      events
-    };
+    return collectStateSnapshot(db, ctx, peer, opts);
   } finally {
     try {
       db.close();
@@ -3530,6 +4490,14 @@ function webIndexHtml() {
       grid-template-columns: 1fr auto;
       gap: 8px;
       align-items: end;
+    }
+    .start-options {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .start-options label[data-resume-field] {
+      grid-column: 1 / -1;
     }
     .session-header {
       border-bottom: 1px solid var(--border);
@@ -3724,6 +4692,10 @@ function webIndexHtml() {
           <label>New session<select id="kind"><option value="codex">codex</option><option value="claude">claude</option><option value="shell">shell</option></select></label>
           <button class="primary" type="submit">Start</button>
         </div>
+        <div class="start-options">
+          <label>Mode<select id="startMode"><option value="new">new</option><option value="resume">resume</option><option value="last">last</option><option value="continue">continue</option></select></label>
+          <label data-resume-field>Session<input id="resumeArg" placeholder="session id or name"></label>
+        </div>
       </form>
       <div class="session-header">
         <strong>Sessions</strong>
@@ -3862,6 +4834,20 @@ function webIndexHtml() {
       return sessionKindFilter === 'all' || kind === sessionKindFilter;
     }
 
+    function syncStartModeOptions() {
+      const kind = document.getElementById('kind').value;
+      const modeSelect = document.getElementById('startMode');
+      const current = modeSelect.value;
+      const modes = kind === 'claude'
+        ? [['new', 'new'], ['resume', 'resume'], ['continue', 'continue']]
+        : kind === 'codex'
+          ? [['new', 'new'], ['resume', 'resume'], ['last', 'last']]
+          : [['new', 'new']];
+      modeSelect.innerHTML = modes.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('');
+      modeSelect.value = modes.some(([value]) => value === current) ? current : 'new';
+      document.querySelector('[data-resume-field]').style.display = modeSelect.value === 'resume' ? '' : 'none';
+    }
+
     async function loadProjects() {
       const data = await api('/api/projects');
       projects = data.projects || [];
@@ -3903,6 +4889,19 @@ function webIndexHtml() {
       return Number.isFinite(n) ? Math.max(0, Math.round(n)) + 's' : '?';
     }
 
+    function sessionPeerId(session) {
+      return session?.peer_id || session?.id || '';
+    }
+
+    function sessionRuntimeNote(session) {
+      const peerId = sessionPeerId(session);
+      return session?.id && peerId && session.id !== peerId ? 'runtime=' + session.id + ' · ' : '';
+    }
+
+    function managedPeerId(id) {
+      return sessionPeerId(sessions.find((s) => s.id === id)) || id;
+    }
+
     function peerIsActive(peer, basisNow = lastStateNow) {
       const age = Number(peer?.age_sec);
       if (Number.isFinite(age)) return age <= activePeerTtl;
@@ -3911,7 +4910,7 @@ function webIndexHtml() {
       return seen > 0 && (t - seen) <= activePeerTtl;
     }
 
-    function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
+      function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
       const activity = peer?.status || 'unknown';
       const liveness = peerIsActive(peer, basisNow) ? 'active' : 'stale';
       const age = fmtAge(peer?.age_sec);
@@ -3928,13 +4927,34 @@ function webIndexHtml() {
           detail: 'last=' + activity + ' age=' + age + branch
         };
       }
-      return {
-        label: activity,
-        detail: liveness + ' age=' + age + branch
-      };
-    }
+        return {
+          label: activity,
+          detail: liveness + ' age=' + age + branch
+        };
+      }
 
-    document.getElementById('projectSelect').addEventListener('change', (event) => {
+      function bodyPinned(el) {
+        if (!el) return false;
+        return el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+      }
+
+      function renderTimelineItem(item) {
+        const meta = [
+          item.source + ':' + item.source_id,
+          item.task_id ? 'task #' + item.task_id : '',
+          item.thread_id ? 'thread #' + item.thread_id : '',
+          item.direction || '',
+          fmtTime(item.ts)
+        ].filter(Boolean).join(' · ');
+        return \`
+          <div class="item timeline-item">
+            <strong>\${esc(item.title || item.kind || item.source)} <span class="badge">\${esc(item.kind || item.source)}</span></strong>
+            <span>\${esc(meta)}</span>
+            \${item.text ? '<span>' + esc(item.text) + '</span>' : ''}
+          </div>\`;
+      }
+
+      document.getElementById('projectSelect').addEventListener('change', (event) => {
       switchProject(event.target.value).catch(console.error);
     });
     document.getElementById('sessionKindFilter').addEventListener('change', (event) => {
@@ -3959,12 +4979,15 @@ function webIndexHtml() {
       const visibleDetected = detected.filter(kindMatches);
       const filterNote = sessionKindFilter === 'all' ? '' : '<br><br>View filter: ' + esc(sessionKindFilter);
       const manHtml = visibleSessions.length
-        ? visibleSessions.map((s) => \`
+        ? visibleSessions.map((s) => {
+          const peerId = sessionPeerId(s);
+          return \`
           <div class="session \${active === s.id && activeType === 'managed' ? 'active' : ''}" data-id="\${esc(s.id)}" data-type="managed">
-            <div class="row"><strong>\${esc(s.id)}</strong><span class="badge \${esc(s.status)}">\${esc(s.status)}</span></div>
+            <div class="row"><strong>\${esc(peerId)}</strong><span class="badge \${esc(s.status)}">\${esc(s.status)}</span></div>
             <div class="row"><span class="badge">\${esc(s.kind)}</span><span class="badge \${s.type === 'external' || s.type === 'tmux' ? 'warn' : ''}">\${s.type === 'external' ? 'external' : s.type === 'tmux' ? 'tmux' : 'pty'}</span></div>
-            <div class="path">\${esc(s.command)}</div>
-          </div>\`).join('')
+            <div class="path">\${esc(sessionRuntimeNote(s) + (s.command || ''))}</div>
+          </div>\`;
+        }).join('')
         : '<div class="empty">No active sessions.' + filterNote + '<br><br>Start one above<br>or run in any terminal:<br><code>hcc peer start X -- claude</code></div>';
 
       const detHtml = visibleDetected.length
@@ -3999,6 +5022,13 @@ function webIndexHtml() {
       const data = await api('/api/sessions');
       sessions = data.sessions || [];
       renderSections();
+      if (active && activeType === 'managed') {
+        const meta = sessions.find((s) => s.id === active);
+        if (meta) {
+          document.getElementById('activeTitle').textContent = sessionPeerId(meta) || active;
+          document.getElementById('activeMeta').textContent = sessionRuntimeNote(meta) + meta.command + (meta.pane ? ' · ' + meta.pane : '') + ' · ' + (meta.cwd || '');
+        }
+      }
       document.getElementById('connState').textContent = 'online';
     }
 
@@ -4020,76 +5050,100 @@ function webIndexHtml() {
       lastStateNow = Number(data.now || lastStateNow);
       const state = document.getElementById('state');
       const preserveScroll = lastStateRoot === stateRoot;
-      const savedStateScroll = preserveScroll ? state.scrollTop : 0;
-      const savedCardScroll = preserveScroll
-        ? new Map(
-          [...state.querySelectorAll('.state-card[data-section]')].map((card) => [
-            card.dataset.section,
-            card.querySelector('.body')?.scrollTop || 0
-          ])
-        )
-        : new Map();
-      const runtimeById = new Map((sessions || []).map((s) => [s.id, s]));
-      const tasksData = data.tasks || [];
-      const peersData = data.peers || [];
-      const locksData = data.locks || [];
-      const messagesData = data.messages || [];
-      const eventsData = data.events || [];
-      const tasks = tasksData.map((t) => \`
-        <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(t.status)} owner=\${esc(t.owner || '')} assignee=\${esc(t.assignee || '')}</span></div>
-      \`).join('') || '<div class="empty">No tasks.</div>';
-      const peers = peersData.map((a) => {
+        const savedStateScroll = preserveScroll ? state.scrollTop : 0;
+        const savedCardScroll = preserveScroll
+          ? new Map(
+            [...state.querySelectorAll('.state-card[data-section]')].map((card) => [
+              card.dataset.section,
+              {
+                top: card.querySelector('.body')?.scrollTop || 0,
+                pinned: bodyPinned(card.querySelector('.body'))
+              }
+            ])
+          )
+          : new Map();
+        const runtimeById = new Map();
+        for (const session of sessions || []) {
+          runtimeById.set(session.id, session);
+          const peerId = sessionPeerId(session);
+          if (peerId) runtimeById.set(peerId, session);
+        }
+	        const tasksData = data.tasks || [];
+	        const peersData = data.peers || [];
+	        const locksData = data.locks || [];
+	        const messagesData = data.messages || [];
+	        const timelineData = data.timeline || [];
+	        const automation = data.automation || {};
+	        const nextAction = automation.next_action || {};
+        const tasks = tasksData.map((t) => \`
+          <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(t.status)} owner=\${esc(t.owner || '')} assignee=\${esc(t.assignee || '')}</span></div>
+        \`).join('') || '<div class="empty">No tasks.</div>';
+        const peers = peersData.map((a) => {
         const peerRuntime = runtimeById.get(a.id);
         const peerState = peerStateView(a, peerRuntime, data.now);
         return \`
         <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span> <span class="badge \${badgeClass(peerState.label)}">\${esc(peerState.label)}</span></strong><span>\${esc(peerState.detail)}</span></div>
       \`;
-      }).join('') || '<div class="empty">No peers.</div>';
-      const locks = locksData.map((l) => \`
-        <div class="item"><strong>\${esc(l.resource)}</strong><span>owner=\${esc(l.owner)} task=\${l.task_id ? '#' + l.task_id : ''}</span></div>
-      \`).join('') || '<div class="empty">No active locks.</div>';
-      const messages = messagesData.map((m) => \`
-        <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || 'all')}</strong><span>\${esc(m.body)}</span></div>
-      \`).join('') || '<div class="empty">No messages.</div>';
-      const events = eventsData.map((e) => \`
-        <div class="item"><strong>#\${e.id} \${esc(e.type)}</strong><span>\${esc(e.actor || '')} \${e.task_id ? '#' + e.task_id : ''} \${fmtTime(e.created_at)}</span></div>
-      \`).join('') || '<div class="empty">No events.</div>';
-      state.innerHTML = \`
-        <div class="card state-card" data-section="peers"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
-        <div class="card state-card" data-section="tasks"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
-        <div class="card state-card" data-section="locks"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
-        <div class="card state-card" data-section="messages"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
-        <div class="card state-card" data-section="events"><h2>Events <span class="badge">\${eventsData.length}</span></h2><div class="body">\${events}</div></div>
-      \`;
-      state.scrollTop = savedStateScroll;
-      for (const [section, top] of savedCardScroll) {
-        const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
-        if (body) body.scrollTop = top;
+        }).join('') || '<div class="empty">No peers.</div>';
+	        const locks = locksData.map((l) => \`
+	          <div class="item"><strong>\${esc(l.resource)}</strong><span>owner=\${esc(l.owner)} task=\${l.task_id ? '#' + l.task_id : ''}</span></div>
+	        \`).join('') || '<div class="empty">No active locks.</div>';
+	        const messages = messagesData.map((m) => \`
+	          <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || 'all')}\${m.reply_to ? ' reply #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
+	        \`).join('') || '<div class="empty">No messages.</div>';
+	        const timeline = timelineData.map(renderTimelineItem).join('') || '<div class="empty">No timeline items.</div>';
+        const actionLines = [
+          '<div class="item"><strong>' + esc(automation.phase || 'idle') + '</strong><span>' + esc(nextAction.reason || 'No immediate coordination action') + '</span></div>',
+          nextAction.command ? '<div class="item"><strong>next</strong><span class="mono">' + esc(nextAction.command) + '</span></div>' : '',
+          (automation.finish_actions || []).length ? '<div class="item"><strong>finish</strong><span>' + esc(automation.finish_actions.map((a) => a.command).join(' | ')) + '</span></div>' : '',
+          (automation.warnings || []).length ? '<div class="item"><strong>warnings</strong><span>' + esc(automation.warnings.join(' | ')) + '</span></div>' : ''
+        ].filter(Boolean).join('');
+        state.innerHTML = \`
+	          <div class="card state-card" data-section="automation"><h2>Next Action <span class="badge">\${esc(automation.phase || 'idle')}</span></h2><div class="body">\${actionLines}</div></div>
+	          <div class="card state-card" data-section="timeline"><h2>Timeline <span class="badge">\${timelineData.length}</span></h2><div class="body">\${timeline}</div></div>
+	          <div class="card state-card" data-section="messages"><h2>Messages <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
+	          <div class="card state-card" data-section="peers"><h2>Peers <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
+          <div class="card state-card" data-section="tasks"><h2>Tasks <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
+          <div class="card state-card" data-section="locks"><h2>Locks <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
+        \`;
+        state.scrollTop = savedStateScroll;
+        for (const [section, saved] of savedCardScroll) {
+          const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
+          if (!body) continue;
+          if (section === 'timeline' && saved.pinned) body.scrollTop = body.scrollHeight;
+          else body.scrollTop = saved.top;
+        }
+        lastStateRoot = stateRoot;
       }
-      lastStateRoot = stateRoot;
-    }
 
     async function refreshState() {
-      const p = active ? '/api/state?peer=' + encodeURIComponent(active) : '/api/state';
+      const peer = active ? managedPeerId(active) : null;
+      const p = peer ? '/api/state?peer=' + encodeURIComponent(peer) : '/api/state';
       const data = await api(p);
       renderState(data);
     }
 
-    async function refreshDetectedState() {
-      if (!activeDetected) return;
-      const data = await api('/api/state?peer=' + encodeURIComponent(activeDetected));
-      renderState(data);
-    }
+      async function refreshDetectedState() {
+        if (!activeDetected) return;
+        const data = await api('/api/state?peer=' + encodeURIComponent(activeDetected));
+        renderState(data);
+      }
+
+      async function refreshCurrentState() {
+        if (activeType === 'detected') return refreshDetectedState();
+        return refreshState();
+      }
 
     // ── Connect to managed (PTY) session ─────────────────────────────────
     function connectManaged(id) {
       const meta = sessions.find((s) => s.id === id);
+      const peerId = sessionPeerId(meta) || id;
       active = id;
       activeDetected = null;
       activeType = 'managed';
       renderSections();
-      document.getElementById('activeTitle').textContent = id;
-      document.getElementById('activeMeta').textContent = meta ? meta.command + (meta.pane ? ' · ' + meta.pane : '') + ' · ' + (meta.cwd || '') : '';
+      document.getElementById('activeTitle').textContent = peerId;
+      document.getElementById('activeMeta').textContent = meta ? sessionRuntimeNote(meta) + meta.command + (meta.pane ? ' · ' + meta.pane : '') + ' · ' + (meta.cwd || '') : '';
       document.getElementById('terminal').style.display = '';
       document.getElementById('detectedPanel').style.display = 'none';
       document.getElementById('quickBar').style.display = '';
@@ -4181,10 +5235,11 @@ function webIndexHtml() {
         await api('/api/detected/' + encodeURIComponent(peer.id) + '/msg', {
           method: 'POST',
           body: JSON.stringify({ body, from: 'web' })
+          });
+          document.getElementById('detMsg').value = '';
+          await refreshDetectedState();
         });
-        document.getElementById('detMsg').value = '';
-      });
-    }
+      }
 
     // ── Helpers ───────────────────────────────────────────────────────────
     function sendLine(text) {
@@ -4193,11 +5248,18 @@ function webIndexHtml() {
     }
 
     // ── Start session form ────────────────────────────────────────────────
+    document.getElementById('kind').addEventListener('change', syncStartModeOptions);
+    document.getElementById('startMode').addEventListener('change', syncStartModeOptions);
+    syncStartModeOptions();
+
     document.getElementById('startForm').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const payload = {
-        kind: document.getElementById('kind').value
-      };
+      const kind = document.getElementById('kind').value;
+      const mode = document.getElementById('startMode').value;
+      const resume = document.getElementById('resumeArg').value.trim();
+      if (mode === 'resume' && !resume) return;
+      const payload = { kind, mode };
+      if (mode === 'resume') payload.resume = resume;
       const data = await api('/api/sessions', { method: 'POST', body: JSON.stringify(payload) });
       await refreshSessions();
       connectManaged(data.session.id);
@@ -4207,12 +5269,13 @@ function webIndexHtml() {
       button.addEventListener('click', () => {
         if (!active) return;
         const session = sessions.find((s) => s.id === active) || { kind: 'other', role: 'peer' };
+        const peerId = sessionPeerId(session) || active;
         const lines = {
-          register: \`hcc register --peer \${active} --kind \${session.kind || 'other'} --role \${session.role || 'peer'}\`,
-          inbox:    \`hcc msg inbox --peer \${active}\`,
-          next:     \`hcc task next --peer \${active}\`,
-          status:   \`hcc status --peer \${active}\`,
-          heartbeat:\`hcc heartbeat --peer \${active} --renew-locks\`
+          register: \`hcc register --peer \${peerId} --kind \${session.kind || 'other'} --role \${session.role || 'peer'}\`,
+          inbox:    \`hcc msg inbox --peer \${peerId}\`,
+          next:     \`hcc task next --peer \${peerId}\`,
+          status:   \`hcc status --peer \${peerId}\`,
+          heartbeat:\`hcc heartbeat --peer \${peerId} --renew-locks\`
         };
         sendLine(lines[button.dataset.send]);
       });
@@ -4223,9 +5286,9 @@ function webIndexHtml() {
       await api('/api/sessions/' + encodeURIComponent(active) + '/stop', { method: 'POST', body: '{}' });
       await refreshSessions();
     });
-    document.getElementById('refreshBtn').addEventListener('click', () => {
-      Promise.all([refreshSessions(), refreshDetected(), refreshState()]).catch(console.error);
-    });
+      document.getElementById('refreshBtn').addEventListener('click', () => {
+        Promise.all([refreshSessions(), refreshDetected(), refreshCurrentState()]).catch(console.error);
+      });
 
     loadProjects().then(() => Promise.all([refreshSessions(), refreshDetected(), refreshState()])).then(() => {
       // Auto-connect to first running managed session on load
@@ -4306,8 +5369,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return [...sessions.values()].filter((session) => session.root === projectCtx.root);
   }
 
-  function getSession(projectCtx, id) {
-    return sessions.get(sessionKey(projectCtx, id));
+  function getSession(projectCtx, id, db = null) {
+    const direct = sessions.get(sessionKey(projectCtx, id));
+    if (direct) return direct;
+    for (const session of sessionsForProject(projectCtx)) {
+      if (session.peerId === id) return session;
+    }
+    if (db) {
+      for (const session of sessionsForProject(projectCtx)) {
+        if (resolveSessionPeerId(db, session) === id) return session;
+      }
+    }
+    return null;
   }
 
   function knownPeerIds(projectCtx) {
@@ -4350,6 +5423,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     const session = {
       id,
+      peerId: id,
       root: pctx.root,
       ctx: pctx,
       kind: meta.kind || 'external',
@@ -4478,9 +5552,58 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const autoAttachPoller = setInterval(scanAndAttachDetectedPeers, 5000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
-  function serializeSession(session) {
+  function resolveSessionPeerId(db, session) {
+    if (!session) return null;
+    if (!db) return session.peerId || session.id || null;
+
+    if (session.type === 'tmux' && session.pane) {
+      const byTarget = db.prepare(`
+        SELECT peer
+        FROM peer_bindings
+        WHERE runtime_target = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `).get(session.pane);
+      if (byTarget?.peer) {
+        session.peerId = byTarget.peer;
+        return byTarget.peer;
+      }
+    }
+
+    if (session.id) {
+      const byRuntime = db.prepare(`
+        SELECT peer
+        FROM peer_bindings
+        WHERE runtime_session_id = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `).get(session.id);
+      if (byRuntime?.peer) {
+        session.peerId = byRuntime.peer;
+        return byRuntime.peer;
+      }
+
+      const byPeer = db.prepare(`
+        SELECT peer
+        FROM peer_bindings
+        WHERE peer = ?
+        LIMIT 1
+      `).get(session.id);
+      if (byPeer?.peer) {
+        session.peerId = byPeer.peer;
+        return byPeer.peer;
+      }
+    }
+
+    session.peerId = session.peerId || session.id || null;
+    return session.peerId;
+  }
+
+  function serializeSession(session, db = null) {
+    const peerId = resolveSessionPeerId(db, session);
     return {
       id: session.id,
+      peer_id: peerId,
       kind: session.kind,
       role: session.role,
       command: session.command,
@@ -4526,9 +5649,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     sessions.delete(sessionKey(pctx, session.id));
     const db = connect(pctx);
     try {
-      db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run(status, now(), session.id);
-      db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), session.id);
-      addEvent(db, status === 'exited' ? 'tmux.session.exited' : 'tmux.session.detached', session.id, null, {
+      const t = now();
+      const peerId = resolveSessionPeerId(db, session) || session.id;
+      db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id IN (?, ?)').run(status, t, session.id, peerId);
+      db.prepare(`
+        UPDATE peer_bindings
+        SET runtime_target = NULL, updated_at = ?
+        WHERE peer IN (?, ?)
+           OR runtime_session_id = ?
+           OR (? IS NOT NULL AND runtime_target = ?)
+      `).run(t, session.id, peerId, session.id, session.pane || null, session.pane || null);
+      addEvent(db, status === 'exited' ? 'tmux.session.exited' : 'tmux.session.detached', peerId, null, {
+        runtime_session_id: session.id,
         pane: session.pane
       });
     } finally {
@@ -4688,6 +5820,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const captured = tmuxCapturePane(info.pane);
     const session = {
       id,
+      peerId: id,
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -4737,7 +5870,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         capabilities: 'tmux'
       });
       const binding = input.binding || {};
-      upsertCanonicalPeerBinding(db, {
+      const canonical = upsertCanonicalPeerBinding(db, {
         peer: id,
         provider: binding.provider || kind,
         provider_session_id: binding.provider_session_id || null,
@@ -4749,6 +5882,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         runtime_session_id: id,
         runtime_target: info.pane
       }, Boolean(input.force));
+      session.peerId = canonical.peer;
       addEvent(db, 'tmux.session.attached', id, null, { pane: info.pane, command, cwd, pid: info.pid });
     } finally {
       db.close();
@@ -4959,6 +6093,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
     const session = {
       id,
+      peerId: id,
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -4986,7 +6121,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         status: 'running',
         capabilities: 'web-pty'
       });
-      upsertCanonicalPeerBinding(db, {
+      const canonical = upsertCanonicalPeerBinding(db, {
         peer: id,
         provider: input.binding?.provider || kind,
         provider_session_id: input.binding?.provider_session_id || null,
@@ -4997,6 +6132,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         transport: 'web-pty',
         runtime_session_id: id
       }, Boolean(input.force));
+      session.peerId = canonical.peer;
       addEvent(db, 'web.session.started', id, null, { command, cwd, pid: child.pid });
     } finally {
       db.close();
@@ -5021,9 +6157,60 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return session;
   }
 
+  function webSessionBuildOptions(input) {
+    const mode = input.mode || 'new';
+    if (mode === 'new') return {};
+    if (mode === 'resume') {
+      const resume = String(input.resume || '').trim();
+      if (!resume) throw new CliError('BAD_REQUEST', 'resume session required');
+      return { resume };
+    }
+    if (mode === 'last') return { last: true };
+    if (mode === 'continue') return { continue: true };
+    throw new CliError('BAD_REQUEST', `Unsupported session mode: ${mode}`);
+  }
+
+  function webSessionPeerId(projectCtx, kind, opts, input) {
+    if (input.id) return input.id;
+    if (opts.resume) return providerSessionPeerId(kind, opts.resume);
+    return nextProjectSessionId(projectCtx, kind);
+  }
+
+  function normalizeWebSessionInput(input) {
+    const pctx = input.projectCtx || ctx;
+    const kind = input.kind || 'shell';
+    if (!['claude', 'codex', 'shell'].includes(kind)) {
+      throw new CliError('BAD_REQUEST', `Unsupported session kind: ${kind}`);
+    }
+    if (input.command || input.binding) return { ...input, kind, projectCtx: pctx };
+
+    const opts = webSessionBuildOptions(input);
+    if (kind === 'shell' && hasResumeOpts(opts)) {
+      throw new CliError('BAD_REQUEST', 'Resume modes are only supported for codex and claude sessions');
+    }
+    if (kind !== 'claude' && opts.continue) {
+      throw new CliError('BAD_REQUEST', 'continue is only supported for claude sessions');
+    }
+    if (kind !== 'codex' && opts.last) {
+      throw new CliError('BAD_REQUEST', 'last is only supported for codex sessions');
+    }
+
+    const id = webSessionPeerId(pctx, kind, opts, input);
+    const built = buildPeerCommand(id, kind, opts, []);
+    return {
+      ...input,
+      id,
+      kind,
+      command: built.command,
+      binding: built.binding,
+      projectCtx: pctx
+    };
+  }
+
   function startSession(input) {
-    if (input.backend === 'pty') return startPtySession(input);
-    return startTmuxManagedSession(input);
+    const normalized = normalizeWebSessionInput(input);
+    if (normalized.backend === 'pty') return startPtySession(normalized);
+    return startTmuxManagedSession(normalized);
   }
 
   for (const projectCtx of projectContexts.values()) {
@@ -5076,13 +6263,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        sendJson(res, 200, statusSnapshot(reqCtx, url.searchParams.get('peer')));
+        const resources = normalizeStateResources([
+          ...url.searchParams.getAll('resource'),
+          url.searchParams.get('resources') || ''
+        ]);
+        sendJson(res, 200, statusSnapshot(reqCtx, url.searchParams.get('peer'), {
+          resources,
+          intent: url.searchParams.get('intent') || null
+        }));
         return;
       }
       // Detected sessions: peers registered via hooks/watcher but without PTY
       if (req.method === 'GET' && url.pathname === '/api/detected') {
         const db = connect(reqCtx);
         let detected = [];
+        const managedIds = new Set();
         const t = now();
         try {
           detected = db.prepare(`
@@ -5092,11 +6287,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             ORDER BY last_seen_at DESC, id ASC
             LIMIT 100
           `).all(t);
+          for (const session of sessionsForProject(reqCtx)) {
+            managedIds.add(session.id);
+            const peerId = resolveSessionPeerId(db, session);
+            if (peerId) managedIds.add(peerId);
+          }
         } finally {
           db.close();
         }
         // Exclude peers that are already in the managed sessions Map
-        const managedIds = new Set(sessionsForProject(reqCtx).map((s) => s.id));
         sendJson(res, 200, {
           now: t,
           active_peer_ttl: ACTIVE_PEER_TTL,
@@ -5122,7 +6321,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/sessions') {
-        sendJson(res, 200, { sessions: sessionsForProject(reqCtx).map(serializeSession) });
+        const db = connect(reqCtx);
+        try {
+          sendJson(res, 200, {
+            sessions: sessionsForProject(reqCtx).map((session) => serializeSession(session, db))
+          });
+        } finally {
+          db.close();
+        }
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/sessions') {
@@ -5140,7 +6346,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const inputMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/input$/);
       if (req.method === 'POST' && inputMatch) {
         const id = decodeURIComponent(inputMatch[1]);
-        const session = getSession(reqCtx, id);
+        const lookupDb = connect(reqCtx);
+        let session;
+        try {
+          session = getSession(reqCtx, id, lookupDb);
+        } finally {
+          lookupDb.close();
+        }
         if (!session) {
           sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Session not found' } });
           return;
@@ -5165,7 +6377,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const stopMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/);
       if (req.method === 'POST' && stopMatch) {
         const id = decodeURIComponent(stopMatch[1]);
-        const session = getSession(reqCtx, id);
+        const lookupDb = connect(reqCtx);
+        let session;
+        try {
+          session = getSession(reqCtx, id, lookupDb);
+        } finally {
+          lookupDb.close();
+        }
         if (!session) {
           sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Session not found' } });
           return;
@@ -5227,7 +6445,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     const reqCtx = projectFromRequest(req, url);
     const id = decodeURIComponent(match[1]);
-    const session = getSession(reqCtx, id);
+    const lookupDb = connect(reqCtx);
+    let session;
+    try {
+      session = getSession(reqCtx, id, lookupDb);
+    } finally {
+      lookupDb.close();
+    }
     if (!session) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();
@@ -5557,6 +6781,7 @@ Commands:
   heartbeat [--peer ID]        Mark the current peer alive, optionally renew locks
   peers                        List known peers
   status [--peer ID]           Show project coordination state
+  state [--peer ID]            Show timeline and next coordination action
   scan [--register]            Detect existing Claude/Codex sessions
   prompt --peer ID             Print copy/paste session instructions
   run --peer ID -- COMMAND     Register a peer and run a command in this terminal
@@ -5565,6 +6790,7 @@ Commands:
   ask PEER MESSAGE             Send a direct work request to one peer
   broadcast MESSAGE            Send a work request to all peers
   task <subcommand>            Create, list, claim, update, finish tasks
+  team <subcommand>            Plan, start, and inspect explicit task teams
   msg <subcommand>             Send, read, and ack messages
   lock <subcommand>            Acquire, renew, release, and list advisory locks
   handoff <subcommand>         Create and list handoffs
@@ -5588,18 +6814,57 @@ function helpTask() {
 
 Usage:
   ${CLI_NAME} task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
+  ${CLI_NAME} task create --title TEXT --parent N [--team-role ROLE]
   ${CLI_NAME} task list [--status pending|claimed|running|review|blocked|done|abandoned] [--peer ID] [--all]
   ${CLI_NAME} task claim [--peer ID] --id N
-  ${CLI_NAME} task next [--peer ID]
+  ${CLI_NAME} task next [--peer ID] [--force]
   ${CLI_NAME} task update [--peer ID] --id N --status STATUS [--summary TEXT] [--body TEXT] [--to ID]
   ${CLI_NAME} task done [--peer ID] --id N --summary TEXT
 
 Default task list shows all project tasks that are not done or abandoned.
 --peer is an explicit filter; HCC_PEER does not hide other open tasks.
 Messages use per-peer unread ack state; tasks do not.
+task next returns your existing claimed/running/review/blocked task before
+claiming another pending task. Use --force only when intentionally taking
+another pending task.
 
 If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal
 as a stable project-local peer.
+`);
+}
+
+function helpTeam() {
+  console.log(`${CLI_NAME} team
+
+Usage:
+  ${CLI_NAME} team plan --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1]
+  ${CLI_NAME} team start --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1] [--force]
+  ${CLI_NAME} team status --task N
+
+team plan is read-only. team start creates explicit child tasks under the parent
+task and optionally assigns them to workers. It does not silently spawn model
+processes or override the current-task rule.
+workers may be explicit peer ids or kind counts such as codex:2,claude:1.
+`);
+}
+
+function helpState() {
+  console.log(`${CLI_NAME} state
+
+Usage:
+  ${CLI_NAME} state [--peer ID] [--resource PATH] [--intent work|stop|finish]
+
+Shows the current collaboration timeline plus a machine-readable coordination
+state machine. With --json, the response includes automation.next_action.argv so
+agents can execute the suggested hcc command explicitly and leave an audit trail.
+automation.current_task shows the peer's active claimed/running/review/blocked
+task when one exists.
+If a current task looks splittable, automation may suggest hcc team plan; this
+is read-only until hcc team start is run explicitly.
+
+State does not execute coordination actions: it does not ack messages, claim
+tasks, acquire locks, send messages, create handoffs, or mark tasks done. Opening
+state may still perform normal SQLite schema maintenance for known project DBs.
 `);
 }
 
@@ -5640,8 +6905,11 @@ Usage:
   ${CLI_NAME} msg send [--from ID] [--to ID|all] --body TEXT [--task N] [--kind note|task|handoff]
   ${CLI_NAME} msg inbox [--peer ID] [--wait SEC] [--all] [--limit N]
   ${CLI_NAME} msg ack [--peer ID] --id N
+  ${CLI_NAME} msg reply [--from ID] --id N --body TEXT [--to ID] [--kind reply]
+  ${CLI_NAME} msg thread --id N [--limit N]
 
 If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal.
+Use msg reply when answering a message so the response stays in the same thread.
 `);
 }
 
@@ -5905,7 +7173,7 @@ async function cmdHook(ctx, args) {
   if (!peerId) {
     resumeId = providerSession.resumeId || readParentResumeId(kind);
     if (resumeId) {
-      peerId = `${kind}-${sanitizePeerPart(resumeId.slice(0, 8), shortHash(resumeId))}`;
+      peerId = providerSessionPeerId(kind, resumeId);
     }
   }
   if (!peerId) {
@@ -5962,7 +7230,7 @@ async function cmdHook(ctx, args) {
     addEvent(db, `hook.${hookKey}`, peerId, null, { session_id: sessionId, cwd: hookCwd });
 
     if (['sessionstart', 'userpromptsubmit'].includes(hookKey)) {
-      const snapshot = buildHookCoordinationContext(db, peerId);
+      const snapshot = buildHookCoordinationContext(db, hookCtx, peerId);
       ackMessages(db, peerId, snapshot.messages);
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: {
@@ -5971,7 +7239,7 @@ async function cmdHook(ctx, args) {
         }
       }) + '\n');
     } else if (['posttooluse', 'stop'].includes(hookKey)) {
-      const snapshot = buildHookCoordinationContext(db, peerId);
+      const snapshot = buildHookCoordinationContext(db, hookCtx, peerId);
       if (snapshot.messages.length > 0) {
         ackMessages(db, peerId, snapshot.messages);
         process.stdout.write(JSON.stringify({
@@ -6404,6 +7672,7 @@ async function dispatch(ctx, rest) {
   if (command === 'heartbeat') return cmdHeartbeat(ctx, args);
   if (command === 'peers') return cmdPeers(ctx, args);
   if (command === 'status') return cmdStatus(ctx, args);
+  if (command === 'state') return cmdState(ctx, args);
   if (command === 'prompt') return cmdPrompt(ctx, args);
   if (command === 'run') return cmdRun(ctx, args);
   if (command === 'peer') return cmdPeer(ctx, args);
@@ -6411,6 +7680,7 @@ async function dispatch(ctx, rest) {
   if (command === 'ask') return cmdAsk(ctx, args);
   if (command === 'broadcast') return cmdBroadcast(ctx, args);
   if (command === 'task') return cmdTask(ctx, args);
+  if (command === 'team') return cmdTeam(ctx, args);
   if (command === 'msg') return cmdMsg(ctx, args);
   if (command === 'lock') return cmdLock(ctx, args);
   if (command === 'handoff') return cmdHandoff(ctx, args);

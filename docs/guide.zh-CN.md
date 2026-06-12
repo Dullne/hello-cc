@@ -143,6 +143,8 @@ Claude/Codex/普通 shell
 
 - 任务是项目事实。所有 peer 默认都能看到未 `done` 且未 `abandoned` 的任务。
 - 消息是带收件人的邮箱消息。`hcc msg inbox` 默认读取当前 peer 的未读消息，`hcc msg ack` 记录每个 peer 的已读状态。
+- 消息回复有 thread。回复某条消息时使用 `hcc msg reply --id N --body "..."`，
+  查看完整线程时使用 `hcc msg thread --id N`。
 - `ask` 和 `broadcast` 会写入持久消息；加 `--inject` 时，还会把内容实时注入到 Web runtime 已接管的终端。
 - 锁使用 SQLite 事务和 TTL，是协作式冲突避免，不是文件系统强制沙箱。
 
@@ -157,7 +159,8 @@ Claude/Codex/普通 shell
 - 未完成任务
 - 当前 peer 的未读消息
 - 活跃锁
-- 建议执行的 `hcc status`、`hcc peers`、`hcc task list`、`hcc msg inbox`、`hcc lock list`
+- 来自 `hcc state` 的机器可读下一步动作
+- 建议执行的 `hcc status`、`hcc state`、`hcc peers`、`hcc task list`、`hcc msg inbox`、`hcc lock list`
 
 因此，当你在已接入的 Claude/Codex 里问“其他会话在做什么”，模型应该基于 hello-cc 注入的最新状态回答，而不是回答“我无法知道其他会话”。
 
@@ -177,6 +180,13 @@ claude -p 'Do you see hello-cc open tasks?' --debug hooks --debug-file /tmp/hcc-
 ```
 
 debug 日志里应该出现 `Hook UserPromptSubmit ... provided additionalContext`，并包含 `hello-cc coordination` 块。
+
+`hcc state --peer <peer> [--resource PATH]` 会读取同一份协作状态，但不会执行
+确认消息、认领任务、获取锁、发送消息、创建 handoff 或标记完成这类协作动作。
+它返回现有项目数组、统一 `timeline`，以及 `automation` 对象。关键机器字段是
+`automation.next_action.argv`：agent 可以显式执行这条 hcc 命令，让协作流程留下
+可审计记录，而不是只依赖 prompt 里的自然语言规则。`automation.current_task`
+会携带当前 peer 的活动任务，让恢复后的会话继续同一个任务，直到交接、完成或阻塞。
 
 ## Web 控制台
 
@@ -202,7 +212,7 @@ Web 控制台能做这些事：
 
 - 在一个端口里切换多个已注册项目 root
 - 直接在浏览器里注册新的项目路径
-- 查看项目状态：peers、tasks、messages、locks、handoffs、events
+- 查看项目状态：下一步动作、timeline、peers、tasks、locks
 - 操作本地终端：启动 Claude/Codex/shell、发送键盘输入、查看输出、停止接管
 
 Web 操作的是 hello-cc 管理的本机 tmux 终端：
@@ -213,6 +223,7 @@ Web 操作的是 hello-cc 管理的本机 tmux 终端：
 - 通过 `hcc peer attach` 接入的已有 tmux pane
 
 已经打开的普通 raw 终端不能被无条件捕获或控制，除非它原本就在 tmux、screen 或 hello-cc shim 之下。它仍然可以通过 hooks 和 `hcc` 命令参与任务、消息和锁。
+对于这类 coordination-only peer，Web 会通过 Timeline 展示协作轨迹，而不是显示终端流。
 
 ## 命令参考
 
@@ -252,10 +263,34 @@ hcc task next
 hcc lock acquire --resource vllm/router --ttl 900 --reason "实现路由诊断"
 ```
 
+`task next` 会先返回当前 peer 已经认领、运行、审查或阻塞中的任务。只有明确
+要再接一个 pending 任务时，才使用 `hcc task next --force`。
+
+当工作确实可以并行时，用显式团队把父任务拆成子任务：
+
+```bash
+hcc team plan --from-task 12 \
+  --item "docs:更新用户指南" \
+  --item "tests:增加回归测试" \
+  --workers codex:1,claude:1
+
+hcc team start --from-task 12 \
+  --item "docs:更新用户指南" \
+  --item "tests:增加回归测试" \
+  --workers codex:1,claude:1
+
+hcc team status --task 12
+```
+
+`team plan` 是只读命令。`team start` 会创建子任务和分配消息，但不会隐藏地启动
+模型进程。每个 agent 仍然通过普通任务、锁、交接和完成命令处理自己的子任务。
+
 发消息或实时注入：
 
 ```bash
 hcc msg send --to claude-a --body "实现已准备好供审查。"
+hcc msg reply --id 12 --body "已审查，未发现阻塞问题。"
+hcc msg thread --id 12
 hcc ask claude-a "请审查当前实现。" --inject
 hcc broadcast "暂停编辑 vllm/router，等待任务完成。" --inject
 ```

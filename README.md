@@ -32,6 +32,8 @@ doing.
   so agents can answer from current project state.
 - **Conflict avoidance**: advisory locks and handoffs make multi-agent editing
   explicit.
+- **Explicit team splits**: `hcc team plan/start/status` turns one parallel
+  task into auditable child tasks without hidden auto-spawning.
 - **Resume-friendly identity**: resumed Claude/Codex sessions map back to
   stable peers when provider session ids are available.
 - **One console, many projects**: one local Web runtime can switch between

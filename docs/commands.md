@@ -32,6 +32,7 @@ shims, starts or reuses the Web console, and returns the terminal to you. Use
 ```text
 hcc peers
 hcc status [--peer ID]
+hcc state [--peer ID] [--resource PATH] [--intent work|stop|finish]
 hcc scan [--register]
 hcc prompt --peer ID [--kind codex|claude|shell|other] [--role ROLE]
 hcc join --peer ID [--kind codex|claude|shell|other] [--role ROLE]
@@ -41,7 +42,12 @@ hcc run --peer ID --kind codex|claude|shell --role ROLE -- COMMAND [ARGS...]
 ```
 
 Use these commands to inspect live project state, register terminals, and run a
-CLI with `HCC_PEER`, `HCC_ROOT`, and `HCC_DB` set.
+CLI with `HCC_PEER`, `HCC_ROOT`, and `HCC_DB` set. `hcc state` does not execute
+coordination actions such as acking messages, claiming tasks, acquiring locks, or
+creating handoffs. It adds a unified collaboration timeline plus
+`automation.next_action.argv`, a machine-readable next coordination command for
+agents to execute explicitly. `automation.current_task` records the peer's active
+task when one exists.
 
 ## Browser-Controllable Terminals
 
@@ -66,12 +72,16 @@ controlled from the Web console.
 hcc msg send [--from ID] [--to ID|all] --body TEXT [--task N] [--kind note|task|handoff]
 hcc msg inbox [--peer ID] [--wait SEC] [--all] [--limit N]
 hcc msg ack [--peer ID] --id N
+hcc msg reply [--from ID] --id N --body TEXT [--to ID] [--kind reply]
+hcc msg thread --id N [--limit N]
 hcc ask PEER MESSAGE [--from ID] [--task N] [--inject]
 hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
 ```
 
 Messages are addressed mailbox items. `ask` and `broadcast` also support live
-terminal injection with `--inject`.
+terminal injection with `--inject`. Use `msg reply` when answering a specific
+message; the reply stays in the same thread and is sent back to the original
+sender by default. Use `msg thread` to inspect the full thread for one message.
 
 ## Tasks
 
@@ -79,13 +89,30 @@ terminal injection with `--inject`.
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
 hcc task list [--status S] [--peer ID] [--all]
 hcc task claim [--peer ID] --id N
-hcc task next [--peer ID]
+hcc task next [--peer ID] [--force]
+hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
 hcc task done [--peer ID] --id N --summary TEXT
 ```
 
 Tasks are shared project facts. They remain visible until marked `done` or
-`abandoned`.
+`abandoned`. `task next` returns your existing claimed/running/review/blocked
+task before claiming a new pending task; use `--force` only when intentionally
+taking another pending task.
+
+## Teams
+
+```text
+hcc team plan --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1]
+hcc team start --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1] [--force]
+hcc team status --task N
+```
+
+Teams are explicit parent-task splits. `team plan` is read-only and shows the
+subtasks that would be created. `team start` creates child tasks under the
+parent and optionally assigns them to worker peer IDs. It does not silently
+spawn model processes or override the current-task rule. `--workers` accepts
+explicit peer IDs or kind counts such as `codex:2,claude:1`.
 
 ## Locks, Handoffs, And Events
 

@@ -107,7 +107,9 @@ function withMeshDb(fn) {
 
 function providerBindingRows(provider, sessionName) {
   return withMeshDb((db) => db.prepare(`
-    SELECT peer, provider, provider_session_id, provider_session_name, transport, runtime_target
+    SELECT
+      peer, provider, provider_session_id, provider_session_name,
+      resume_mode, resume_arg, command, transport, runtime_target
     FROM peer_bindings
     WHERE provider = ? AND provider_session_name = ?
     ORDER BY peer
@@ -177,6 +179,42 @@ function insertRuntimeTargetBinding(peer, provider, sessionName, runtimeTarget) 
       )
       VALUES (?, ?, NULL, ?, 'resume', ?, ?, 'tmux', ?, ?, ?, ?)
     `).run(peer, provider, sessionName, sessionName, `${provider} resume ${sessionName}`, peer, runtimeTarget, t, t);
+  });
+}
+
+function moveRuntimeBindingPeer(fromPeer, toPeer) {
+  withMeshDb((db) => {
+    const peer = db.prepare('SELECT * FROM peers WHERE id = ?').get(fromPeer);
+    if (!peer) fail(`cannot move missing peer ${fromPeer}`);
+    const binding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(fromPeer);
+    if (!binding) fail(`cannot move missing peer binding ${fromPeer}`);
+    const t = Math.floor(Date.now() / 1000);
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        kind = excluded.kind,
+        role = excluded.role,
+        worktree = excluded.worktree,
+        branch = excluded.branch,
+        pid = excluded.pid,
+        status = excluded.status,
+        capabilities = excluded.capabilities,
+        last_seen_at = excluded.last_seen_at
+    `).run(
+      toPeer,
+      peer.kind,
+      peer.role,
+      peer.worktree,
+      peer.branch,
+      peer.pid,
+      peer.status,
+      peer.capabilities,
+      t,
+      t
+    );
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(toPeer);
+    db.prepare('UPDATE peer_bindings SET peer = ?, updated_at = ? WHERE peer = ?').run(toPeer, t, fromPeer);
   });
 }
 
@@ -280,6 +318,227 @@ function createLegacyBindingDb(dbPath) {
     );
   } finally {
     db.close();
+  }
+}
+
+function createLegacySchemaDb(dbPath) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    const t = Math.floor(Date.now() / 1000) - 3600;
+    db.exec(`
+      CREATE TABLE meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        role TEXT,
+        worktree TEXT,
+        branch TEXT,
+        pid INTEGER,
+        status TEXT NOT NULL DEFAULT 'idle',
+        capabilities TEXT,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE peer_bindings (
+        peer TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_session_id TEXT,
+        provider_session_name TEXT,
+        resume_mode TEXT NOT NULL DEFAULT 'new',
+        resume_arg TEXT,
+        command TEXT,
+        transport TEXT NOT NULL,
+        runtime_session_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        assignee TEXT,
+        owner TEXT,
+        priority INTEGER NOT NULL DEFAULT 100,
+        created_by TEXT,
+        claimed_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        recipient TEXT,
+        task_id INTEGER,
+        kind TEXT NOT NULL DEFAULT 'note',
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE message_reads (
+        message_id INTEGER NOT NULL,
+        peer TEXT NOT NULL,
+        read_at INTEGER NOT NULL,
+        PRIMARY KEY (message_id, peer)
+      );
+
+      CREATE TABLE locks (
+        resource TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        task_id INTEGER,
+        reason TEXT,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE handoffs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER,
+        from_peer TEXT NOT NULL,
+        to_peer TEXT,
+        summary TEXT NOT NULL,
+        changed_files TEXT,
+        tests TEXT,
+        risks TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        actor TEXT,
+        task_id INTEGER,
+        payload TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_tasks_status_priority ON tasks(status, priority, id);
+      CREATE INDEX idx_tasks_owner ON tasks(owner);
+      CREATE INDEX idx_messages_recipient_id ON messages(recipient, id);
+      CREATE INDEX idx_events_id ON events(id);
+      CREATE INDEX idx_locks_expires ON locks(expires_at);
+
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES ('legacy-peer', 'codex', 'peer', '${root.replace(/'/g, "''")}', '', NULL, 'idle', 'legacy', ${t}, ${t});
+      INSERT INTO peer_bindings(peer, provider, provider_session_id, provider_session_name, resume_mode, resume_arg, command, transport, runtime_session_id, created_at, updated_at)
+      VALUES ('legacy-peer', 'codex', NULL, 'legacy-session', 'detected', NULL, NULL, 'detected', 'legacy-peer', ${t}, ${t});
+      INSERT INTO messages(sender, recipient, task_id, kind, body, created_at)
+      VALUES ('legacy-peer', 'all', NULL, 'note', 'legacy-message', ${t});
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function assertLegacySchemaMigration() {
+  const legacyRoot = path.join(os.tmpdir(), `hcc-reg-legacy-schema-root-${testId}`);
+  const legacyDb = path.join(legacyRoot, '.hello-cc', 'mesh.db');
+  try {
+    createLegacySchemaDb(legacyDb);
+    run(process.execPath, [hccBin, '--root', legacyRoot, 'status', '--peer', 'legacy-check'], { env });
+    const db = new DatabaseSync(legacyDb);
+    try {
+      const peerBindingColumns = new Set(db.prepare('PRAGMA table_info(peer_bindings)').all().map((row) => row.name));
+      if (!peerBindingColumns.has('runtime_target')) fail('legacy migration did not add peer_bindings.runtime_target');
+      const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((row) => row.name));
+      for (const column of ['reply_to', 'thread_id']) {
+        if (!messageColumns.has(column)) fail(`legacy migration did not add messages.${column}`);
+      }
+      const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name));
+      for (const column of ['parent_id', 'team_role']) {
+        if (!taskColumns.has(column)) fail(`legacy migration did not add tasks.${column}`);
+      }
+      const message = db.prepare('SELECT id, thread_id FROM messages WHERE body = ?').get('legacy-message');
+      if (!message || message.thread_id !== message.id) {
+        fail(`legacy message thread_id not backfilled:\n${JSON.stringify(message, null, 2)}`);
+      }
+      const metaVersion = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
+      const pragmaVersion = db.prepare('PRAGMA user_version').get().user_version;
+      if (metaVersion !== '4' || pragmaVersion !== 4) {
+        fail(`schema version not synchronized: meta=${metaVersion} pragma=${pragmaVersion}`);
+      }
+      const migrations = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
+      if (migrations.length !== 4 || migrations[3].version !== 4 || migrations[3].name !== 'team task hierarchy') {
+        fail(`schema migrations history wrong:\n${JSON.stringify(migrations, null, 2)}`);
+      }
+    } finally {
+      db.close();
+    }
+  } finally {
+    try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function assertRegisteredProjectDbMigration() {
+  const otherRoot = path.join(os.tmpdir(), `hcc-reg-registered-legacy-root-${testId}`);
+  const otherDb = path.join(otherRoot, '.hello-cc', 'mesh.db');
+  const registryFile = path.join(home, '.hello-cc', 'projects.json');
+  try {
+    createLegacySchemaDb(otherDb);
+    fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+    fs.writeFileSync(registryFile, JSON.stringify({
+      projects: [
+        { root, db: path.join(root, '.hello-cc', 'mesh.db'), name: 'current', last_seen_at: 2 },
+        { root: otherRoot, db: otherDb, name: 'registered-legacy', last_seen_at: 1 }
+      ]
+    }, null, 2));
+    hcc(['status', '--peer', 'registered-migration-check']);
+    const db = new DatabaseSync(otherDb);
+    try {
+      const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name));
+      if (!taskColumns.has('parent_id') || !taskColumns.has('team_role')) {
+        fail(`registered project DB was not migrated:\n${JSON.stringify([...taskColumns], null, 2)}`);
+      }
+      const version = db.prepare('PRAGMA user_version').get().user_version;
+      if (version !== 4) fail(`registered project DB user_version wrong: ${version}`);
+    } finally {
+      db.close();
+    }
+  } finally {
+    try { fs.rmSync(otherRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function assertFutureSchemaMigrationHistoryRejected() {
+  const futureRoot = path.join(os.tmpdir(), `hcc-reg-future-schema-root-${testId}`);
+  const futureDb = path.join(futureRoot, '.hello-cc', 'mesh.db');
+  try {
+    fs.mkdirSync(path.dirname(futureDb), { recursive: true });
+    const db = new DatabaseSync(futureDb);
+    try {
+      db.exec(`
+        CREATE TABLE meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        INSERT INTO meta(key, value) VALUES ('schema_version', '4');
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at INTEGER NOT NULL
+        );
+        INSERT INTO schema_migrations(version, name, applied_at)
+        VALUES (999, 'future migration', 1);
+      `);
+    } finally {
+      db.close();
+    }
+    const result = runMaybe(process.execPath, [hccBin, '--root', futureRoot, 'status', '--peer', 'future-schema-check'], { env });
+    if (result.status === 0 || !`${result.stdout}\n${result.stderr}`.includes('Database schema version 999 is newer than this hcc (4)')) {
+      fail(`future schema migration history was not rejected:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+    }
+  } finally {
+    try { fs.rmSync(futureRoot, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -640,6 +899,9 @@ async function setupRegression() {
   }
   await stopRuntime();
   assertPeerBindingUniqueConstraints();
+  assertLegacySchemaMigration();
+  assertRegisteredProjectDbMigration();
+  assertFutureSchemaMigrationHistoryRejected();
   assertLegacyBindingRepair();
 
   const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
@@ -714,9 +976,71 @@ async function dbWorkflow() {
   if (!inbox.includes('please review')) fail('inbox did not include message');
   const msgMatch = inbox.match(/^#(\d+)/m);
   if (!msgMatch) fail(`cannot parse message id: ${inbox}`);
-  hcc(['msg', 'ack', '--peer', 'claude-a', '--id', msgMatch[1]]);
+  const msgId = msgMatch[1];
+  const reply = hcc(['msg', 'reply', '--from', 'claude-a', '--id', msgId, '--body', 'review reply']);
+  const replyMatch = reply.match(/sent reply #(\d+) to #(\d+)/);
+  if (!replyMatch || replyMatch[2] !== msgId) fail(`cannot parse reply output: ${reply}`);
+  const thread = hcc(['msg', 'thread', '--id', msgId]);
+  if (!thread.includes(`thread #${msgId}`) || !thread.includes('please review') || !thread.includes('review reply')) {
+    fail(`thread output missing original or reply:\n${thread}`);
+  }
+  const replyInbox = hcc(['msg', 'inbox', '--peer', 'codex-a']);
+  if (!replyInbox.includes('review reply') || !replyInbox.includes(`#${msgId}`)) {
+    fail(`reply did not reach original sender inbox with thread context:\n${replyInbox}`);
+  }
+  const stateBeforeAck = hccJson(['state', '--peer', 'codex-a', '--resource', 'src/router']);
+  if (stateBeforeAck.automation?.schema_version !== 1 || stateBeforeAck.automation.phase !== 'reply_message') {
+    fail(`state automation did not prioritize unread reply:\n${JSON.stringify(stateBeforeAck, null, 2)}`);
+  }
+  if (stateBeforeAck.automation.next_action.kind !== 'msg.reply' || !stateBeforeAck.automation.next_action.argv.includes(replyMatch[1])) {
+    fail(`state next action did not target unread reply:\n${JSON.stringify(stateBeforeAck.automation, null, 2)}`);
+  }
+  const timelineIds = new Set((stateBeforeAck.timeline || []).map((item) => item.id));
+  if (!timelineIds.has(`message:${msgId}`) || !timelineIds.has(`message:${replyMatch[1]}`)) {
+    fail(`state timeline missing message thread entries:\n${JSON.stringify(stateBeforeAck.timeline, null, 2)}`);
+  }
+  if ([...(stateBeforeAck.timeline || [])].some((item) => item.kind === 'message.sent' || item.kind === 'message.ack')) {
+    fail(`state timeline includes noisy message events:\n${JSON.stringify(stateBeforeAck.timeline, null, 2)}`);
+  }
+  hcc(['msg', 'ack', '--peer', 'claude-a', '--id', msgId]);
+  hcc(['msg', 'ack', '--peer', 'codex-a', '--id', replyMatch[1]]);
+  const stateAfterAck = hccJson(['state', '--peer', 'codex-a', '--resource', 'src/new-lock']);
+  if (stateAfterAck.automation.next_action.kind !== 'lock.acquire') {
+    fail(`state automation did not suggest lock acquire after ack:\n${JSON.stringify(stateAfterAck.automation, null, 2)}`);
+  }
+  const queuedTask = hcc(['task', 'create', '--from', 'human', '--to', 'codex-a', '--title', 'queued while busy']);
+  const queuedTaskMatch = queuedTask.match(/created task #(\d+):/);
+  if (!queuedTaskMatch) fail(`cannot parse queued task id: ${queuedTask}`);
+  const queuedTaskId = queuedTaskMatch[1];
+  const busyState = hccJson(['state', '--peer', 'codex-a']);
+  if (String(busyState.automation.current_task?.id) !== String(taskId)) {
+    fail(`state did not preserve current task while another task was assigned:\n${JSON.stringify(busyState.automation, null, 2)}`);
+  }
+  if (['task.claim', 'task.next', 'msg.inbox'].includes(busyState.automation.next_action.kind)) {
+    fail(`state let a new assigned task interrupt current work:\n${JSON.stringify(busyState.automation, null, 2)}`);
+  }
+  const busyHookPayload = JSON.stringify({ session_id: 'codex-busy-session', cwd: root, hook_event_name: 'UserPromptSubmit', prompt: 'new user prompt while busy' });
+  const busyHook = hookContext(hcc(['hook', 'userpromptsubmit'], { env: { ...env, HCC_PEER: 'codex-a' }, input: busyHookPayload }), 'UserPromptSubmit');
+  if (!busyHook.includes('[hello-cc current task]') || !busyHook.includes(`#${taskId} running`)) {
+    fail(`hook did not preserve current task while another task was assigned:\n${busyHook}`);
+  }
+  if (busyHook.includes(`hcc task claim --peer codex-a --id ${queuedTaskId}`)) {
+    fail(`hook suggested claiming a new task while current task was active:\n${busyHook}`);
+  }
+  const nextAgain = hcc(['task', 'next', '--peer', 'codex-a']);
+  if (!nextAgain.includes(`current task #${taskId}`)) {
+    fail(`task next did not preserve current task:\n${nextAgain}`);
+  }
+  hcc(['task', 'update', '--peer', 'human', '--id', queuedTaskId, '--status', 'abandoned', '--summary', 'queued task cleanup']);
   hcc(['handoff', 'create', '--from', 'codex-a', '--to', 'claude-a', '--task', taskId, '--summary', 'handoff summary', '--tests', 'full script', '--risks', 'none']);
   if (!hcc(['handoff', 'list', '--task', taskId]).includes('handoff summary')) fail('handoff missing');
+  const stateAfterHandoff = hccJson(['state', '--peer', 'claude-a']);
+  if (!(stateAfterHandoff.timeline || []).some((item) => item.id.startsWith('handoff:') && item.text.includes('handoff summary'))) {
+    fail(`state timeline missing handoff item:\n${JSON.stringify(stateAfterHandoff.timeline, null, 2)}`);
+  }
+  if ((stateAfterHandoff.timeline || []).some((item) => item.kind === 'handoff.created')) {
+    fail(`state timeline includes noisy handoff event:\n${JSON.stringify(stateAfterHandoff.timeline, null, 2)}`);
+  }
   if (!hcc(['status', '--peer', 'codex-a']).includes('codex-a')) fail('status missing peer');
   hcc(['lock', 'release', '--peer', 'codex-a', '--resource', 'src/router']);
   hcc(['task', 'done', '--peer', 'codex-a', '--id', taskId, '--summary', 'done']);
@@ -724,6 +1048,77 @@ async function dbWorkflow() {
   if (hasTask(doneDefaultTasks, taskId)) fail(`done task still shown in default list: #${taskId}`);
   if (!hasTask(hccJson(['task', 'list', '--all']), taskId)) fail(`done task missing from --all list: #${taskId}`);
   if (!hasTask(hccJson(['task', 'list', '--status', 'done']), taskId)) fail(`done task missing from --status done list: #${taskId}`);
+
+  const teamParent = hcc([
+    'task', 'create',
+    '--from', 'human',
+    '--to', 'codex-team-captain',
+    '--title', 'parallel release cleanup',
+    '--body', '- Update docs\n- Add regression\n- Verify migration'
+  ]);
+  const teamParentMatch = teamParent.match(/created task #(\d+):/);
+  if (!teamParentMatch) fail(`cannot parse team parent id: ${teamParent}`);
+  const teamParentId = teamParentMatch[1];
+  hcc(['task', 'claim', '--peer', 'codex-team-captain', '--id', teamParentId]);
+  hcc(['task', 'update', '--peer', 'codex-team-captain', '--id', teamParentId, '--status', 'running', '--summary', 'team captain']);
+  const teamState = hccJson(['state', '--peer', 'codex-team-captain']);
+  if (teamState.automation.phase !== 'team_plan' || teamState.automation.next_action.kind !== 'team.plan') {
+    fail(`state did not suggest team plan for splittable task:\n${JSON.stringify(teamState.automation, null, 2)}`);
+  }
+  const teamPlan = hcc(['team', 'plan', '--from-task', teamParentId, '--item', 'docs:Update docs', '--item', 'tests:Add regression', '--workers', 'codex-worker-a,claude-worker-a']);
+  if (!teamPlan.includes('team plan for task') || !teamPlan.includes('Update docs')) {
+    fail(`team plan output wrong:\n${teamPlan}`);
+  }
+  const kindWorkerPlan = hcc(['team', 'plan', '--from-task', teamParentId, '--item', 'docs:Docs slot', '--item', 'tests:Tests slot', '--workers', 'codex:2']);
+  if (!kindWorkerPlan.includes(`codex-team-${teamParentId}-1`) || !kindWorkerPlan.includes(`codex-team-${teamParentId}-2`)) {
+    fail(`team workers kind-count syntax was not expanded:\n${kindWorkerPlan}`);
+  }
+  const childrenBeforeStart = withMeshDb((db) => db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE parent_id = ?').get(teamParentId).n);
+  if (childrenBeforeStart !== 0) fail(`team plan created children: ${childrenBeforeStart}`);
+  const teamStart = hccJson(['team', 'start', '--from', 'codex-team-captain', '--from-task', teamParentId, '--item', 'docs:Update docs', '--item', 'tests:Add regression', '--workers', 'codex-worker-a,claude-worker-a']);
+  if (teamStart.children.length !== 2) {
+    fail(`team start created wrong child count:\n${JSON.stringify(teamStart, null, 2)}`);
+  }
+  const teamRows = withMeshDb((db) => db.prepare(`
+    SELECT id, title, assignee, parent_id, team_role
+    FROM tasks
+    WHERE parent_id = ?
+    ORDER BY id
+  `).all(teamParentId));
+  if (teamRows.length !== 2 ||
+      teamRows[0].assignee !== 'codex-worker-a' ||
+      teamRows[1].assignee !== 'claude-worker-a' ||
+      teamRows.some((row) => String(row.parent_id) !== String(teamParentId) || !row.team_role)) {
+    fail(`team child rows wrong:\n${JSON.stringify(teamRows, null, 2)}`);
+  }
+  const duplicateTeamStart = hccMaybe(['team', 'start', '--from-task', teamParentId]);
+  if (duplicateTeamStart.status === 0 || !String(duplicateTeamStart.stderr || duplicateTeamStart.stdout).includes('already has')) {
+    fail(`duplicate team start was not rejected:\n${duplicateTeamStart.stdout}\n${duplicateTeamStart.stderr}`);
+  }
+  const teamStatus = hcc(['team', 'status', '--task', teamParentId]);
+  if (!teamStatus.includes('subtasks: 2') || !teamStatus.includes('codex-worker-a')) {
+    fail(`team status output wrong:\n${teamStatus}`);
+  }
+  for (const row of teamRows) {
+    hcc(['task', 'update', '--peer', 'human', '--force', '--id', String(row.id), '--status', 'abandoned', '--summary', 'team regression cleanup']);
+  }
+  hcc(['task', 'done', '--peer', 'codex-team-captain', '--id', teamParentId, '--summary', 'team regression done']);
+
+  const conflictTask = hcc(['task', 'create', '--from', 'human', '--to', 'codex-b', '--title', 'conflict automation task']);
+  const conflictTaskMatch = conflictTask.match(/created task #(\d+):/);
+  if (!conflictTaskMatch) fail(`cannot parse conflict task id: ${conflictTask}`);
+  const conflictTaskId = conflictTaskMatch[1];
+  hcc(['task', 'claim', '--peer', 'codex-b', '--id', conflictTaskId]);
+  hcc(['lock', 'acquire', '--peer', 'codex-a', '--resource', 'src/conflict', '--ttl', '60', '--reason', 'held by other peer']);
+  const conflictState = hccJson(['state', '--peer', 'codex-b', '--resource', 'src/conflict']);
+  if (conflictState.automation.phase !== 'coordinate_lock' || conflictState.automation.next_action.kind !== 'msg.send') {
+    fail(`state automation did not suggest lock coordination:\n${JSON.stringify(conflictState.automation, null, 2)}`);
+  }
+  if (conflictState.automation.next_action.argv.includes('--force')) {
+    fail(`state automation suggested forcing a lock:\n${JSON.stringify(conflictState.automation, null, 2)}`);
+  }
+  hcc(['lock', 'release', '--peer', 'codex-a', '--resource', 'src/conflict']);
+  hcc(['task', 'done', '--peer', 'codex-b', '--id', conflictTaskId, '--summary', 'conflict done']);
 
   const abandoned = hcc(['task', 'create', '--from', 'human', '--title', 'abandoned regression task']);
   const abandonedMatch = abandoned.match(/created task #(\d+):/);
@@ -753,8 +1148,11 @@ async function dbWorkflow() {
   if (!firstHook.includes('[hello-cc known peers]') || !firstHook.includes('do not say sessions are isolated')) {
     fail(`UserPromptSubmit hook missing strong cross-session instruction:\n${firstHook}`);
   }
-  if (!firstHook.includes('hcc task list') || !firstHook.includes('hook-only-message')) {
+  if (!firstHook.includes('hcc task list') || !firstHook.includes('hcc msg reply --id <message-id>') || !firstHook.includes('hook-only-message')) {
     fail(`UserPromptSubmit hook missing instructions or unread message:\n${firstHook}`);
+  }
+  if (!firstHook.includes('[hello-cc next action]') || !firstHook.includes('phase: reply_message') || !firstHook.includes('hcc msg reply')) {
+    fail(`UserPromptSubmit hook missing executable next action:\n${firstHook}`);
   }
   const secondHook = hookContext(hcc(['hook', 'userpromptsubmit'], { env: hookEnv, input: hookPayload }), 'UserPromptSubmit');
   if (!secondHook.includes(`#${hookTaskId} running`)) {
@@ -762,6 +1160,9 @@ async function dbWorkflow() {
   }
   if (secondHook.includes('hook-only-message')) {
     fail(`UserPromptSubmit hook repeated acked unread message:\n${secondHook}`);
+  }
+  if (!secondHook.includes('[hello-cc next action]')) {
+    fail(`UserPromptSubmit hook dropped next action after ack:\n${secondHook}`);
   }
   const sessionHookPayload = JSON.stringify({ session_id: 'claude-hook-session', cwd: root, hook_event_name: 'SessionStart', source: 'resume' });
   const sessionHook = hookContext(hcc(['hook', 'sessionstart'], { env: hookEnv, input: sessionHookPayload }), 'SessionStart');
@@ -784,12 +1185,22 @@ async function dbWorkflow() {
   const autoTaskId = autoTaskMatch[1];
   hcc(['task', 'claim', '--id', autoTaskId], { env: autoEnv });
   hcc(['task', 'update', '--id', autoTaskId, '--status', 'running', '--summary', 'auto running'], { env: autoEnv });
+  const autoState = hccJson(['state'], { env: autoEnv });
+  if (autoState.automation.peer?.id !== autoPeer) {
+    fail(`auto state used wrong peer: ${autoPeer}\n${JSON.stringify(autoState.automation, null, 2)}`);
+  }
+  if (String(autoState.automation.current_task?.id) !== String(autoTaskId)) {
+    fail(`auto state lost current task #${autoTaskId}:\n${JSON.stringify(autoState.automation, null, 2)}`);
+  }
+  if (autoState.automation.next_action.kind === 'task.next') {
+    fail(`auto state suggested task.next while current task was active:\n${JSON.stringify(autoState.automation, null, 2)}`);
+  }
   hcc(['lock', 'acquire', '--resource', 'auto/resource', '--task', autoTaskId, '--ttl', '60'], { env: autoEnv });
   hcc(['lock', 'renew', '--resource', 'auto/resource', '--ttl', '60'], { env: autoEnv });
   hcc(['handoff', 'create', '--summary', 'auto handoff', '--tests', 'auto test', '--risks', 'none'], { env: autoEnv });
   hcc(['lock', 'release', '--resource', 'auto/resource'], { env: autoEnv });
   hcc(['task', 'done', '--id', autoTaskId, '--summary', 'auto done'], { env: autoEnv });
-  const autoEvents = hcc(['event', 'tail', '--limit', '50']);
+  const autoEvents = hcc(['event', 'tail', '--limit', '200']);
   if (!autoEvents.includes('peer.auto_joined') || !autoEvents.includes(autoPeer)) {
     fail(`auto join event missing for ${autoPeer}:\n${autoEvents}`);
   }
@@ -840,8 +1251,17 @@ async function multiProjectWebWorkflow() {
   if (!html.includes('Register Project') || !html.includes('New session') || !html.includes('<strong>Sessions</strong>') || !html.includes('<label>View<select')) {
     fail('web form missing simplified project/session controls');
   }
+  if (!html.includes('id="startMode"') || !html.includes('id="resumeArg"') || !html.includes('syncStartModeOptions') || !html.includes("mode === 'resume'")) {
+    fail('web form missing provider resume controls');
+  }
   if (!html.includes('state-card') || !html.includes('peerStateView') || !html.includes('savedCardScroll') || !html.includes('lastStateRoot') || !html.includes('data-section="peers"')) {
     fail('web state panel missing scrollable peer state UI');
+  }
+  if (!html.includes('data-section="timeline"') || !html.includes('renderTimelineItem') || !html.includes('bodyPinned') || !html.includes('refreshCurrentState')) {
+    fail('web state panel missing collaboration timeline or refresh routing');
+  }
+  if (!html.includes('data-section="messages"') || !html.includes('Messages <span class="badge">')) {
+    fail('web state panel missing dedicated messages card');
   }
 
   if (!tmuxAvailable()) return;
@@ -859,6 +1279,93 @@ async function multiProjectWebWorkflow() {
   }
   if (!(otherSessions.sessions || []).some((s) => s.id === 'other-shell')) {
     fail(`second project API did not see its session:\n${JSON.stringify(otherSessions)}`);
+  }
+
+  const startProvider = async (payload) => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        env: {
+          HOME: home,
+          PATH: env.PATH,
+          SHELL: process.env.SHELL || 'bash',
+          HCC_FAKE_STAY_ALIVE: '1'
+        },
+        ...payload
+      })
+    });
+    const json = await response.json();
+    if (!response.ok) fail(`web provider session start failed: ${JSON.stringify(json)}`);
+    return json.session;
+  };
+  const stopSession = async (id) => {
+    await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(id)}/stop?root=${encodeURIComponent(root)}`, { method: 'POST' });
+  };
+
+  const claudeResumeName = `web-claude-resume-${testId}`;
+  const claudeResume = await startProvider({ kind: 'claude', mode: 'resume', resume: claudeResumeName });
+  const expectedClaudePeer = `claude-${claudeResumeName.slice(0, 8)}`;
+  if (!claudeResume.command.includes(`claude --resume ${claudeResumeName}`)) {
+    fail(`web claude resume command wrong:\n${JSON.stringify(claudeResume, null, 2)}`);
+  }
+  if (claudeResume.id !== expectedClaudePeer || claudeResume.peer_id !== expectedClaudePeer) {
+    fail(`web claude resume did not use canonical provider peer id ${expectedClaudePeer}:\n${JSON.stringify(claudeResume, null, 2)}`);
+  }
+  const claudeRows = providerBindingRows('claude', claudeResumeName);
+  if (claudeRows.length !== 1 ||
+      claudeRows[0].peer !== claudeResume.peer_id ||
+      claudeRows[0].resume_mode !== 'resume' ||
+      claudeRows[0].resume_arg !== claudeResumeName ||
+      claudeRows[0].transport !== 'tmux' ||
+      !claudeRows[0].runtime_target) {
+    fail(`web claude resume binding wrong:\n${JSON.stringify(claudeRows, null, 2)}`);
+  }
+  await stopSession(claudeResume.id);
+
+  const codexResumeName = `web-codex-resume-${testId}`;
+  const codexResume = await startProvider({ kind: 'codex', mode: 'resume', resume: codexResumeName });
+  const expectedCodexPeer = `codex-${codexResumeName.slice(0, 8)}`;
+  if (!codexResume.command.includes(`codex resume ${codexResumeName}`)) {
+    fail(`web codex resume command wrong:\n${JSON.stringify(codexResume, null, 2)}`);
+  }
+  if (codexResume.id !== expectedCodexPeer || codexResume.peer_id !== expectedCodexPeer) {
+    fail(`web codex resume did not use canonical provider peer id ${expectedCodexPeer}:\n${JSON.stringify(codexResume, null, 2)}`);
+  }
+  const codexRows = providerBindingRows('codex', codexResumeName);
+  if (codexRows.length !== 1 ||
+      codexRows[0].peer !== codexResume.peer_id ||
+      codexRows[0].resume_mode !== 'resume' ||
+      codexRows[0].resume_arg !== codexResumeName ||
+      codexRows[0].transport !== 'tmux' ||
+      !codexRows[0].runtime_target) {
+    fail(`web codex resume binding wrong:\n${JSON.stringify(codexRows, null, 2)}`);
+  }
+  await stopSession(codexResume.id);
+  const codexRowsAfterStop = providerBindingRows('codex', codexResumeName);
+  if (codexRowsAfterStop.length !== 1 || codexRowsAfterStop[0].peer !== expectedCodexPeer) {
+    fail(`web codex resume binding was not stable after stop:\n${JSON.stringify(codexRowsAfterStop, null, 2)}`);
+  }
+
+  const codexLast = await startProvider({ kind: 'codex', mode: 'last' });
+  if (codexLast.command !== 'codex resume --last') {
+    fail(`web codex last command wrong:\n${JSON.stringify(codexLast, null, 2)}`);
+  }
+  await stopSession(codexLast.id);
+
+  const claudeContinue = await startProvider({ kind: 'claude', mode: 'continue' });
+  if (claudeContinue.command !== 'claude --continue') {
+    fail(`web claude continue command wrong:\n${JSON.stringify(claudeContinue, null, 2)}`);
+  }
+  await stopSession(claudeContinue.id);
+
+  const badShellResume = await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'shell', mode: 'resume', resume: 'not-supported' })
+  });
+  if (badShellResume.ok) {
+    fail('web shell resume was accepted');
   }
 
   const startAuto = async () => {
@@ -907,6 +1414,23 @@ async function tmuxBackedStartWorkflow() {
   const restoredFile = path.join(outDir, 'pty-restored-ok');
   hcc(['inject', 'shell-a', `echo PTY_RESTORED_OK > ${restoredFile}`]);
   await waitForFile(restoredFile, 'PTY_RESTORED_OK', 'tmux restore injection');
+
+  const aliasPeer = 'shell-canonical-alias';
+  parsePane(hcc(['peer', 'start', 'shell-runtime-alias', '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
+  moveRuntimeBindingPeer('shell-runtime-alias', aliasPeer);
+  const aliasSessions = await (await fetch(`http://127.0.0.1:${port}/api/sessions?root=${encodeURIComponent(root)}`)).json();
+  const aliasSession = (aliasSessions.sessions || []).find((session) => session.id === 'shell-runtime-alias');
+  if (!aliasSession || aliasSession.peer_id !== aliasPeer) {
+    fail(`sessions API did not expose canonical peer id for runtime alias:\n${JSON.stringify(aliasSessions, null, 2)}`);
+  }
+  const aliasDetected = await (await fetch(`http://127.0.0.1:${port}/api/detected?root=${encodeURIComponent(root)}`)).json();
+  if ((aliasDetected.detected || []).some((peer) => peer.id === aliasPeer || peer.id === 'shell-runtime-alias')) {
+    fail(`detected API showed managed runtime/canonical duplicate:\n${JSON.stringify(aliasDetected, null, 2)}`);
+  }
+  const aliasFile = path.join(outDir, 'runtime-alias-ok');
+  hcc(['inject', aliasPeer, `echo RUNTIME_ALIAS_OK > ${aliasFile}`]);
+  await waitForFile(aliasFile, 'RUNTIME_ALIAS_OK', 'canonical peer injection to runtime alias');
+  hcc(['peer', 'stop', aliasPeer]);
 
   const canonicalSession = 'canonical-session';
   insertStaleProviderBinding('claude-stale-canonical', 'claude', canonicalSession);
@@ -1173,8 +1697,32 @@ function syntaxAndHelp() {
   if (!mainHelp.includes('  update                       Update the global npm install of hello-cc')) {
     fail(`main help missing update command:\n${mainHelp}`);
   }
+  if (!mainHelp.includes('  state [--peer ID]            Show timeline and next coordination action')) {
+    fail(`main help missing state command:\n${mainHelp}`);
+  }
+  if (!mainHelp.includes('  team <subcommand>            Plan, start, and inspect explicit task teams')) {
+    fail(`main help missing team command:\n${mainHelp}`);
+  }
   if (!mainHelp.includes('  uninstall                    Remove hooks, shims, and optional project data')) {
     fail(`main help missing uninstall command:\n${mainHelp}`);
+  }
+  const msgHelp = run(process.execPath, [hccBin, 'msg', '--help']);
+  if (!msgHelp.includes('msg reply') || !msgHelp.includes('msg thread')) {
+    fail(`msg help missing reply/thread commands:\n${msgHelp}`);
+  }
+  const taskHelp = run(process.execPath, [hccBin, 'task', '--help']);
+  if (!taskHelp.includes('task next [--peer ID] [--force]') ||
+      !taskHelp.includes('existing claimed/running/review/blocked task') ||
+      !taskHelp.includes('task create --title TEXT --parent N')) {
+    fail(`task help missing current-task task next semantics:\n${taskHelp}`);
+  }
+  const teamHelp = run(process.execPath, [hccBin, 'team', '--help']);
+  if (!teamHelp.includes('hcc team') || !teamHelp.includes('team plan') || !teamHelp.includes('team start') || !teamHelp.includes('team status')) {
+    fail(`team help missing expected content:\n${teamHelp}`);
+  }
+  const stateHelp = run(process.execPath, [hccBin, 'state', '--help']);
+  if (!stateHelp.includes('hcc state') || !stateHelp.includes('automation.next_action.argv') || !stateHelp.includes('automation.current_task') || !stateHelp.includes('hcc team plan')) {
+    fail(`state help missing expected content:\n${stateHelp}`);
   }
   const updateHelp = run(process.execPath, [hccBin, 'update', '--help']);
   if (!updateHelp.includes('hcc update') || !updateHelp.includes('npm install -g @logicseek/hello-cc@TAG')) {
@@ -1200,7 +1748,7 @@ function syntaxAndHelp() {
   if (runHelp.includes('--web-managed')) fail(`run help exposes removed --web-managed:\n${runHelp}`);
   const subcommandHelpCases = [
     ['task', 'done', 'hcc task done'],
-    ['msg', 'ack', 'hcc msg ack'],
+    ['msg', 'reply', 'hcc msg reply'],
     ['peer', 'attach', 'peer attach'],
     ['lock', 'release', 'hcc lock release'],
     ['handoff', 'create', 'hcc handoff create'],

@@ -119,7 +119,9 @@ Messages:
 ```text
 from peer
 to peer | all | tag:<tag> | task:<task-id>
-kind note | ask | handoff | system
+kind note | ask | reply | handoff | system
+reply_to optional source message id
+thread_id root message id for threaded collaboration history
 delivery store-only | inject-terminal | both
 ```
 
@@ -128,10 +130,28 @@ Tasks:
 ```text
 pending -> claimed -> running -> review/block/done|abandoned
 owner is dynamic; there is no fixed dispatcher
+parent_id/team_role record explicit team child tasks
 ```
 
 Default task reads are lifecycle-based: all peers see tasks until they are
 `done` or `abandoned`. Read/ack state exists only for messages.
+
+`hcc team plan` is read-only. `hcc team start` creates child tasks under the
+parent and assignment messages; it does not spawn hidden agents or bypass the
+normal claim/lock/handoff protocol.
+
+State:
+
+```text
+hcc state / /api/state
+timeline derived from messages, handoffs, tasks, locks, and selected events
+automation.next_action.argv suggests the next explicit hcc command
+automation.current_task preserves sticky task context across prompts
+```
+
+State inspection does not perform coordination actions such as acking messages,
+claiming tasks, acquiring locks, sending messages, creating handoffs, or marking
+tasks done. Opening a DB may still run schema/version maintenance.
 
 Locks:
 

@@ -157,6 +157,8 @@ Tasks and messages have different read semantics:
   `abandoned`.
 - Messages are addressed mailbox items. `hcc msg inbox` defaults to unread
   messages for the current peer, and `hcc msg ack` records per-peer read state.
+- Message replies are threaded. Use `hcc msg reply --id N --body "..."` when
+  answering a message, and use `hcc msg thread --id N` to read the full thread.
 - `ask` and `broadcast` write durable messages. With `--inject`, they also send
   live input to runtime-attached terminals.
 - Locks use SQLite transactions and TTLs. They are coordination locks, not a
@@ -175,8 +177,9 @@ into the model context:
 - open tasks
 - unread messages for the current peer
 - active locks
-- suggested commands such as `hcc status`, `hcc peers`, `hcc task list`,
-  `hcc msg inbox`, and `hcc lock list`
+- a machine-readable next action from `hcc state`
+- suggested commands such as `hcc status`, `hcc state`, `hcc peers`,
+  `hcc task list`, `hcc msg inbox`, and `hcc lock list`
 
 When an attached Claude/Codex session is asked what other sessions are doing,
 it should answer from the latest hello-cc state instead of generic isolation
@@ -202,6 +205,17 @@ claude -p 'Do you see hello-cc open tasks?' --debug hooks --debug-file /tmp/hcc-
 The debug log should contain `Hook UserPromptSubmit ... provided
 additionalContext` and the `hello-cc coordination` block.
 
+`hcc state --peer <peer> [--resource PATH]` exposes the same coordination state
+without performing coordination actions such as acking messages, claiming tasks,
+acquiring locks, sending messages, creating handoffs, or marking tasks done. It
+returns the existing project arrays plus a unified `timeline` and an
+`automation` object. The important machine field is
+`automation.next_action.argv`: agents can execute that explicit hcc command, so
+the coordination flow becomes auditable instead of being only a prompt
+instruction. `automation.current_task` carries the peer's active task so a
+resumed session keeps working on the same task until it is handed off, done, or
+blocked.
+
 ## Web Console
 
 Start local and LAN-visible control:
@@ -226,7 +240,7 @@ The web console can:
 
 - switch between multiple registered project roots on one port
 - register another project path from the browser
-- show project state: peers, tasks, messages, locks, handoffs, events
+- show project state: next action, timeline, peers, tasks, and locks
 - operate local terminals: start Claude/Codex/shell, send keyboard input, view
   output, detach runtime control
 
@@ -240,6 +254,8 @@ Browser-controlled sessions are local tmux terminals:
 Already-open raw terminals cannot be captured or controlled unconditionally
 unless they started under tmux, screen, or a hello-cc shim. They can still
 participate in tasks, messages, and locks through hooks and `hcc` commands.
+For these coordination-only peers, the Web console shows collaboration through
+the Timeline rather than a terminal stream.
 
 ## Command Reference
 
@@ -281,10 +297,35 @@ hcc task next
 hcc lock acquire --resource vllm/router --ttl 900 --reason "implement diagnostics"
 ```
 
+`task next` first returns the peer's current claimed/running/review/blocked task.
+Use `hcc task next --force` only when intentionally taking another pending task.
+
+Split a task into an explicit team when the work is genuinely parallel:
+
+```bash
+hcc team plan --from-task 12 \
+  --item "docs:Update user guide" \
+  --item "tests:Add regression" \
+  --workers codex:1,claude:1
+
+hcc team start --from-task 12 \
+  --item "docs:Update user guide" \
+  --item "tests:Add regression" \
+  --workers codex:1,claude:1
+
+hcc team status --task 12
+```
+
+`team plan` is read-only. `team start` creates child tasks and assignment
+messages, but it does not spawn hidden model processes. Agents still claim,
+lock, hand off, and finish their own child tasks through the normal commands.
+
 Message or inject:
 
 ```bash
 hcc msg send --to claude-a --body "Implementation is ready for review."
+hcc msg reply --id 12 --body "Reviewed; no blocker found."
+hcc msg thread --id 12
 hcc ask claude-a "Please review the current implementation." --inject
 hcc broadcast "Pause edits under vllm/router until this task finishes." --inject
 ```

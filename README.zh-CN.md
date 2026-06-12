@@ -23,6 +23,8 @@
 - **Web 控制真实终端**：浏览器 attach 到和本地终端相同的 tmux pane，不是浏览器里另开的临时 shell。
 - **Claude/Codex 感知项目状态**：hooks 会在模型回答前注入实时 `hcc` 状态。
 - **减少编辑冲突**：通过 advisory lock 和 handoff 显式协调多 agent 修改。
+- **显式团队拆分**：`hcc team plan/start/status` 可以把一个并行任务拆成可审计
+  子任务，不会隐藏地自动启动进程。
 - **resume 友好的稳定身份**：当 provider 暴露 session id 时，恢复会话会映射回稳定 peer。
 - **一个控制台管理多个项目**：单个本地 Web runtime 可以在多个 project root 之间切换。
 
