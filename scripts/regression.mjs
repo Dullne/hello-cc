@@ -473,6 +473,31 @@ async function expectWebSocketMarker(peer, marker) {
   });
 }
 
+async function expectResizeReplaceSnapshot(peer, marker) {
+  await new Promise((resolve, reject) => {
+    let sawSnapshot = false;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal/${encodeURIComponent(peer)}`);
+    const timer = setTimeout(() => reject(new Error(`${peer} resize replace timeout`)), 5000);
+    ws.on('open', () => {
+      const result = hccMaybe(['inject', peer, `echo ${marker}`]);
+      if (result.status !== 0) reject(new Error(result.stderr || result.stdout || 'inject failed'));
+    });
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw));
+      if (msg.type === 'snapshot') {
+        sawSnapshot = true;
+        ws.send(JSON.stringify({ type: 'resize', cols: 96, rows: 28 }));
+      }
+      if (sawSnapshot && msg.type === 'replace' && String(msg.data || '').includes(marker)) {
+        clearTimeout(timer);
+        ws.close();
+        resolve();
+      }
+    });
+    ws.on('error', reject);
+  });
+}
+
 function tmuxStreamNodes() {
   const dir = path.join(root, '.hello-cc', 'bufs');
   if (!fs.existsSync(dir)) return [];
@@ -871,6 +896,7 @@ async function tmuxBackedStartWorkflow() {
   hcc(['inject', 'shell-a', `echo PTY_OK > ${file}`]);
   await waitForFile(file, 'PTY_OK', 'pty injection');
   await expectWebSocketMarker('shell-a', 'WS_PTY_OK');
+  await expectResizeReplaceSnapshot('shell-a', 'WS_RESIZE_OK');
   await expectBoundedTmuxStream('tmux-backed FIFO stream');
 
   await stopRuntime();

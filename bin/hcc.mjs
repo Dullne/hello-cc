@@ -4107,7 +4107,7 @@ function webIndexHtml() {
         // The server streams the tmux pane's raw output, so xterm renders
         // incrementally (no reset/redraw → no flicker) and the program's own
         // escape sequences carry the cursor.
-        if (msg.type === 'snapshot') { term.write(msg.data || '', () => { term.scrollToBottom(); }); }
+        if (msg.type === 'snapshot') { term.reset(); term.write(msg.data || '', () => { term.scrollToBottom(); }); }
         if (msg.type === 'data') { term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
         if (msg.type === 'replace') { term.reset(); term.write(msg.data || '', pinned ? () => { term.scrollToBottom(); } : undefined); }
         if (msg.type === 'exit') { refreshSessions().catch(console.error); }
@@ -4535,6 +4535,30 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       (payload.visible ? '[?25h' : '[?25l');
   }
 
+  function tmuxSnapshot(session) {
+    const captured = tmuxCapturePane(session.pane);
+    return captured + cursorEscape(tmuxCursorPayload(captured, tmuxCursorInfo(session.pane)));
+  }
+
+  function refreshTmuxSnapshot(session) {
+    if (session.type !== 'tmux' || !session.pane) return session.buffer || '';
+    try {
+      session.buffer = tmuxSnapshot(session);
+    } catch {
+      // Keep the previous buffer if the pane disappears during capture.
+    }
+    return session.buffer || '';
+  }
+
+  function scheduleTmuxReplace(session) {
+    if (session.type !== 'tmux' || !session.pane) return;
+    if (session.replaceTimer) clearTimeout(session.replaceTimer);
+    session.replaceTimer = setTimeout(() => {
+      session.replaceTimer = null;
+      broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
+    }, 80);
+  }
+
   // Stream the tmux pane's RAW output (escape sequences and all) into the
   // browser via `tmux pipe-pane`, so xterm.js renders incrementally — no
   // screenshot-poll, no full-screen reset, no flicker — and the program's own
@@ -4547,8 +4571,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     // Capture the existing screen once for the initial paint; pipe-pane only
     // forwards output produced after it is enabled.
     try {
-      const captured = tmuxCapturePane(session.pane);
-      session.buffer = captured + cursorEscape(tmuxCursorPayload(captured, tmuxCursorInfo(session.pane)));
+      session.buffer = tmuxSnapshot(session);
     } catch {}
 
     // Use a FIFO rather than an append-only regular file. The old file-backed
@@ -4612,6 +4635,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   function stopTmuxStream(session) {
     if (session.streamPoller) { clearInterval(session.streamPoller); session.streamPoller = null; }
+    if (session.replaceTimer) { clearTimeout(session.replaceTimer); session.replaceTimer = null; }
     // Turn piping back off for this pane (no command toggles it off).
     try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
     if (session.streamFd !== null && session.streamFd !== undefined) {
@@ -5202,7 +5226,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       session.clients.add(ws);
-      ws.send(JSON.stringify({ type: 'snapshot', data: session.buffer }));
+      ws.send(JSON.stringify({ type: 'snapshot', data: refreshTmuxSnapshot(session) }));
       ws.on('message', (raw) => {
         try {
           const msg = JSON.parse(String(raw));
@@ -5213,6 +5237,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             const cols = Math.max(20, Number.parseInt(msg.cols || 100, 10));
             const rows = Math.max(8, Number.parseInt(msg.rows || 30, 10));
             resizeSession(session, cols, rows);
+            scheduleTmuxReplace(session);
           }
         } catch {
           // Ignore malformed terminal frames.
