@@ -16,7 +16,7 @@ const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
 async function loadDiscover() { return import(path.join(_libDir, 'discover.mjs')); }
 async function loadSetup()    { return import(path.join(_libDir, 'setup.mjs')); }
 
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 const PRODUCT_NAME = 'hello-cc';
 const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = '@logicseek/hello-cc';
@@ -3186,44 +3186,7 @@ async function taskNext(ctx, args) {
   const peer = identity.id;
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const task = tx(db, () => {
-    if (!opts.force) {
-      const current = db.prepare(`
-        SELECT * FROM tasks
-        WHERE owner = ?
-          AND status IN ('claimed', 'running', 'review', 'blocked')
-        ORDER BY
-          CASE status
-            WHEN 'running' THEN 0
-            WHEN 'claimed' THEN 1
-            WHEN 'review' THEN 2
-            WHEN 'blocked' THEN 3
-            ELSE 4
-          END,
-          priority ASC,
-          id ASC
-        LIMIT 1
-      `).get(peer);
-      if (current) return { ...current, current: true };
-    }
-    const row = db.prepare(`
-      SELECT * FROM tasks
-      WHERE status = 'pending'
-        AND owner IS NULL
-        AND (assignee IS NULL OR assignee = ?)
-      ORDER BY CASE WHEN assignee = ? THEN 0 ELSE 1 END, priority ASC, id ASC
-      LIMIT 1
-    `).get(peer, peer);
-    if (!row) return null;
-    const t = now();
-    db.prepare(`
-      UPDATE tasks
-      SET owner = ?, status = 'claimed', claimed_at = ?, updated_at = ?
-      WHERE id = ? AND owner IS NULL AND status = 'pending'
-    `).run(peer, t, t, row.id);
-    addEvent(db, 'task.claimed', peer, row.id, { next: true });
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
-  });
+  const task = claimNextTaskForPeer(db, peer, Boolean(opts.force));
   printResult(ctx, task, (data) => {
     if (!data) return 'no pending task';
     return data.current
@@ -4009,36 +3972,46 @@ async function cmdStatus(ctx, args) {
   const opts = parseOpts(args);
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
+  const data = statusSummary(ctx, peer, identity);
+  printResult(ctx, data, (s) => renderStatusSummary(s, peer));
+}
+
+function statusSummary(ctx, peer = null, identity = null) {
   const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const t = now();
-  const activePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at >= ?').get(t - ACTIVE_PEER_TTL).n;
-  const stalePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at < ?').get(t - ACTIVE_PEER_TTL).n;
-  const taskRows = db.prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY status').all();
-  const locks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at > ?').get(t).n;
-  const unread = peer ? queryInbox(db, peer, false, 1000).length : null;
-  const recent = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 8').all().reverse();
-  const data = { root: ctx.root, db: ctx.dbPath, active_peers: activePeers, stale_peers: stalePeers, tasks: taskRows, active_locks: locks, unread, recent_events: recent };
-  printResult(ctx, data, (s) => {
-    const taskSummary = s.tasks.length ? s.tasks.map((r) => `${r.status}:${r.n}`).join(', ') : 'none';
-    return [
-      `root: ${s.root}`,
-      `db: ${s.db}`,
-      `peers: active=${s.active_peers}, stale=${s.stale_peers}`,
-      `tasks: ${taskSummary}`,
-      `locks: active=${s.active_locks}`,
-      peer ? `inbox(${peer}): unread=${s.unread}` : null,
-      '',
-      'recent events:',
-      table(s.recent_events, [
-        { label: 'id', value: (r) => `#${r.id}` },
-        { label: 'type', value: (r) => r.type },
-        { label: 'actor', value: (r) => r.actor || '' },
-        { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-        { label: 'time', value: (r) => iso(r.created_at) }
-      ])
-    ].filter((line) => line !== null).join('\n');
-  });
+  try {
+    if (identity) touchCurrentPeer(db, ctx, identity, null, 'shell');
+    const t = now();
+    const activePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at >= ?').get(t - ACTIVE_PEER_TTL).n;
+    const stalePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at < ?').get(t - ACTIVE_PEER_TTL).n;
+    const taskRows = db.prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY status').all();
+    const locks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at > ?').get(t).n;
+    const unread = peer ? queryInbox(db, peer, false, 1000).length : null;
+    const recent = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 8').all().reverse();
+    return { root: ctx.root, db: ctx.dbPath, active_peers: activePeers, stale_peers: stalePeers, tasks: taskRows, active_locks: locks, unread, recent_events: recent };
+  } finally {
+    db.close();
+  }
+}
+
+function renderStatusSummary(s, peer = null) {
+  const taskSummary = s.tasks.length ? s.tasks.map((r) => `${r.status}:${r.n}`).join(', ') : 'none';
+  return [
+    `root: ${s.root}`,
+    `db: ${s.db}`,
+    `peers: active=${s.active_peers}, stale=${s.stale_peers}`,
+    `tasks: ${taskSummary}`,
+    `locks: active=${s.active_locks}`,
+    peer ? `inbox(${peer}): unread=${s.unread}` : null,
+    '',
+    'recent events:',
+    table(s.recent_events, [
+      { label: 'id', value: (r) => `#${r.id}` },
+      { label: 'type', value: (r) => r.type },
+      { label: 'actor', value: (r) => r.actor || '' },
+      { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
+      { label: 'time', value: (r) => iso(r.created_at) }
+    ])
+  ].filter((line) => line !== null).join('\n');
 }
 
 function normalizeStateResources(values) {
@@ -4478,6 +4451,161 @@ function statusSnapshot(ctx, peer = null, opts = {}) {
   }
 }
 
+function webPeerRegister(projectCtx, peer, input = {}) {
+  const db = connect(projectCtx);
+  const row = {
+    id: peer,
+    kind: input.kind || 'other',
+    role: input.role || 'peer',
+    worktree: path.resolve(input.worktree || projectCtx.cwd),
+    branch: input.branch || detectBranch(projectCtx.cwd),
+    pid: intOpt(input, 'pid', process.ppid),
+    status: input.status || 'idle',
+    capabilities: Array.isArray(input.cap) ? input.cap.join(',') : (input.cap || input.capabilities || 'web')
+  };
+  try {
+    upsertPeer(db, row);
+    addEvent(db, 'peer.registered', peer, null, { ...row, source: 'web' });
+  } finally {
+    db.close();
+  }
+  return { peer: row, summary: `registered ${row.id} (${row.kind}${row.role ? `, ${row.role}` : ''})` };
+}
+
+function webPeerHeartbeat(projectCtx, peer, input = {}) {
+  const ttl = intOpt(input, 'ttl', DEFAULT_LOCK_TTL);
+  const status = input.status || null;
+  const renewLocks = input['renew-locks'] !== false && input.renew_locks !== false;
+  const db = connect(projectCtx);
+  const t = now();
+  let renewed = 0;
+  try {
+    touchPeer(db, peer, status);
+    if (renewLocks) {
+      renewed = db.prepare(`
+        UPDATE locks SET expires_at = ?
+        WHERE owner = ? AND expires_at > ?
+      `).run(t + ttl, peer, t).changes;
+    }
+    addEvent(db, 'peer.heartbeat', peer, null, { status, renewed, source: 'web' });
+  } finally {
+    db.close();
+  }
+  return {
+    peer,
+    status,
+    renewed,
+    summary: `heartbeat ${peer}${renewed ? `, renewed locks: ${renewed}` : ''}`
+  };
+}
+
+function claimNextTaskForPeer(db, peer, force = false) {
+  return tx(db, () => {
+    if (!force) {
+      const current = db.prepare(`
+        SELECT * FROM tasks
+        WHERE owner = ?
+          AND status IN ('claimed', 'running', 'review', 'blocked')
+        ORDER BY
+          CASE status
+            WHEN 'running' THEN 0
+            WHEN 'claimed' THEN 1
+            WHEN 'review' THEN 2
+            WHEN 'blocked' THEN 3
+            ELSE 4
+          END,
+          priority ASC,
+          id ASC
+        LIMIT 1
+      `).get(peer);
+      if (current) return { ...current, current: true };
+    }
+    const row = db.prepare(`
+      SELECT * FROM tasks
+      WHERE status = 'pending'
+        AND owner IS NULL
+        AND (assignee IS NULL OR assignee = ?)
+      ORDER BY CASE WHEN assignee = ? THEN 0 ELSE 1 END, priority ASC, id ASC
+      LIMIT 1
+    `).get(peer, peer);
+    if (!row) return null;
+    const t = now();
+    db.prepare(`
+      UPDATE tasks
+      SET owner = ?, status = 'claimed', claimed_at = ?, updated_at = ?
+      WHERE id = ? AND owner IS NULL AND status = 'pending'
+    `).run(peer, t, t, row.id);
+    addEvent(db, 'task.claimed', peer, row.id, { next: true });
+    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
+  });
+}
+
+function webPeerTaskNext(projectCtx, peer, input = {}) {
+  const db = connect(projectCtx);
+  try {
+    touchPeer(db, peer, 'working');
+    const task = claimNextTaskForPeer(db, peer, Boolean(input.force));
+    if (!task) return { peer, task: null, summary: 'no pending task' };
+    return {
+      peer,
+      task,
+      current: Boolean(task.current),
+      summary: task.current
+        ? `current task #${task.id}: ${task.title} (${task.status})`
+        : `claimed task #${task.id}: ${task.title}`
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function webPeerInbox(projectCtx, peer, input = {}) {
+  const db = connect(projectCtx);
+  try {
+    const messages = queryInbox(db, peer, Boolean(input.all), intOpt(input, 'limit', 20));
+    return {
+      peer,
+      messages,
+      summary: messages.length ? `${messages.length} message${messages.length === 1 ? '' : 's'}` : 'no messages'
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function webPeerAction(projectCtx, peer, action, input = {}) {
+  const normalized = String(action || '').replace(/_/g, '-');
+  if (!peer) throw new CliError('BAD_REQUEST', 'peer required');
+  if (normalized === 'status') {
+    const status = statusSummary(projectCtx, peer);
+    return { ok: true, action: normalized, peer, summary: `active=${status.active_peers}, stale=${status.stale_peers}, locks=${status.active_locks}, unread=${status.unread ?? 0}`, data: status };
+  }
+  if (normalized === 'state') {
+    const data = statusSnapshot(projectCtx, peer, {
+      resources: normalizeStateResources(input.resource || input.resources || []),
+      intent: input.intent || null
+    });
+    return { ok: true, action: normalized, peer, summary: data.automation?.next_action?.reason || 'state loaded', data };
+  }
+  if (normalized === 'inbox') {
+    const data = webPeerInbox(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'task-next') {
+    const data = webPeerTaskNext(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'heartbeat') {
+    const data = webPeerHeartbeat(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'register') {
+    const data = webPeerRegister(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  throw new CliError('BAD_REQUEST', `Unknown peer action: ${action}`);
+}
+
 function webIndexHtml() {
   return `<!doctype html>
 <html lang="en">
@@ -4824,6 +4952,47 @@ function webIndexHtml() {
       color: var(--text);
     }
     .menu button:hover { background: #1b1f26; }
+    .menu .divider {
+      height: 1px;
+      margin: 4px 2px;
+      background: var(--border);
+    }
+    .action-result {
+      position: fixed;
+      right: 16px;
+      top: 64px;
+      z-index: 1200;
+      width: min(520px, calc(100vw - 32px));
+      max-height: min(68vh, 640px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.5);
+      overflow: hidden;
+    }
+    .action-result[hidden] { display: none; }
+    .action-result header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .action-result header strong { font-size: 13px; }
+    .action-result pre {
+      margin: 0;
+      padding: 10px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text);
+      background: #0d0f12;
+    }
     #terminal {
       min-height: 0;
       overflow: hidden;
@@ -4856,6 +5025,9 @@ function webIndexHtml() {
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
     }
+    .card.state-card.state-card-collapsed {
+      grid-template-rows: auto 0;
+    }
     .card h2 {
       margin: 0;
       padding: 8px 10px;
@@ -4866,6 +5038,44 @@ function webIndexHtml() {
       justify-content: space-between;
       align-items: center;
       gap: 8px;
+    }
+    .state-card-toggle {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .state-card-toggle:hover { background: #151922; }
+    .state-card-toggle-title {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow: hidden;
+    }
+    .state-card-toggle-title strong {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .state-card-chevron {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+    }
+    .state-card.state-card-collapsed .state-card-chevron {
+      transform: rotate(-90deg);
     }
     .card .body {
       padding: 8px 10px;
@@ -4880,6 +5090,9 @@ function webIndexHtml() {
       align-content: start;
       scrollbar-width: thin;
       scrollbar-color: #3a3f4a transparent;
+    }
+    .state-card.state-card-collapsed .body {
+      display: none;
     }
     .state-card .body::-webkit-scrollbar { width: 8px; }
     .state-card .body::-webkit-scrollbar-track { background: transparent; }
@@ -4947,11 +5160,14 @@ function webIndexHtml() {
           <div class="menu-wrap">
             <button class="menu-btn" id="actionsBtn" type="button" aria-haspopup="true" aria-expanded="false"><span data-i18n="actions">Actions</span> ▾</button>
             <div class="menu" id="actionsMenu" hidden>
-              <button data-send="register" data-i18n="action.register">register</button>
-              <button data-send="inbox" data-i18n="action.inbox">inbox</button>
-              <button data-send="next" data-i18n="action.nextTask">next task</button>
-              <button data-send="status" data-i18n="action.status">status</button>
-              <button data-send="heartbeat" data-i18n="action.heartbeat">heartbeat</button>
+              <button data-action="state" data-i18n="action.state">state</button>
+              <button data-action="status" data-i18n="action.status">status</button>
+              <button data-action="inbox" data-i18n="action.inbox">inbox</button>
+              <button data-action="task-next" data-i18n="action.claimNextTask">claim next task</button>
+              <button data-action="heartbeat" data-i18n="action.renewHeartbeat">renew heartbeat</button>
+              <div class="divider" role="separator"></div>
+              <button data-action="register" data-i18n="action.reregister">re-register peer</button>
+              <button data-terminal-action="status" data-i18n="action.runStatusTerminal">run status in terminal</button>
             </div>
           </div>
           <button class="danger" id="stopBtn" type="button" data-i18n="stop">stop</button>
@@ -4960,6 +5176,14 @@ function webIndexHtml() {
       <div id="terminal" style="min-height:0;flex:1"></div>
       <div id="detectedPanel" style="display:none;overflow:auto;flex:1"></div>
     </main>
+
+    <section class="action-result" id="actionResult" hidden aria-live="polite">
+      <header>
+        <strong id="actionResultTitle"></strong>
+        <button id="actionResultClose" type="button" aria-label="Close">×</button>
+      </header>
+      <pre id="actionResultBody"></pre>
+    </section>
 
     <aside class="inspector">
       <div class="brand">
@@ -5019,11 +5243,14 @@ function webIndexHtml() {
         noSessionSelected: 'No session selected',
         startOrSelect: 'Start or select a session from the left panel',
         actions: 'Actions',
-        'action.register': 'register',
+        'action.state': 'state',
         'action.inbox': 'inbox',
-        'action.nextTask': 'next task',
+        'action.claimNextTask': 'claim next task',
         'action.status': 'status',
-        'action.heartbeat': 'heartbeat',
+        'action.renewHeartbeat': 'renew heartbeat',
+        'action.reregister': 're-register peer',
+        'action.runStatusTerminal': 'run status in terminal',
+        actionResult: 'Action Result',
         stop: 'stop',
         projectState: 'Project State',
         refresh: 'Refresh',
@@ -5127,11 +5354,14 @@ function webIndexHtml() {
         noSessionSelected: '未选择会话',
         startOrSelect: '从左侧面板启动或选择一个会话',
         actions: '操作',
-        'action.register': '注册',
+        'action.state': '状态详情',
         'action.inbox': '收件箱',
-        'action.nextTask': '下个任务',
+        'action.claimNextTask': '认领下个任务',
         'action.status': '状态',
-        'action.heartbeat': '心跳',
+        'action.renewHeartbeat': '续期心跳',
+        'action.reregister': '重新注册协作方',
+        'action.runStatusTerminal': '在终端运行状态命令',
+        actionResult: '操作结果',
         stop: '停止',
         projectState: '项目状态',
         refresh: '刷新',
@@ -5466,7 +5696,7 @@ function webIndexHtml() {
       return seen > 0 && (t - seen) <= activePeerTtl;
     }
 
-      function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
+    function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
       const activity = peer?.status || 'unknown';
       const liveness = peerIsActive(peer, basisNow) ? 'active' : 'stale';
       const age = fmtAge(peer?.age_sec);
@@ -5483,32 +5713,62 @@ function webIndexHtml() {
           detail: tr('lastSeen') + '=' + statusText(activity) + ' ' + tr('age') + '=' + age + branch
         };
       }
-        return {
-          label: activity,
-          detail: statusText(liveness) + ' ' + tr('age') + '=' + age + branch
-        };
-      }
+      return {
+        label: activity,
+        detail: statusText(liveness) + ' ' + tr('age') + '=' + age + branch
+      };
+    }
 
-      function bodyPinned(el) {
-        if (!el) return false;
-        return el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
-      }
+    function bodyPinned(el) {
+      if (!el) return false;
+      return el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+    }
 
-      function renderTimelineItem(item) {
-        const meta = [
-          item.source + ':' + item.source_id,
-          item.task_id ? tr('task') + ' #' + item.task_id : '',
-          item.thread_id ? tr('thread') + ' #' + item.thread_id : '',
-          item.direction || '',
-          fmtTime(item.ts)
-        ].filter(Boolean).join(' · ');
-        return \`
+    function stateCardCollapsed(section) {
+      return localStorage.getItem('hcc.stateCard.' + section + '.collapsed') === '1';
+    }
+
+    function stateCardHtml(section, title, count, bodyHtml) {
+      const collapsed = stateCardCollapsed(section);
+      return \`
+          <div class="card state-card \${collapsed ? 'state-card-collapsed' : ''}" data-section="\${esc(section)}">
+            <button class="state-card-toggle" type="button" aria-expanded="\${collapsed ? 'false' : 'true'}">
+              <span class="state-card-toggle-title"><strong>\${esc(title)}</strong> <span class="badge">\${esc(count)}</span></span>
+              <span class="state-card-chevron">⌄</span>
+            </button>
+            <div class="body">\${bodyHtml}</div>
+          </div>\`;
+    }
+
+    function bindStateCardToggles() {
+      document.querySelectorAll('.state-card[data-section] .state-card-toggle').forEach((button) => {
+        button.addEventListener('click', () => {
+          const card = button.closest('.state-card[data-section]');
+          if (!card) return;
+          const section = card.dataset.section || '';
+          const collapsed = !card.classList.contains('state-card-collapsed');
+          card.classList.toggle('state-card-collapsed', collapsed);
+          button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+          localStorage.setItem('hcc.stateCard.' + section + '.collapsed', collapsed ? '1' : '0');
+        });
+      });
+    }
+
+    function renderTimelineItem(item) {
+      const meta = [
+        item.source + ':' + item.source_id,
+        item.task_id ? tr('task') + ' #' + item.task_id : '',
+        item.thread_id ? tr('thread') + ' #' + item.thread_id : '',
+        item.direction || '',
+        fmtTime(item.ts)
+      ].filter(Boolean).join(' · ');
+      return \`
           <div class="item timeline-item">
             <strong>\${esc(item.title || item.kind || item.source)} <span class="badge">\${esc(item.kind || item.source)}</span></strong>
             <span>\${esc(meta)}</span>
             \${item.text ? '<span>' + esc(item.text) + '</span>' : ''}
           </div>\`;
-      }
+    }
 
     document.getElementById('projectSelect').addEventListener('change', (event) => {
       switchProject(event.target.value).catch(console.error);
@@ -5610,71 +5870,72 @@ function webIndexHtml() {
       lastStateNow = Number(data.now || lastStateNow);
       const state = document.getElementById('state');
       const preserveScroll = lastStateRoot === stateRoot;
-        const savedStateScroll = preserveScroll ? state.scrollTop : 0;
-        const savedCardScroll = preserveScroll
-          ? new Map(
-            [...state.querySelectorAll('.state-card[data-section]')].map((card) => [
-              card.dataset.section,
-              {
-                top: card.querySelector('.body')?.scrollTop || 0,
-                pinned: bodyPinned(card.querySelector('.body'))
-              }
-            ])
-          )
-          : new Map();
-        const runtimeById = new Map();
-        for (const session of sessions || []) {
-          runtimeById.set(session.id, session);
-          const peerId = sessionPeerId(session);
-          if (peerId) runtimeById.set(peerId, session);
-        }
-	        const tasksData = data.tasks || [];
-	        const peersData = data.peers || [];
-	        const locksData = data.locks || [];
-	        const messagesData = data.messages || [];
-	        const timelineData = data.timeline || [];
-	        const automation = data.automation || {};
-	        const nextAction = automation.next_action || {};
+      const savedStateScroll = preserveScroll ? state.scrollTop : 0;
+      const savedCardScroll = preserveScroll
+        ? new Map(
+          [...state.querySelectorAll('.state-card[data-section]')].map((card) => [
+            card.dataset.section,
+            {
+              top: card.querySelector('.body')?.scrollTop || 0,
+              pinned: bodyPinned(card.querySelector('.body'))
+            }
+          ])
+        )
+        : new Map();
+      const runtimeById = new Map();
+      for (const session of sessions || []) {
+        runtimeById.set(session.id, session);
+        const peerId = sessionPeerId(session);
+        if (peerId) runtimeById.set(peerId, session);
+      }
+      const tasksData = data.tasks || [];
+      const peersData = data.peers || [];
+      const locksData = data.locks || [];
+      const messagesData = data.messages || [];
+      const timelineData = data.timeline || [];
+      const automation = data.automation || {};
+      const nextAction = automation.next_action || {};
       const tasks = tasksData.map((t) => \`
           <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(statusText(t.status))} \${esc(tr('owner'))}=\${esc(t.owner || '')} \${esc(tr('assignee'))}=\${esc(t.assignee || '')}</span></div>
         \`).join('') || '<div class="empty">' + esc(tr('noTasks')) + '</div>';
-        const peers = peersData.map((a) => {
+      const peers = peersData.map((a) => {
         const peerRuntime = runtimeById.get(a.id);
         const peerState = peerStateView(a, peerRuntime, data.now);
         return \`
         <div class="item"><strong>\${esc(a.id)} <span class="badge">\${esc(a.kind)}</span> <span class="badge \${badgeClass(peerState.label)}">\${esc(statusText(peerState.label))}</span></strong><span>\${esc(peerState.detail)}</span></div>
       \`;
-        }).join('') || '<div class="empty">' + esc(tr('noPeers')) + '</div>';
-		        const locks = locksData.map((l) => \`
-		          <div class="item"><strong>\${esc(l.resource)}</strong><span>\${esc(tr('owner'))}=\${esc(l.owner)} \${esc(tr('task'))}=\${l.task_id ? '#' + l.task_id : ''}</span></div>
-		        \`).join('') || '<div class="empty">' + esc(tr('noActiveLocks')) + '</div>';
-		        const messages = messagesData.map((m) => \`
-			          <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || tr('all'))}\${m.reply_to ? ' ' + esc(tr('reply')) + ' #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
-			        \`).join('') || '<div class="empty">' + esc(tr('noMessages')) + '</div>';
-			        const timeline = timelineData.map(renderTimelineItem).join('') || '<div class="empty">' + esc(tr('noTimelineItems')) + '</div>';
-        const actionLines = [
-          '<div class="item"><strong>' + esc(statusText(automation.phase || 'idle')) + '</strong><span>' + esc(nextAction.reason || tr('noImmediateAction')) + '</span></div>',
-          nextAction.command ? '<div class="item"><strong>' + esc(tr('next')) + '</strong><span class="mono">' + esc(nextAction.command) + '</span></div>' : '',
-          (automation.finish_actions || []).length ? '<div class="item"><strong>' + esc(tr('finish')) + '</strong><span>' + esc(automation.finish_actions.map((a) => a.command).join(' | ')) + '</span></div>' : '',
-          (automation.warnings || []).length ? '<div class="item"><strong>' + esc(tr('warnings')) + '</strong><span>' + esc(automation.warnings.join(' | ')) + '</span></div>' : ''
-        ].filter(Boolean).join('');
-        state.innerHTML = \`
-		          <div class="card state-card" data-section="automation"><h2>\${esc(tr('nextAction'))} <span class="badge">\${esc(statusText(automation.phase || 'idle'))}</span></h2><div class="body">\${actionLines}</div></div>
-		          <div class="card state-card" data-section="timeline"><h2>\${esc(tr('timeline'))} <span class="badge">\${timelineData.length}</span></h2><div class="body">\${timeline}</div></div>
-		          <div class="card state-card" data-section="messages"><h2>\${esc(tr('messages'))} <span class="badge">\${messagesData.length}</span></h2><div class="body">\${messages}</div></div>
-		          <div class="card state-card" data-section="peers"><h2>\${esc(tr('peers'))} <span class="badge">\${peersData.length}</span></h2><div class="body">\${peers}</div></div>
-          <div class="card state-card" data-section="tasks"><h2>\${esc(tr('tasks'))} <span class="badge">\${tasksData.length}</span></h2><div class="body">\${tasks}</div></div>
-          <div class="card state-card" data-section="locks"><h2>\${esc(tr('locks'))} <span class="badge">\${locksData.length}</span></h2><div class="body">\${locks}</div></div>
-      \`;
-        state.scrollTop = savedStateScroll;
-        for (const [section, saved] of savedCardScroll) {
-          const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
-          if (!body) continue;
-          if (section === 'timeline' && saved.pinned) body.scrollTop = body.scrollHeight;
-          else body.scrollTop = saved.top;
-        }
-        lastStateRoot = stateRoot;
+      }).join('') || '<div class="empty">' + esc(tr('noPeers')) + '</div>';
+      const locks = locksData.map((l) => \`
+          <div class="item"><strong>\${esc(l.resource)}</strong><span>\${esc(tr('owner'))}=\${esc(l.owner)} \${esc(tr('task'))}=\${l.task_id ? '#' + l.task_id : ''}</span></div>
+        \`).join('') || '<div class="empty">' + esc(tr('noActiveLocks')) + '</div>';
+      const messages = messagesData.map((m) => \`
+          <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || tr('all'))}\${m.reply_to ? ' ' + esc(tr('reply')) + ' #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
+        \`).join('') || '<div class="empty">' + esc(tr('noMessages')) + '</div>';
+      const timeline = timelineData.map(renderTimelineItem).join('') || '<div class="empty">' + esc(tr('noTimelineItems')) + '</div>';
+      const actionLines = [
+        '<div class="item"><strong>' + esc(statusText(automation.phase || 'idle')) + '</strong><span>' + esc(nextAction.reason || tr('noImmediateAction')) + '</span></div>',
+        nextAction.command ? '<div class="item"><strong>' + esc(tr('next')) + '</strong><span class="mono">' + esc(nextAction.command) + '</span></div>' : '',
+        (automation.finish_actions || []).length ? '<div class="item"><strong>' + esc(tr('finish')) + '</strong><span>' + esc(automation.finish_actions.map((a) => a.command).join(' | ')) + '</span></div>' : '',
+        (automation.warnings || []).length ? '<div class="item"><strong>' + esc(tr('warnings')) + '</strong><span>' + esc(automation.warnings.join(' | ')) + '</span></div>' : ''
+      ].filter(Boolean).join('');
+      state.innerHTML = [
+        stateCardHtml('automation', tr('nextAction'), statusText(automation.phase || 'idle'), actionLines),
+        stateCardHtml('timeline', tr('timeline'), timelineData.length, timeline),
+        stateCardHtml('messages', tr('messages'), messagesData.length, messages),
+        stateCardHtml('peers', tr('peers'), peersData.length, peers),
+        stateCardHtml('tasks', tr('tasks'), tasksData.length, tasks),
+        stateCardHtml('locks', tr('locks'), locksData.length, locks)
+      ].join('');
+      state.scrollTop = savedStateScroll;
+      for (const [section, saved] of savedCardScroll) {
+        const body = state.querySelector('.state-card[data-section="' + section + '"] .body');
+        if (!body) continue;
+        if (section === 'timeline' && saved.pinned) body.scrollTop = body.scrollHeight;
+        else body.scrollTop = saved.top;
       }
+      bindStateCardToggles();
+      lastStateRoot = stateRoot;
+    }
 
     async function refreshState() {
       const peer = active ? managedPeerId(active) : null;
@@ -5683,16 +5944,16 @@ function webIndexHtml() {
       renderState(data);
     }
 
-      async function refreshDetectedState() {
-        if (!activeDetected) return;
-        const data = await api('/api/state?peer=' + encodeURIComponent(activeDetected));
-        renderState(data);
-      }
+    async function refreshDetectedState() {
+      if (!activeDetected) return;
+      const data = await api('/api/state?peer=' + encodeURIComponent(activeDetected));
+      renderState(data);
+    }
 
-      async function refreshCurrentState() {
-        if (activeType === 'detected') return refreshDetectedState();
-        return refreshState();
-      }
+    async function refreshCurrentState() {
+      if (activeType === 'detected') return refreshDetectedState();
+      return refreshState();
+    }
 
     // ── Connect to managed (PTY) session ─────────────────────────────────
     function connectManaged(id) {
@@ -5829,21 +6090,107 @@ function webIndexHtml() {
       connectManaged(data.session.id);
     });
 
-    document.querySelectorAll('[data-send]').forEach((button) => {
+    function activePeerInfo() {
+      if (!active) return null;
+      const session = sessions.find((s) => s.id === active) || { id: active, kind: 'other', role: 'peer' };
+      return {
+        session,
+        peerId: sessionPeerId(session) || active
+      };
+    }
+
+    function terminalCommandForAction(action, info) {
+      const session = info.session || {};
+      const peerId = info.peerId;
+      const lines = {
+        register: \`hcc register --peer \${peerId} --kind \${session.kind || 'other'} --role \${session.role || 'peer'}\`,
+        inbox:    \`hcc msg inbox --peer \${peerId}\`,
+        'task-next': \`hcc task next --peer \${peerId}\`,
+        state:    \`hcc state --peer \${peerId}\`,
+        status:   \`hcc status --peer \${peerId}\`,
+        heartbeat:\`hcc heartbeat --peer \${peerId} --renew-locks\`
+      };
+      return lines[action] || lines.status;
+    }
+
+    function formatActionResult(result) {
+      if (!result) return '';
+      const data = result.data || {};
+      if (result.action === 'status') {
+        const tasks = (data.tasks || []).map((row) => row.status + ':' + row.n).join(', ') || 'none';
+        return [
+          data.root,
+          'peers active=' + data.active_peers + ' stale=' + data.stale_peers,
+          'tasks ' + tasks,
+          'locks active=' + data.active_locks,
+          'unread ' + (data.unread ?? 0)
+        ].filter(Boolean).join('\\n');
+      }
+      if (result.action === 'state') {
+        const automation = data.automation || {};
+        const next = automation.next_action || {};
+        return [
+          'phase: ' + (automation.phase || 'idle'),
+          'next: ' + (next.command || next.kind || 'none'),
+          'why: ' + (next.reason || tr('noImmediateAction')),
+          ...(automation.warnings || []).map((w) => 'warning: ' + w)
+        ].join('\\n');
+      }
+      if (result.action === 'inbox') {
+        const messages = data.messages || [];
+        return messages.length
+          ? messages.map((m) => '#' + m.id + ' ' + m.sender + ' -> ' + (m.recipient || 'all') + ': ' + m.body).join('\\n')
+          : tr('noMessages');
+      }
+      if (result.action === 'task-next') {
+        return data.task
+          ? (data.current ? 'current ' : 'claimed ') + '#' + data.task.id + ' ' + data.task.title + ' (' + data.task.status + ')'
+          : result.summary;
+      }
+      return result.summary || JSON.stringify(result, null, 2);
+    }
+
+    function showActionResult(result) {
+      const panel = document.getElementById('actionResult');
+      document.getElementById('actionResultTitle').textContent = (result.action || tr('actionResult')) + ' · ' + (result.peer || '');
+      document.getElementById('actionResultBody').textContent = formatActionResult(result);
+      panel.hidden = false;
+    }
+
+    async function runPeerAction(action) {
+      const info = activePeerInfo();
+      if (!info) return;
+      const payload = action === 'register'
+        ? { kind: info.session.kind || 'other', role: info.session.role || 'peer', worktree: info.session.cwd || currentProject }
+        : action === 'heartbeat'
+          ? { renew_locks: true }
+          : {};
+      const readOnly = ['status', 'state', 'inbox'].includes(action);
+      const result = await api('/api/peers/' + encodeURIComponent(info.peerId) + '/actions/' + encodeURIComponent(action), readOnly
+        ? {}
+        : { method: 'POST', body: JSON.stringify(payload) });
+      showActionResult(result);
+      await Promise.all([refreshSessions(), refreshDetected(), refreshCurrentState()]);
+    }
+
+    document.querySelectorAll('[data-action]').forEach((button) => {
       button.addEventListener('click', () => {
-        if (!active) return;
-        const session = sessions.find((s) => s.id === active) || { kind: 'other', role: 'peer' };
-        const peerId = sessionPeerId(session) || active;
-        const lines = {
-          register: \`hcc register --peer \${peerId} --kind \${session.kind || 'other'} --role \${session.role || 'peer'}\`,
-          inbox:    \`hcc msg inbox --peer \${peerId}\`,
-          next:     \`hcc task next --peer \${peerId}\`,
-          status:   \`hcc status --peer \${peerId}\`,
-          heartbeat:\`hcc heartbeat --peer \${peerId} --renew-locks\`
-        };
-        sendLine(lines[button.dataset.send]);
+        closeActionsMenu();
+        runPeerAction(button.dataset.action).catch((err) => {
+          showActionResult({ action: button.dataset.action, peer: activePeerInfo()?.peerId || '', summary: err.message, data: { error: err.message } });
+        });
+      });
+    });
+    document.querySelectorAll('[data-terminal-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const info = activePeerInfo();
+        if (!info) return;
+        sendLine(terminalCommandForAction(button.dataset.terminalAction, info));
         closeActionsMenu();
       });
+    });
+    document.getElementById('actionResultClose').addEventListener('click', () => {
+      document.getElementById('actionResult').hidden = true;
     });
 
     // ── Actions dropdown (declutters the toolbar) ─────────────────────────
@@ -6426,6 +6773,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const safeId = String(session.id).replace(/[^A-Za-z0-9_.-]/g, '_');
     const pipeFile = path.join(bufsDir, `tmux-${safePane}-${safeId}.pipe`);
     session.pipeFile = pipeFile;
+    // Restored panes may still have pipe-pane writers from a previous runtime.
+    // Disable first so tmux tears down the stale writer before this runtime
+    // installs its own FIFO reader.
+    try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
     // Capture the existing screen once for the initial paint; pipe-pane only
     // forwards output produced after it is enabled.
     try {
@@ -6494,6 +6845,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function stopTmuxStream(session) {
     if (session.streamPoller) { clearInterval(session.streamPoller); session.streamPoller = null; }
     if (session.replaceTimer) { clearTimeout(session.replaceTimer); session.replaceTimer = null; }
+    if (session.inputRefreshTimer) { clearTimeout(session.inputRefreshTimer); session.inputRefreshTimer = null; }
     // Turn piping back off for this pane (no command toggles it off).
     try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
     if (session.streamFd !== null && session.streamFd !== undefined) {
@@ -6612,9 +6964,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try { fs.appendFileSync(session.inFile, data); } catch {}
     } else if (session.type === 'tmux') {
       tmuxSendLiteral(session.pane, data);
+      scheduleTmuxInputRefresh(session);
     } else {
       session.pty.write(data);
     }
+  }
+
+  function scheduleTmuxInputRefresh(session) {
+    if (session.type !== 'tmux' || !session.pane) return;
+    if (session.inputRefreshTimer) return;
+    session.inputRefreshTimer = setTimeout(() => {
+      session.inputRefreshTimer = null;
+      if (session.status === 'running') broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
+    }, 80);
   }
 
   function resizeSession(session, cols, rows) {
@@ -6988,6 +7350,28 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           resources,
           intent: url.searchParams.get('intent') || null
         }));
+        return;
+      }
+      const peerActionMatch = url.pathname.match(/^\/api\/peers\/([^/]+)\/actions\/([^/]+)$/);
+      if (peerActionMatch) {
+        const peer = decodeURIComponent(peerActionMatch[1]);
+        const action = decodeURIComponent(peerActionMatch[2]);
+        const readOnly = ['status', 'state', 'inbox'].includes(action);
+        if (readOnly && req.method !== 'GET') {
+          sendJson(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'Use GET for read-only peer actions' } });
+          return;
+        }
+        if (!readOnly && req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'Use POST for mutating peer actions' } });
+          return;
+        }
+        const input = readOnly
+          ? {
+              ...Object.fromEntries(url.searchParams.entries()),
+              resource: url.searchParams.getAll('resource')
+            }
+          : await readJsonRequest(req);
+        sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));
         return;
       }
       // Detected sessions: peers registered via hooks/watcher but without PTY

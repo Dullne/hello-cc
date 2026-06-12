@@ -809,6 +809,39 @@ async function expectResizeReplaceSnapshot(peer, marker) {
   });
 }
 
+async function expectWebSocketInputVisible(peer, marker) {
+  await new Promise((resolve, reject) => {
+    let sawSnapshot = false;
+    let sent = false;
+    let sawMarkerAfterInput = false;
+    let sawFrameAfterInput = false;
+    const ws = new WebSocket(runtimeWsUrl(peer));
+    const timer = setTimeout(() => reject(new Error(`${peer} websocket input visibility timeout`)), 5000);
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw));
+      const data = String(msg.data || '');
+      if (msg.type === 'snapshot') {
+        sawSnapshot = true;
+        if (!sent) {
+          sent = true;
+          ws.send(JSON.stringify({ type: 'input', data: `echo ${marker}\r` }));
+        }
+        return;
+      }
+      if (sent && ['data', 'replace'].includes(msg.type)) {
+        sawFrameAfterInput = true;
+        if (data.includes(marker)) sawMarkerAfterInput = true;
+      }
+      if (sawSnapshot && sawFrameAfterInput && sawMarkerAfterInput) {
+        clearTimeout(timer);
+        ws.close();
+        resolve();
+      }
+    });
+    ws.on('error', reject);
+  });
+}
+
 function tmuxStreamNodes() {
   const dir = path.join(root, '.hello-cc', 'bufs');
   if (!fs.existsSync(dir)) return [];
@@ -1436,13 +1469,56 @@ async function multiProjectWebWorkflow() {
   ]) {
     if (!html.includes(expected)) fail(`web layout missing resizable sidebar support: ${expected}`);
   }
-  if (!html.includes('state-card') || !html.includes('peerStateView') || !html.includes('savedCardScroll') || !html.includes('lastStateRoot') || !html.includes('data-section="peers"')) {
+  if (!html.includes('state-card') || !html.includes('peerStateView') || !html.includes('savedCardScroll') || !html.includes('lastStateRoot') || !html.includes("stateCardHtml('peers'")) {
     fail('web state panel missing scrollable peer state UI');
   }
-  if (!html.includes('data-section="timeline"') || !html.includes('renderTimelineItem') || !html.includes('bodyPinned') || !html.includes('refreshCurrentState')) {
+  for (const expected of [
+    'function stateCardCollapsed(section)',
+    "localStorage.getItem('hcc.stateCard.' + section + '.collapsed')",
+    'function stateCardHtml(section, title, count, bodyHtml)',
+    'state-card-toggle',
+    'aria-expanded=',
+    'state-card-collapsed',
+    'function bindStateCardToggles()',
+    "localStorage.setItem('hcc.stateCard.' + section + '.collapsed'",
+    "stateCardHtml('automation'",
+    "stateCardHtml('timeline'",
+    "stateCardHtml('messages'",
+    "stateCardHtml('peers'",
+    "stateCardHtml('tasks'",
+    "stateCardHtml('locks'",
+    'bindStateCardToggles();'
+  ]) {
+    if (!html.includes(expected)) fail(`web state panel missing collapsible card support: ${expected}`);
+  }
+  for (const expected of [
+    'id="actionResult"',
+    'data-action="state"',
+    'data-action="status"',
+    'data-action="inbox"',
+    'data-action="task-next"',
+    'data-action="heartbeat"',
+    'data-action="register"',
+    'data-terminal-action="status"',
+    'function runPeerAction(action)',
+    "'/api/peers/' + encodeURIComponent(info.peerId) + '/actions/' + encodeURIComponent(action)",
+    'showActionResult(result)'
+  ]) {
+    if (!html.includes(expected)) fail(`web actions missing API result UI: ${expected}`);
+  }
+  if (html.includes('data-send=') || html.includes("document.querySelectorAll('[data-send]')")) {
+    fail('web actions still use implicit terminal command injection');
+  }
+  for (const expected of [
+    'term.onData((data) => {',
+    "ws.send(JSON.stringify({ type: 'input', data }))"
+  ]) {
+    if (!html.includes(expected)) fail(`web terminal input forwarding missing: ${expected}`);
+  }
+  if (!html.includes("stateCardHtml('timeline'") || !html.includes('renderTimelineItem') || !html.includes('bodyPinned') || !html.includes('refreshCurrentState')) {
     fail('web state panel missing collaboration timeline or refresh routing');
   }
-  if (!html.includes('data-section="messages"') || !html.includes('messagesData.length')) {
+  if (!html.includes("stateCardHtml('messages'") || !html.includes('messagesData.length')) {
     fail('web state panel missing dedicated messages card');
   }
 
@@ -1461,6 +1537,40 @@ async function multiProjectWebWorkflow() {
   }
   if (!(otherSessions.sessions || []).some((s) => s.id === 'other-shell')) {
     fail(`second project API did not see its session:\n${JSON.stringify(otherSessions)}`);
+  }
+
+  hcc(['register', '--peer', 'web-action-peer', '--kind', 'codex', '--role', 'peer']);
+  hcc(['msg', 'send', '--from', 'human', '--to', 'web-action-peer', '--body', 'web action inbox ok']);
+  const actionStatus = await (await runtimeFetch('/api/peers/web-action-peer/actions/status', {}, { root })).json();
+  if (!actionStatus.ok || actionStatus.action !== 'status' || actionStatus.peer !== 'web-action-peer' || !actionStatus.data || typeof actionStatus.data.unread !== 'number') {
+    fail(`web status action did not return structured status:\n${JSON.stringify(actionStatus, null, 2)}`);
+  }
+  const actionInbox = await (await runtimeFetch('/api/peers/web-action-peer/actions/inbox', {}, { root })).json();
+  if (!actionInbox.ok || actionInbox.action !== 'inbox' || !(actionInbox.data?.messages || []).some((m) => m.body === 'web action inbox ok')) {
+    fail(`web inbox action did not return unread messages:\n${JSON.stringify(actionInbox, null, 2)}`);
+  }
+  const actionState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
+  if (!actionState.ok || actionState.action !== 'state' || actionState.data?.automation?.peer?.id !== 'web-action-peer') {
+    fail(`web state action did not return peer automation:\n${JSON.stringify(actionState, null, 2)}`);
+  }
+  const taskOutput = hcc(['task', 'create', '--title', 'web action task', '--body', 'claim through web action']);
+  const taskMatch = taskOutput.match(/created task #(\d+):/);
+  if (!taskMatch) fail(`cannot parse web action task id:\n${taskOutput}`);
+  const actionNext = await (await runtimeFetch('/api/peers/web-action-peer/actions/task-next', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  }, { root })).json();
+  if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
+    fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
+  }
+  const actionHeartbeat = await (await runtimeFetch('/api/peers/web-action-peer/actions/heartbeat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ renew_locks: true })
+  }, { root })).json();
+  if (!actionHeartbeat.ok || actionHeartbeat.action !== 'heartbeat' || actionHeartbeat.data?.peer !== 'web-action-peer') {
+    fail(`web heartbeat action did not return structured result:\n${JSON.stringify(actionHeartbeat, null, 2)}`);
   }
 
   const startProvider = async (payload) => {
@@ -1599,6 +1709,7 @@ async function tmuxBackedStartWorkflow() {
   await waitForFile(file, 'PTY_OK', 'pty injection');
   await expectWebSocketMarker('shell-a', 'WS_PTY_OK');
   await expectResizeReplaceSnapshot('shell-a', 'WS_RESIZE_OK');
+  await expectWebSocketInputVisible('shell-a', 'WS_INPUT_VISIBLE_OK');
   await expectBoundedTmuxStream('tmux-backed FIFO stream');
 
   await stopRuntime();
@@ -1910,6 +2021,33 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'setup.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
+  const hccSource = fs.readFileSync(hccBin, 'utf8');
+  for (const expected of [
+    'function scheduleTmuxInputRefresh(session)',
+    "runTmux(['pipe-pane', '-t', session.pane]);",
+    'if (session.inputRefreshTimer) return;',
+    'session.inputRefreshTimer = setTimeout',
+    'scheduleTmuxInputRefresh(session)',
+    "if (session.inputRefreshTimer) { clearTimeout(session.inputRefreshTimer); session.inputRefreshTimer = null; }",
+    "broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });"
+  ]) {
+    if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
+  }
+  for (const expected of [
+    'function webPeerAction(projectCtx, peer, action, input = {})',
+    'function claimNextTaskForPeer(db, peer, force = false)',
+    'function statusSummary(ctx, peer = null, identity = null)',
+    'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
+    "const readOnly = ['status', 'state', 'inbox'].includes(action)",
+    "sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));"
+  ]) {
+    if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
+  }
+  const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
+  const cliVersion = run(process.execPath, [hccBin, '--version']).trim();
+  if (cliVersion !== packageVersion) {
+    fail(`CLI version ${cliVersion} does not match package.json ${packageVersion}`);
+  }
   const mainHelp = run(process.execPath, [hccBin, '--help']);
   if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {
     fail(`public help exposes maintenance or removed commands:\n${mainHelp}`);
