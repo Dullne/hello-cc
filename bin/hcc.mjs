@@ -95,8 +95,11 @@ import {
 } from '../lib/session-launch.mjs';
 import {
   expectedWebHost,
+  isLoopbackHost,
+  listenServer,
   localRuntimeUrl,
   makeWebToken,
+  nextSessionId,
   publicRuntimeUrl,
   rememberRuntimeToken,
   requestUrl,
@@ -2036,51 +2039,6 @@ Coordination rules:
   ${cmd} lock release --peer ${peer} --resource <path-or-module> [--scope <scope>]
 `;
   printResult(ctx, { prompt: text }, () => text);
-}
-
-function isLoopbackHost(host) {
-  return host === '127.0.0.1' || host === 'localhost' || host === '::1';
-}
-
-function nextSessionId(existingIds, kind) {
-  const prefix = sanitizePeerPart(kind || 'shell', 'shell');
-  const ids = new Set();
-  if (existingIds instanceof Map) {
-    for (const value of existingIds.values()) {
-      if (value && typeof value === 'object' && value.id) ids.add(value.id);
-      else if (value) ids.add(String(value));
-    }
-  } else {
-    for (const value of existingIds || []) ids.add(String(value));
-  }
-  let i = 1;
-  while (ids.has(`${prefix}-${i}`)) i += 1;
-  return `${prefix}-${i}`;
-}
-
-function listenServer(server, host, port, autoPort) {
-  return new Promise((resolve, reject) => {
-    function attempt(candidate, remaining) {
-      const onError = (err) => {
-        if (err.code === 'EADDRINUSE' && autoPort && remaining > 0 && candidate < 65535) {
-          attempt(candidate + 1, remaining - 1);
-          return;
-        }
-        if (err.code === 'EADDRINUSE') {
-          reject(new CliError('PORT_IN_USE', `Port ${candidate} is already in use on ${host}`, { host, port: candidate }));
-          return;
-        }
-        reject(new CliError('LISTEN_FAILED', `Cannot listen on ${host}:${candidate}: ${err.message}`, { host, port: candidate }));
-      };
-      server.once('error', onError);
-      server.listen(candidate, host, () => {
-        server.off('error', onError);
-        const address = server.address();
-        resolve(address && typeof address === 'object' ? address.port : candidate);
-      });
-    }
-    attempt(port, 20);
-  });
 }
 
 async function cmdUp(ctx, args) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -3453,6 +3454,9 @@ async function syntaxAndHelp() {
     'function runtimeBaseUrl',
     'function runtimeApiUrl',
     'function requestUrl',
+    'function isLoopbackHost',
+    'function nextSessionId',
+    'function listenServer',
     'function runtimeUrlQuery',
     'function makeWebToken',
     'function validateWebTokenOpts',
@@ -3522,6 +3526,26 @@ async function syntaxAndHelp() {
   expectEqual(String(webRuntime.runtimeApiUrl({ base_url: 'http://127.0.0.1:8787/base' }, '/api/state?peer=a b')), 'http://127.0.0.1:8787/api/state?peer=a%20b', 'runtimeApiUrl route');
   expectEqual(String(webRuntime.requestUrl({ url: '/api/state?peer=a b', headers: { host: 'example.test:8787' } })), 'http://example.test:8787/api/state?peer=a%20b', 'requestUrl host and query');
   expectEqual(String(webRuntime.requestUrl({ url: '', headers: {} })), 'http://localhost/', 'requestUrl fallback');
+  if (!webRuntime.isLoopbackHost('127.0.0.1') ||
+      !webRuntime.isLoopbackHost('localhost') ||
+      !webRuntime.isLoopbackHost('::1') ||
+      webRuntime.isLoopbackHost('0.0.0.0')) {
+    fail('web runtime isLoopbackHost checks failed');
+  }
+  expectEqual(webRuntime.nextSessionId(['shell-1', 'shell-2'], 'shell'), 'shell-3', 'nextSessionId array');
+  expectEqual(webRuntime.nextSessionId(new Map([
+    ['a', { id: 'codex-1' }],
+    ['b', 'codex-2']
+  ]), 'codex'), 'codex-3', 'nextSessionId map');
+  const listenProbe = http.createServer((req, res) => res.end('ok'));
+  try {
+    const listenPort = await webRuntime.listenServer(listenProbe, '127.0.0.1', 0, false);
+    if (!Number.isInteger(listenPort) || listenPort <= 0) {
+      fail(`listenServer did not return a usable port: ${listenPort}`);
+    }
+  } finally {
+    await new Promise((resolve) => listenProbe.close(resolve));
+  }
   expectEqual(webRuntime.publicRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl wildcard');
   expectEqual(webRuntime.localRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://127.0.0.1:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'localRuntimeUrl wildcard');
   expectEqual(webRuntime.publicRuntimeUrl(ipv6WildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8788/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl ipv6 wildcard');
