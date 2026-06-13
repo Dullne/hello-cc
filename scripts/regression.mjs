@@ -2240,6 +2240,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
       !hccSource.includes("} from '../lib/automation.mjs'") ||
       !hccSource.includes("} from '../lib/state-render.mjs'") ||
+      !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2252,7 +2253,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2739,6 +2740,77 @@ async function syntaxAndHelp() {
       !renderedState.includes('review locks before commit') ||
       !renderedState.includes('message:12 note')) {
     fail(`state render state output changed:\n${renderedState}`);
+  }
+  for (const helper of [
+    'function helpMain',
+    'function helpTask',
+    'function helpTeam',
+    'function helpState',
+    'function helpJoin',
+    'function helpEnv',
+    'function helpMsg',
+    'function helpAsk',
+    'function helpBroadcast',
+    'function helpInject',
+    'function helpPeer',
+    'function helpLock',
+    'function helpHandoff',
+    'function helpEvent',
+    'function helpRun',
+    'function helpUp',
+    'function helpDown',
+    'function helpUpdate',
+    'function helpWeb'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds help text helper: ${helper}`);
+  }
+  const helpModule = await import(path.join(repoRoot, 'lib', 'help.mjs'));
+  if (typeof helpModule.createHelpFunctions !== 'function') fail('help module missing createHelpFunctions export');
+  const capturedHelp = [];
+  const savedConsoleLog = console.log;
+  try {
+    console.log = (value = '') => capturedHelp.push(String(value));
+    const helpFns = helpModule.createHelpFunctions({
+      productName: 'product-x',
+      version: '1.2.3',
+      cliName: 'hccx',
+      npmPackageName: '@scope/pkg-x'
+    });
+    for (const name of [
+      'helpMain',
+      'helpTask',
+      'helpTeam',
+      'helpState',
+      'helpJoin',
+      'helpEnv',
+      'helpMsg',
+      'helpAsk',
+      'helpBroadcast',
+      'helpInject',
+      'helpPeer',
+      'helpLock',
+      'helpHandoff',
+      'helpEvent',
+      'helpRun',
+      'helpUp',
+      'helpDown',
+      'helpUpdate',
+      'helpWeb'
+    ]) {
+      if (typeof helpFns[name] !== 'function') fail(`help factory missing function: ${name}`);
+    }
+    helpFns.helpMain();
+    helpFns.helpUpdate();
+    helpFns.helpWeb();
+  } finally {
+    console.log = savedConsoleLog;
+  }
+  const [factoryMainHelp, factoryUpdateHelp, factoryWebHelp] = capturedHelp;
+  if (!factoryMainHelp?.startsWith('product-x 1.2.3') ||
+      !factoryMainHelp.includes('hccx [--root DIR]') ||
+      !factoryUpdateHelp?.includes('npm install -g @scope/pkg-x@TAG') ||
+      !factoryWebHelp?.includes("HCC_WEB_TOKEN='long-token' hccx web --port 8787")) {
+    fail(`help factory output changed:\n${capturedHelp.join('\n---\n')}`);
   }
   for (const helper of [
     'const WEB_CHILD_ENV',

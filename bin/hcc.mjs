@@ -77,6 +77,7 @@ import {
   renderStateSummary,
   renderStatusSummary
 } from '../lib/state-render.mjs';
+import { createHelpFunctions } from '../lib/help.mjs';
 import {
   LAUNCH_FINGERPRINT_ENV,
   PROVIDER_STATE_ENV,
@@ -177,6 +178,33 @@ const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = PACKAGE_META.name;
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
+
+const {
+  helpMain,
+  helpTask,
+  helpTeam,
+  helpState,
+  helpJoin,
+  helpEnv,
+  helpMsg,
+  helpAsk,
+  helpBroadcast,
+  helpInject,
+  helpPeer,
+  helpLock,
+  helpHandoff,
+  helpEvent,
+  helpRun,
+  helpUp,
+  helpDown,
+  helpUpdate,
+  helpWeb
+} = createHelpFunctions({
+  productName: PRODUCT_NAME,
+  version: VERSION,
+  cliName: CLI_NAME,
+  npmPackageName: NPM_PACKAGE_NAME
+});
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
 
@@ -4279,363 +4307,6 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
   } else {
     process.exitCode = exitCode.exitCode ?? 0;
   }
-}
-
-function helpMain() {
-  console.log(`${PRODUCT_NAME} ${VERSION}
-
-Project-local coordination bus for multiple Claude Code and Codex CLI sessions.
-
-Usage:
-  ${CLI_NAME} [--root DIR] [--db FILE] [--json] <command> [args]
-
-Commands:
-  web                          Start coordination, shims, tmux, and browser console
-  up                           Initialize local coordination only
-  down                         Stop the running hello-cc web runtime
-  update                       Update the global npm install of hello-cc
-  uninstall                    Remove hooks, shims, and optional project data
-  init                         Initialize .hello-cc/mesh.db and guidance
-  register --peer ID           Register or update a peer session identity
-  join --peer ID               Register this shell and print eval-able env
-  env --peer ID                Print eval-able HCC_PEER/HCC_ROOT/HCC_DB exports
-  heartbeat [--peer ID]        Mark the current peer alive, optionally renew locks
-  peers                        List known peers
-  status [--peer ID]           Show project coordination state
-  state [--peer ID]            Show timeline and next coordination action
-  scan [--register]            Detect existing Claude/Codex sessions
-  prompt --peer ID             Print copy/paste session instructions
-  run --peer ID -- COMMAND     Register a peer and run a command in this terminal
-  peer <subcommand>            Start, attach, list, and stop tmux-backed peers
-  inject PEER TEXT             Write text into an attached terminal
-  ask PEER MESSAGE             Send a direct work request to one peer
-  broadcast MESSAGE            Send a work request to all peers
-  task <subcommand>            Create, list, claim, update, finish tasks
-  team <subcommand>            Plan, start, and inspect explicit task teams
-  msg <subcommand>             Send, read, and ack messages
-  lock <subcommand>            Acquire, renew, release, and list advisory locks
-  handoff <subcommand>         Create and list handoffs
-  event tail                   Show recent coordination events
-  gc [--older-than DAYS] [--yes] Clean up stale peers, events, tasks, and buf files
-Internal:
-  hook                         Hook entrypoint used by Claude/Codex
-  find-root                    Shim helper
-  which-real                   Shim helper
-
-Environment:
-  HCC_ROOT               Override project root
-  HCC_DB                 Override database path
-  HCC_PEER               Default peer id; inferred automatically when absent
-  HCC_WEB_TOKEN          Replace and save the stable web access token
-`);
-}
-
-function helpTask() {
-  console.log(`${CLI_NAME} task
-
-Usage:
-  ${CLI_NAME} task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
-  ${CLI_NAME} task create --title TEXT --parent N [--team-role ROLE]
-  ${CLI_NAME} task list [--status pending|claimed|running|review|blocked|done|abandoned] [--peer ID] [--all]
-  ${CLI_NAME} task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
-  ${CLI_NAME} task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
-  ${CLI_NAME} task next [--peer ID] [--force] [--count N]
-  ${CLI_NAME} task update [--peer ID] --id N --status STATUS [--summary TEXT] [--body TEXT] [--to ID]
-  ${CLI_NAME} task done [--peer ID] --id N --summary TEXT
-
-Default task list shows all project tasks that are not done or abandoned.
---peer is an explicit filter; HCC_PEER does not hide other open tasks.
-Messages use per-peer unread ack state; tasks do not.
-task next returns your existing claimed/running/review/blocked task before
-claiming another pending task. Use --force when intentionally taking additional
-pending tasks; combine it with --count N for explicit batch claims.
-Use task takeover when explicitly taking over a non-complete task from another
-owner; it records the previous owner, requires a reason, and notifies them.
-Use --policy blocked, stale, or blocked-or-stale to require an auditable
-precondition before takeover. The default policy is any for backward
-compatibility.
-
-If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal
-as a stable project-local peer.
-`);
-}
-
-function helpTeam() {
-  console.log(`${CLI_NAME} team
-
-Usage:
-  ${CLI_NAME} team plan --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1]
-  ${CLI_NAME} team start --from-task N [--item ROLE:TITLE] [--item PEER:ROLE:TITLE] [--workers A,B|codex:2,claude:1] [--force]
-  ${CLI_NAME} team status --task N
-
-team plan is read-only. team start creates explicit child tasks under the parent
-task and optionally assigns them to workers. It does not silently spawn model
-processes or override the current-task rule.
-workers may be explicit peer ids or kind counts such as codex:2,claude:1.
-`);
-}
-
-function helpState() {
-  console.log(`${CLI_NAME} state
-
-Usage:
-  ${CLI_NAME} state [--peer ID] [--resource PATH] [--scope SCOPE] [--intent read|review|work|write|stop|finish]
-
-Shows the current collaboration timeline plus a machine-readable coordination
-state machine. With --json, the response includes automation.next_action.argv so
-agents can execute the suggested hcc command explicitly and leave an audit trail.
-automation.current_task shows the peer's active claimed/running/review/blocked
-task when one exists.
-If a current task looks splittable, automation may suggest hcc team plan; this
-is read-only until hcc team start is run explicitly.
-With --intent read or --intent review, state treats resources as snapshot
-inspection and does not suggest acquiring file locks. With write/work intents,
---scope lets agents coordinate independent regions of the same resource.
-
-State does not execute coordination actions: it does not ack messages, claim
-tasks, acquire locks, send messages, create handoffs, or mark tasks done. Opening
-state may still perform normal SQLite schema maintenance for known project DBs.
-`);
-}
-
-function helpJoin() {
-  console.log(`${CLI_NAME} join
-
-Usage:
-  eval "$(${CLI_NAME} join --peer ID [--kind codex|claude|shell|other] [--role ROLE])"
-
-Examples:
-  eval "$(${CLI_NAME} join --peer codex-current --kind codex)"
-  ${CLI_NAME} status
-
-This registers the current shell as a peer and prints shell exports for
-HCC_PEER, HCC_ROOT, and HCC_DB. A child CLI cannot mutate its parent shell
-environment directly, so use eval to apply the exports to the current window.
-`);
-}
-
-function helpEnv() {
-  console.log(`${CLI_NAME} env
-
-Usage:
-  eval "$(${CLI_NAME} env --peer ID)"
-
-Examples:
-  eval "$(${CLI_NAME} env --peer codex-current)"
-
-This only prints shell exports. Use hcc join when you also want to register
-the peer in the project bus.
-`);
-}
-
-function helpMsg() {
-  console.log(`${CLI_NAME} msg
-
-Usage:
-  ${CLI_NAME} msg send [--from ID] [--to ID|all] --body TEXT [--task N] [--kind note|task|handoff]
-  ${CLI_NAME} msg inbox [--peer ID] [--wait SEC] [--all] [--limit N]
-  ${CLI_NAME} msg ack [--peer ID] --id N
-  ${CLI_NAME} msg reply [--from ID] --id N --body TEXT [--to ID] [--kind reply]
-  ${CLI_NAME} msg thread --id N [--limit N]
-
-If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal.
-Use msg reply when answering a message so the response stays in the same thread.
-`);
-}
-
-function helpAsk() {
-  console.log(`${CLI_NAME} ask
-
-Usage:
-  ${CLI_NAME} ask PEER MESSAGE [--from ID] [--task N] [--inject]
-  ${CLI_NAME} ask --to PEER --body TEXT [--from ID] [--task N] [--inject]
-
-Examples:
-  ${CLI_NAME} ask claude-a "Please review task #3."
-  ${CLI_NAME} ask --to codex-b --body "Can you run the router tests?" --task 3
-  ${CLI_NAME} ask claude-a "Please review task #3." --inject
-`);
-}
-
-function helpBroadcast() {
-  console.log(`${CLI_NAME} broadcast
-
-Usage:
-  ${CLI_NAME} broadcast MESSAGE [--from ID] [--task N] [--inject]
-  ${CLI_NAME} broadcast --body TEXT [--from ID] [--task N] [--inject]
-
-Example:
-  ${CLI_NAME} broadcast "Pause edits under src/router until lock clears."
-`);
-}
-
-function helpInject() {
-  console.log(`${CLI_NAME} inject
-
-Usage:
-  ${CLI_NAME} inject PEER TEXT [--no-enter]
-  ${CLI_NAME} inject --peer PEER --body TEXT [--no-enter]
-
-Examples:
-  ${CLI_NAME} inject codex-a "hcc msg inbox --peer codex-a"
-  ${CLI_NAME} inject claude-a "Please review task #3."
-
-This works for peers attached to the running hcc web runtime, including
-tmux-backed local terminals, attached tmux panes, and shim-launched tmux
-terminals.
-`);
-}
-
-function helpPeer() {
-  console.log(`${CLI_NAME} peer
-
-Usage:
-  ${CLI_NAME} peer list
-  ${CLI_NAME} peer start PEER [--kind codex|claude|shell] [--role ROLE] [--cwd DIR] [--resume ID|NAME]
-  ${CLI_NAME} peer start PEER --kind codex --last
-  ${CLI_NAME} peer start PEER --kind claude --continue
-  ${CLI_NAME} peer start PEER [--kind codex|claude|shell] [--role ROLE] [--cwd DIR] -- COMMAND [ARGS...]
-  ${CLI_NAME} peer attach PEER [--pane PANE] [--kind codex|claude|shell] [--role ROLE] [--cwd DIR]
-  ${CLI_NAME} peer stop PEER
-
-Examples:
-  ${CLI_NAME} peer start codex-a --kind codex -- codex
-  ${CLI_NAME} peer start codex-a --kind codex --resume 00000000-0000-0000-0000-000000000000
-  ${CLI_NAME} peer start codex-a --kind codex --last
-  ${CLI_NAME} peer start claude-a --kind claude -- claude
-  ${CLI_NAME} peer start claude-a --kind claude --resume 00000000-0000-0000-0000-000000000000
-  ${CLI_NAME} peer start claude-a --kind claude --continue
-  ${CLI_NAME} peer attach codex-a --pane %1
-  ${CLI_NAME} peer stop codex-a
-
-Start hcc web first. peer start creates a local tmux-backed terminal by default.
-The web runtime attaches to that terminal; hcc down stops only the web runtime
-and leaves the tmux terminal alive. peer attach imports an existing tmux pane.
-If --pane is omitted, peer attach uses the current tmux pane when available.
-Use --force only when intentionally overriding a provider-session or pane binding.
-`);
-}
-
-function helpLock() {
-  console.log(`${CLI_NAME} lock
-
-Usage:
-  ${CLI_NAME} lock acquire [--peer ID] --resource PATH [--scope SCOPE] [--task N] [--ttl SEC] [--reason TEXT]
-  ${CLI_NAME} lock renew [--peer ID] --resource PATH [--scope SCOPE] [--ttl SEC]
-  ${CLI_NAME} lock release [--peer ID] --resource PATH [--scope SCOPE] [--force]
-  ${CLI_NAME} lock list [--all]
-
-Omit --scope to lock the whole resource. Different scopes on the same resource
-can be held concurrently, but a whole-resource lock conflicts with every scope.
-`);
-}
-
-function helpHandoff() {
-  console.log(`${CLI_NAME} handoff
-
-Usage:
-  ${CLI_NAME} handoff create [--from ID] --summary TEXT [--task N] [--to ID] [--changed-files JSON_OR_CSV] [--tests TEXT] [--risks TEXT]
-  ${CLI_NAME} handoff list [--task N] [--limit N]
-`);
-}
-
-function helpEvent() {
-  console.log(`${CLI_NAME} event
-
-Usage:
-  ${CLI_NAME} event tail [--limit N]
-`);
-}
-
-function helpRun() {
-  console.log(`${CLI_NAME} run
-
-Usage:
-  ${CLI_NAME} run --peer ID --kind codex|claude|shell --role ROLE -- COMMAND [ARGS...]
-
-Examples:
-  ${CLI_NAME} run --peer codex-a --kind codex --role peer -- codex
-  ${CLI_NAME} run --peer claude-a --kind claude --role peer -- claude
-
-This keeps the CLI in your current terminal while injecting HCC_PEER,
-HCC_ROOT, and HCC_DB so the session can use the shared bus.
-Use hcc peer start, hcc web, or the installed claude/codex shims when the
-session should also be browser-controllable.
-`);
-}
-
-function helpUp() {
-  console.log(`${CLI_NAME} up
-
-Usage:
-  ${CLI_NAME} up [--no-discover] [--no-guidance]
-
-Examples:
-  ${CLI_NAME} up
-
-This initializes the project-local coordination bus, writes bounded guidance,
-installs Claude/Codex hooks when missing, and registers currently detected
-sessions. It does not start the browser terminal console.
-
-Run hcc web for the default full experience: local coordination, hooks, shims,
-tmux-backed terminal sessions, and browser control.
-`);
-}
-
-function helpDown() {
-  console.log(`${CLI_NAME} down
-
-Usage:
-  ${CLI_NAME} down
-
-Stops the web runtime started by hcc web for this project.
-`);
-}
-
-function helpUpdate() {
-  console.log(`${CLI_NAME} update
-
-Usage:
-  ${CLI_NAME} update [--tag TAG] [--registry URL] [--dry-run]
-
-Examples:
-  ${CLI_NAME} update
-  ${CLI_NAME} update --tag latest
-  ${CLI_NAME} update --dry-run
-
-Updates the global npm install by running:
-  npm install -g ${NPM_PACKAGE_NAME}@TAG
-
-The default TAG is latest.
-`);
-}
-
-function helpWeb() {
-  console.log(`${CLI_NAME} web
-
-Usage:
-  ${CLI_NAME} web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
-
-Examples:
-  ${CLI_NAME} web
-  HCC_WEB_TOKEN='long-token' ${CLI_NAME} web --port 8787
-  ${CLI_NAME} web --local
-
-This is the default one-command entrypoint. It prepares local coordination,
-installs Claude/Codex hooks and shims, ensures tmux is available, starts the
-browser terminal console as a background runtime, prints the URL, PID, runtime
-file, and log file, then returns the terminal to you.
-
-By default, the web runtime listens on 0.0.0.0 and uses a saved token,
-generating one on first use. Use HCC_WEB_TOKEN or --token to replace the saved
-token, --local to bind only to 127.0.0.1, or --no-token only for a trusted
-local/test environment.
-
-After hcc web, plain claude/codex commands started from a new shell are wrapped
-as local tmux-backed terminals. Existing ordinary terminals can communicate
-through the bus, but cannot be visually attached unless they were started under
-tmux/screen or a hello-cc shim.
-`);
 }
 
 /**
