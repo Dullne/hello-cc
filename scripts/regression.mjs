@@ -2238,6 +2238,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/timeline.mjs'") ||
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
+      !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
@@ -2249,7 +2250,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2585,6 +2586,110 @@ async function syntaxAndHelp() {
   }
   if (taskLivenessModule.formatOpenTaskLine(staleTask) !== '#2 running owner=stale-owner owner_state=stale/no-lock: Stale task') {
     fail(`task liveness formatOpenTaskLine changed: ${taskLivenessModule.formatOpenTaskLine(staleTask)}`);
+  }
+  for (const helper of [
+    'const WEB_CHILD_ENV',
+    'const LAUNCH_FINGERPRINT_ENV',
+    'const PROVIDER_STATE_ENV',
+    'const LAUNCH_ENV_IGNORED_KEYS',
+    'function childSessionEnv',
+    'function launchEnvironmentFingerprint',
+    'function launchFingerprint',
+    'function isLikelyShellCommand',
+    'function isProviderFallbackWrapper',
+    'function isRelaunchableProviderSession',
+    'function tmuxProviderState',
+    'function tmuxManagedSessionName',
+    'function tmuxEnvironmentArgs',
+    'function isolatedEnvCommandArgs'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds session launch helper: ${helper}`);
+  }
+  const sessionLaunch = await import(path.join(repoRoot, 'lib', 'session-launch.mjs'));
+  for (const name of [
+    'childSessionEnv',
+    'launchEnvironmentFingerprint',
+    'launchFingerprint',
+    'isLikelyShellCommand',
+    'isProviderFallbackWrapper',
+    'isRelaunchableProviderSession',
+    'tmuxProviderState',
+    'tmuxManagedSessionName',
+    'tmuxEnvironmentArgs',
+    'isolatedEnvCommandArgs'
+  ]) {
+    if (typeof sessionLaunch[name] !== 'function') fail(`session launch module missing export: ${name}`);
+  }
+  if (sessionLaunch.WEB_CHILD_ENV !== 'HCC_WEB_CHILD' ||
+      sessionLaunch.LAUNCH_FINGERPRINT_ENV !== 'HCC_LAUNCH_FINGERPRINT' ||
+      sessionLaunch.PROVIDER_STATE_ENV !== 'HCC_PROVIDER_STATE') {
+    fail('session launch env constant changed');
+  }
+  const childEnv = sessionLaunch.childSessionEnv({ EXTRA: '1' }, { HCC_WEB_CHILD: '1', BASE: '2' });
+  if (childEnv.HCC_WEB_CHILD !== undefined || childEnv.BASE !== '2' || childEnv.EXTRA !== '1') {
+    fail(`session launch childSessionEnv changed: ${JSON.stringify(childEnv)}`);
+  }
+  const launchEnvA = sessionLaunch.launchEnvironmentFingerprint({
+    B: '2',
+    A: '1',
+    PWD: '/ignored',
+    TMUX: 'ignored',
+    HCC_PEER: 'ignored'
+  });
+  const launchEnvB = sessionLaunch.launchEnvironmentFingerprint({ A: '1', B: '2' });
+  const launchEnvC = sessionLaunch.launchEnvironmentFingerprint({ A: '1', B: '3' });
+  if (launchEnvA !== launchEnvB || launchEnvA === launchEnvC) {
+    fail('session launch environment fingerprint filtering/sorting changed');
+  }
+  const launchFingerprintA = sessionLaunch.launchFingerprint({ command: 'cmd', cwd: '/tmp/a', env: { A: '1' } });
+  const launchFingerprintB = sessionLaunch.launchFingerprint({ command: 'cmd', cwd: '/tmp/b', env: { A: '1' } });
+  if (launchFingerprintA === launchFingerprintB) {
+    fail('session launch fingerprint no longer includes cwd');
+  }
+  if (!sessionLaunch.isLikelyShellCommand('/bin/bash') ||
+      !sessionLaunch.isLikelyShellCommand('-zsh') ||
+      sessionLaunch.isLikelyShellCommand('node')) {
+    fail('session launch shell command detection changed');
+  }
+  if (!sessionLaunch.isProviderFallbackWrapper(`${sessionLaunch.PROVIDER_STATE_ENV}=starting exec bash`) ||
+      !sessionLaunch.isProviderFallbackWrapper('exec zsh') ||
+      sessionLaunch.isProviderFallbackWrapper('node script.js')) {
+    fail('session launch provider fallback detection changed');
+  }
+  if (!sessionLaunch.isRelaunchableProviderSession('shell', 'exec bash', { provider: 'codex' }) ||
+      sessionLaunch.isRelaunchableProviderSession('shell', 'exec bash', {}) ||
+      sessionLaunch.isRelaunchableProviderSession('codex', 'node script.js', {})) {
+    fail('session launch relaunchable provider detection changed');
+  }
+  const managedSessionName = sessionLaunch.tmuxManagedSessionName({ root: '/tmp/hcc root' }, 'Bad Peer!');
+  if (!managedSessionName.startsWith('hcc-') ||
+      !managedSessionName.endsWith('-bad-peer') ||
+      managedSessionName.length > 80) {
+    fail(`session launch tmux session name changed: ${managedSessionName}`);
+  }
+  const tmuxEnvArgs = sessionLaunch.tmuxEnvironmentArgs({
+    A: '1',
+    TMUX: 'ignored',
+    'BAD-NAME': 'ignored',
+    B: 2,
+    C: null
+  });
+  if (JSON.stringify(tmuxEnvArgs) !== JSON.stringify(['-e', 'A=1', '-e', 'B=2'])) {
+    fail(`session launch tmux env args changed: ${JSON.stringify(tmuxEnvArgs)}`);
+  }
+  const isolatedEnvArgs = sessionLaunch.isolatedEnvCommandArgs({
+    A: '1',
+    TMUX_PANE: 'ignored',
+    'BAD-NAME': 'ignored',
+    B: 2,
+    C: null
+  });
+  if (!['/usr/bin/env', 'env'].includes(isolatedEnvArgs[0]) ||
+      isolatedEnvArgs[1] !== '-i' ||
+      !isolatedEnvArgs.includes('A=1') ||
+      !isolatedEnvArgs.includes('B=2') ||
+      isolatedEnvArgs.some((arg) => arg.includes('TMUX_PANE') || arg.includes('BAD-NAME'))) {
+    fail(`session launch isolated env args changed: ${JSON.stringify(isolatedEnvArgs)}`);
   }
   for (const helper of [
     'function runTmux',

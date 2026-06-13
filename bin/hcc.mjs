@@ -72,6 +72,19 @@ import {
   taskOwnerStateText
 } from '../lib/task-liveness.mjs';
 import {
+  LAUNCH_FINGERPRINT_ENV,
+  PROVIDER_STATE_ENV,
+  WEB_CHILD_ENV,
+  childSessionEnv,
+  isolatedEnvCommandArgs,
+  isLikelyShellCommand,
+  isRelaunchableProviderSession,
+  launchFingerprint,
+  tmuxEnvironmentArgs,
+  tmuxManagedSessionName,
+  tmuxProviderState
+} from '../lib/session-launch.mjs';
+import {
   expectedWebHost,
   localRuntimeUrl,
   makeWebToken,
@@ -155,7 +168,6 @@ const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
-const WEB_CHILD_ENV = 'HCC_WEB_CHILD';
 
 function now() {
   return Math.floor(Date.now() / 1000);
@@ -206,110 +218,6 @@ function tailFile(file, maxBytes = 12000) {
   } catch {
     return '';
   }
-}
-
-function childSessionEnv(extra = {}, baseEnv = process.env) {
-  const env = { ...(baseEnv || {}), ...extra };
-  delete env[WEB_CHILD_ENV];
-  return env;
-}
-
-const LAUNCH_FINGERPRINT_ENV = 'HCC_LAUNCH_FINGERPRINT';
-const PROVIDER_STATE_ENV = 'HCC_PROVIDER_STATE';
-
-const LAUNCH_ENV_IGNORED_KEYS = new Set([
-  '_',
-  'COLUMNS',
-  'HCC_DB',
-  'HCC_NO_AUTO_INSTALL_TMUX',
-  'HCC_PEER',
-  'HCC_ROOT',
-  PROVIDER_STATE_ENV,
-  'HCC_SHIM_ENSURED',
-  'HCC_SHIM_NO_ATTACH',
-  'HCC_WEB_TOKEN',
-  LAUNCH_FINGERPRINT_ENV,
-  'LINES',
-  'OLDPWD',
-  'PROMPT_COMMAND',
-  'PS1',
-  'PS2',
-  'PS4',
-  'PWD',
-  'SHLVL',
-  'TERM',
-  'TERMCAP',
-  'TMUX',
-  'TMUX_PANE',
-  'WINDOWID'
-]);
-
-function launchEnvironmentFingerprint(env) {
-  const entries = Object.entries(env || {})
-    .filter(([key, value]) =>
-      value !== undefined &&
-      value !== null &&
-      !LAUNCH_ENV_IGNORED_KEYS.has(key) &&
-      /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
-    )
-    .map(([key, value]) => [key, String(value)])
-    .sort(([a], [b]) => a.localeCompare(b));
-  return shortHash(JSON.stringify(entries));
-}
-
-function launchFingerprint({ command, cwd, env }) {
-  return shortHash(JSON.stringify({
-    command: command || '',
-    cwd: cwd || '',
-    env: launchEnvironmentFingerprint(env || {})
-  }));
-}
-
-function isLikelyShellCommand(command) {
-  const base = path.basename(String(command || '')).replace(/^-/, '');
-  return new Set(['bash', 'dash', 'fish', 'ksh', 'mksh', 'sh', 'zsh']).has(base);
-}
-
-function isProviderFallbackWrapper(command) {
-  const text = String(command || '');
-  return text.includes(PROVIDER_STATE_ENV) || /\bexec\s+(?:bash|dash|fish|ksh|mksh|sh|zsh)\b/.test(text);
-}
-
-function isRelaunchableProviderSession(kind, command, binding = {}) {
-  const provider = binding.provider || kind;
-  return ['claude', 'codex'].includes(provider) && isProviderFallbackWrapper(command);
-}
-
-function tmuxProviderState(sessionName) {
-  return tmuxSessionEnvironmentValue(sessionName, PROVIDER_STATE_ENV);
-}
-
-function tmuxManagedSessionName(ctx, peerId) {
-  const name = `hcc-${shortHash(ctx.root)}-${sanitizePeerPart(peerId, 'peer')}`;
-  return name.slice(0, 80);
-}
-
-function tmuxEnvironmentArgs(env) {
-  const args = [];
-  for (const [key, value] of Object.entries(env)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    if (['TMUX', 'TMUX_PANE'].includes(key)) continue;
-    if (value === undefined || value === null) continue;
-    args.push('-e', `${key}=${String(value)}`);
-  }
-  return args;
-}
-
-function isolatedEnvCommandArgs(env) {
-  const envBin = fs.existsSync('/usr/bin/env') ? '/usr/bin/env' : 'env';
-  const args = [envBin, '-i'];
-  for (const [key, value] of Object.entries(env || {})) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    if (['TMUX', 'TMUX_PANE'].includes(key)) continue;
-    if (value === undefined || value === null) continue;
-    args.push(`${key}=${String(value)}`);
-  }
-  return args;
 }
 
 function tmuxPaneInfo(targetPane = null) {
