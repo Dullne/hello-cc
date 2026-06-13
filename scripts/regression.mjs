@@ -2433,6 +2433,24 @@ async function syntaxAndHelp() {
   if (assignedTeam[0].assignee !== 'codex-team-42-1' || assignedTeam[1].assignee !== 'codex-a') {
     fail(`team planning worker assignment changed: ${JSON.stringify(assignedTeam)}`);
   }
+  const peerFormat = await import(path.join(repoRoot, 'lib', 'peer-format.mjs'));
+  if (typeof peerFormat.sanitizePeerPart !== 'function' ||
+      typeof peerFormat.shortHash !== 'function' ||
+      peerFormat.sanitizePeerPart('Bad Peer!', 'fallback') !== 'bad-peer' ||
+      peerFormat.sanitizePeerPart('!!!', 'fallback') !== 'fallback' ||
+      peerFormat.shortHash('hello') !== 'aaf4c61d') {
+    fail('peer format module behavior changed');
+  }
+  for (const [label, source] of [
+    ['provider commands', fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8')],
+    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'team-planning.mjs'), 'utf8')],
+    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'peer-identity.mjs'), 'utf8')]
+  ]) {
+    if (!source.includes("from './peer-format.mjs'")) fail(`${label} module does not import peer format helpers`);
+    if (source.includes('function sanitizePeerPart') || source.includes('function shortHash')) {
+      fail(`${label} module still embeds peer format helpers`);
+    }
+  }
   for (const helper of [
     'function sanitizePeerPart',
     'function shortHash',
