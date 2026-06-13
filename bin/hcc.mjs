@@ -198,6 +198,7 @@ const {
   helpUp,
   helpDown,
   helpUpdate,
+  helpUninstall,
   helpWeb
 } = createHelpFunctions({
   productName: PRODUCT_NAME,
@@ -4651,18 +4652,7 @@ async function cmdUpdate(ctx, args) {
 
 async function cmdUninstall(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') {
-    console.log(`${CLI_NAME} uninstall
-
-Usage:
-  ${CLI_NAME} uninstall [--purge --yes]
-
-Stops the current project runtime and removes user-level hello-cc integrations:
-Claude/Codex hooks and claude/codex shims.
-
-With --purge --yes, also removes current project data:
-  .hello-cc/
-  hello-cc blocks from CLAUDE.md and AGENTS.md
-`);
+    helpUninstall();
     return;
   }
 

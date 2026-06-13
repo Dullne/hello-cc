@@ -2760,6 +2760,7 @@ async function syntaxAndHelp() {
     'function helpUp',
     'function helpDown',
     'function helpUpdate',
+    'function helpUninstall',
     'function helpWeb'
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds help text helper: ${helper}`);
@@ -2795,20 +2796,23 @@ async function syntaxAndHelp() {
       'helpUp',
       'helpDown',
       'helpUpdate',
+      'helpUninstall',
       'helpWeb'
     ]) {
       if (typeof helpFns[name] !== 'function') fail(`help factory missing function: ${name}`);
     }
     helpFns.helpMain();
     helpFns.helpUpdate();
+    helpFns.helpUninstall();
     helpFns.helpWeb();
   } finally {
     console.log = savedConsoleLog;
   }
-  const [factoryMainHelp, factoryUpdateHelp, factoryWebHelp] = capturedHelp;
+  const [factoryMainHelp, factoryUpdateHelp, factoryUninstallHelp, factoryWebHelp] = capturedHelp;
   if (!factoryMainHelp?.startsWith('product-x 1.2.3') ||
       !factoryMainHelp.includes('hccx [--root DIR]') ||
       !factoryUpdateHelp?.includes('npm install -g @scope/pkg-x@TAG') ||
+      !factoryUninstallHelp?.includes('hccx uninstall [--purge --yes]') ||
       !factoryWebHelp?.includes("HCC_WEB_TOKEN='long-token' hccx web --port 8787")) {
     fail(`help factory output changed:\n${capturedHelp.join('\n---\n')}`);
   }
