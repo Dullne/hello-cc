@@ -2239,6 +2239,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/timeline.mjs'") ||
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
       !hccSource.includes("} from '../lib/automation.mjs'") ||
+      !hccSource.includes("} from '../lib/state-render.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2251,7 +2252,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2678,6 +2679,66 @@ async function syntaxAndHelp() {
   if (!automationContext.includes('phase: acquire_lock') ||
       !automationContext.includes('why: task #10 needs bin/hcc.mjs [automation] lock')) {
     fail(`automation render context changed: ${automationContext}`);
+  }
+  for (const helper of [
+    'function renderStatusSummary',
+    'function normalizeStateResources',
+    'function renderStateSummary'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds state render helper: ${helper}`);
+  }
+  const stateRender = await import(path.join(repoRoot, 'lib', 'state-render.mjs'));
+  for (const name of [
+    'renderStatusSummary',
+    'normalizeStateResources',
+    'renderStateSummary'
+  ]) {
+    if (typeof stateRender[name] !== 'function') fail(`state render module missing export: ${name}`);
+  }
+  const normalizedResources = stateRender.normalizeStateResources(['bin/hcc.mjs,scripts/regression.mjs', 'bin/hcc.mjs', '', null]);
+  if (JSON.stringify(normalizedResources) !== JSON.stringify(['bin/hcc.mjs', 'scripts/regression.mjs'])) {
+    fail(`state resource normalization changed: ${JSON.stringify(normalizedResources)}`);
+  }
+  const renderedStatus = stateRender.renderStatusSummary({
+    root: '/repo',
+    db: '/repo/.hello-cc/mesh.db',
+    active_peers: 2,
+    stale_peers: 3,
+    tasks: [
+      { status: 'done', n: 4 },
+      { status: 'running', n: 1 }
+    ],
+    active_locks: 5,
+    unread: 6,
+    recent_events: [
+      { id: 7, type: 'task.done', actor: 'peer-a', task_id: 8, created_at: 9 }
+    ]
+  }, 'peer-a');
+  if (!renderedStatus.includes('peers: active=2, stale=3') ||
+      !renderedStatus.includes('tasks: done:4, running:1') ||
+      !renderedStatus.includes('inbox(peer-a): unread=6') ||
+      !renderedStatus.includes('1970-01-01T00:00:09.000Z')) {
+    fail(`state render status output changed:\n${renderedStatus}`);
+  }
+  const renderedState = stateRender.renderStateSummary({
+    root: '/repo',
+    automation: {
+      current_task: { id: 10, status: 'running', title: 'State task' },
+      phase: 'work',
+      next_action: { kind: 'none', command: '', reason: 'continue task #10' },
+      finish_actions: [{ command: 'hcc handoff create' }],
+      warnings: ['review locks before commit']
+    },
+    timeline: [
+      { ts: 11, source: 'message', source_id: 12, title: 'note', text: 'body' }
+    ]
+  }, 'peer-a');
+  if (!renderedState.includes('current task: #10 running State task') ||
+      !renderedState.includes('next: none') ||
+      !renderedState.includes('- hcc handoff create') ||
+      !renderedState.includes('review locks before commit') ||
+      !renderedState.includes('message:12 note')) {
+    fail(`state render state output changed:\n${renderedState}`);
   }
   for (const helper of [
     'const WEB_CHILD_ENV',

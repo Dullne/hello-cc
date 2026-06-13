@@ -61,8 +61,7 @@ import {
   normalizeListText
 } from '../lib/handoff.mjs';
 import {
-  timelineFromRows,
-  uniqueList
+  timelineFromRows
 } from '../lib/timeline.mjs';
 import {
   annotateTasksWithLiveness,
@@ -73,6 +72,11 @@ import {
   deriveAutomation,
   renderAutomationContext
 } from '../lib/automation.mjs';
+import {
+  normalizeStateResources,
+  renderStateSummary,
+  renderStatusSummary
+} from '../lib/state-render.mjs';
 import {
   LAUNCH_FINGERPRINT_ENV,
   PROVIDER_STATE_ENV,
@@ -2294,32 +2298,6 @@ function statusSummary(ctx, peer = null, identity = null) {
   }
 }
 
-function renderStatusSummary(s, peer = null) {
-  const taskSummary = s.tasks.length ? s.tasks.map((r) => `${r.status}:${r.n}`).join(', ') : 'none';
-  return [
-    `root: ${s.root}`,
-    `db: ${s.db}`,
-    `peers: active=${s.active_peers}, stale=${s.stale_peers}`,
-    `tasks: ${taskSummary}`,
-    `locks: active=${s.active_locks}`,
-    peer ? `inbox(${peer}): unread=${s.unread}` : null,
-    '',
-    'recent events:',
-    table(s.recent_events, [
-      { label: 'id', value: (r) => `#${r.id}` },
-      { label: 'type', value: (r) => r.type },
-      { label: 'actor', value: (r) => r.actor || '' },
-      { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-      { label: 'time', value: (r) => iso(r.created_at) }
-    ])
-  ].filter((line) => line !== null).join('\n');
-}
-
-function normalizeStateResources(values) {
-  const list = Array.isArray(values) ? values : [values];
-  return uniqueList(list.flatMap((value) => String(value || '').split(',').map((part) => part.trim())));
-}
-
 async function cmdState(ctx, args) {
   if (wantsHelp(args)) return helpState();
   const opts = parseOpts(args, { arrays: ['resource'] });
@@ -2327,32 +2305,7 @@ async function cmdState(ctx, args) {
   const peer = identity.id;
   const resources = normalizeStateResources(opts.resource || opts.resources || []);
   const snapshot = statusSnapshot(ctx, peer, { resources, intent: opts.intent || null, scope: opts.scope || null });
-  printResult(ctx, snapshot, (data) => {
-    const automation = data.automation;
-    const lines = [
-      `root: ${data.root}`,
-      `peer: ${peer}`,
-      automation.current_task ? `current task: #${automation.current_task.id} ${automation.current_task.status} ${automation.current_task.title}` : null,
-      `phase: ${automation.phase}`,
-      `next: ${automation.next_action.command || automation.next_action.kind}`,
-      `why: ${automation.next_action.reason}`
-    ].filter(Boolean);
-    if (automation.finish_actions.length) {
-      lines.push('', 'finish actions:');
-      lines.push(...automation.finish_actions.map((action) => `- ${action.command}`));
-    }
-    if (automation.warnings.length) {
-      lines.push('', 'warnings:');
-      lines.push(...automation.warnings.map((warning) => `- ${warning}`));
-    }
-    if (data.timeline.length) {
-      lines.push('', 'timeline:');
-      for (const item of data.timeline.slice(-8)) {
-        lines.push(`- ${iso(item.ts)} ${item.source}:${item.source_id} ${item.title}${item.text ? ` — ${item.text}` : ''}`);
-      }
-    }
-    return lines.join('\n');
-  });
+  printResult(ctx, snapshot, (data) => renderStateSummary(data, peer));
 }
 
 async function cmdPrompt(ctx, args) {
