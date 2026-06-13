@@ -36,7 +36,7 @@ want coordination without the Web console or shims.
 ```text
 hcc peers
 hcc status [--peer ID]
-hcc state [--peer ID] [--resource PATH] [--intent work|stop|finish]
+hcc state [--peer ID] [--resource PATH] [--scope SCOPE] [--intent read|review|work|write|stop|finish]
 hcc scan [--register]
 hcc prompt --peer ID [--kind codex|claude|shell|other] [--role ROLE]
 hcc join --peer ID [--kind codex|claude|shell|other] [--role ROLE]
@@ -51,7 +51,9 @@ coordination actions such as acking messages, claiming tasks, acquiring locks, o
 creating handoffs. It adds a unified collaboration timeline plus
 `automation.next_action.argv`, a machine-readable next coordination command for
 agents to execute explicitly. `automation.current_task` records the peer's active
-task when one exists.
+task when one exists. Use `--intent read` or `--intent review` for snapshot
+inspection that should not acquire locks; use `--scope` with write/work intents
+to coordinate one region of a larger shared resource.
 
 ## Browser-Controllable Terminals
 
@@ -93,6 +95,7 @@ sender by default. Use `msg thread` to inspect the full thread for one message.
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
 hcc task list [--status S] [--peer ID] [--all]
 hcc task claim [--peer ID] --id N
+hcc task takeover [--peer ID] --id N --reason TEXT
 hcc task next [--peer ID] [--force]
 hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
@@ -102,7 +105,9 @@ hcc task done [--peer ID] --id N --summary TEXT
 Tasks are shared project facts. They remain visible until marked `done` or
 `abandoned`. `task next` returns your existing claimed/running/review/blocked
 task before claiming a new pending task; use `--force` only when intentionally
-taking another pending task.
+taking another pending task. Use `task takeover` when explicitly taking a
+non-complete task from another owner; it records the previous owner, requires a
+reason, and notifies them.
 
 ## Teams
 
@@ -121,9 +126,9 @@ explicit peer IDs or kind counts such as `codex:2,claude:1`.
 ## Locks, Handoffs, And Events
 
 ```text
-hcc lock acquire [--peer ID] --resource PATH [--task N] [--ttl SEC] [--reason TEXT]
-hcc lock renew [--peer ID] --resource PATH [--ttl SEC]
-hcc lock release [--peer ID] --resource PATH [--force]
+hcc lock acquire [--peer ID] --resource PATH [--scope SCOPE] [--task N] [--ttl SEC] [--reason TEXT]
+hcc lock renew [--peer ID] --resource PATH [--scope SCOPE] [--ttl SEC]
+hcc lock release [--peer ID] --resource PATH [--scope SCOPE] [--force]
 hcc lock list [--all]
 hcc handoff create [--from ID] --summary TEXT [--task N] [--to ID] [--changed-files JSON_OR_CSV] [--tests TEXT] [--risks TEXT]
 hcc handoff list [--task N] [--limit N]
@@ -131,5 +136,8 @@ hcc event tail [--limit N]
 hcc gc [--older-than DAYS] [--yes]
 ```
 
-Locks are advisory coordination locks with TTLs. Handoffs preserve the result,
+Locks are advisory coordination locks with TTLs. Omitting `--scope` locks the
+whole resource. Different scopes on the same resource can be held concurrently,
+for example `--resource bin/hcc.mjs --scope db-schema` and `--scope web-ui`, but
+a whole-resource lock conflicts with every scope. Handoffs preserve the result,
 tests, changed files, and remaining risks when work moves between peers.

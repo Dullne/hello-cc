@@ -458,17 +458,21 @@ function assertLegacySchemaMigration() {
       for (const column of ['parent_id', 'team_role']) {
         if (!taskColumns.has(column)) fail(`legacy migration did not add tasks.${column}`);
       }
+      const lockColumns = new Set(db.prepare('PRAGMA table_info(locks)').all().map((row) => row.name));
+      for (const column of ['base_resource', 'scope']) {
+        if (!lockColumns.has(column)) fail(`legacy migration did not add locks.${column}`);
+      }
       const message = db.prepare('SELECT id, thread_id FROM messages WHERE body = ?').get('legacy-message');
       if (!message || message.thread_id !== message.id) {
         fail(`legacy message thread_id not backfilled:\n${JSON.stringify(message, null, 2)}`);
       }
       const metaVersion = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
       const pragmaVersion = db.prepare('PRAGMA user_version').get().user_version;
-      if (metaVersion !== '4' || pragmaVersion !== 4) {
+      if (metaVersion !== '5' || pragmaVersion !== 5) {
         fail(`schema version not synchronized: meta=${metaVersion} pragma=${pragmaVersion}`);
       }
       const migrations = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
-      if (migrations.length !== 4 || migrations[3].version !== 4 || migrations[3].name !== 'team task hierarchy') {
+      if (migrations.length !== 5 || migrations[4].version !== 5 || migrations[4].name !== 'scoped advisory locks') {
         fail(`schema migrations history wrong:\n${JSON.stringify(migrations, null, 2)}`);
       }
     } finally {
@@ -500,7 +504,7 @@ function assertRegisteredProjectDbMigration() {
         fail(`registered project DB was not migrated:\n${JSON.stringify([...taskColumns], null, 2)}`);
       }
       const version = db.prepare('PRAGMA user_version').get().user_version;
-      if (version !== 4) fail(`registered project DB user_version wrong: ${version}`);
+      if (version !== 5) fail(`registered project DB user_version wrong: ${version}`);
     } finally {
       db.close();
     }
@@ -521,7 +525,7 @@ function assertFutureSchemaMigrationHistoryRejected() {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
-        INSERT INTO meta(key, value) VALUES ('schema_version', '4');
+        INSERT INTO meta(key, value) VALUES ('schema_version', '5');
         CREATE TABLE schema_migrations (
           version INTEGER PRIMARY KEY,
           name TEXT NOT NULL,
@@ -534,7 +538,7 @@ function assertFutureSchemaMigrationHistoryRejected() {
       db.close();
     }
     const result = runMaybe(process.execPath, [hccBin, '--root', futureRoot, 'status', '--peer', 'future-schema-check'], { env });
-    if (result.status === 0 || !`${result.stdout}\n${result.stderr}`.includes('Database schema version 999 is newer than this hcc (4)')) {
+    if (result.status === 0 || !`${result.stdout}\n${result.stderr}`.includes('Database schema version 999 is newer than this hcc (5)')) {
       fail(`future schema migration history was not rejected:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
     }
   } finally {
@@ -676,6 +680,11 @@ function assertGuidanceLockPolicy(file) {
     'Do not silently treat a snapshot review as final approval',
     'Before mutating work:',
     'Before editing or mutating shared resources:',
+    'module scope',
+    'Locks are coordination signals',
+    '--scope db-schema',
+    '--scope web-ui',
+    'narrower scoped locks',
     'Commit-readiness checks are read-only until staging begins',
     'lock `.git/index` only while staging and'
   ]) {
@@ -1158,6 +1167,13 @@ async function dbWorkflow() {
   if (stateAfterAck.automation.next_action.kind !== 'lock.acquire') {
     fail(`state automation did not suggest lock acquire after ack:\n${JSON.stringify(stateAfterAck.automation, null, 2)}`);
   }
+  const readOnlyState = hccJson(['state', '--peer', 'codex-a', '--resource', 'src/read-only', '--intent', 'review']);
+  if (readOnlyState.automation.next_action.kind === 'lock.acquire' || readOnlyState.automation.phase === 'acquire_lock') {
+    fail(`read-only state suggested acquiring a lock:\n${JSON.stringify(readOnlyState.automation, null, 2)}`);
+  }
+  if (!(readOnlyState.automation.warnings || []).some((warning) => warning.includes('read-only'))) {
+    fail(`read-only state did not explain no-lock behavior:\n${JSON.stringify(readOnlyState.automation, null, 2)}`);
+  }
   const queuedTask = hcc(['task', 'create', '--from', 'human', '--to', 'codex-a', '--title', 'queued while busy']);
   const queuedTaskMatch = queuedTask.match(/created task #(\d+):/);
   if (!queuedTaskMatch) fail(`cannot parse queued task id: ${queuedTask}`);
@@ -1254,6 +1270,27 @@ async function dbWorkflow() {
   }
   hcc(['task', 'done', '--peer', 'codex-team-captain', '--id', teamParentId, '--summary', 'team regression done']);
 
+  const scopedA = hcc(['lock', 'acquire', '--peer', 'codex-a', '--resource', 'bin/hcc.mjs', '--scope', 'db-schema', '--ttl', '60', '--reason', 'db split']);
+  const scopedB = hcc(['lock', 'acquire', '--peer', 'codex-b', '--resource', 'bin/hcc.mjs', '--scope', 'web-ui', '--ttl', '60', '--reason', 'ui split']);
+  if (!scopedA.includes('bin/hcc.mjs [db-schema]') || !scopedB.includes('bin/hcc.mjs [web-ui]')) {
+    fail(`scoped lock output missing labels:\n${scopedA}\n${scopedB}`);
+  }
+  const scopedRows = hccJson(['lock', 'list']);
+  if (!scopedRows.some((row) => row.base_resource === 'bin/hcc.mjs' && row.scope === 'db-schema') ||
+      !scopedRows.some((row) => row.base_resource === 'bin/hcc.mjs' && row.scope === 'web-ui')) {
+    fail(`scoped locks missing from list:\n${JSON.stringify(scopedRows, null, 2)}`);
+  }
+  const duplicateScope = hccMaybe(['lock', 'acquire', '--peer', 'claude-a', '--resource', 'bin/hcc.mjs', '--scope', 'db-schema', '--ttl', '60', '--reason', 'same scope']);
+  if (duplicateScope.status === 0 || !`${duplicateScope.stdout}\n${duplicateScope.stderr}`.includes('conflicts with lock bin/hcc.mjs [db-schema]')) {
+    fail(`same-scope lock was not rejected:\n${duplicateScope.stdout}\n${duplicateScope.stderr}`);
+  }
+  const wholeResource = hccMaybe(['lock', 'acquire', '--peer', 'claude-a', '--resource', 'bin/hcc.mjs', '--ttl', '60', '--reason', 'whole file']);
+  if (wholeResource.status === 0 || !`${wholeResource.stdout}\n${wholeResource.stderr}`.includes('conflicts with lock bin/hcc.mjs [db-schema]')) {
+    fail(`whole-resource lock did not conflict with scoped locks:\n${wholeResource.stdout}\n${wholeResource.stderr}`);
+  }
+  hcc(['lock', 'release', '--peer', 'codex-a', '--resource', 'bin/hcc.mjs', '--scope', 'db-schema']);
+  hcc(['lock', 'release', '--peer', 'codex-b', '--resource', 'bin/hcc.mjs', '--scope', 'web-ui']);
+
   const conflictTask = hcc(['task', 'create', '--from', 'human', '--to', 'codex-b', '--title', 'conflict automation task']);
   const conflictTaskMatch = conflictTask.match(/created task #(\d+):/);
   if (!conflictTaskMatch) fail(`cannot parse conflict task id: ${conflictTask}`);
@@ -1269,6 +1306,23 @@ async function dbWorkflow() {
   }
   hcc(['lock', 'release', '--peer', 'codex-a', '--resource', 'src/conflict']);
   hcc(['task', 'done', '--peer', 'codex-b', '--id', conflictTaskId, '--summary', 'conflict done']);
+
+  const takeoverTask = hcc(['task', 'create', '--from', 'human', '--to', 'codex-owner', '--title', 'takeover regression task']);
+  const takeoverTaskMatch = takeoverTask.match(/created task #(\d+):/);
+  if (!takeoverTaskMatch) fail(`cannot parse takeover task id: ${takeoverTask}`);
+  const takeoverTaskId = takeoverTaskMatch[1];
+  hcc(['task', 'claim', '--peer', 'codex-owner', '--id', takeoverTaskId]);
+  const takeoverOutput = hcc(['task', 'takeover', '--peer', 'codex-taker', '--id', takeoverTaskId, '--reason', 'owner inactive']);
+  if (!takeoverOutput.includes(`took over task #${takeoverTaskId}`)) fail(`takeover output wrong:\n${takeoverOutput}`);
+  const takeoverRow = hccJson(['task', 'list', '--all']).find((row) => String(row.id) === String(takeoverTaskId));
+  if (!takeoverRow || takeoverRow.owner !== 'codex-taker' || takeoverRow.status !== 'claimed') {
+    fail(`takeover task row wrong:\n${JSON.stringify(takeoverRow, null, 2)}`);
+  }
+  const takeoverInbox = hcc(['msg', 'inbox', '--peer', 'codex-owner']);
+  if (!takeoverInbox.includes(`Task #${takeoverTaskId} taken over by codex-taker`)) {
+    fail(`takeover did not notify previous owner:\n${takeoverInbox}`);
+  }
+  hcc(['task', 'done', '--peer', 'codex-taker', '--id', takeoverTaskId, '--summary', 'takeover done']);
 
   const abandoned = hcc(['task', 'create', '--from', 'human', '--title', 'abandoned regression task']);
   const abandonedMatch = abandoned.match(/created task #(\d+):/);
@@ -2043,6 +2097,7 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'errors.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'format.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'guidance.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'json-file.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'package-meta.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'release-notes.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'runtime-paths.mjs')]);
@@ -2105,6 +2160,7 @@ function syntaxAndHelp() {
   const taskHelp = run(process.execPath, [hccBin, 'task', '--help']);
   if (!taskHelp.includes('task next [--peer ID] [--force]') ||
       !taskHelp.includes('existing claimed/running/review/blocked task') ||
+      !taskHelp.includes('task takeover [--peer ID] --id N --reason TEXT') ||
       !taskHelp.includes('task create --title TEXT --parent N')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
@@ -2113,8 +2169,17 @@ function syntaxAndHelp() {
     fail(`team help missing expected content:\n${teamHelp}`);
   }
   const stateHelp = run(process.execPath, [hccBin, 'state', '--help']);
-  if (!stateHelp.includes('hcc state') || !stateHelp.includes('automation.next_action.argv') || !stateHelp.includes('automation.current_task') || !stateHelp.includes('hcc team plan')) {
+  if (!stateHelp.includes('hcc state') ||
+      !stateHelp.includes('--scope SCOPE') ||
+      !stateHelp.includes('--intent read|review|work|write|stop|finish') ||
+      !stateHelp.includes('automation.next_action.argv') ||
+      !stateHelp.includes('automation.current_task') ||
+      !stateHelp.includes('hcc team plan')) {
     fail(`state help missing expected content:\n${stateHelp}`);
+  }
+  const lockHelp = run(process.execPath, [hccBin, 'lock', '--help']);
+  if (!lockHelp.includes('--scope SCOPE') || !lockHelp.toLowerCase().includes('different scopes on the same resource')) {
+    fail(`lock help missing scoped lock content:\n${lockHelp}`);
   }
   const updateHelp = run(process.execPath, [hccBin, 'update', '--help']);
   if (!updateHelp.includes('hcc update') || !updateHelp.includes('npm install -g @logicseek/hello-cc@TAG')) {

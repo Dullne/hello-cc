@@ -53,7 +53,7 @@ const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = PACKAGE_META.name;
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
-const DB_SCHEMA_VERSION = 4;
+const DB_SCHEMA_VERSION = 5;
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
 const WEB_CHILD_ENV = 'HCC_WEB_CHILD';
@@ -1536,6 +1536,8 @@ function createBaseSchema(db) {
 
     CREATE TABLE IF NOT EXISTS locks (
       resource TEXT PRIMARY KEY,
+      base_resource TEXT,
+      scope TEXT NOT NULL DEFAULT '*',
       owner TEXT NOT NULL,
       task_id INTEGER,
       reason TEXT,
@@ -1646,6 +1648,23 @@ function runSchemaMigrations(db) {
         addColumnIfMissing(database, 'tasks', 'parent_id', 'parent_id INTEGER');
         addColumnIfMissing(database, 'tasks', 'team_role', 'team_role TEXT');
         database.exec('CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id, priority, id);');
+      }
+    },
+    {
+      version: 5,
+      name: 'scoped advisory locks',
+      up(database) {
+        addColumnIfMissing(database, 'locks', 'base_resource', 'base_resource TEXT');
+        addColumnIfMissing(database, 'locks', 'scope', "scope TEXT NOT NULL DEFAULT '*'");
+        database.exec(`
+          UPDATE locks
+          SET base_resource = resource
+          WHERE base_resource IS NULL OR base_resource = '';
+          UPDATE locks
+          SET scope = '*'
+          WHERE scope IS NULL OR scope = '';
+          CREATE INDEX IF NOT EXISTS idx_locks_base_scope ON locks(base_resource, scope);
+        `);
       }
     }
   ];
@@ -2177,6 +2196,7 @@ const TIMELINE_EVENT_ALLOW = new Set([
   'task.blocked',
   'task.done',
   'task.abandoned',
+  'task.takeover',
   'team.started',
   'lock.acquired',
   'lock.released',
@@ -2278,7 +2298,7 @@ function timelineFromRows({ messages = [], handoffs = [], tasks = [], locks = []
       peers: uniqueList([lock.owner]),
       task_id: lock.task_id || null,
       kind: 'active',
-      title: `lock ${lock.resource}`,
+      title: `lock ${lockLabel(lock)}`,
       text: compactText(lock.reason || `owner=${lock.owner}`),
       direction: 'project'
     };
@@ -2326,6 +2346,51 @@ function makeAction(kind, argv, reason, mutates = true, extra = {}) {
   };
 }
 
+const WHOLE_LOCK_SCOPE = '*';
+
+function normalizeLockScope(scope) {
+  const text = String(scope || '').trim();
+  return text || WHOLE_LOCK_SCOPE;
+}
+
+function scopedLockResource(resource, scope = WHOLE_LOCK_SCOPE) {
+  const baseResource = String(resource || '').trim();
+  const normalizedScope = normalizeLockScope(scope);
+  if (!baseResource) throw new CliError('BAD_ARGS', 'Missing --resource');
+  return {
+    resource: normalizedScope === WHOLE_LOCK_SCOPE
+      ? baseResource
+      : `scoped:${Buffer.from(JSON.stringify([baseResource, normalizedScope]), 'utf8').toString('base64url')}`,
+    base_resource: baseResource,
+    scope: normalizedScope
+  };
+}
+
+function lockBaseResource(lock) {
+  return lock?.base_resource || lock?.resource || '';
+}
+
+function lockScope(lock) {
+  return normalizeLockScope(lock?.scope);
+}
+
+function lockLabel(lock) {
+  const base = lockBaseResource(lock);
+  const scope = lockScope(lock);
+  return scope === WHOLE_LOCK_SCOPE ? base : `${base} [${scope}]`;
+}
+
+function lockArgv(resource, scope) {
+  const argv = ['--resource', resource];
+  if (normalizeLockScope(scope) !== WHOLE_LOCK_SCOPE) argv.push('--scope', normalizeLockScope(scope));
+  return argv;
+}
+
+function locksConflict(a, b) {
+  return lockBaseResource(a) === lockBaseResource(b) &&
+    (lockScope(a) === WHOLE_LOCK_SCOPE || lockScope(b) === WHOLE_LOCK_SCOPE || lockScope(a) === lockScope(b));
+}
+
 function looksLikeMultiTask(task) {
   if (!task) return false;
   const text = `${task.title || ''}\n${task.body || ''}`;
@@ -2369,11 +2434,15 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
   const assignedTasks = peerId ? openTasks.filter((task) => !task.owner && task.assignee === peerId) : [];
   const availableTasks = openTasks.filter((task) => !task.owner && !task.assignee);
   const ownedTask = selectCurrentTask(openTasks, peerId);
+  const intent = String(opts.intent || 'work').toLowerCase();
+  const scope = normalizeLockScope(opts.scope || opts.lock_scope);
   const resources = uniqueList(Array.isArray(opts.resources) ? opts.resources : (opts.resource ? [opts.resource] : []));
   const ownLocks = peerId ? (snapshot.locks || []).filter((lock) => lock.owner === peerId) : [];
   const requestedLocks = resources.map((resource) => {
-    const lock = (snapshot.locks || []).find((row) => row.resource === resource && Number(row.expires_at || 0) > t);
-    return { resource, lock };
+    const requested = scopedLockResource(resource, scope);
+    const lock = (snapshot.locks || []).find((row) => Number(row.expires_at || 0) > t && locksConflict(row, requested));
+    const exact = (snapshot.locks || []).find((row) => Number(row.expires_at || 0) > t && lockBaseResource(row) === requested.base_resource && lockScope(row) === requested.scope);
+    return { ...requested, lock, exact };
   });
   const conflict = requestedLocks.find((entry) => entry.lock && entry.lock.owner !== peerId);
   const missingLock = requestedLocks.find((entry) => !entry.lock);
@@ -2424,10 +2493,27 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
   }
 
   if (ownedTask) {
-    if (conflict) {
-      lockActions.push(makeAction('msg.send', ['msg', 'send', '--from', peerId, '--to', conflict.lock.owner, '--task', String(ownedTask.id), '--body', `Please coordinate ${conflict.resource}; it is locked by ${conflict.lock.owner}.`], `${conflict.resource} is locked by ${conflict.lock.owner}`, true, { task_id: ownedTask.id, resource: conflict.resource, lock_owner: conflict.lock.owner }));
+    const readOnlyIntent = ['read', 'review', 'inspect'].includes(intent);
+    if (readOnlyIntent && resources.length) {
+      warnings.push(`intent=${intent} is read-only; do not acquire file locks for snapshot inspection`);
+    } else if (conflict) {
+      const requestedLabel = lockLabel(conflict);
+      const heldLabel = lockLabel(conflict.lock);
+      lockActions.push(makeAction(
+        'msg.send',
+        ['msg', 'send', '--from', peerId, '--to', conflict.lock.owner, '--task', String(ownedTask.id), '--body', `Please coordinate ${requestedLabel}; ${heldLabel} is locked by ${conflict.lock.owner}. If our edits are separate, split to scoped locks before final tests/commit.`],
+        `${requestedLabel} conflicts with ${heldLabel} held by ${conflict.lock.owner}`,
+        true,
+        { task_id: ownedTask.id, resource: conflict.base_resource, scope: conflict.scope, lock_owner: conflict.lock.owner, lock_resource: conflict.lock.resource, lock_scope: lockScope(conflict.lock) }
+      ));
     } else if (missingLock) {
-      lockActions.push(makeAction('lock.acquire', ['lock', 'acquire', '--peer', peerId, '--task', String(ownedTask.id), '--resource', missingLock.resource, '--ttl', String(DEFAULT_LOCK_TTL), '--reason', '<work>'], `task #${ownedTask.id} needs lock for ${missingLock.resource}`, true, { task_id: ownedTask.id, resource: missingLock.resource }));
+      lockActions.push(makeAction(
+        'lock.acquire',
+        ['lock', 'acquire', '--peer', peerId, '--task', String(ownedTask.id), ...lockArgv(missingLock.base_resource, missingLock.scope), '--ttl', String(DEFAULT_LOCK_TTL), '--reason', '<work>'],
+        `task #${ownedTask.id} needs ${lockLabel(missingLock)} lock`,
+        true,
+        { task_id: ownedTask.id, resource: missingLock.base_resource, scope: missingLock.scope }
+      ));
     }
     if (ownedTask.status === 'claimed') {
       taskActions.push(makeAction('task.update', ['task', 'update', '--peer', peerId, '--id', String(ownedTask.id), '--status', 'running', '--summary', '<started>'], `task #${ownedTask.id} is claimed but not running`, true, { task_id: ownedTask.id }));
@@ -2441,7 +2527,7 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
     automation.finish_actions.push(makeAction('handoff.create', ['handoff', 'create', '--from', peerId, '--task', String(ownedTask.id), '--summary', '<summary>', '--tests', '<tests>', '--risks', '<risks>'], `handoff task #${ownedTask.id} before stopping`, true, { task_id: ownedTask.id }));
     automation.finish_actions.push(makeAction('task.done', ['task', 'done', '--peer', peerId, '--id', String(ownedTask.id), '--summary', '<summary>'], `mark task #${ownedTask.id} done after handoff`, true, { task_id: ownedTask.id }));
     for (const lock of ownLocks) {
-      automation.finish_actions.push(makeAction('lock.release', ['lock', 'release', '--peer', peerId, '--resource', lock.resource], `release ${lock.resource}`, true, { task_id: lock.task_id || null, resource: lock.resource }));
+      automation.finish_actions.push(makeAction('lock.release', ['lock', 'release', '--peer', peerId, ...lockArgv(lockBaseResource(lock), lockScope(lock))], `release ${lockLabel(lock)}`, true, { task_id: lock.task_id || null, resource: lockBaseResource(lock), scope: lockScope(lock) }));
     }
   }
   automation.actions.push(...lockActions, ...messageActions, ...taskActions);
@@ -2536,7 +2622,7 @@ function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
   `).all(t);
   const tasks = queryOpenTasks(db, 200);
   const locks = db.prepare(`
-    SELECT resource, owner, task_id, reason, expires_at, created_at
+    SELECT resource, base_resource, scope, owner, task_id, reason, expires_at, created_at
     FROM locks
     WHERE expires_at > ?
     ORDER BY resource ASC
@@ -2632,7 +2718,7 @@ function buildHookCoordinationContext(db, ctx, peerId) {
   if (snapshot.locks.length > 0) {
     parts.push('[hello-cc active locks]');
     parts.push(...snapshot.locks.slice(0, 8).map((lock) =>
-      `- ${lock.resource} owner=${lock.owner}${lock.task_id ? ` task #${lock.task_id}` : ''}`));
+      `- ${lockLabel(lock)} owner=${lock.owner}${lock.task_id ? ` task #${lock.task_id}` : ''}`));
   } else {
     parts.push('[hello-cc active locks]\n(none)');
   }
@@ -2829,6 +2915,7 @@ async function cmdTask(ctx, args) {
   if (sub === 'create') return taskCreate(ctx, args.slice(1));
   if (sub === 'list') return taskList(ctx, args.slice(1));
   if (sub === 'claim') return taskClaim(ctx, args.slice(1));
+  if (sub === 'takeover') return taskTakeover(ctx, args.slice(1));
   if (sub === 'next') return taskNext(ctx, args.slice(1));
   if (sub === 'update') return taskUpdate(ctx, args.slice(1));
   if (sub === 'done') return taskDone(ctx, args.slice(1));
@@ -2938,6 +3025,42 @@ async function taskClaim(ctx, args) {
     return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
   });
   printResult(ctx, task, (data) => `claimed task #${data.id}: ${data.title}`);
+}
+
+async function taskTakeover(ctx, args) {
+  const opts = parseOpts(args);
+  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
+  const peer = identity.id;
+  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
+  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
+  const reason = required(opts, 'reason');
+  const db = connect(ctx);
+  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
+  const task = tx(db, () => {
+    const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
+    if (['done', 'abandoned'].includes(row.status)) {
+      throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
+    }
+    const previousOwner = row.owner || null;
+    const previousAssignee = row.assignee || null;
+    const t = now();
+    db.prepare(`
+      UPDATE tasks
+      SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
+      WHERE id = ?
+    `).run(peer, t, t, id);
+    addEvent(db, 'task.takeover', peer, id, {
+      previous_owner: previousOwner,
+      previous_assignee: previousAssignee,
+      reason
+    });
+    if (previousOwner && previousOwner !== peer) {
+      sendMessage(db, peer, previousOwner, id, 'task.takeover', `Task #${id} taken over by ${peer}: ${reason}`);
+    }
+    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+  });
+  printResult(ctx, task, (data) => `took over task #${data.id}: ${data.title}`);
 }
 
 async function taskNext(ctx, args) {
@@ -3569,7 +3692,7 @@ async function lockAcquire(ctx, args) {
   const opts = parseOpts(args);
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
-  const resource = required(opts, 'resource');
+  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
   const taskId = intOpt(opts, 'task', null);
   const ttl = intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const reason = opts.reason || '';
@@ -3577,66 +3700,73 @@ async function lockAcquire(ctx, args) {
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   const lock = tx(db, () => {
     const t = now();
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(resource);
-    if (existing && existing.expires_at > t && existing.owner !== peer) {
-      throw new CliError('LOCK_HELD', `Resource is locked by ${existing.owner}`, {
-        resource,
-        owner: existing.owner,
-        expires_at: iso(existing.expires_at)
+    const activeLocks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+    const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
+    if (conflict) {
+      throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
+        resource: requested.base_resource,
+        scope: requested.scope,
+        lock_resource: conflict.resource,
+        lock_scope: lockScope(conflict),
+        owner: conflict.owner,
+        expires_at: iso(conflict.expires_at)
       });
     }
+    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
     db.prepare(`
-      INSERT INTO locks(resource, owner, task_id, reason, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(resource) DO UPDATE SET
+        base_resource = excluded.base_resource,
+        scope = excluded.scope,
         owner = excluded.owner,
         task_id = excluded.task_id,
         reason = excluded.reason,
         expires_at = excluded.expires_at
-    `).run(resource, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
-    addEvent(db, 'lock.acquired', peer, taskId, { resource, ttl, previous_owner: existing ? existing.owner : null });
-    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(resource);
+    `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
+    addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
+    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
   });
-  printResult(ctx, lock, (data) => `locked ${data.resource} by ${data.owner} until ${iso(data.expires_at)}`);
+  printResult(ctx, lock, (data) => `locked ${lockLabel(data)} by ${data.owner} until ${iso(data.expires_at)}`);
 }
 
 async function lockRelease(ctx, args) {
   const opts = parseOpts(args, { booleans: ['force'] });
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
-  const resource = required(opts, 'resource');
+  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, null, 'shell');
   const result = tx(db, () => {
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(resource);
-    if (!existing) return { released: false, resource };
+    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+    if (!existing) return { released: false, ...requested };
     if (existing.owner !== peer && !opts.force) {
       throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
     }
-    db.prepare('DELETE FROM locks WHERE resource = ?').run(resource);
-    addEvent(db, 'lock.released', peer, existing.task_id || null, { resource, force: Boolean(opts.force) });
-    return { released: true, resource };
+    db.prepare('DELETE FROM locks WHERE resource = ?').run(requested.resource);
+    addEvent(db, 'lock.released', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, force: Boolean(opts.force) });
+    return { released: true, ...requested };
   });
-  printResult(ctx, result, (data) => data.released ? `released ${data.resource}` : `no lock for ${data.resource}`);
+  printResult(ctx, result, (data) => data.released ? `released ${lockLabel(data)}` : `no lock for ${lockLabel(data)}`);
 }
 
 async function lockRenew(ctx, args) {
   const opts = parseOpts(args);
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
-  const resource = required(opts, 'resource');
+  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
   const ttl = intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   const lock = tx(db, () => {
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(resource);
-    if (!existing) throw new CliError('NOT_FOUND', `No lock for ${resource}`);
+    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+    if (!existing) throw new CliError('NOT_FOUND', `No lock for ${lockLabel(requested)}`);
     if (existing.owner !== peer) throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
-    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?').run(now() + ttl, resource);
-    addEvent(db, 'lock.renewed', peer, existing.task_id || null, { resource, ttl });
-    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(resource);
+    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?').run(now() + ttl, requested.resource);
+    addEvent(db, 'lock.renewed', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl });
+    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
   });
-  printResult(ctx, lock, (data) => `renewed ${data.resource} until ${iso(data.expires_at)}`);
+  printResult(ctx, lock, (data) => `renewed ${lockLabel(data)} until ${iso(data.expires_at)}`);
 }
 
 async function lockList(ctx, args) {
@@ -3646,7 +3776,8 @@ async function lockList(ctx, args) {
     ? db.prepare('SELECT * FROM locks ORDER BY resource ASC').all()
     : db.prepare('SELECT * FROM locks WHERE expires_at > ? ORDER BY resource ASC').all(now());
   printResult(ctx, rows, (data) => table(data, [
-    { label: 'resource', value: (r) => r.resource },
+    { label: 'resource', value: (r) => lockBaseResource(r) },
+    { label: 'scope', value: (r) => lockScope(r) },
     { label: 'owner', value: (r) => r.owner },
     { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
     { label: 'expires', value: (r) => iso(r.expires_at) },
@@ -3785,7 +3916,7 @@ async function cmdState(ctx, args) {
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const resources = normalizeStateResources(opts.resource || opts.resources || []);
-  const snapshot = statusSnapshot(ctx, peer, { resources, intent: opts.intent || null });
+  const snapshot = statusSnapshot(ctx, peer, { resources, intent: opts.intent || null, scope: opts.scope || null });
   printResult(ctx, snapshot, (data) => {
     const automation = data.automation;
     const lines = [
@@ -3836,14 +3967,14 @@ Coordination rules:
 - Claim exactly one task before editing.
 - If state shows a current task for ${peer}, continue that task before claiming another pending task.
 - Before editing a file, directory, module, or shared test resource, run:
-  ${cmd} lock acquire --peer ${peer} --resource <path-or-module> --task <task-id>
+  ${cmd} lock acquire --peer ${peer} --resource <path-or-module> [--scope <scope>] --task <task-id>
 - If a lock is held by another peer, message that peer instead of editing:
   ${cmd} msg send --from ${peer} --to <peer-id> --body "<question>"
 - Report progress or requests through msg send.
 - Before stopping, run tests, create a handoff, and release locks:
   ${cmd} handoff create --from ${peer} --task <task-id> --summary "<what changed>" --tests "<commands/results>" --risks "<known risks>"
   ${cmd} task done --peer ${peer} --id <task-id> --summary "<done summary>"
-  ${cmd} lock release --peer ${peer} --resource <path-or-module>
+  ${cmd} lock release --peer ${peer} --resource <path-or-module> [--scope <scope>]
 `;
   printResult(ctx, { prompt: text }, () => text);
 }
@@ -4319,6 +4450,108 @@ function webPeerTaskNext(projectCtx, peer, input = {}) {
   }
 }
 
+function webPeerTaskTakeover(projectCtx, peer, input = {}) {
+  const id = intOpt(input, 'id', intOpt({ id: input.task }, 'id'));
+  if (!id) throw new CliError('BAD_REQUEST', 'task id required');
+  const reason = required(input, 'reason');
+  const db = connect(projectCtx);
+  try {
+    touchPeer(db, peer, 'working');
+    const task = tx(db, () => {
+      const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+      if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
+      if (['done', 'abandoned'].includes(row.status)) {
+        throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
+      }
+      const previousOwner = row.owner || null;
+      const t = now();
+      db.prepare(`
+        UPDATE tasks
+        SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
+        WHERE id = ?
+      `).run(peer, t, t, id);
+      addEvent(db, 'task.takeover', peer, id, {
+        previous_owner: previousOwner,
+        previous_assignee: row.assignee || null,
+        reason,
+        source: 'web'
+      });
+      if (previousOwner && previousOwner !== peer) {
+        sendMessage(db, peer, previousOwner, id, 'task.takeover', `Task #${id} taken over by ${peer}: ${reason}`);
+      }
+      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    });
+    return { peer, task, summary: `took over task #${task.id}: ${task.title}` };
+  } finally {
+    db.close();
+  }
+}
+
+function webPeerLockAcquire(projectCtx, peer, input = {}) {
+  const requested = scopedLockResource(required(input, 'resource'), input.scope);
+  const ttl = intOpt(input, 'ttl', DEFAULT_LOCK_TTL);
+  const taskId = intOpt(input, 'task', intOpt(input, 'task_id', null));
+  const reason = input.reason || '';
+  const db = connect(projectCtx);
+  try {
+    touchPeer(db, peer, 'working');
+    const lock = tx(db, () => {
+      const t = now();
+      const activeLocks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+      const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
+      if (conflict) {
+        throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
+          resource: requested.base_resource,
+          scope: requested.scope,
+          lock_resource: conflict.resource,
+          lock_scope: lockScope(conflict),
+          owner: conflict.owner,
+          expires_at: iso(conflict.expires_at)
+        });
+      }
+      const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+      db.prepare(`
+        INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(resource) DO UPDATE SET
+          base_resource = excluded.base_resource,
+          scope = excluded.scope,
+          owner = excluded.owner,
+          task_id = excluded.task_id,
+          reason = excluded.reason,
+          expires_at = excluded.expires_at
+      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
+      addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null, source: 'web' });
+      return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+    });
+    return { peer, lock, summary: `locked ${lockLabel(lock)} by ${lock.owner} until ${iso(lock.expires_at)}` };
+  } finally {
+    db.close();
+  }
+}
+
+function webPeerLockRelease(projectCtx, peer, input = {}) {
+  const requested = scopedLockResource(required(input, 'resource'), input.scope);
+  const force = Boolean(input.force);
+  const db = connect(projectCtx);
+  try {
+    touchPeer(db, peer, null);
+    const result = tx(db, () => {
+      const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+      if (!existing) return { released: false, ...requested };
+      if (existing.owner !== peer && !force) {
+        throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
+      }
+      db.prepare('DELETE FROM locks WHERE resource = ?').run(requested.resource);
+      addEvent(db, 'lock.released', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, force, source: 'web' });
+      return { released: true, ...requested };
+    });
+    return { peer, result, summary: result.released ? `released ${lockLabel(result)}` : `no lock for ${lockLabel(result)}` };
+  } finally {
+    db.close();
+  }
+}
+
 function webPeerInbox(projectCtx, peer, input = {}) {
   const db = connect(projectCtx);
   try {
@@ -4343,7 +4576,8 @@ function webPeerAction(projectCtx, peer, action, input = {}) {
   if (normalized === 'state') {
     const data = statusSnapshot(projectCtx, peer, {
       resources: normalizeStateResources(input.resource || input.resources || []),
-      intent: input.intent || null
+      intent: input.intent || null,
+      scope: input.scope || null
     });
     return { ok: true, action: normalized, peer, summary: data.automation?.next_action?.reason || 'state loaded', data };
   }
@@ -4353,6 +4587,18 @@ function webPeerAction(projectCtx, peer, action, input = {}) {
   }
   if (normalized === 'task-next') {
     const data = webPeerTaskNext(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'task-takeover') {
+    const data = webPeerTaskTakeover(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'lock-acquire') {
+    const data = webPeerLockAcquire(projectCtx, peer, input);
+    return { ok: true, action: normalized, peer, summary: data.summary, data };
+  }
+  if (normalized === 'lock-release') {
+    const data = webPeerLockRelease(projectCtx, peer, input);
     return { ok: true, action: normalized, peer, summary: data.summary, data };
   }
   if (normalized === 'heartbeat') {
@@ -5444,6 +5690,12 @@ function webIndexHtml() {
       return tr('status.' + value.toLowerCase(), value);
     }
 
+    function lockLabel(lock) {
+      const base = lock.base_resource || lock.resource || '';
+      const scope = lock.scope || '*';
+      return scope === '*' ? base : base + ' [' + scope + ']';
+    }
+
     function managedPeerId(id) {
       return sessionPeerId(sessions.find((s) => s.id === id)) || id;
     }
@@ -5666,7 +5918,7 @@ function webIndexHtml() {
       \`;
       }).join('') || '<div class="empty">' + esc(tr('noPeers')) + '</div>';
       const locks = locksData.map((l) => \`
-          <div class="item"><strong>\${esc(l.resource)}</strong><span>\${esc(tr('owner'))}=\${esc(l.owner)} \${esc(tr('task'))}=\${l.task_id ? '#' + l.task_id : ''}</span></div>
+          <div class="item"><strong>\${esc(lockLabel(l))}</strong><span>\${esc(tr('owner'))}=\${esc(l.owner)} \${esc(tr('task'))}=\${l.task_id ? '#' + l.task_id : ''}</span></div>
         \`).join('') || '<div class="empty">' + esc(tr('noActiveLocks')) + '</div>';
       const messages = messagesData.map((m) => \`
           <div class="item"><strong>#\${m.id} \${esc(m.sender)} → \${esc(m.recipient || tr('all'))}\${m.reply_to ? ' ' + esc(tr('reply')) + ' #' + m.reply_to : ''}</strong><span>\${esc(m.body)}</span></div>
@@ -5906,6 +6158,15 @@ function webIndexHtml() {
         return data.task
           ? (data.current ? 'current ' : 'claimed ') + '#' + data.task.id + ' ' + data.task.title + ' (' + data.task.status + ')'
           : result.summary;
+      }
+      if (result.action === 'task-takeover') {
+        return data.task ? '#' + data.task.id + ' ' + data.task.title + ' -> ' + data.task.owner : result.summary;
+      }
+      if (result.action === 'lock-acquire') {
+        return data.lock ? 'locked ' + lockLabel(data.lock) + ' by ' + data.lock.owner : result.summary;
+      }
+      if (result.action === 'lock-release') {
+        return result.summary || JSON.stringify(data.result || data, null, 2);
       }
       return result.summary || JSON.stringify(result, null, 2);
     }
@@ -7108,7 +7369,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         ]);
         sendJson(res, 200, statusSnapshot(reqCtx, url.searchParams.get('peer'), {
           resources,
-          intent: url.searchParams.get('intent') || null
+          intent: url.searchParams.get('intent') || null,
+          scope: url.searchParams.get('scope') || null
         }));
         return;
       }
@@ -7716,6 +7978,7 @@ Usage:
   ${CLI_NAME} task create --title TEXT --parent N [--team-role ROLE]
   ${CLI_NAME} task list [--status pending|claimed|running|review|blocked|done|abandoned] [--peer ID] [--all]
   ${CLI_NAME} task claim [--peer ID] --id N
+  ${CLI_NAME} task takeover [--peer ID] --id N --reason TEXT
   ${CLI_NAME} task next [--peer ID] [--force]
   ${CLI_NAME} task update [--peer ID] --id N --status STATUS [--summary TEXT] [--body TEXT] [--to ID]
   ${CLI_NAME} task done [--peer ID] --id N --summary TEXT
@@ -7726,6 +7989,8 @@ Messages use per-peer unread ack state; tasks do not.
 task next returns your existing claimed/running/review/blocked task before
 claiming another pending task. Use --force only when intentionally taking
 another pending task.
+Use task takeover when explicitly taking over a non-complete task from another
+owner; it records the previous owner, requires a reason, and notifies them.
 
 If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal
 as a stable project-local peer.
@@ -7751,7 +8016,7 @@ function helpState() {
   console.log(`${CLI_NAME} state
 
 Usage:
-  ${CLI_NAME} state [--peer ID] [--resource PATH] [--intent work|stop|finish]
+  ${CLI_NAME} state [--peer ID] [--resource PATH] [--scope SCOPE] [--intent read|review|work|write|stop|finish]
 
 Shows the current collaboration timeline plus a machine-readable coordination
 state machine. With --json, the response includes automation.next_action.argv so
@@ -7760,6 +8025,9 @@ automation.current_task shows the peer's active claimed/running/review/blocked
 task when one exists.
 If a current task looks splittable, automation may suggest hcc team plan; this
 is read-only until hcc team start is run explicitly.
+With --intent read or --intent review, state treats resources as snapshot
+inspection and does not suggest acquiring file locks. With write/work intents,
+--scope lets agents coordinate independent regions of the same resource.
 
 State does not execute coordination actions: it does not ack messages, claim
 tasks, acquire locks, send messages, create handoffs, or mark tasks done. Opening
@@ -7889,10 +8157,13 @@ function helpLock() {
   console.log(`${CLI_NAME} lock
 
 Usage:
-  ${CLI_NAME} lock acquire [--peer ID] --resource PATH [--task N] [--ttl SEC] [--reason TEXT]
-  ${CLI_NAME} lock renew [--peer ID] --resource PATH [--ttl SEC]
-  ${CLI_NAME} lock release [--peer ID] --resource PATH [--force]
+  ${CLI_NAME} lock acquire [--peer ID] --resource PATH [--scope SCOPE] [--task N] [--ttl SEC] [--reason TEXT]
+  ${CLI_NAME} lock renew [--peer ID] --resource PATH [--scope SCOPE] [--ttl SEC]
+  ${CLI_NAME} lock release [--peer ID] --resource PATH [--scope SCOPE] [--force]
   ${CLI_NAME} lock list [--all]
+
+Omit --scope to lock the whole resource. Different scopes on the same resource
+can be held concurrently, but a whole-resource lock conflicts with every scope.
 `);
 }
 

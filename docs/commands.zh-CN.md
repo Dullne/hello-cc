@@ -33,7 +33,7 @@ URL token；首次使用时自动生成并保存。用 `--local` 可只绑定 `1
 ```text
 hcc peers
 hcc status [--peer ID]
-hcc state [--peer ID] [--resource PATH] [--intent work|stop|finish]
+hcc state [--peer ID] [--resource PATH] [--scope SCOPE] [--intent read|review|work|write|stop|finish]
 hcc scan [--register]
 hcc prompt --peer ID [--kind codex|claude|shell|other] [--role ROLE]
 hcc join --peer ID [--kind codex|claude|shell|other] [--role ROLE]
@@ -47,6 +47,8 @@ hcc run --peer ID --kind codex|claude|shell --role ROLE -- COMMAND [ARGS...]
 创建 handoff 这类协作动作；它会返回统一协作时间线，以及
 `automation.next_action.argv` 这种机器可读的下一步协作命令，供 agent 显式执行
 并留下审计记录。`automation.current_task` 会记录当前 peer 已经拥有的活动任务。
+使用 `--intent read` 或 `--intent review` 表示只做快照检查，不应获取文件锁；
+写入/工作意图下可用 `--scope` 协调同一个大资源中的某个区域。
 
 ## Web 可控终端
 
@@ -86,6 +88,7 @@ hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
 hcc task list [--status S] [--peer ID] [--all]
 hcc task claim [--peer ID] --id N
+hcc task takeover [--peer ID] --id N --reason TEXT
 hcc task next [--peer ID] [--force]
 hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
@@ -94,7 +97,8 @@ hcc task done [--peer ID] --id N --summary TEXT
 
 任务是项目共享事实。任务会一直可见，直到被标记为 `done` 或 `abandoned`。
 `task next` 会优先返回当前 peer 已经认领、运行、审查或阻塞中的任务；只有明确
-要再接一个 pending 任务时才使用 `--force`。
+要再接一个 pending 任务时才使用 `--force`。明确要从其他 owner 手里接管未完成
+任务时，使用 `task takeover`；它要求填写 reason，会记录原 owner 并通知对方。
 
 ## 团队
 
@@ -112,9 +116,9 @@ hcc team status --task N
 ## 锁、交接和事件
 
 ```text
-hcc lock acquire [--peer ID] --resource PATH [--task N] [--ttl SEC] [--reason TEXT]
-hcc lock renew [--peer ID] --resource PATH [--ttl SEC]
-hcc lock release [--peer ID] --resource PATH [--force]
+hcc lock acquire [--peer ID] --resource PATH [--scope SCOPE] [--task N] [--ttl SEC] [--reason TEXT]
+hcc lock renew [--peer ID] --resource PATH [--scope SCOPE] [--ttl SEC]
+hcc lock release [--peer ID] --resource PATH [--scope SCOPE] [--force]
 hcc lock list [--all]
 hcc handoff create [--from ID] --summary TEXT [--task N] [--to ID] [--changed-files JSON_OR_CSV] [--tests TEXT] [--risks TEXT]
 hcc handoff list [--task N] [--limit N]
@@ -122,5 +126,7 @@ hcc event tail [--limit N]
 hcc gc [--older-than DAYS] [--yes]
 ```
 
-锁是带 TTL 的协作式 advisory lock。交接记录用于保存结果、测试、变更文件和
-剩余风险，方便工作在多个 peer 之间继续。
+锁是带 TTL 的协作式 advisory lock。不传 `--scope` 表示锁住整个资源。同一个
+资源的不同 scope 可以并行持有，例如 `--resource bin/hcc.mjs --scope db-schema`
+和 `--scope web-ui`；但整资源锁会和所有 scope 冲突。交接记录用于保存结果、
+测试、变更文件和剩余风险，方便工作在多个 peer 之间继续。
