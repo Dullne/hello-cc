@@ -2854,9 +2854,21 @@ async function syntaxAndHelp() {
     'function tmuxHasSession',
     'function tmuxSessionHasClients',
     'function tmuxKillSession',
-    'function tmuxSessionEnvironmentValue'
+    'function tmuxSessionEnvironmentValue',
+    'function tmuxPaneInfo',
+    'function tmuxCapturePane',
+    'function tmuxCursorInfo',
+    'function tmuxCursorPayload',
+    'function tmuxSendKeys',
+    'function tmuxSendRawLiteral',
+    'function tmuxInCopyMode',
+    'function tmuxExitCopyMode',
+    'function tmuxPasteBuffer',
+    'function readTmuxEscapeSequence',
+    'function isTmuxRawControlChar',
+    'function tmuxSendLiteral'
   ]) {
-    if (hccSource.includes(helper)) fail(`CLI still embeds low-level tmux helper: ${helper}`);
+    if (hccSource.includes(helper)) fail(`CLI still embeds tmux helper: ${helper}`);
   }
   const tmuxModule = await import(path.join(repoRoot, 'lib', 'tmux.mjs'));
   for (const name of [
@@ -2866,9 +2878,35 @@ async function syntaxAndHelp() {
     'tmuxHasSession',
     'tmuxSessionHasClients',
     'tmuxKillSession',
-    'tmuxSessionEnvironmentValue'
+    'tmuxSessionEnvironmentValue',
+    'tmuxPaneInfo',
+    'tmuxCapturePane',
+    'tmuxCursorInfo',
+    'tmuxCursorPayload',
+    'tmuxSendLiteral'
   ]) {
     if (typeof tmuxModule[name] !== 'function') fail(`tmux module missing export: ${name}`);
+  }
+  const cursorPayload = tmuxModule.tmuxCursorPayload('a\nb\nc\nd', {
+    x: 3,
+    y: 1,
+    visible: true,
+    history: 2,
+    height: 4
+  });
+  if (JSON.stringify(cursorPayload) !== JSON.stringify({ row: 3, col: 3, visible: true })) {
+    fail(`tmux cursor payload mapping changed: ${JSON.stringify(cursorPayload)}`);
+  }
+  const clampedCursorPayload = tmuxModule.tmuxCursorPayload('a\nb\nc\nd\ne', {
+    x: 4,
+    y: 1,
+    visible: false,
+    history: 5,
+    height: 3
+  });
+  if (JSON.stringify(clampedCursorPayload) !== JSON.stringify({ row: 2, col: 4, visible: false }) ||
+      tmuxModule.tmuxCursorPayload('', null) !== null) {
+    fail(`tmux cursor payload clamp/null behavior changed: ${JSON.stringify(clampedCursorPayload)}`);
   }
   for (const helper of [
     'function providerSessionPeerId',
