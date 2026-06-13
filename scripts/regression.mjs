@@ -2237,12 +2237,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
       !hccSource.includes("} from '../lib/team-planning.mjs'") ||
+      !hccSource.includes("} from '../lib/peer-identity.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2431,6 +2432,93 @@ async function syntaxAndHelp() {
   const assignedTeam = teamPlanning.assignTeamWorkers(parsedTeam, ['codex:2'], 42);
   if (assignedTeam[0].assignee !== 'codex-team-42-1' || assignedTeam[1].assignee !== 'codex-a') {
     fail(`team planning worker assignment changed: ${JSON.stringify(assignedTeam)}`);
+  }
+  for (const helper of [
+    'function sanitizePeerPart',
+    'function shortHash',
+    'function currentTtyName',
+    'function readProcCmdline',
+    'function readProcEnv',
+    'function readProcParentPid',
+    'function argsLookLikeCli',
+    'function detectCliKindFromProcess',
+    'function readAncestorCliInfo',
+    'function resumeIdFromArgs',
+    'function autoPeerProviderSession',
+    'function autoPeerSessionId',
+    'function autoPeerResumeId',
+    'function autoPeerKind',
+    'function autoPeerBasis',
+    'function autoPeerId',
+    'function resolveCurrentPeer',
+    'function currentPeer'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds peer identity helper: ${helper}`);
+  }
+  const peerIdentity = await import(path.join(repoRoot, 'lib', 'peer-identity.mjs'));
+  for (const name of [
+    'sanitizePeerPart',
+    'shortHash',
+    'currentTtyName',
+    'readAncestorCliInfo',
+    'resumeIdFromArgs',
+    'autoPeerProviderSession',
+    'autoPeerSessionId',
+    'autoPeerResumeId',
+    'autoPeerKind',
+    'autoPeerBasis',
+    'autoPeerId',
+    'resolveCurrentPeer',
+    'currentPeer'
+  ]) {
+    if (typeof peerIdentity[name] !== 'function') fail(`peer identity module missing export: ${name}`);
+  }
+  if (peerIdentity.sanitizePeerPart('Bad Peer!', 'fallback') !== 'bad-peer' ||
+      peerIdentity.sanitizePeerPart('!!!', 'fallback') !== 'fallback' ||
+      peerIdentity.shortHash('hello') !== 'aaf4c61d') {
+    fail('peer identity sanitize/hash behavior changed');
+  }
+  if (peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session']) !== 'named-session' ||
+      peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume=inline-session']) !== 'inline-session' ||
+      peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session', '--fork-session']) !== null ||
+      peerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', 'codex-session']) !== 'codex-session' ||
+      peerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', '--last']) !== null) {
+    fail('peer identity resume id parsing changed');
+  }
+  const savedPeerEnv = {
+    HCC_PEER: process.env.HCC_PEER,
+    CLAUDE_CODE_SESSION_ID: process.env.CLAUDE_CODE_SESSION_ID,
+    CLAUDECODE: process.env.CLAUDECODE,
+    CODEX_SESSION_ID: process.env.CODEX_SESSION_ID,
+    CODEX_THREAD_ID: process.env.CODEX_THREAD_ID,
+    CODEX_MANAGED_BY_NPM: process.env.CODEX_MANAGED_BY_NPM,
+    CODEX_MANAGED_BY_BUN: process.env.CODEX_MANAGED_BY_BUN
+  };
+  try {
+    process.env.HCC_PEER = 'env-peer';
+    if (peerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell').id !== 'env-peer') {
+      fail('peer identity resolveCurrentPeer ignored HCC_PEER');
+    }
+    delete process.env.HCC_PEER;
+    delete process.env.CLAUDE_CODE_SESSION_ID;
+    delete process.env.CLAUDECODE;
+    process.env.CODEX_SESSION_ID = '0123456789abcdef';
+    delete process.env.CODEX_THREAD_ID;
+    delete process.env.CODEX_MANAGED_BY_NPM;
+    delete process.env.CODEX_MANAGED_BY_BUN;
+    const autoPeer = peerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell');
+    if (!autoPeer.auto || autoPeer.id !== 'codex-01234567') {
+      fail(`peer identity auto peer id changed: ${JSON.stringify(autoPeer)}`);
+    }
+    const explicitPeer = peerIdentity.resolveCurrentPeer({ root: repoRoot }, { peer: 'manual-peer' }, 'peer', 'shell');
+    if (explicitPeer.auto || explicitPeer.id !== 'manual-peer') {
+      fail(`peer identity explicit peer resolution changed: ${JSON.stringify(explicitPeer)}`);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(savedPeerEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
   for (const helper of [
     'function runtimeBaseUrl',
