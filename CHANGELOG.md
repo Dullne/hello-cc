@@ -16,6 +16,57 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.5
+
+### Summary
+
+hello-cc 0.1.5 publishes the Web runtime split that landed after 0.1.4. The
+CLI keeps the same user-facing Web behavior, while runtime URLs, request
+parsing, HTTP response helpers, and the browser UI template now live in focused
+`lib/` modules. This release also includes the latest coordination automation
+improvements for stale task owners, batch task claims, and takeover-ready task
+state.
+
+### Highlights
+
+- Added batch task claiming and takeover policy support for blocked or stale
+  work, including owner liveness details in task/state output.
+- Fixed detected-peer Web controls so active `working` or `idle` peers show the
+  correct stop action instead of being treated as restart-only peers.
+- Kept stop-dialog labels tied into Web i18n so language changes update the
+  dialog controls consistently.
+- Extracted Web runtime URL/token helpers into `lib/web-runtime.mjs`.
+- Extracted the browser UI template into `lib/web-ui-template.mjs`.
+- Extracted low-level Web HTTP helpers into `lib/web-http.mjs`.
+- Expanded regression coverage for the new helper modules, packaged module
+  contents, Web display guards, and release/package checks.
+
+### Validation
+
+The 0.1.5 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+node --check lib/web-http.mjs
+node --check lib/web-runtime.mjs
+node --check lib/web-ui-template.mjs
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.5
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.4
 
 ### Summary
