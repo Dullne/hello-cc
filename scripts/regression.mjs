@@ -2186,6 +2186,7 @@ async function syntaxAndHelp() {
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
+  const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-ui-template.mjs'), 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
@@ -2214,15 +2215,36 @@ async function syntaxAndHelp() {
     fail('detected peer action rendering still depends on status === running instead of liveness');
   }
   for (const expected of [
-    'function webPeerAction(projectCtx, peer, action, input = {})',
-    'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
-    'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
-    'const status = statusSummary(projectCtx, peer)',
+    'import { createWebPeerActions } from \'../lib/web-peer-actions.mjs\'',
+    '} = createWebPeerActions({',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
     "sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));"
   ]) {
     if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
+  }
+  for (const helper of [
+    'function webPeerRegister(',
+    'function webPeerHeartbeat(',
+    'function webPeerTaskNext(',
+    'function webPeerTaskTakeover(',
+    'function webPeerLockAcquire(',
+    'function webPeerLockRelease(',
+    'function webPeerInbox(',
+    'function webPeerAction('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds web peer action helper: ${helper}`);
+  }
+  for (const expected of [
+    'function webPeerAction(projectCtx, peer, action, input = {})',
+    'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
+    'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
+    'const status = statusSummary(projectCtx, peer)',
+    "normalized === 'task-next'",
+    "normalized === 'lock-acquire'",
+    "normalized === 'lock-release'"
+  ]) {
+    if (!webPeerActionsSource.includes(expected)) fail(`web peer action helper missing: ${expected}`);
   }
   const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
   const cliVersion = run(process.execPath, [hccBin, '--version']).trim();
@@ -2235,6 +2257,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
       !hccSource.includes("import { createCoordinationState } from '../lib/coordination-state.mjs'") ||
+      !hccSource.includes("import { createWebPeerActions } from '../lib/web-peer-actions.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-state.mjs'") ||
