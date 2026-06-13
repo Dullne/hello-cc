@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
-import os from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -19,11 +18,28 @@ import {
   validateOpts,
   wantsHelp
 } from '../lib/cli-args.mjs';
+import {
+  compactText,
+  formatJson,
+  printResult,
+  shellExports,
+  shellQuoteArg,
+  table
+} from '../lib/format.mjs';
 import { readPackageMeta } from '../lib/package-meta.mjs';
 import {
   removeGuidanceBlocks as removeGuidanceBlocksForRoot,
   writeGuidance as writeGuidanceForRoot
 } from '../lib/guidance.mjs';
+import {
+  contextForProject,
+  globalRuntimePath,
+  globalWebTokenPath,
+  projectDbPath,
+  projectRegistryPath,
+  runtimePath,
+  webLogPath
+} from '../lib/runtime-paths.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -290,43 +306,8 @@ function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
 function createContext(global) {
   const cwd = process.cwd();
   const root = detectRoot(cwd, global.root);
-  const dbPath = path.resolve(global.db || process.env.HCC_DB || path.join(root, '.hello-cc', 'mesh.db'));
+  const dbPath = path.resolve(global.db || process.env.HCC_DB || projectDbPath(root));
   return { cwd, root, dbPath, json: global.json, explicitRoot: Boolean(global.root || process.env.HCC_ROOT) };
-}
-
-function runtimePath(ctx) {
-  return path.join(ctx.root, '.hello-cc', 'runtime.json');
-}
-
-function webLogPath(ctx) {
-  return path.join(ctx.root, '.hello-cc', 'web.log');
-}
-
-function globalStateDir() {
-  return path.join(os.homedir(), '.hello-cc');
-}
-
-function globalRuntimePath() {
-  return path.join(globalStateDir(), 'runtime.json');
-}
-
-function globalWebTokenPath() {
-  return path.join(globalStateDir(), 'web-token');
-}
-
-function projectRegistryPath() {
-  return path.join(globalStateDir(), 'projects.json');
-}
-
-function contextForProject(root, dbPath = null, base = {}) {
-  const resolvedRoot = path.resolve(root);
-  return {
-    cwd: base.cwd || resolvedRoot,
-    root: resolvedRoot,
-    dbPath: path.resolve(dbPath || path.join(resolvedRoot, '.hello-cc', 'mesh.db')),
-    json: Boolean(base.json),
-    explicitRoot: true
-  };
 }
 
 function projectRecord(ctx) {
@@ -348,7 +329,7 @@ function readProjectRegistry() {
       .filter((p) => p && typeof p.root === 'string')
       .map((p) => ({
         root: path.resolve(p.root),
-        db: path.resolve(p.db || path.join(p.root, '.hello-cc', 'mesh.db')),
+        db: path.resolve(p.db || projectDbPath(p.root)),
         name: String(p.name || path.basename(p.root) || p.root),
         last_seen_at: Number.parseInt(p.last_seen_at || '0', 10) || 0
       }));
@@ -365,7 +346,7 @@ function writeProjectRegistry(projects) {
     if (!project?.root) continue;
     unique.set(path.resolve(project.root), {
       root: path.resolve(project.root),
-      db: path.resolve(project.db || path.join(project.root, '.hello-cc', 'mesh.db')),
+      db: path.resolve(project.db || projectDbPath(project.root)),
       name: String(project.name || path.basename(project.root) || project.root),
       last_seen_at: Number.parseInt(project.last_seen_at || '0', 10) || 0
     });
@@ -507,12 +488,6 @@ function clearRuntime(ctx, pid = process.pid) {
   } catch {
     fs.rmSync(globalFile, { force: true });
   }
-}
-
-function shellQuoteArg(value) {
-  const text = String(value);
-  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(text)) return text;
-  return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
 function shellCommand(args) {
@@ -2159,11 +2134,6 @@ function parseEventPayload(row) {
   }
 }
 
-function compactText(value, limit = 160) {
-  const text = String(value || '').replace(/\s+/g, ' ').trim();
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
-}
-
 function uniqueList(values) {
   return [...new Set(values.filter(Boolean).map(String))];
 }
@@ -2682,35 +2652,6 @@ function ackMessages(db, peerId, messages) {
       ON CONFLICT(message_id, peer) DO UPDATE SET read_at = excluded.read_at
     `).run(m.id, peerId, t);
   }
-}
-
-function formatJson(ok, dataOrError) {
-  if (ok) return JSON.stringify({ ok: true, data: dataOrError }, null, 2);
-  return JSON.stringify({ ok: false, error: dataOrError }, null, 2);
-}
-
-function printResult(ctx, data, render) {
-  if (ctx.json) {
-    console.log(formatJson(true, data));
-  } else {
-    const output = render ? render(data) : String(data ?? '');
-    if (output) console.log(output);
-  }
-}
-
-function shellExports(values) {
-  return Object.entries(values)
-    .map(([key, value]) => `export ${key}=${shellQuoteArg(value)}`)
-    .join('\n');
-}
-
-function table(rows, columns) {
-  if (!rows.length) return '(none)';
-  const widths = columns.map((col) => Math.max(col.label.length, ...rows.map((row) => String(col.value(row) ?? '').length)));
-  const header = columns.map((col, i) => col.label.padEnd(widths[i])).join('  ');
-  const sep = widths.map((w) => '-'.repeat(w)).join('  ');
-  const body = rows.map((row) => columns.map((col, i) => String(col.value(row) ?? '').padEnd(widths[i])).join('  '));
-  return [header, sep, ...body].join('\n');
 }
 
 function writeGuidance(ctx) {

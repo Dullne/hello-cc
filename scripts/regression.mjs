@@ -1963,9 +1963,11 @@ async function downGcPackWorkflow() {
     'docs/commands.zh-CN.md',
     'lib/cli-args.mjs',
     'lib/errors.mjs',
+    'lib/format.mjs',
     'lib/guidance.mjs',
     'lib/package-meta.mjs',
     'lib/release-notes.mjs',
+    'lib/runtime-paths.mjs',
     'scripts/github-release.mjs'
   ]) {
     if (!files.has(file)) fail(`npm package missing ${file}`);
@@ -2039,9 +2041,11 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'cli-args.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'errors.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'format.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'guidance.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'package-meta.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'release-notes.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'runtime-paths.mjs')]);
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
@@ -2072,9 +2076,11 @@ function syntaxAndHelp() {
   if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
       !hccSource.includes("} from '../lib/cli-args.mjs'") ||
       !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
+      !hccSource.includes("} from '../lib/format.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, format helpers, runtime paths, or guidance wiring');
   }
   const mainHelp = run(process.execPath, [hccBin, '--help']);
   if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {
