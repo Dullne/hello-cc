@@ -2241,6 +2241,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/automation.mjs'") ||
       !hccSource.includes("} from '../lib/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
+      !hccSource.includes("import { runtimeRequest } from '../lib/runtime-client.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/messages.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
@@ -2254,7 +2255,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2375,6 +2376,72 @@ async function syntaxAndHelp() {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+  if (hccSource.includes('async function runtimeRequest')) fail('CLI still embeds runtime request client helper');
+  const runtimeClient = await import(path.join(repoRoot, 'lib', 'runtime-client.mjs'));
+  if (typeof runtimeClient.runtimeRequest !== 'function') fail('runtime client module missing runtimeRequest export');
+  const savedFetch = globalThis.fetch;
+  const runtimeFetchCalls = [];
+  try {
+    globalThis.fetch = async (url, opts = {}) => {
+      runtimeFetchCalls.push({ url, opts });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const runtimeClientData = await runtimeClient.runtimeRequest(
+      { root: '/repo-root', dbPath: '/repo-root/.hello-cc/mesh.db' },
+      'POST',
+      '/api/test',
+      { value: 1 },
+      { base_url: 'http://127.0.0.1:8787/', token: 'runtime-token', source: 'runtime-file' },
+      { cliName: 'hccx' }
+    );
+    if (runtimeClientData.ok !== true || runtimeFetchCalls.length !== 1) {
+      fail(`runtime client request data changed: ${JSON.stringify({ runtimeClientData, runtimeFetchCalls })}`);
+    }
+    const call = runtimeFetchCalls[0];
+    if (String(call.url) !== 'http://127.0.0.1:8787/api/test' ||
+        call.opts.method !== 'POST' ||
+        call.opts.headers.Authorization !== 'Bearer runtime-token' ||
+        call.opts.headers['X-HCC-Root'] !== '/repo-root' ||
+        call.opts.headers['X-HCC-DB'] !== '/repo-root/.hello-cc/mesh.db' ||
+        call.opts.body !== JSON.stringify({ value: 1 })) {
+      fail(`runtime client request shape changed: ${JSON.stringify(runtimeFetchCalls, null, 2)}`);
+    }
+    globalThis.fetch = async () => new Response('not-json', { status: 200 });
+    try {
+      await runtimeClient.runtimeRequest(
+        { root: '/repo-root', dbPath: '/repo-root/.hello-cc/mesh.db' },
+        'GET',
+        '/api/bad',
+        null,
+        { base_url: 'http://127.0.0.1:8787/' }
+      );
+      fail('runtime client accepted non-JSON runtime response');
+    } catch (err) {
+      if (err?.code !== 'RUNTIME_BAD_RESPONSE') throw err;
+    }
+    globalThis.fetch = async () => {
+      throw new Error('offline');
+    };
+    try {
+      await runtimeClient.runtimeRequest(
+        { root: '/repo-root', dbPath: '/repo-root/.hello-cc/mesh.db' },
+        'GET',
+        '/api/offline',
+        null,
+        { base_url: 'http://127.0.0.1:8787/', source: 'runtime-file' },
+        { cliName: 'hccx' }
+      );
+      fail('runtime client accepted unreachable runtime');
+    } catch (err) {
+      if (err?.code !== 'RUNTIME_UNREACHABLE' ||
+          !String(err.message || '').includes('Start hccx web again') ||
+          err.extra?.runtime !== 'runtime-file') {
+        throw err;
+      }
+    }
+  } finally {
+    globalThis.fetch = savedFetch;
   }
   for (const helper of [
     'function runGit',

@@ -52,6 +52,7 @@ import {
   writeGlobalRuntime,
   writeRuntime
 } from '../lib/runtime-state.mjs';
+import { runtimeRequest } from '../lib/runtime-client.mjs';
 import {
   detectBranch,
   detectRoot
@@ -99,7 +100,6 @@ import {
   publicRuntimeUrl,
   rememberRuntimeToken,
   requestUrl,
-  runtimeApiUrl,
   runtimeBaseUrl,
   validateWebTokenOpts,
   webRuntimeMatchesRequest
@@ -282,42 +282,6 @@ function bindingFromDetected(peer, transport = 'detected') {
     transport,
     runtime_session_id: peer.peerId || peer.id
   };
-}
-
-async function runtimeRequest(ctx, method, route, body = null, runtime = null) {
-  const rt = runtime || readRuntime(ctx);
-  const url = runtimeApiUrl(rt, route);
-  const headers = { 'Content-Type': 'application/json' };
-  headers['X-HCC-Root'] = ctx.root;
-  headers['X-HCC-DB'] = ctx.dbPath;
-  if (rt.token) headers.Authorization = `Bearer ${rt.token}`;
-  let res;
-  try {
-    res = await fetch(url, {
-      method,
-      headers,
-      body: body === null ? undefined : JSON.stringify(body)
-    });
-  } catch (err) {
-    throw new CliError('RUNTIME_UNREACHABLE', `Runtime is not reachable at ${rt.base_url}. Start ${CLI_NAME} web again.`, {
-      runtime: rt.source || rt.base_url,
-      message: err.message
-    });
-  }
-  let json = null;
-  const text = await res.text();
-  if (text.trim()) {
-    try {
-      json = JSON.parse(text);
-    } catch {
-      throw new CliError('RUNTIME_BAD_RESPONSE', `Runtime returned non-JSON response from ${url.pathname}`);
-    }
-  }
-  if (!res.ok) {
-    const error = json && json.error ? json.error : { code: 'RUNTIME_ERROR', message: `Runtime request failed: ${res.status}` };
-    throw new CliError(error.code || 'RUNTIME_ERROR', error.message || `Runtime request failed: ${res.status}`, error);
-  }
-  return json || {};
 }
 
 let projectMigrationFanoutDepth = 0;
