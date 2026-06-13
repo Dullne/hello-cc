@@ -91,6 +91,11 @@ import {
   normalizeLockScope,
   scopedLockResource
 } from '../lib/locks.mjs';
+import {
+  assignTeamWorkers,
+  expandTeamWorkers,
+  inferTeamItems
+} from '../lib/team-planning.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -2505,70 +2510,6 @@ async function taskDone(ctx, args) {
   opts.status = 'done';
   if (opts.summary && !opts.body) opts.body = opts.summary;
   return taskUpdate(ctx, args.concat(['--status', 'done']));
-}
-
-function splitCsvList(value) {
-  if (Array.isArray(value)) return value.flatMap((item) => splitCsvList(item));
-  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
-}
-
-function parseTeamItems(opts) {
-  const rawItems = [
-    ...splitCsvList(opts.item || []),
-    ...splitCsvList(opts.items || [])
-  ];
-  return rawItems.map((raw, index) => {
-    const parts = String(raw).split(':').map((part) => part.trim());
-    let assignee = null;
-    let role = null;
-    let title = raw.trim();
-    if (parts.length >= 3) {
-      assignee = parts.shift() || null;
-      role = parts.shift() || null;
-      title = parts.join(':').trim();
-    } else if (parts.length === 2) {
-      role = parts[0] || null;
-      title = parts[1] || title;
-    }
-    if (!title) title = `subtask ${index + 1}`;
-    return { title, role: role || `worker-${index + 1}`, assignee };
-  });
-}
-
-function inferTeamItems(task, opts) {
-  const explicit = parseTeamItems(opts);
-  if (explicit.length) return explicit;
-  const count = Math.max(1, intOpt(opts, 'count', 3));
-  const baseTitle = task?.title || 'team task';
-  return Array.from({ length: count }, (_, index) => ({
-    title: `${baseTitle} / subtask ${index + 1}`,
-    role: `worker-${index + 1}`,
-    assignee: null
-  }));
-}
-
-function expandTeamWorkers(workers, parentId) {
-  const expanded = [];
-  for (const token of splitCsvList(workers || [])) {
-    const match = token.match(/^([A-Za-z][A-Za-z0-9._-]*):([1-9][0-9]*)$/);
-    if (!match) {
-      expanded.push(token);
-      continue;
-    }
-    const kind = sanitizePeerPart(match[1], 'peer');
-    const count = Number.parseInt(match[2], 10);
-    for (let i = 1; i <= count; i += 1) expanded.push(`${kind}-team-${parentId}-${i}`);
-  }
-  return expanded;
-}
-
-function assignTeamWorkers(items, workers, parentId) {
-  const workerList = expandTeamWorkers(workers, parentId);
-  if (!workerList.length) return items;
-  return items.map((item, index) => ({
-    ...item,
-    assignee: item.assignee || workerList[index % workerList.length]
-  }));
 }
 
 function teamChildren(db, parentId) {

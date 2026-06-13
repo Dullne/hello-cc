@@ -2236,12 +2236,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
+      !hccSource.includes("} from '../lib/team-planning.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2378,6 +2379,58 @@ async function syntaxAndHelp() {
       locksModule.locksConflict(scopedLock, locksModule.scopedLockResource('bin/hcc.mjs', 'tmux-helpers')) ||
       locksModule.locksConflict(scopedLock, locksModule.scopedLockResource('scripts/regression.mjs', 'provider-commands'))) {
     fail('locks module conflict behavior changed');
+  }
+  for (const helper of [
+    'function splitCsvList',
+    'function parseTeamItems',
+    'function inferTeamItems',
+    'function expandTeamWorkers',
+    'function assignTeamWorkers'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds team planning helper: ${helper}`);
+  }
+  const teamPlanning = await import(path.join(repoRoot, 'lib', 'team-planning.mjs'));
+  for (const name of [
+    'splitCsvList',
+    'parseTeamItems',
+    'inferTeamItems',
+    'expandTeamWorkers',
+    'assignTeamWorkers'
+  ]) {
+    if (typeof teamPlanning[name] !== 'function') fail(`team planning module missing export: ${name}`);
+  }
+  const splitTeam = teamPlanning.splitCsvList(['codex:2, claude-a', ' docs-a ']);
+  if (JSON.stringify(splitTeam) !== JSON.stringify(['codex:2', 'claude-a', 'docs-a'])) {
+    fail(`team planning splitCsvList changed: ${JSON.stringify(splitTeam)}`);
+  }
+  const parsedTeam = teamPlanning.parseTeamItems({
+    item: ['docs:Update docs', 'codex-a:tests:Add: regression']
+  });
+  if (parsedTeam.length !== 2 ||
+      parsedTeam[0].role !== 'docs' ||
+      parsedTeam[0].title !== 'Update docs' ||
+      parsedTeam[1].assignee !== 'codex-a' ||
+      parsedTeam[1].role !== 'tests' ||
+      parsedTeam[1].title !== 'Add:regression') {
+    fail(`team planning parseTeamItems changed: ${JSON.stringify(parsedTeam)}`);
+  }
+  const inferredTeam = teamPlanning.inferTeamItems({ title: 'Parent task' }, { count: '0' });
+  if (inferredTeam.length !== 1 || inferredTeam[0].title !== 'Parent task / subtask 1') {
+    fail(`team planning count normalization changed: ${JSON.stringify(inferredTeam)}`);
+  }
+  try {
+    teamPlanning.inferTeamItems({ title: 'Parent task' }, { count: 'not-a-number' });
+    fail('team planning accepted non-integer count');
+  } catch (err) {
+    if (err?.code !== 'BAD_ARGS') throw err;
+  }
+  const expandedWorkers = teamPlanning.expandTeamWorkers(['Codex:2', 'claude-a'], 42);
+  if (JSON.stringify(expandedWorkers) !== JSON.stringify(['codex-team-42-1', 'codex-team-42-2', 'claude-a'])) {
+    fail(`team planning worker expansion changed: ${JSON.stringify(expandedWorkers)}`);
+  }
+  const assignedTeam = teamPlanning.assignTeamWorkers(parsedTeam, ['codex:2'], 42);
+  if (assignedTeam[0].assignee !== 'codex-team-42-1' || assignedTeam[1].assignee !== 'codex-a') {
+    fail(`team planning worker assignment changed: ${JSON.stringify(assignedTeam)}`);
   }
   for (const helper of [
     'function runtimeBaseUrl',
