@@ -65,6 +65,23 @@ import {
   sendJson
 } from '../lib/web-http.mjs';
 import { webIndexHtml } from '../lib/web-ui-template.mjs';
+import {
+  bindingFromRun,
+  buildPeerCommand,
+  defaultSessionCommand,
+  hasResumeOpts,
+  inferPeerKind,
+  providerSessionParts,
+  providerSessionPeerId
+} from '../lib/provider-commands.mjs';
+import {
+  ensureTmuxAvailable,
+  runTmux,
+  tmuxHasSession,
+  tmuxKillSession,
+  tmuxSessionEnvironmentValue,
+  tmuxSessionHasClients
+} from '../lib/tmux.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -129,10 +146,6 @@ function sanitizePeerPart(value, fallback = 'peer') {
 
 function shortHash(value) {
   return createHash('sha1').update(String(value)).digest('hex').slice(0, 8);
-}
-
-function providerSessionPeerId(kind, providerId) {
-  return `${kind}-${sanitizePeerPart(String(providerId || '').slice(0, 8), shortHash(providerId))}`;
 }
 
 function currentTtyName() {
@@ -583,125 +596,6 @@ function launchFingerprint({ command, cwd, env }) {
   }));
 }
 
-function runTmux(args, opts = {}) {
-  const result = spawnSync('tmux', args, {
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    input: opts.input || ''
-  });
-  if (result.error) {
-    throw new CliError('TMUX_ERROR', `tmux failed: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    const message = (result.stderr || result.stdout || '').trim() || `tmux ${args.join(' ')} failed`;
-    throw new CliError('TMUX_ERROR', message);
-  }
-  return result.stdout || '';
-}
-
-function tmuxInstallHint() {
-  if (process.platform === 'darwin') return 'Install tmux with: brew install tmux';
-  if (process.platform === 'linux') {
-    if (fs.existsSync('/etc/debian_version')) return 'Install tmux with: sudo apt-get update && sudo apt-get install -y tmux';
-    if (fs.existsSync('/etc/alpine-release')) return 'Install tmux with: sudo apk add tmux';
-    if (fs.existsSync('/etc/arch-release')) return 'Install tmux with: sudo pacman -S --noconfirm tmux';
-    if (fs.existsSync('/etc/fedora-release')) return 'Install tmux with: sudo dnf install -y tmux';
-    return 'Install tmux with your system package manager.';
-  }
-  return 'Install tmux and make sure it is on PATH.';
-}
-
-function commandExists(name) {
-  return spawnSync('sh', ['-lc', `command -v ${shellQuoteArg(name)} >/dev/null 2>&1`], {
-    stdio: ['ignore', 'ignore', 'ignore']
-  }).status === 0;
-}
-
-function runInstallCommand(command) {
-  const result = spawnSync('sh', ['-lc', command], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 120000
-  });
-  return {
-    ok: result.status === 0,
-    output: [result.stdout, result.stderr].filter(Boolean).join('\n').trim()
-  };
-}
-
-function tryInstallTmux() {
-  if (process.env.HCC_NO_AUTO_INSTALL_TMUX === '1') {
-    return { ok: false, output: 'automatic tmux installation disabled by HCC_NO_AUTO_INSTALL_TMUX=1' };
-  }
-  const sudo = typeof process.getuid === 'function' && process.getuid() === 0 ? '' : (commandExists('sudo') ? 'sudo ' : '');
-  if (process.platform === 'darwin' && commandExists('brew')) {
-    return runInstallCommand('brew install tmux');
-  }
-  if (process.platform === 'linux') {
-    if (commandExists('apt-get')) {
-      const update = runInstallCommand(`${sudo}apt-get update`);
-      if (!update.ok) return update;
-      return runInstallCommand(`${sudo}apt-get install -y tmux`);
-    }
-    if (commandExists('dnf')) return runInstallCommand(`${sudo}dnf install -y tmux`);
-    if (commandExists('yum')) return runInstallCommand(`${sudo}yum install -y tmux`);
-    if (commandExists('apk')) return runInstallCommand(`${sudo}apk add tmux`);
-    if (commandExists('pacman')) return runInstallCommand(`${sudo}pacman -S --noconfirm tmux`);
-  }
-  return { ok: false, output: 'no supported package manager found' };
-}
-
-function ensureTmuxAvailable({ autoInstall = true } = {}) {
-  if (spawnSync('tmux', ['-V'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).status === 0) return;
-  let install = { ok: false, output: '' };
-  if (autoInstall) {
-    install = tryInstallTmux();
-    if (install.ok && spawnSync('tmux', ['-V'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).status === 0) return;
-  }
-  const detail = install.output ? `\n\nAutomatic install failed:\n${install.output}` : '';
-  throw new CliError('TMUX_REQUIRED', `tmux is required for browser-controllable local terminals. ${tmuxInstallHint()}${detail}`);
-}
-
-function tmuxHasSession(sessionName) {
-  const result = spawnSync('tmux', ['has-session', '-t', sessionName], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  return result.status === 0;
-}
-
-function tmuxSessionHasClients(sessionName) {
-  const result = spawnSync('tmux', ['list-clients', '-t', sessionName], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  if (result.status !== 0) return false;
-  return Boolean((result.stdout || '').trim());
-}
-
-function tmuxKillSession(sessionName) {
-  const result = spawnSync('tmux', ['kill-session', '-t', sessionName], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  if (result.status !== 0 && !String(result.stderr || result.stdout || '').includes('can\'t find session')) {
-    const message = (result.stderr || result.stdout || '').trim() || `tmux kill-session -t ${sessionName} failed`;
-    throw new CliError('TMUX_ERROR', message);
-  }
-}
-
-function tmuxSessionEnvironmentValue(sessionName, key) {
-  const result = spawnSync('tmux', ['show-environment', '-t', sessionName, key], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  if (result.status !== 0) return null;
-  const line = (result.stdout || '').trim();
-  if (!line || line.startsWith('-')) return null;
-  const prefix = `${key}=`;
-  return line.startsWith(prefix) ? line.slice(prefix.length) : null;
-}
-
 function isLikelyShellCommand(command) {
   const base = path.basename(String(command || '')).replace(/^-/, '');
   return new Set(['bash', 'dash', 'fish', 'ksh', 'mksh', 'sh', 'zsh']).has(base);
@@ -965,128 +859,6 @@ function tmuxSendLiteral(pane, text) {
   if (pendingText) tmuxSendRawLiteral(pane, pendingText);
 }
 
-function inferPeerKind(id, explicitKind, firstCommand) {
-  if (explicitKind) return explicitKind;
-  if (['codex', 'claude'].includes(firstCommand)) return firstCommand;
-  if (String(id).startsWith('codex')) return 'codex';
-  if (String(id).startsWith('claude')) return 'claude';
-  return 'shell';
-}
-
-function hasResumeOpts(opts) {
-  return opts.resume !== undefined || Boolean(opts.last) || Boolean(opts.continue) || Boolean(opts.fork) || opts.session !== undefined;
-}
-
-function buildPeerCommand(id, kind, opts, cmdArgs) {
-  const explicitCommand = opts.command || cmdArgs.length > 0;
-  if (explicitCommand && hasResumeOpts(opts)) {
-    throw new CliError('BAD_ARGS', 'Use resume options without an explicit -- COMMAND');
-  }
-  if (explicitCommand) {
-    const command = opts.command || shellCommand(cmdArgs);
-    return {
-      command,
-      binding: {
-        peer: id,
-        provider: kind,
-        resume_mode: 'command',
-        resume_arg: null,
-        command
-      }
-    };
-  }
-  if (kind === 'codex') return buildCodexCommand(id, opts);
-  if (kind === 'claude') return buildClaudeCommand(id, opts);
-  if (hasResumeOpts(opts)) throw new CliError('BAD_ARGS', `Resume options are only supported for codex and claude peers`);
-  const command = defaultSessionCommand(kind);
-  return {
-    command,
-    binding: {
-      peer: id,
-      provider: kind,
-      resume_mode: 'new',
-      resume_arg: null,
-      command
-    }
-  };
-}
-
-function buildCodexCommand(id, opts) {
-  let command;
-  let resumeMode = 'new';
-  let resumeArg = null;
-  let session = { provider_session_id: null, provider_session_name: null };
-  if (opts.fork) {
-    resumeMode = opts.last ? 'fork-last' : 'fork';
-    if (opts.last) {
-      command = 'codex fork --last';
-      resumeArg = '--last';
-    } else if (opts.resume) {
-      command = `codex fork ${shellQuoteArg(opts.resume)}`;
-      resumeArg = opts.resume;
-    } else {
-      command = 'codex fork';
-    }
-  } else if (opts.last) {
-    command = 'codex resume --last';
-    resumeMode = 'last';
-    resumeArg = '--last';
-  } else if (opts.resume) {
-    command = `codex resume ${shellQuoteArg(opts.resume)}`;
-    resumeMode = 'resume';
-    resumeArg = opts.resume;
-    session = providerSessionParts(opts.resume);
-  } else {
-    command = 'codex';
-  }
-  return {
-    command,
-    binding: {
-      peer: id,
-      provider: 'codex',
-      ...session,
-      resume_mode: resumeMode,
-      resume_arg: resumeArg,
-      command
-    }
-  };
-}
-
-function buildClaudeCommand(id, opts) {
-  let command = 'claude';
-  let resumeMode = 'new';
-  let resumeArg = null;
-  let session = { provider_session_id: null, provider_session_name: null };
-  if (opts.continue) {
-    command += ' --continue';
-    resumeMode = opts.fork ? 'fork-continue' : 'continue';
-    resumeArg = '--continue';
-  } else if (opts.resume) {
-    command += ` --resume ${shellQuoteArg(opts.resume)}`;
-    resumeMode = opts.fork ? 'fork-resume' : 'resume';
-    resumeArg = opts.resume;
-    if (!opts.fork) session = providerSessionParts(opts.resume);
-  } else if (opts.session) {
-    command += ` --session-id ${shellQuoteArg(opts.session)}`;
-    resumeMode = 'session';
-    resumeArg = opts.session;
-    session = { provider_session_id: opts.session, provider_session_name: null };
-  }
-  if (opts.fork && (opts.continue || opts.resume)) command += ' --fork-session';
-  if (opts.name) command += ` --name ${shellQuoteArg(opts.name)}`;
-  return {
-    command,
-    binding: {
-      peer: id,
-      provider: 'claude',
-      ...session,
-      resume_mode: resumeMode,
-      resume_arg: resumeArg,
-      command
-    }
-  };
-}
-
 function bindingFromDetected(peer, transport = 'detected') {
   const provider = peer.kind || 'other';
   const session = providerSessionParts(peer.resumeId || peer.sessionId || '');
@@ -1100,148 +872,6 @@ function bindingFromDetected(peer, transport = 'detected') {
     transport,
     runtime_session_id: peer.peerId || peer.id
   };
-}
-
-function bindingFromRun(id, kind, command, commandArgs, transport) {
-  const cmdline = [command, ...commandArgs];
-  const provider = kind || 'other';
-  let resumeMode = 'command';
-  let resumeArg = null;
-  let session = { provider_session_id: null, provider_session_name: null };
-  if (provider === 'codex') {
-    const parsed = parseCodexCommandArgs(cmdline);
-    resumeMode = parsed.resume_mode;
-    resumeArg = parsed.resume_arg;
-    session = parsed.session;
-  } else if (provider === 'claude') {
-    const parsed = parseClaudeCommandArgs(cmdline);
-    resumeMode = parsed.resume_mode;
-    resumeArg = parsed.resume_arg;
-    session = parsed.session;
-  }
-  return {
-    peer: id,
-    provider,
-    ...session,
-    resume_mode: resumeMode,
-    resume_arg: resumeArg,
-    command: cmdline.join(' '),
-    transport,
-    runtime_session_id: id
-  };
-}
-
-function optionValue(args, names) {
-  const nameSet = new Set(names);
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (nameSet.has(arg) && args[i + 1]) return args[i + 1];
-    for (const name of names) {
-      if (name.startsWith('--') && arg.startsWith(`${name}=`)) return arg.slice(name.length + 1);
-    }
-  }
-  return null;
-}
-
-function hasFlag(args, names) {
-  const nameSet = new Set(names);
-  return args.some((arg) => nameSet.has(arg));
-}
-
-function parseClaudeCommandArgs(args) {
-  const resumeId = optionValue(args, ['--resume', '-r']);
-  const sessionId = optionValue(args, ['--session-id']);
-  const name = optionValue(args, ['--name', '-n']);
-  const continuing = hasFlag(args, ['--continue', '-c']);
-  const fork = hasFlag(args, ['--fork-session']);
-  let resumeMode = 'command';
-  let resumeArg = null;
-  let session = { provider_session_id: null, provider_session_name: null };
-
-  if (sessionId) {
-    resumeMode = 'session';
-    resumeArg = sessionId;
-    session = { provider_session_id: sessionId, provider_session_name: null };
-  } else if (resumeId) {
-    resumeMode = fork ? 'fork-resume' : 'resume';
-    resumeArg = resumeId;
-    if (!fork) session = providerSessionParts(resumeId);
-  } else if (continuing) {
-    resumeMode = fork ? 'fork-continue' : 'continue';
-    resumeArg = '--continue';
-  } else if (fork) {
-    resumeMode = 'fork';
-  } else if (name) {
-    resumeMode = 'named';
-    resumeArg = name;
-  }
-
-  return { resume_mode: resumeMode, resume_arg: resumeArg, session };
-}
-
-function codexOptionTakesValue(arg) {
-  if (!arg || arg.includes('=')) return false;
-  return new Set([
-    '-c', '--config',
-    '--remote',
-    '--remote-auth-token-env',
-    '--enable',
-    '--disable',
-    '-i', '--image',
-    '-m', '--model',
-    '--local-provider',
-    '-p', '--profile',
-    '-s', '--sandbox',
-    '-C', '--cd',
-    '--add-dir',
-    '-a', '--ask-for-approval'
-  ]).has(arg);
-}
-
-function firstCodexSessionArg(args, startIndex) {
-  for (let i = startIndex; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--last') continue;
-    if (arg.startsWith('-')) {
-      if (codexOptionTakesValue(arg)) i += 1;
-      continue;
-    }
-    return arg;
-  }
-  return null;
-}
-
-function parseCodexCommandArgs(args) {
-  const subIndex = args.findIndex((arg) => arg === 'resume' || arg === 'fork');
-  if (subIndex < 0) {
-    return {
-      resume_mode: 'command',
-      resume_arg: null,
-      session: { provider_session_id: null, provider_session_name: null }
-    };
-  }
-
-  const subcommand = args[subIndex];
-  const last = args.slice(subIndex + 1).includes('--last');
-  const sessionArg = firstCodexSessionArg(args, subIndex + 1);
-  let resumeMode = subcommand;
-  let resumeArg = sessionArg || null;
-  let session = { provider_session_id: null, provider_session_name: null };
-
-  if (subcommand === 'resume') {
-    if (last && !sessionArg) {
-      resumeMode = 'last';
-      resumeArg = '--last';
-    } else if (sessionArg) {
-      resumeMode = 'resume';
-      session = providerSessionParts(sessionArg);
-    }
-  } else if (subcommand === 'fork') {
-    resumeMode = last && !sessionArg ? 'fork-last' : 'fork';
-    resumeArg = sessionArg || (last ? '--last' : null);
-  }
-
-  return { resume_mode: resumeMode, resume_arg: resumeArg, session };
 }
 
 async function runtimeRequest(ctx, method, route, body = null, runtime = null) {
@@ -1455,15 +1085,6 @@ function upsertPeer(db, peer) {
     t,
     t
   );
-}
-
-function providerSessionParts(value) {
-  if (!value) return { provider_session_id: null, provider_session_name: null };
-  const text = String(value);
-  const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text);
-  return uuidLike
-    ? { provider_session_id: text, provider_session_name: null }
-    : { provider_session_id: null, provider_session_name: text };
 }
 
 function bindingHasProviderSession(binding) {
@@ -3784,12 +3405,6 @@ Coordination rules:
 
 function isLoopbackHost(host) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1';
-}
-
-function defaultSessionCommand(kind) {
-  if (kind === 'codex') return 'codex';
-  if (kind === 'claude') return 'claude';
-  return process.env.SHELL || 'bash';
 }
 
 function nextSessionId(existingIds, kind) {

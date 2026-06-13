@@ -2233,17 +2233,108 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
+      !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
+      !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
       hccSource.includes('function readSchemaVersion')) {
     fail('CLI still embeds DB schema or migration helpers');
+  }
+  for (const helper of [
+    'function runTmux',
+    'function tmuxInstallHint',
+    'function commandExists',
+    'function runInstallCommand',
+    'function tryInstallTmux',
+    'function ensureTmuxAvailable',
+    'function tmuxHasSession',
+    'function tmuxSessionHasClients',
+    'function tmuxKillSession',
+    'function tmuxSessionEnvironmentValue'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds low-level tmux helper: ${helper}`);
+  }
+  const tmuxModule = await import(path.join(repoRoot, 'lib', 'tmux.mjs'));
+  for (const name of [
+    'runTmux',
+    'tryInstallTmux',
+    'ensureTmuxAvailable',
+    'tmuxHasSession',
+    'tmuxSessionHasClients',
+    'tmuxKillSession',
+    'tmuxSessionEnvironmentValue'
+  ]) {
+    if (typeof tmuxModule[name] !== 'function') fail(`tmux module missing export: ${name}`);
+  }
+  for (const helper of [
+    'function providerSessionPeerId',
+    'function providerSessionParts',
+    'function inferPeerKind',
+    'function hasResumeOpts',
+    'function defaultSessionCommand',
+    'function buildPeerCommand',
+    'function buildCodexCommand',
+    'function buildClaudeCommand',
+    'function bindingFromRun',
+    'function parseClaudeCommandArgs',
+    'function parseCodexCommandArgs'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds provider command helper: ${helper}`);
+  }
+  const providerCommands = await import(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
+  for (const name of [
+    'providerSessionPeerId',
+    'providerSessionParts',
+    'inferPeerKind',
+    'hasResumeOpts',
+    'defaultSessionCommand',
+    'buildPeerCommand',
+    'buildCodexCommand',
+    'buildClaudeCommand',
+    'bindingFromRun',
+    'parseClaudeCommandArgs',
+    'parseCodexCommandArgs'
+  ]) {
+    if (typeof providerCommands[name] !== 'function') fail(`provider command module missing export: ${name}`);
+  }
+  const providerNameSession = providerCommands.providerSessionParts('named-session');
+  if (providerNameSession.provider_session_name !== 'named-session' || providerNameSession.provider_session_id !== null) {
+    fail(`provider command module misclassified named session: ${JSON.stringify(providerNameSession)}`);
+  }
+  const providerUuidSession = providerCommands.providerSessionParts('00000000-0000-0000-0000-000000000000');
+  if (providerUuidSession.provider_session_id !== '00000000-0000-0000-0000-000000000000' || providerUuidSession.provider_session_name !== null) {
+    fail(`provider command module misclassified UUID session: ${JSON.stringify(providerUuidSession)}`);
+  }
+  const builtClaude = providerCommands.buildPeerCommand('claude-peer', 'claude', { resume: 'named-session' }, []);
+  if (builtClaude.command !== 'claude --resume named-session' ||
+      builtClaude.binding.resume_mode !== 'resume' ||
+      builtClaude.binding.provider_session_name !== 'named-session') {
+    fail(`provider command module built wrong Claude resume command: ${JSON.stringify(builtClaude)}`);
+  }
+  const builtCodex = providerCommands.buildPeerCommand('codex-peer', 'codex', { resume: 'codex-session' }, []);
+  if (builtCodex.command !== 'codex resume codex-session' ||
+      builtCodex.binding.resume_mode !== 'resume' ||
+      builtCodex.binding.provider_session_name !== 'codex-session') {
+    fail(`provider command module built wrong Codex resume command: ${JSON.stringify(builtCodex)}`);
+  }
+  const parsedCodex = providerCommands.parseCodexCommandArgs(['codex', 'resume', '--model', 'gpt-test', 'codex-session']);
+  if (parsedCodex.resume_mode !== 'resume' ||
+      parsedCodex.resume_arg !== 'codex-session' ||
+      parsedCodex.session.provider_session_name !== 'codex-session') {
+    fail(`provider command module parsed Codex resume args wrong: ${JSON.stringify(parsedCodex)}`);
+  }
+  const parsedClaude = providerCommands.parseClaudeCommandArgs(['claude', '--resume', 'claude-session', '--fork-session']);
+  if (parsedClaude.resume_mode !== 'fork-resume' ||
+      parsedClaude.resume_arg !== 'claude-session' ||
+      parsedClaude.session.provider_session_name !== null) {
+    fail(`provider command module parsed Claude fork resume args wrong: ${JSON.stringify(parsedClaude)}`);
   }
   for (const helper of [
     'function runtimeBaseUrl',
