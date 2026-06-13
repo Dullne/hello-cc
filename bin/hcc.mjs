@@ -2104,6 +2104,63 @@ function selectCurrentTask(tasks, peerId) {
   return ownedTasks.find((task) => ['running', 'claimed', 'review', 'blocked'].includes(task.status)) || ownedTasks[0] || null;
 }
 
+function taskRelatedLocks(task, locks) {
+  const taskId = Number(task?.id || 0);
+  const owner = task?.owner || '';
+  return (locks || []).filter((lock) => {
+    if (taskId && Number(lock.task_id || 0) === taskId) return true;
+    return Boolean(owner && lock.owner === owner);
+  });
+}
+
+function taskOwnerLiveness(task, peers, locks, t = now()) {
+  const owner = task?.owner || null;
+  const relatedLocks = taskRelatedLocks(task, locks);
+  if (!owner) {
+    return {
+      owner_known: false,
+      owner_active: null,
+      owner_stale: false,
+      owner_age_sec: null,
+      related_lock_count: relatedLocks.length,
+      takeover_ready: false
+    };
+  }
+  const ownerRow = (peers || []).find((row) => row.id === owner) || null;
+  const ownerAge = ownerRow
+    ? Number(ownerRow.age_sec ?? (t - Number(ownerRow.last_seen_at || 0)))
+    : null;
+  const ownerActive = Boolean(ownerRow && Number.isFinite(ownerAge) && ownerAge <= ACTIVE_PEER_TTL);
+  const ownerStale = !ownerActive;
+  const takeoverStatus = ['claimed', 'running', 'review', 'blocked'].includes(task.status);
+  return {
+    owner_known: Boolean(ownerRow),
+    owner_active: ownerActive,
+    owner_stale: ownerStale,
+    owner_age_sec: Number.isFinite(ownerAge) ? ownerAge : null,
+    related_lock_count: relatedLocks.length,
+    takeover_ready: Boolean(takeoverStatus && ownerStale && relatedLocks.length === 0)
+  };
+}
+
+function annotateTasksWithLiveness(tasks, peers, locks, t = now()) {
+  return (tasks || []).map((task) => ({
+    ...task,
+    ...taskOwnerLiveness(task, peers, locks, t)
+  }));
+}
+
+function taskOwnerStateText(task) {
+  if (!task?.owner) return '';
+  if (task.owner_stale) {
+    if (task.takeover_ready) return 'stale/no-lock';
+    const locks = Number(task.related_lock_count || 0);
+    return locks ? `stale/locks=${locks}` : 'stale';
+  }
+  if (task.owner_active) return 'active';
+  return '';
+}
+
 function summarizeTask(task) {
   if (!task) return null;
   return {
@@ -2114,7 +2171,12 @@ function summarizeTask(task) {
     assignee: task.assignee || null,
     parent_id: task.parent_id || null,
     team_role: task.team_role || null,
-    priority: task.priority
+    priority: task.priority,
+    owner_active: task.owner_active ?? null,
+    owner_stale: Boolean(task.owner_stale),
+    owner_age_sec: task.owner_age_sec ?? null,
+    related_lock_count: Number(task.related_lock_count || 0),
+    takeover_ready: Boolean(task.takeover_ready)
   };
 }
 
@@ -2264,6 +2326,9 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
   const assignedTasks = peerId ? openTasks.filter((task) => !task.owner && task.assignee === peerId) : [];
   const availableTasks = openTasks.filter((task) => !task.owner && !task.assignee);
   const ownedTask = selectCurrentTask(openTasks, peerId);
+  const takeoverReadyTasks = peerId
+    ? openTasks.filter((task) => task.owner && task.owner !== peerId && task.takeover_ready)
+    : [];
   const intent = String(opts.intent || 'work').toLowerCase();
   const scope = normalizeLockScope(opts.scope || opts.lock_scope);
   const resources = uniqueList(Array.isArray(opts.resources) ? opts.resources : (opts.resource ? [opts.resource] : []));
@@ -2290,14 +2355,14 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
       known: Boolean(peerRow),
       active: Boolean(peerRow && Number(peerRow.age_sec || 0) <= ACTIVE_PEER_TTL),
       age_sec: peerRow ? Number(peerRow.age_sec || 0) : null
-      } : null,
-      current_task: summarizeTask(ownedTask),
-      phase: 'idle',
-      next_action: makeAction('none', [], 'no immediate coordination action', false),
-      actions: [],
-      finish_actions: [],
-      warnings
-    };
+    } : null,
+    current_task: summarizeTask(ownedTask),
+    phase: 'idle',
+    next_action: makeAction('none', [], 'no immediate coordination action', false),
+    actions: [],
+    finish_actions: [],
+    warnings
+  };
 
   const orderedUnread = unread
     .filter((message) => message.sender !== peerId)
@@ -2318,6 +2383,15 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
   if (!ownedTask && assignedTasks.length) {
     const task = assignedTasks[0];
     taskActions.push(makeAction('task.claim', ['task', 'claim', '--peer', peerId, '--id', String(task.id)], `assigned task #${task.id}`, true, { task_id: task.id }));
+  } else if (!ownedTask && takeoverReadyTasks.length) {
+    const task = takeoverReadyTasks[0];
+    taskActions.push(makeAction(
+      'task.takeover',
+      ['task', 'takeover', '--peer', peerId, '--id', String(task.id), '--reason', 'owner stale and no active related locks', '--policy', 'stale'],
+      `task #${task.id} owner ${task.owner} is stale and has no active related locks`,
+      true,
+      { task_id: task.id, owner: task.owner, owner_age_sec: task.owner_age_sec ?? null }
+    ));
   } else if (!ownedTask && availableTasks.length) {
     taskActions.push(makeAction('task.next', ['task', 'next', '--peer', peerId], 'available pending task exists', true));
   }
@@ -2372,6 +2446,7 @@ function deriveAutomation(snapshot, peer = null, opts = {}) {
     : automation.next_action);
   if (automation.next_action.kind === 'msg.reply' || automation.next_action.kind === 'msg.inbox') automation.phase = 'reply_message';
   else if (automation.next_action.kind === 'task.claim' || automation.next_action.kind === 'task.next') automation.phase = 'claim_task';
+  else if (automation.next_action.kind === 'task.takeover') automation.phase = 'takeover_task';
   else if (automation.next_action.kind === 'lock.acquire') automation.phase = 'acquire_lock';
   else if (automation.next_action.kind === 'msg.send') automation.phase = 'coordinate_lock';
   else if (automation.next_action.kind === 'team.plan') automation.phase = 'team_plan';
@@ -2426,6 +2501,8 @@ function formatOpenTaskLine(task) {
   const parts = [`#${task.id}`, task.status];
   if (task.owner) parts.push(`owner=${task.owner}`);
   if (task.assignee) parts.push(`assignee=${task.assignee}`);
+  const ownerState = taskOwnerStateText(task);
+  if (ownerState) parts.push(`owner_state=${ownerState}`);
   return `${parts.join(' ')}: ${task.title}`;
 }
 
@@ -2450,7 +2527,7 @@ function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
     ORDER BY last_seen_at DESC, id ASC
     LIMIT 200
   `).all(t);
-  const tasks = queryOpenTasks(db, 200);
+  const taskRows = queryOpenTasks(db, 200);
   const locks = db.prepare(`
     SELECT resource, base_resource, scope, owner, task_id, reason, expires_at, created_at
     FROM locks
@@ -2458,6 +2535,7 @@ function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
     ORDER BY resource ASC
     LIMIT 200
   `).all(t);
+  const tasks = annotateTasksWithLiveness(taskRows, peers, locks, t);
   const messages = peer
     ? queryInbox(db, peer, false, 50)
     : db.prepare(`
@@ -2813,12 +2891,20 @@ async function taskList(ctx, args) {
   } else {
     rows = queryOpenTasks(db, limit);
   }
+  const t = now();
+  const peers = db.prepare(`
+    SELECT id, last_seen_at, (? - last_seen_at) AS age_sec
+    FROM peers
+  `).all(t);
+  const locks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+  rows = annotateTasksWithLiveness(rows, peers, locks, t);
   printResult(ctx, rows, (data) => table(data, [
     { label: 'id', value: (r) => `#${r.id}` },
     { label: 'status', value: (r) => r.status },
     { label: 'prio', value: (r) => r.priority },
     { label: 'assignee', value: (r) => r.assignee || '' },
     { label: 'owner', value: (r) => r.owner || '' },
+    { label: 'owner_state', value: (r) => taskOwnerStateText(r) },
     { label: 'parent', value: (r) => r.parent_id ? `#${r.parent_id}` : '' },
     { label: 'role', value: (r) => r.team_role || '' },
     { label: 'title', value: (r) => r.title }
@@ -2859,8 +2945,9 @@ async function taskNext(ctx, args) {
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   const result = claimNextTasksForPeer(db, peer, { force: Boolean(opts.force), count });
-  printResult(ctx, count === 1 ? (result.current ? { current: result.current, tasks: [] } : (result.tasks[0] || null)) : result, (data) => {
+  printResult(ctx, count === 1 ? (result.current || result.tasks[0] || null) : result, (data) => {
     if (!data) return 'no pending task';
+    if (data.current === true) return `current task #${data.id}: ${data.title} (${data.status})`;
     if (data.current) return `current task #${data.current.id}: ${data.current.title} (${data.current.status})`;
     if (data.tasks) return data.tasks.length ? taskRowsText(data.tasks, 'claimed') : 'no pending task';
     return `claimed task #${data.id}: ${data.title}`;
@@ -4777,6 +4864,24 @@ function webIndexHtml() {
       color: var(--text);
       background: #0d0f12;
     }
+    /* Confirm dialog overlay */
+    .dialog-overlay {
+      position: fixed; inset: 0; z-index: 2000;
+      background: rgba(0,0,0,0.55);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .dialog-overlay[hidden] { display: none; }
+    .dialog {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 20px 22px;
+      min-width: 320px; max-width: 420px;
+      display: grid; gap: 14px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.5);
+    }
+    .dialog h3 { margin: 0; font-size: 15px; }
+    .dialog .row { display: flex; gap: 12px; align-items: center; }
+    .dialog .row label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+    .dialog .btns { display: flex; gap: 8px; justify-content: flex-end; }
     #terminal {
       min-height: 0;
       overflow: hidden;
@@ -4983,6 +5088,18 @@ function webIndexHtml() {
     <div class="edge-resizer edge-resizer-right" id="resizeRight" role="separator" aria-orientation="vertical" data-i18n-aria="resizeRightPanel" data-i18n-title="resizeRightPanel" aria-label="Resize right panel" title="Resize right panel"></div>
   </div>
 
+  <div class="dialog-overlay" id="stopDialog" hidden>
+    <div class="dialog">
+      <h3 id="stopDialogTitle">Stop session?</h3>
+      <div class="path" id="stopDialogMeta" style="font-size:12px"></div>
+      <div class="row"><label><input type="checkbox" id="stopKillCb"> <span id="stopKillLabel" data-i18n="dialog.killTmux">Also kill tmux session</span></label></div>
+      <div class="btns">
+        <button id="stopCancelBtn" type="button" data-i18n="dialog.cancel">Cancel</button>
+        <button class="danger" id="stopConfirmBtn" type="button" data-i18n="stop">Stop</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/assets/xterm.js"></script>
   <script>
     const initialParams = new URLSearchParams(location.search);
@@ -5112,7 +5229,12 @@ function webIndexHtml() {
         toggleRightPanel: 'Toggle right panel',
         resizeLeftSidebar: 'Resize left sidebar',
         resizeRightPanel: 'Resize right panel',
-        customSession: 'custom session id...'
+        customSession: 'custom session id...',
+        'dialog.cancel': 'Cancel',
+        'dialog.killTmux': 'Also kill tmux session',
+        'action.stopPeer': 'Stop peer',
+        'action.restartPeer': 'Restart peer',
+        detectedPeer: 'detected peer'
       },
       zh: {
         language: '语言',
@@ -5223,7 +5345,12 @@ function webIndexHtml() {
         toggleRightPanel: '切换右侧面板',
         resizeLeftSidebar: '调整左侧栏宽度',
         resizeRightPanel: '调整右侧面板宽度',
-        customSession: '自定义会话 ID...'
+        customSession: '自定义会话 ID...',
+        'dialog.cancel': '取消',
+        'dialog.killTmux': '同时终止 tmux 会话',
+        'action.stopPeer': '停止协作方',
+        'action.restartPeer': '恢复协作方',
+        detectedPeer: '检测到的协作方'
       }
     };
     let lang = localStorage.getItem('hcc.lang') || ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
@@ -5486,6 +5613,12 @@ function webIndexHtml() {
       return seen > 0 && (t - seen) <= activePeerTtl;
     }
 
+    function detectedPeerCanStop(peer) {
+      const status = String(peer?.status || '').toLowerCase();
+      if (['exited', 'detached'].includes(status)) return false;
+      return peerIsActive(peer);
+    }
+
     function peerStateView(peer, runtime = null, basisNow = lastStateNow) {
       const activity = peer?.status || 'unknown';
       const liveness = peerIsActive(peer, basisNow) ? 'active' : 'stale';
@@ -5507,6 +5640,17 @@ function webIndexHtml() {
         label: activity,
         detail: statusText(liveness) + ' ' + tr('age') + '=' + age + branch
       };
+    }
+
+    function taskOwnerStateText(task) {
+      if (!task?.owner) return '';
+      if (task.owner_stale) {
+        if (task.takeover_ready) return 'owner_state=stale/no-lock';
+        const locks = Number(task.related_lock_count || 0);
+        return locks ? 'owner_state=stale/locks=' + locks : 'owner_state=stale';
+      }
+      if (task.owner_active) return 'owner_state=active';
+      return '';
     }
 
     function bodyPinned(el) {
@@ -5603,9 +5747,20 @@ function webIndexHtml() {
       const detHtml = visibleDetected.length
         ? visibleDetected.map((p) => {
           const state = peerStateView(p);
+          const canStop = detectedPeerCanStop(p);
           return \`
           <div class="session \${activeDetected === p.id && activeType === 'detected' ? 'active' : ''}" data-id="\${esc(p.id)}" data-type="detected">
-            <div class="row"><strong>\${esc(p.id)}</strong><span class="badge" style="color:var(--warn);border-color:#6b5a20">\${esc(tr('detected'))}</span></div>
+            <div class="row">
+              <strong>\${esc(p.id)}</strong>
+              <div style="display:flex;gap:6px;align-items:center">
+                <span class="badge" style="color:var(--warn);border-color:#6b5a20">\${esc(tr('detected'))}</span>
+                \${canStop ? \`
+                <button class="stop-detected-btn" data-action="stop-detected" data-id="\${esc(p.id)}" title="\${esc(tr('action.stopPeer'))}" aria-label="\${esc(tr('action.stopPeer')) + ' ' + esc(p.id)}" type="button" style="flex:0 0 auto;width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:12px;line-height:1;color:var(--muted);background:transparent;border:1px solid var(--border);border-radius:5px;cursor:pointer">✕</button>
+                \` : \`
+                <button data-action="restart-detected" data-id="\${esc(p.id)}" title="\${esc(tr('action.restartPeer'))}" aria-label="\${esc(tr('action.restartPeer')) + ' ' + esc(p.id)}" type="button" style="flex:0 0 auto;width:22px;height:22px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:12px;line-height:1;color:var(--ok);background:transparent;border:1px solid var(--ok);border-radius:5px;cursor:pointer">↻</button>
+                \`}
+              </div>
+            </div>
             <div class="row"><span class="badge">\${esc(p.kind)}</span><span class="badge \${badgeClass(state.label)}" title="\${esc(state.detail)}">\${esc(statusText(state.label))}</span></div>
             <div class="path" title="\${esc(p.worktree || '')}">\${esc((p.worktree || '').split('/').slice(-2).join('/'))}</div>
           </div>\`;
@@ -5624,7 +5779,30 @@ function webIndexHtml() {
         el.addEventListener('click', () => connectManaged(el.dataset.id));
       });
       box.querySelectorAll('.session[data-type="detected"]').forEach((el) => {
-        el.addEventListener('click', () => connectDetected(el.dataset.id));
+        el.addEventListener('click', (e) => {
+          if (e.target.closest('[data-action]')) return;
+          connectDetected(el.dataset.id);
+        });
+      });
+      box.querySelectorAll('[data-action="stop-detected"]').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const peerId = btn.dataset.id;
+          document.getElementById('stopDialogTitle').textContent = tr('stop') + ' ' + peerId + '?';
+          stopKillCb.checked = false;
+          document.getElementById('stopDialogMeta').textContent = tr('detectedPeer');
+          stopDialog._action = 'detected';
+          stopDialog._peerId = peerId;
+          stopDialog.hidden = false;
+        });
+      });
+      box.querySelectorAll('[data-action="restart-detected"]').forEach((btn) => {
+        btn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const peerId = btn.dataset.id;
+          await api('/api/detected/' + encodeURIComponent(peerId) + '/restart', { method: 'POST', body: '{}' });
+          await Promise.all([refreshSessions(), refreshDetected()]);
+        });
       });
     }
 
@@ -5686,7 +5864,7 @@ function webIndexHtml() {
       const automation = data.automation || {};
       const nextAction = automation.next_action || {};
       const tasks = tasksData.map((t) => \`
-          <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(statusText(t.status))} \${esc(tr('owner'))}=\${esc(t.owner || '')} \${esc(tr('assignee'))}=\${esc(t.assignee || '')}</span></div>
+          <div class="item"><strong>#\${t.id} \${esc(t.title)}</strong><span>\${esc(statusText(t.status))} \${esc(tr('owner'))}=\${esc(t.owner || '')} \${esc(tr('assignee'))}=\${esc(t.assignee || '')}\${taskOwnerStateText(t) ? ' · ' + esc(taskOwnerStateText(t)) : ''}</span></div>
         \`).join('') || '<div class="empty">' + esc(tr('noTasks')) + '</div>';
       const peers = peersData.map((a) => {
         const peerRuntime = runtimeById.get(a.id);
@@ -6143,10 +6321,15 @@ function webIndexHtml() {
     });
     applyCollapseState();
 
-    document.getElementById('stopBtn').addEventListener('click', async () => {
+    document.getElementById('stopBtn').addEventListener('click', () => {
       if (!active) return;
-      await api('/api/sessions/' + encodeURIComponent(active) + '/stop', { method: 'POST', body: '{}' });
-      await refreshSessions();
+      const session = sessions.find((s) => s.id === active) || {};
+      document.getElementById('stopDialogTitle').textContent = tr('stop') + ' ' + (sessionPeerId(session) || active) + '?';
+      stopKillCb.checked = false;
+      const meta = sessionMetaText(session);
+      document.getElementById('stopDialogMeta').textContent = meta || '';
+      stopDialog._action = null; stopDialog._peerId = null;
+      stopDialog.hidden = false;
     });
       document.getElementById('refreshBtn').addEventListener('click', () => {
         Promise.all([refreshSessions(), refreshDetected(), refreshCurrentState()]).catch(console.error);
@@ -6173,6 +6356,32 @@ function webIndexHtml() {
     setInterval(() => {
       loadProjects().catch(console.error);
     }, 8000);
+
+    // ── Stop confirmation dialog ───────────────────────────────────────
+    const stopDialog = document.getElementById('stopDialog');
+    const stopConfirmBtn = document.getElementById('stopConfirmBtn');
+    const stopCancelBtn = document.getElementById('stopCancelBtn');
+    const stopKillCb = document.getElementById('stopKillCb');
+
+    stopCancelBtn.addEventListener('click', () => { stopDialog.hidden = true; });
+    stopDialog.addEventListener('click', (e) => { if (e.target === stopDialog) stopDialog.hidden = true; });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !stopDialog.hidden) stopDialog.hidden = true; });
+
+    stopConfirmBtn.addEventListener('click', async () => {
+      stopDialog.hidden = true;
+      const killTmux = stopKillCb.checked;
+      if (stopDialog._action === 'detected') {
+        const peerId = stopDialog._peerId;
+        stopDialog._action = null; stopDialog._peerId = null;
+        if (!peerId) return;
+        await api('/api/detected/' + encodeURIComponent(peerId) + '/stop', { method: 'POST', body: JSON.stringify({ kill_tmux: killTmux }) });
+        await Promise.all([refreshSessions(), refreshDetected()]);
+      } else {
+        if (!active) return;
+        await api('/api/sessions/' + encodeURIComponent(active) + '/stop', { method: 'POST', body: JSON.stringify({ kill_tmux: killTmux }) });
+        await refreshSessions();
+      }
+    });
   </script>
 </body>
 </html>`;
@@ -6559,6 +6768,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (session.replaceTimer) clearTimeout(session.replaceTimer);
     session.replaceTimer = setTimeout(() => {
       session.replaceTimer = null;
+      session.lastBroadcastTime = Date.now();
       broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
     }, 80);
   }
@@ -6631,6 +6841,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const data = Buffer.concat(chunks).toString();
         session.buffer += data;
         if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
+        session.lastBroadcastTime = Date.now();
         broadcast(session, { type: 'data', data });
       } catch {
         if (session.streamFd !== null && session.streamFd !== undefined) {
@@ -6639,10 +6850,24 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         }
       }
     }, 40);
+
+    // Fallback replace poller: if the FIFO produces no data for N seconds
+    // (e.g. pipe-pane output is fully buffered), send a fresh capture-pane
+    // snapshot so the browser stays current. This also recovers from any
+    // silent FIFO-read failures on restored panes.
+    session.lastBroadcastTime = Date.now();
+    session.replacePoller = setInterval(() => {
+      if (session.status !== 'running') return;
+      if (Date.now() - (session.lastBroadcastTime || 0) > 4000) {
+        session.lastBroadcastTime = Date.now();
+        broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
+      }
+    }, 1600);
   }
 
   function stopTmuxStream(session) {
     if (session.streamPoller) { clearInterval(session.streamPoller); session.streamPoller = null; }
+    if (session.replacePoller) { clearInterval(session.replacePoller); session.replacePoller = null; }
     if (session.replaceTimer) { clearTimeout(session.replaceTimer); session.replaceTimer = null; }
     if (session.inputRefreshTimer) { clearTimeout(session.inputRefreshTimer); session.inputRefreshTimer = null; }
     // Turn piping back off for this pane (no command toggles it off).
@@ -6706,6 +6931,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       streamPoller: null,
       streamFd: null,
       pipeFile: null,
+      replacePoller: null,
+      lastBroadcastTime: 0,
       exitPoller: null
     };
     sessions.set(key, session);
@@ -7334,7 +7561,17 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             if (session.wrapperPid) { try { process.kill(session.wrapperPid, 'SIGTERM'); } catch {} }
             if (session.pid && session.pid !== session.wrapperPid) { try { process.kill(session.pid, 'SIGTERM'); } catch {} }
           } else if (session.type === 'tmux') {
+            let input = {};
+            try { input = await readJsonRequest(req); } catch {}
             detachTmuxSession(session, 'detached');
+            if (input.kill_tmux) {
+              try {
+                const sessName = runTmux(['display-message', '-p', '-t', session.pane, '#{session_name}']).trim();
+                if (sessName) tmuxKillSession(sessName);
+              } catch {
+                // Pane or session already gone; no fallback needed.
+              }
+            }
           } else {
             session.pty.kill();
           }
@@ -7359,6 +7596,46 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           db.close();
         }
         sendJson(res, 200, { ok: true, id: msgId });
+        return;
+      }
+      const detectedStopMatch = url.pathname.match(/^\/api\/detected\/([^/]+)\/stop$/);
+      if (req.method === 'POST' && detectedStopMatch) {
+        const peerId = decodeURIComponent(detectedStopMatch[1]);
+        let input = {};
+        try { input = await readJsonRequest(req); } catch {}
+        const db = connect(reqCtx);
+        try {
+          const now_ = now();
+          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now_, peerId);
+          const binding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(peerId);
+          if (binding && input.kill_tmux && binding.runtime_target) {
+            try {
+              const sessName = runTmux(['display-message', '-p', '-t', binding.runtime_target, '#{session_name}']).trim();
+              if (sessName) tmuxKillSession(sessName);
+            } catch {
+              // Session already gone.
+            }
+          }
+          db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now_, peerId);
+          addEvent(db, 'peer.stopped', 'web', null, { peer: peerId });
+        } finally {
+          db.close();
+        }
+        sendJson(res, 200, { ok: true, peer: peerId, status: 'exited' });
+        return;
+      }
+      const detectedRestartMatch = url.pathname.match(/^\/api\/detected\/([^/]+)\/restart$/);
+      if (req.method === 'POST' && detectedRestartMatch) {
+        const peerId = decodeURIComponent(detectedRestartMatch[1]);
+        const db = connect(reqCtx);
+        try {
+          const now_ = now();
+          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('running', now_, peerId);
+          addEvent(db, 'peer.restarted', 'web', null, { peer: peerId });
+        } finally {
+          db.close();
+        }
+        sendJson(res, 200, { ok: true, peer: peerId, status: 'running' });
         return;
       }
       sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });

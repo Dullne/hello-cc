@@ -1204,6 +1204,10 @@ async function dbWorkflow() {
   if (!nextAgain.includes(`current task #${taskId}`)) {
     fail(`task next did not preserve current task:\n${nextAgain}`);
   }
+  const nextAgainJson = hccJson(['task', 'next', '--peer', 'codex-a']);
+  if (String(nextAgainJson.id) !== String(taskId) || nextAgainJson.current !== true || nextAgainJson.tasks) {
+    fail(`task next --json current task shape changed:\n${JSON.stringify(nextAgainJson, null, 2)}`);
+  }
   const batchClaimIds = [];
   for (const title of ['batch claim one', 'batch claim two']) {
     const out = hcc(['task', 'create', '--from', 'human', '--title', title]);
@@ -1276,7 +1280,7 @@ async function dbWorkflow() {
     db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(staleAt, 'stale-liveness-owner');
   });
   const staleLivenessList = hcc(['task', 'list', '--status', 'claimed']);
-  if (!staleLivenessList.includes(`#${staleLivenessTaskId}`) || !staleLivenessList.includes('owner_state=stale/no-lock')) {
+  if (!staleLivenessList.includes(`#${staleLivenessTaskId}`) || !staleLivenessList.includes('stale/no-lock')) {
     fail(`task list did not surface stale/no-lock owner state:\n${staleLivenessList}`);
   }
   const staleLivenessState = hccJson(['state', '--peer', 'takeover-ready-peer']);
@@ -2189,6 +2193,21 @@ function syntaxAndHelp() {
     "broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });"
   ]) {
     if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
+  }
+  for (const expected of [
+    'function detectedPeerCanStop(peer)',
+    "if (['exited', 'detached'].includes(status)) return false;",
+    'const canStop = detectedPeerCanStop(p);',
+    '${canStop ?',
+    "if (e.target.closest('[data-action]')) return;",
+    'id="stopKillLabel" data-i18n="dialog.killTmux"',
+    'id="stopCancelBtn" type="button" data-i18n="dialog.cancel"',
+    'id="stopConfirmBtn" type="button" data-i18n="stop"'
+  ]) {
+    if (!hccSource.includes(expected)) fail(`web display regression guard missing: ${expected}`);
+  }
+  if (hccSource.includes("p.status === 'running' ?")) {
+    fail('detected peer action rendering still depends on status === running instead of liveness');
   }
   for (const expected of [
     'function webPeerAction(projectCtx, peer, action, input = {})',
