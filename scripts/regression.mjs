@@ -7,6 +7,7 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
+import { Readable } from 'node:stream';
 import WebSocket from 'ws';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -2233,10 +2234,11 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
+      !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2257,9 +2259,20 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds web runtime helper: ${helper}`);
   }
+  for (const helper of [
+    'function readRequestBody',
+    'function readJsonRequest',
+    'function sendHttp',
+    'function sendJson',
+    'function sendFile',
+    'function authOk'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds web HTTP helper: ${helper}`);
+  }
   if (hccSource.includes('new URL(req.url')) fail('CLI still embeds raw server request URL parsing');
   if (hccSource.includes('function webIndexHtml()')) fail('CLI still embeds the web UI template');
   const webRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
+  const webHttp = await import(path.join(repoRoot, 'lib', 'web-http.mjs'));
   const webUiTemplate = await import(path.join(repoRoot, 'lib', 'web-ui-template.mjs'));
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
@@ -2269,6 +2282,33 @@ async function syntaxAndHelp() {
       !html.includes('<div class="app">') ||
       !html.includes('<script src="/assets/xterm.js"></script>')) {
     fail('web UI template module did not render the expected shell HTML');
+  }
+  const jsonReq = Readable.from(['{"ok":true}']);
+  jsonReq.headers = {};
+  const parsedJson = await webHttp.readJsonRequest(jsonReq);
+  if (parsedJson.ok !== true) fail(`web HTTP helper failed to parse JSON request: ${JSON.stringify(parsedJson)}`);
+  const emptyReq = Readable.from(['']);
+  emptyReq.headers = {};
+  const parsedEmpty = await webHttp.readJsonRequest(emptyReq);
+  if (Object.keys(parsedEmpty).length !== 0) fail(`web HTTP helper failed empty request fallback: ${JSON.stringify(parsedEmpty)}`);
+  const mockRes = {
+    status: null,
+    headers: null,
+    body: '',
+    writeHead(status, headers) { this.status = status; this.headers = headers; },
+    end(body) { this.body = body; }
+  };
+  webHttp.sendJson(mockRes, 202, { ok: true });
+  if (mockRes.status !== 202 ||
+      mockRes.headers?.['Content-Type'] !== 'application/json; charset=utf-8' ||
+      mockRes.headers?.['Cache-Control'] !== 'no-store' ||
+      !mockRes.body.includes('"ok": true')) {
+    fail(`web HTTP helper failed sendJson response: ${JSON.stringify(mockRes)}`);
+  }
+  if (!webHttp.authOk(new URL('http://example.test/?token=tok'), { headers: {} }, 'tok') ||
+      !webHttp.authOk(new URL('http://example.test/'), { headers: { authorization: 'Bearer tok' } }, 'tok') ||
+      webHttp.authOk(new URL('http://example.test/?token=bad'), { headers: {} }, 'tok')) {
+    fail('web HTTP helper authOk token checks failed');
   }
   const wildcardRuntime = { host: '0.0.0.0', port: 8787, token: 'tok' };
   const ipv6WildcardRuntime = { host: '::', port: 8788, token: 'tok' };
