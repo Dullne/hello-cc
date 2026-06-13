@@ -20,5 +20,7 @@
 - [设计说明](design.md)：产品边界、项目边界、能力层级、协作语义和 provider
   session 绑定。
 - [实现说明](implementation.md)：架构、协议、命令面、技术栈、shim 行为和实现计划。
+- [架构设计](architecture.zh-CN.md)：目标目录结构、模块边界、依赖方向和分阶段
+  迁移计划。
 
-设计和实现文档目前只有英文版。
+`design.md` 和 `implementation.md` 目前只有英文版。

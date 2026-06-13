@@ -22,3 +22,5 @@ summary and first command. Use these docs when you need more detail.
   levels, coordination semantics, and provider-session binding.
 - [Implementation Notes](implementation.md): architecture, protocol, command
   surface, stack, shim behavior, and implementation plan.
+- [Architecture](architecture.md): target project layout, module boundaries,
+  dependency direction, and staged migration plan.
