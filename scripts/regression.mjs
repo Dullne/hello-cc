@@ -2183,6 +2183,7 @@ async function syntaxAndHelp() {
     run(process.execPath, ['--check', path.join(repoRoot, file)]);
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
+  const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-ui-template.mjs'), 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
     "runTmux(['pipe-pane', '-t', session.pane]);",
@@ -2204,9 +2205,9 @@ async function syntaxAndHelp() {
     'id="stopCancelBtn" type="button" data-i18n="dialog.cancel"',
     'id="stopConfirmBtn" type="button" data-i18n="stop"'
   ]) {
-    if (!hccSource.includes(expected)) fail(`web display regression guard missing: ${expected}`);
+    if (!webUiTemplateSource.includes(expected)) fail(`web display regression guard missing: ${expected}`);
   }
-  if (hccSource.includes("p.status === 'running' ?")) {
+  if (webUiTemplateSource.includes("p.status === 'running' ?")) {
     fail('detected peer action rendering still depends on status === running instead of liveness');
   }
   for (const expected of [
@@ -2232,9 +2233,10 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
+      !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2256,10 +2258,18 @@ async function syntaxAndHelp() {
     if (hccSource.includes(helper)) fail(`CLI still embeds web runtime helper: ${helper}`);
   }
   if (hccSource.includes('new URL(req.url')) fail('CLI still embeds raw server request URL parsing');
+  if (hccSource.includes('function webIndexHtml()')) fail('CLI still embeds the web UI template');
   const webRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
+  const webUiTemplate = await import(path.join(repoRoot, 'lib', 'web-ui-template.mjs'));
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
   };
+  const html = webUiTemplate.webIndexHtml();
+  if (!html.includes('<!doctype html>') ||
+      !html.includes('<div class="app">') ||
+      !html.includes('<script src="/assets/xterm.js"></script>')) {
+    fail('web UI template module did not render the expected shell HTML');
+  }
   const wildcardRuntime = { host: '0.0.0.0', port: 8787, token: 'tok' };
   const ipv6WildcardRuntime = { host: '::', port: 8788, token: 'tok' };
   const localRuntime = { host: '127.0.0.1', port: 8789, token: 'tok' };
