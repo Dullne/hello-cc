@@ -2244,6 +2244,7 @@ async function syntaxAndHelp() {
   for (const helper of [
     'function runtimeBaseUrl',
     'function runtimeApiUrl',
+    'function requestUrl',
     'function runtimeUrlQuery',
     'function makeWebToken',
     'function validateWebTokenOpts',
@@ -2254,6 +2255,7 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds web runtime helper: ${helper}`);
   }
+  if (hccSource.includes('new URL(req.url')) fail('CLI still embeds raw server request URL parsing');
   const webRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
@@ -2264,6 +2266,8 @@ async function syntaxAndHelp() {
   expectEqual(webRuntime.runtimeBaseUrl('0.0.0.0', 8787), 'http://127.0.0.1:8787', 'runtimeBaseUrl 0.0.0.0');
   expectEqual(webRuntime.runtimeBaseUrl('::', 8788), 'http://127.0.0.1:8788', 'runtimeBaseUrl ::');
   expectEqual(String(webRuntime.runtimeApiUrl({ base_url: 'http://127.0.0.1:8787/base' }, '/api/state?peer=a b')), 'http://127.0.0.1:8787/api/state?peer=a%20b', 'runtimeApiUrl route');
+  expectEqual(String(webRuntime.requestUrl({ url: '/api/state?peer=a b', headers: { host: 'example.test:8787' } })), 'http://example.test:8787/api/state?peer=a%20b', 'requestUrl host and query');
+  expectEqual(String(webRuntime.requestUrl({ url: '', headers: {} })), 'http://localhost/', 'requestUrl fallback');
   expectEqual(webRuntime.publicRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl wildcard');
   expectEqual(webRuntime.localRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://127.0.0.1:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'localRuntimeUrl wildcard');
   expectEqual(webRuntime.publicRuntimeUrl(ipv6WildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8788/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl ipv6 wildcard');

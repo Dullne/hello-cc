@@ -51,6 +51,7 @@ import {
   makeWebToken,
   publicRuntimeUrl,
   rememberRuntimeToken,
+  requestUrl,
   runtimeApiUrl,
   runtimeBaseUrl,
   validateWebTokenOpts,
@@ -7241,7 +7242,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const url = requestUrl(req);
     try {
       if (req.method === 'GET' && url.pathname === '/') {
         sendHttp(res, 200, 'text/html; charset=utf-8', webIndexHtml());
@@ -7565,7 +7566,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const url = requestUrl(req);
     if (!authOk(url, req, token)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
