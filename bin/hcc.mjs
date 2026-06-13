@@ -30,6 +30,7 @@ import {
   shellCommand as shellCommandWithQuote,
   tailFile
 } from '../lib/cli-runtime.mjs';
+import { createCoordinationState } from '../lib/coordination-state.mjs';
 import {
   formatJson,
   printResult,
@@ -69,17 +70,9 @@ import {
   normalizeListText
 } from '../lib/handoff.mjs';
 import {
-  timelineFromRows
-} from '../lib/timeline.mjs';
-import {
   annotateTasksWithLiveness,
-  formatOpenTaskLine,
   taskOwnerStateText
 } from '../lib/task-liveness.mjs';
-import {
-  deriveAutomation,
-  renderAutomationContext
-} from '../lib/automation.mjs';
 import {
   normalizeStateResources,
   renderStateSummary,
@@ -248,6 +241,22 @@ const {
   addEvent,
   now,
   sendMessage
+});
+const {
+  ackMessages,
+  buildHookCoordinationContext,
+  statusSnapshot,
+  statusSummary
+} = createCoordinationState({
+  activePeerTtl: ACTIVE_PEER_TTL,
+  cliName: CLI_NAME,
+  connect,
+  defaultLockTtl: DEFAULT_LOCK_TTL,
+  now,
+  queryInbox,
+  queryOpenTasks,
+  queryTimelineMessages,
+  touchCurrentPeer
 });
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
@@ -443,140 +452,6 @@ function formatHookEventName(hookType) {
   };
   const compact = String(hookType || '').replace(/[^a-z]/gi, '').toLowerCase();
   return known[compact] || String(hookType || 'unknown');
-}
-
-function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
-  const t = now();
-  const peers = db.prepare(`
-    SELECT id, kind, role, status, worktree, branch, pid, capabilities,
-           created_at, last_seen_at, (? - last_seen_at) AS age_sec
-    FROM peers
-    ORDER BY last_seen_at DESC, id ASC
-    LIMIT 200
-  `).all(t);
-  const taskRows = queryOpenTasks(db, 200);
-  const locks = db.prepare(`
-    SELECT resource, base_resource, scope, owner, task_id, reason, expires_at, created_at
-    FROM locks
-    WHERE expires_at > ?
-    ORDER BY resource ASC
-    LIMIT 200
-  `).all(t);
-  const tasks = annotateTasksWithLiveness(taskRows, peers, locks, t, ACTIVE_PEER_TTL);
-  const messages = peer
-    ? queryInbox(db, peer, false, 50)
-    : db.prepare(`
-        SELECT id, sender, recipient, task_id, kind, body, reply_to, thread_id, created_at
-        FROM messages
-        ORDER BY id DESC
-        LIMIT 50
-      `).all().reverse();
-  const timelineMessages = queryTimelineMessages(db, peer, 80);
-  const handoffs = db.prepare(`
-    SELECT id, task_id, from_peer, to_peer, summary, changed_files, tests, risks, created_at
-    FROM handoffs
-    ORDER BY id DESC
-    LIMIT 50
-  `).all().reverse();
-  const events = db.prepare(`
-    SELECT id, type, actor, task_id, payload, created_at
-    FROM events
-    ORDER BY id DESC
-    LIMIT 80
-  `).all().reverse();
-  const snapshot = {
-    root: ctx.root,
-    db: ctx.dbPath,
-    now: t,
-    active_peer_ttl: ACTIVE_PEER_TTL,
-    peers,
-    tasks,
-    locks,
-    messages,
-    handoffs,
-    events
-  };
-  snapshot.timeline = timelineFromRows({ messages: timelineMessages, handoffs, tasks, locks, events }, peer);
-  snapshot.automation = deriveAutomation(snapshot, peer, opts, {
-    activePeerTtl: ACTIVE_PEER_TTL,
-    defaultLockTtl: DEFAULT_LOCK_TTL,
-    cliName: CLI_NAME
-  });
-  return snapshot;
-}
-
-function buildHookCoordinationContext(db, ctx, peerId) {
-  const snapshot = collectStateSnapshot(db, ctx, peerId);
-  const openTasks = snapshot.tasks.slice(0, 8);
-  const unread = snapshot.messages.slice(0, 5);
-  const peers = snapshot.peers.slice(0, 8);
-  const parts = [
-    '[hello-cc coordination]',
-    `peer: ${peerId}`,
-    'This is live project coordination context injected by hello-cc.',
-    'You are not isolated for project coordination: hcc is the source of truth for other Claude/Codex/shell sessions in this project.',
-    'If the user asks what other sessions are doing, what tasks exist, or whether you can see other sessions, do not answer from generic model knowledge and do not say sessions are isolated. Run hcc status, hcc state, hcc peers, hcc task list, hcc msg inbox, and hcc lock list, then answer from those results.',
-    'Tasks are project work facts, not read/unread items. Open tasks stay relevant to every session until they are marked done or abandoned. Messages are the unread/ack notification channel.',
-    'If you already own a current task, continue that task until handoff/done/blocked; do not claim a different task just because a new prompt arrived.',
-    'When a hello-cc message asks for a response, reply with hcc msg reply --id <message-id> --body "<answer>" so the answer stays in the same thread.'
-  ];
-
-  if (peers.length > 0) {
-    parts.push('[hello-cc known peers]');
-    parts.push(...peers.map((peer) => {
-      const age = Math.max(0, snapshot.now - Number(peer.last_seen_at || 0));
-      const active = age <= ACTIVE_PEER_TTL ? 'active' : 'stale';
-      return `- ${peer.id} ${peer.kind || 'other'} ${peer.status || 'idle'} ${active}`;
-    }));
-  } else {
-    parts.push('[hello-cc known peers]\n(none)');
-  }
-
-  if (snapshot.automation.current_task) {
-    const task = snapshot.automation.current_task;
-    parts.push('[hello-cc current task]');
-    parts.push(`#${task.id} ${task.status}: ${task.title}`);
-  }
-
-  if (openTasks.length > 0) {
-    parts.push('[hello-cc open tasks]');
-    parts.push(...openTasks.map((task) => `- ${formatOpenTaskLine(task)}`));
-  } else {
-    parts.push('[hello-cc open tasks]\n(none)');
-  }
-
-  if (unread.length > 0) {
-    parts.push('[hello-cc unread messages]');
-    parts.push(...unread.map((m) =>
-      `- #${m.id} from ${m.sender}${m.task_id ? ` task #${m.task_id}` : ''}${m.reply_to ? ` reply #${m.reply_to}` : ''}: ${m.body}`
-    ));
-  } else {
-    parts.push('[hello-cc unread messages]\n(none)');
-  }
-
-  if (snapshot.locks.length > 0) {
-    parts.push('[hello-cc active locks]');
-    parts.push(...snapshot.locks.slice(0, 8).map((lock) =>
-      `- ${lockLabel(lock)} owner=${lock.owner}${lock.task_id ? ` task #${lock.task_id}` : ''}`));
-  } else {
-    parts.push('[hello-cc active locks]\n(none)');
-  }
-
-  parts.push(renderAutomationContext(snapshot.automation));
-
-  return { text: parts.join('\n'), messages: unread };
-}
-
-function ackMessages(db, peerId, messages) {
-  if (!messages.length) return;
-  const t = now();
-  for (const m of messages) {
-    db.prepare(`
-      INSERT INTO message_reads(message_id, peer, read_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(message_id, peer) DO UPDATE SET read_at = excluded.read_at
-    `).run(m.id, peerId, t);
-  }
 }
 
 function writeGuidance(ctx) {
@@ -1539,23 +1414,6 @@ async function cmdStatus(ctx, args) {
   printResult(ctx, data, (s) => renderStatusSummary(s, peer));
 }
 
-function statusSummary(ctx, peer = null, identity = null) {
-  const db = connect(ctx);
-  try {
-    if (identity) touchCurrentPeer(db, ctx, identity, null, 'shell');
-    const t = now();
-    const activePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at >= ?').get(t - ACTIVE_PEER_TTL).n;
-    const stalePeers = db.prepare('SELECT COUNT(*) AS n FROM peers WHERE last_seen_at < ?').get(t - ACTIVE_PEER_TTL).n;
-    const taskRows = db.prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY status').all();
-    const locks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at > ?').get(t).n;
-    const unread = peer ? queryInbox(db, peer, false, 1000).length : null;
-    const recent = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 8').all().reverse();
-    return { root: ctx.root, db: ctx.dbPath, active_peers: activePeers, stale_peers: stalePeers, tasks: taskRows, active_locks: locks, unread, recent_events: recent };
-  } finally {
-    db.close();
-  }
-}
-
 async function cmdState(ctx, args) {
   if (wantsHelp(args)) return helpState();
   const opts = parseOpts(args, { arrays: ['resource'] });
@@ -1844,19 +1702,6 @@ async function cmdDown(ctx, args) {
     try { fs.rmSync(runtimePath(ctx), { force: true }); } catch {}
   }
   printResult(ctx, { runtime: runtime.source || runtime.base_url }, () => `${PRODUCT_NAME} runtime stopped`);
-}
-
-function statusSnapshot(ctx, peer = null, opts = {}) {
-  const db = connect(ctx);
-  try {
-    return collectStateSnapshot(db, ctx, peer, opts);
-  } finally {
-    try {
-      db.close();
-    } catch {
-      // Ignore close failures for short-lived snapshots.
-    }
-  }
 }
 
 function webPeerRegister(projectCtx, peer, input = {}) {

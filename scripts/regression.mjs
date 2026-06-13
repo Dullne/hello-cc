@@ -2185,6 +2185,7 @@ async function syntaxAndHelp() {
     run(process.execPath, ['--check', path.join(repoRoot, file)]);
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
+  const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-ui-template.mjs'), 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
@@ -2216,7 +2217,7 @@ async function syntaxAndHelp() {
     'function webPeerAction(projectCtx, peer, action, input = {})',
     'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
     'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
-    'function statusSummary(ctx, peer = null, identity = null)',
+    'const status = statusSummary(projectCtx, peer)',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
     "sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));"
@@ -2233,14 +2234,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
+      !hccSource.includes("import { createCoordinationState } from '../lib/coordination-state.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-state.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
-      !hccSource.includes("} from '../lib/timeline.mjs'") ||
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
-      !hccSource.includes("} from '../lib/automation.mjs'") ||
       !hccSource.includes("} from '../lib/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
       !hccSource.includes("import { runtimeRequest } from '../lib/runtime-client.mjs'") ||
@@ -2260,7 +2260,17 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+  }
+  for (const expected of [
+    "renderAutomationContext",
+    "from './automation.mjs'",
+    "formatOpenTaskLine",
+    "from './task-liveness.mjs'",
+    "timelineFromRows",
+    "from './timeline.mjs'"
+  ]) {
+    if (!coordinationStateSource.includes(expected)) fail(`coordination state dependency missing: ${expected}`);
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2300,6 +2310,28 @@ async function syntaxAndHelp() {
   fs.writeFileSync(tailPath, '0123456789\n');
   if (cliRuntime.tailFile(tailPath, 4) !== '789' || cliRuntime.tailFile(path.join(outDir, 'missing-tail')) !== '') {
     fail('CLI runtime tailFile behavior changed');
+  }
+  for (const helper of [
+    'function collectStateSnapshot(',
+    'function buildHookCoordinationContext(',
+    'function ackMessages(',
+    'function statusSummary(',
+    'function statusSnapshot('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds coordination state helper: ${helper}`);
+  }
+  const coordinationState = await import(path.join(repoRoot, 'lib', 'coordination-state.mjs'));
+  if (typeof coordinationState.createCoordinationState !== 'function') {
+    fail('coordination state module missing createCoordinationState');
+  }
+  const stateHelpers = coordinationState.createCoordinationState({
+    connect: () => ({ close() {} }),
+    queryInbox: () => [],
+    queryOpenTasks: () => [],
+    queryTimelineMessages: () => []
+  });
+  for (const name of ['ackMessages', 'buildHookCoordinationContext', 'collectStateSnapshot', 'statusSnapshot', 'statusSummary']) {
+    if (typeof stateHelpers[name] !== 'function') fail(`coordination state factory missing function: ${name}`);
   }
   for (const helper of [
     'function readGlobalRuntimeFile',
