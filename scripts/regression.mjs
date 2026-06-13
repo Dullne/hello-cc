@@ -2238,6 +2238,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/timeline.mjs'") ||
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
+      !hccSource.includes("} from '../lib/automation.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2250,7 +2251,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2586,6 +2587,97 @@ async function syntaxAndHelp() {
   }
   if (taskLivenessModule.formatOpenTaskLine(staleTask) !== '#2 running owner=stale-owner owner_state=stale/no-lock: Stale task') {
     fail(`task liveness formatOpenTaskLine changed: ${taskLivenessModule.formatOpenTaskLine(staleTask)}`);
+  }
+  for (const helper of [
+    'function actionCommand',
+    'function makeAction',
+    'function looksLikeMultiTask',
+    'function selectCurrentTask',
+    'function deriveAutomation',
+    'function renderAutomationContext'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds automation helper: ${helper}`);
+  }
+  const automationModule = await import(path.join(repoRoot, 'lib', 'automation.mjs'));
+  for (const name of [
+    'actionCommand',
+    'makeAction',
+    'looksLikeMultiTask',
+    'selectCurrentTask',
+    'deriveAutomation',
+    'renderAutomationContext'
+  ]) {
+    if (typeof automationModule[name] !== 'function') fail(`automation module missing export: ${name}`);
+  }
+  if (!automationModule.looksLikeMultiTask({ title: 'split', body: '- one\n- two' })) {
+    fail('automation looksLikeMultiTask bullet detection changed');
+  }
+  const selectedTask = automationModule.selectCurrentTask([
+    { id: 2, status: 'claimed', owner: 'peer-a', priority: 1 },
+    { id: 1, status: 'running', owner: 'peer-a', priority: 9 }
+  ], 'peer-a');
+  if (selectedTask?.id !== 1) fail(`automation selectCurrentTask ranking changed: ${JSON.stringify(selectedTask)}`);
+  const automationConfig = { cliName: 'hccx', activePeerTtl: 600, defaultLockTtl: 321 };
+  const automationSnapshot = {
+    now: 1000,
+    active_peer_ttl: 600,
+    peers: [
+      { id: 'peer-a', age_sec: 10 },
+      { id: 'other-peer', age_sec: 20 }
+    ],
+    tasks: [
+      { id: 10, status: 'running', owner: 'peer-a', assignee: '', title: 'Main task', priority: 1, parent_id: null }
+    ],
+    locks: [],
+    messages: []
+  };
+  const acquireAutomation = automationModule.deriveAutomation(
+    automationSnapshot,
+    'peer-a',
+    { resource: 'bin/hcc.mjs', scope: 'automation' },
+    automationConfig
+  );
+  if (acquireAutomation.phase !== 'acquire_lock' ||
+      acquireAutomation.next_action.kind !== 'lock.acquire' ||
+      !acquireAutomation.next_action.argv.includes('321') ||
+      !String(acquireAutomation.next_action.command || '').startsWith('hccx lock acquire')) {
+    fail(`automation lock acquire action changed: ${JSON.stringify(acquireAutomation, null, 2)}`);
+  }
+  const finishAutomation = automationModule.deriveAutomation(
+    automationSnapshot,
+    'peer-a',
+    { intent: 'finish' },
+    automationConfig
+  );
+  if (finishAutomation.phase !== 'handoff' || finishAutomation.next_action.kind !== 'handoff.create') {
+    fail(`automation finish action changed: ${JSON.stringify(finishAutomation, null, 2)}`);
+  }
+  const claimAutomation = automationModule.deriveAutomation({
+    ...automationSnapshot,
+    tasks: [
+      { id: 11, status: 'pending', owner: '', assignee: 'peer-a', title: 'Assigned task', priority: 1 }
+    ]
+  }, 'peer-a', {}, automationConfig);
+  if (claimAutomation.phase !== 'claim_task' ||
+      claimAutomation.next_action.kind !== 'task.claim' ||
+      claimAutomation.next_action.task_id !== 11) {
+    fail(`automation assigned claim action changed: ${JSON.stringify(claimAutomation, null, 2)}`);
+  }
+  const conflictAutomation = automationModule.deriveAutomation({
+    ...automationSnapshot,
+    locks: [
+      { resource: 'scoped:runtime', base_resource: 'bin/hcc.mjs', scope: 'automation', owner: 'other-peer', task_id: 99, expires_at: 1200 }
+    ]
+  }, 'peer-a', { resource: 'bin/hcc.mjs', scope: 'automation' }, automationConfig);
+  if (conflictAutomation.phase !== 'coordinate_lock' ||
+      conflictAutomation.next_action.kind !== 'msg.send' ||
+      conflictAutomation.next_action.lock_owner !== 'other-peer') {
+    fail(`automation lock conflict action changed: ${JSON.stringify(conflictAutomation, null, 2)}`);
+  }
+  const automationContext = automationModule.renderAutomationContext(acquireAutomation);
+  if (!automationContext.includes('phase: acquire_lock') ||
+      !automationContext.includes('why: task #10 needs bin/hcc.mjs [automation] lock')) {
+    fail(`automation render context changed: ${automationContext}`);
   }
   for (const helper of [
     'const WEB_CHILD_ENV',
