@@ -2235,12 +2235,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
+      !hccSource.includes("} from '../lib/locks.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2335,6 +2336,48 @@ async function syntaxAndHelp() {
       parsedClaude.resume_arg !== 'claude-session' ||
       parsedClaude.session.provider_session_name !== null) {
     fail(`provider command module parsed Claude fork resume args wrong: ${JSON.stringify(parsedClaude)}`);
+  }
+  for (const helper of [
+    'const WHOLE_LOCK_SCOPE',
+    'function normalizeLockScope',
+    'function scopedLockResource',
+    'function lockBaseResource',
+    'function lockScope',
+    'function lockLabel',
+    'function lockArgv',
+    'function locksConflict'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds lock helper: ${helper}`);
+  }
+  const locksModule = await import(path.join(repoRoot, 'lib', 'locks.mjs'));
+  for (const name of [
+    'normalizeLockScope',
+    'scopedLockResource',
+    'lockBaseResource',
+    'lockScope',
+    'lockLabel',
+    'lockArgv',
+    'locksConflict'
+  ]) {
+    if (typeof locksModule[name] !== 'function') fail(`locks module missing export: ${name}`);
+  }
+  const wholeLock = locksModule.scopedLockResource('bin/hcc.mjs', '');
+  const scopedLock = locksModule.scopedLockResource('bin/hcc.mjs', 'provider-commands');
+  if (wholeLock.resource !== 'bin/hcc.mjs' ||
+      wholeLock.base_resource !== 'bin/hcc.mjs' ||
+      wholeLock.scope !== '*') {
+    fail(`locks module built wrong whole-resource lock: ${JSON.stringify(wholeLock)}`);
+  }
+  if (!scopedLock.resource.startsWith('scoped:') ||
+      scopedLock.base_resource !== 'bin/hcc.mjs' ||
+      scopedLock.scope !== 'provider-commands' ||
+      locksModule.lockLabel(scopedLock) !== 'bin/hcc.mjs [provider-commands]') {
+    fail(`locks module built wrong scoped lock: ${JSON.stringify(scopedLock)}`);
+  }
+  if (!locksModule.locksConflict(wholeLock, scopedLock) ||
+      locksModule.locksConflict(scopedLock, locksModule.scopedLockResource('bin/hcc.mjs', 'tmux-helpers')) ||
+      locksModule.locksConflict(scopedLock, locksModule.scopedLockResource('scripts/regression.mjs', 'provider-commands'))) {
+    fail('locks module conflict behavior changed');
   }
   for (const helper of [
     'function runtimeBaseUrl',
