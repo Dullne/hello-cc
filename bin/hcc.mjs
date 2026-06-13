@@ -43,6 +43,16 @@ import {
   webLogPath
 } from '../lib/runtime-paths.mjs';
 import {
+  clearRuntime,
+  readGlobalRuntimeFile,
+  readHealthyGlobalRuntime,
+  readHealthyRuntime,
+  readRuntime,
+  readRuntimeFile,
+  writeGlobalRuntime,
+  writeRuntime
+} from '../lib/runtime-state.mjs';
+import {
   detectBranch,
   detectRoot
 } from '../lib/project-context.mjs';
@@ -169,120 +179,6 @@ function createContext(global) {
   const root = detectRoot(cwd, global.root);
   const dbPath = path.resolve(global.db || process.env.HCC_DB || projectDbPath(root));
   return { cwd, root, dbPath, json: global.json, explicitRoot: Boolean(global.root || process.env.HCC_ROOT) };
-}
-
-function readGlobalRuntimeFile() {
-  const file = globalRuntimePath();
-  if (!fs.existsSync(file)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    try { fs.rmSync(file, { force: true }); } catch {}
-    return null;
-  }
-}
-
-function writeGlobalRuntime(runtime) {
-  const file = globalRuntimePath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(runtime, null, 2), { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return file;
-}
-
-function writeRuntime(ctx, runtime) {
-  const file = runtimePath(ctx);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(runtime, null, 2), { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return file;
-}
-
-function readRuntime(ctx) {
-  if (process.env.HCC_RUNTIME_URL) {
-    return {
-      base_url: process.env.HCC_RUNTIME_URL,
-      token: process.env.HCC_RUNTIME_TOKEN || '',
-      source: 'env'
-    };
-  }
-  const file = runtimePath(ctx);
-  if (fs.existsSync(file)) {
-    try {
-      const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!runtime.base_url) throw new Error('missing base_url');
-      return { ...runtime, source: file };
-    } catch {
-      try { fs.rmSync(file, { force: true }); } catch {}
-    }
-  }
-  const global = readGlobalRuntimeFile();
-  if (global?.base_url) {
-    return { ...global, source: globalRuntimePath(), global: true };
-  }
-  throw new CliError('RUNTIME_NOT_RUNNING',
-    `No running ${PRODUCT_NAME} web runtime found. Start it with:\n  ${CLI_NAME} web`);
-}
-
-function readRuntimeFile(ctx) {
-  const file = runtimePath(ctx);
-  if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
-
-async function probeRuntime(runtime) {
-  if (!runtime?.base_url) return false;
-  const url = runtimeApiUrl(runtime, '/api/runtime');
-  const headers = {};
-  if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
-  try {
-    const response = await fetch(url, { headers });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function readHealthyRuntime(ctx) {
-  try {
-    const runtime = readRuntimeFile(ctx);
-    if (runtime && await probeRuntime(runtime)) return runtime;
-    const global = readGlobalRuntimeFile();
-    if (global && await probeRuntime(global)) return global;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function readHealthyGlobalRuntime() {
-  try {
-    const runtime = readGlobalRuntimeFile();
-    if (!runtime) return null;
-    return await probeRuntime(runtime) ? runtime : null;
-  } catch {
-    return null;
-  }
-}
-
-function clearRuntime(ctx, pid = process.pid) {
-  const file = runtimePath(ctx);
-  if (fs.existsSync(file)) {
-    try {
-      const runtime = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!runtime.pid || runtime.pid === pid) fs.rmSync(file, { force: true });
-    } catch {
-      fs.rmSync(file, { force: true });
-    }
-  }
-  const globalFile = globalRuntimePath();
-  if (!fs.existsSync(globalFile)) return;
-  try {
-    const runtime = JSON.parse(fs.readFileSync(globalFile, 'utf8'));
-    if (!runtime.pid || runtime.pid === pid) fs.rmSync(globalFile, { force: true });
-  } catch {
-    fs.rmSync(globalFile, { force: true });
-  }
 }
 
 function shellCommand(args) {

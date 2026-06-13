@@ -2233,6 +2233,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime-state.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/timeline.mjs'") ||
@@ -2247,12 +2248,127 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, handoff helpers, timeline helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
       hccSource.includes('function readSchemaVersion')) {
     fail('CLI still embeds DB schema or migration helpers');
+  }
+  for (const helper of [
+    'function readGlobalRuntimeFile',
+    'function writeGlobalRuntime',
+    'function writeRuntime',
+    'function readRuntime',
+    'function readRuntimeFile',
+    'function probeRuntime',
+    'function readHealthyRuntime',
+    'function readHealthyGlobalRuntime',
+    'function clearRuntime'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds runtime state helper: ${helper}`);
+  }
+  const runtimeState = await import(path.join(repoRoot, 'lib', 'runtime-state.mjs'));
+  for (const name of [
+    'readGlobalRuntimeFile',
+    'writeGlobalRuntime',
+    'writeRuntime',
+    'readRuntime',
+    'readRuntimeFile',
+    'probeRuntime',
+    'readHealthyRuntime',
+    'readHealthyGlobalRuntime',
+    'clearRuntime'
+  ]) {
+    if (typeof runtimeState[name] !== 'function') fail(`runtime state module missing export: ${name}`);
+  }
+  const savedRuntimeEnv = {
+    HOME: process.env.HOME,
+    HCC_RUNTIME_URL: process.env.HCC_RUNTIME_URL,
+    HCC_RUNTIME_TOKEN: process.env.HCC_RUNTIME_TOKEN
+  };
+  try {
+    process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-state-home-'));
+    delete process.env.HCC_RUNTIME_URL;
+    delete process.env.HCC_RUNTIME_TOKEN;
+    const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-state-root-'));
+    const runtimeCtx = { root: runtimeRoot };
+
+    const projectRuntimeFile = runtimeState.writeRuntime(runtimeCtx, {
+      base_url: 'http://127.0.0.1:11',
+      token: 'project-token',
+      pid: 101
+    });
+    if (!fs.existsSync(projectRuntimeFile) || (fs.statSync(projectRuntimeFile).mode & 0o777) !== 0o600) {
+      fail('runtime state writeRuntime did not create a 0600 runtime file');
+    }
+    const projectRuntime = runtimeState.readRuntime(runtimeCtx);
+    if (projectRuntime.base_url !== 'http://127.0.0.1:11' ||
+        projectRuntime.token !== 'project-token' ||
+        projectRuntime.source !== projectRuntimeFile) {
+      fail(`runtime state project read changed: ${JSON.stringify(projectRuntime)}`);
+    }
+    if (runtimeState.readRuntimeFile(runtimeCtx)?.token !== 'project-token') {
+      fail('runtime state readRuntimeFile changed');
+    }
+    runtimeState.clearRuntime(runtimeCtx, 202);
+    if (!fs.existsSync(projectRuntimeFile)) fail('runtime state clearRuntime removed a different pid');
+    runtimeState.clearRuntime(runtimeCtx, 101);
+    if (fs.existsSync(projectRuntimeFile)) fail('runtime state clearRuntime did not remove matching project pid');
+
+    const globalRuntimeFile = runtimeState.writeGlobalRuntime({
+      base_url: 'http://127.0.0.1:12',
+      token: 'global-token',
+      pid: 303
+    });
+    const globalRuntime = runtimeState.readRuntime(runtimeCtx);
+    if (globalRuntime.base_url !== 'http://127.0.0.1:12' ||
+        globalRuntime.token !== 'global-token' ||
+        globalRuntime.source !== globalRuntimeFile ||
+        globalRuntime.global !== true) {
+      fail(`runtime state global fallback changed: ${JSON.stringify(globalRuntime)}`);
+    }
+    runtimeState.clearRuntime(runtimeCtx, 404);
+    if (!fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime removed a different global pid');
+    runtimeState.clearRuntime(runtimeCtx, 303);
+    if (fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime did not remove matching global pid');
+
+    fs.writeFileSync(globalRuntimeFile, '{bad');
+    if (runtimeState.readGlobalRuntimeFile() !== null || fs.existsSync(globalRuntimeFile)) {
+      fail('runtime state readGlobalRuntimeFile did not remove invalid JSON');
+    }
+
+    process.env.HCC_RUNTIME_URL = 'http://env-runtime.test';
+    process.env.HCC_RUNTIME_TOKEN = 'env-token';
+    const envRuntime = runtimeState.readRuntime(runtimeCtx);
+    if (envRuntime.base_url !== 'http://env-runtime.test' ||
+        envRuntime.token !== 'env-token' ||
+        envRuntime.source !== 'env') {
+      fail(`runtime state env runtime precedence changed: ${JSON.stringify(envRuntime)}`);
+    }
+    delete process.env.HCC_RUNTIME_URL;
+    delete process.env.HCC_RUNTIME_TOKEN;
+
+    try {
+      runtimeState.readRuntime(runtimeCtx, { productName: 'product-x', cliName: 'cli-x' });
+      fail('runtime state readRuntime succeeded without runtime');
+    } catch (err) {
+      if (err?.code !== 'RUNTIME_NOT_RUNNING' ||
+          !String(err.message || '').includes('product-x') ||
+          !String(err.message || '').includes('cli-x web')) {
+        throw err;
+      }
+    }
+    if (await runtimeState.probeRuntime(null) !== false ||
+        await runtimeState.readHealthyRuntime(runtimeCtx) !== null ||
+        await runtimeState.readHealthyGlobalRuntime() !== null) {
+      fail('runtime state unhealthy runtime behavior changed');
+    }
+  } finally {
+    for (const [key, value] of Object.entries(savedRuntimeEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
   for (const helper of [
     'function runGit',
