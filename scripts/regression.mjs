@@ -2214,8 +2214,8 @@ async function syntaxAndHelp() {
   }
   for (const expected of [
     'function webPeerAction(projectCtx, peer, action, input = {})',
-    'function claimNextTasksForPeer(db, peer, { force = false, count = 1 } = {})',
-    'function takeOverTaskForPeer(db, peer, id, { reason, policy = ',
+    'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
+    'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
     'function statusSummary(ctx, peer = null, identity = null)',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
@@ -2244,6 +2244,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
       !hccSource.includes("import { runtimeRequest } from '../lib/runtime-client.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/messages.mjs'") ||
+      !hccSource.includes("import { createTaskStore } from '../lib/task-store.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2256,7 +2257,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2956,6 +2957,113 @@ async function syntaxAndHelp() {
     }
   } finally {
     messageDb.close();
+  }
+  for (const helper of [
+    'function claimTaskRowsForPeer(',
+    'function takeoverPolicyDetails(',
+    'function takeOverTaskForPeer(',
+    'function queryOpenTasks(',
+    'function taskById(',
+    'function teamChildren(',
+    'function teamSummary(',
+    'function claimNextTasksForPeer('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds task store helper: ${helper}`);
+  }
+  const taskStoreModule = await import(path.join(repoRoot, 'lib', 'task-store.mjs'));
+  if (typeof taskStoreModule.createTaskStore !== 'function') fail('task store module missing createTaskStore export');
+  const taskEvents = [];
+  const taskMessages = [];
+  const taskStore = taskStoreModule.createTaskStore({
+    now: () => 2000,
+    activePeerTtl: 60,
+    addEvent: (_db, type, actor, taskId, payload) => taskEvents.push({ type, actor, taskId, payload }),
+    sendMessage: (_db, sender, recipient, taskId, kind, body) => {
+      taskMessages.push({ sender, recipient, taskId, kind, body });
+      return taskMessages.length;
+    }
+  });
+  for (const name of [
+    'claimNextTasksForPeer',
+    'claimTaskRowsForPeer',
+    'queryOpenTasks',
+    'takeOverTaskForPeer',
+    'taskById',
+    'teamChildren',
+    'teamSummary',
+    'takeoverPolicyDetails'
+  ]) {
+    if (typeof taskStore[name] !== 'function') fail(`task store missing function: ${name}`);
+  }
+  const taskDb = new DatabaseSync(':memory:');
+  try {
+    taskDb.exec(`
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        assignee TEXT,
+        owner TEXT,
+        parent_id INTEGER,
+        team_role TEXT,
+        priority INTEGER NOT NULL DEFAULT 100,
+        created_by TEXT,
+        claimed_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE handoffs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER,
+        summary TEXT
+      );
+    `);
+    taskDb.prepare(`
+      INSERT INTO tasks(title, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
+      VALUES
+        ('assigned pending', 'pending', 'bob', NULL, NULL, NULL, 10, 'alice', 1000, 1000),
+        ('stale owned', 'running', NULL, 'old-owner', NULL, NULL, 20, 'alice', 1000, 1000),
+        ('parent', 'pending', NULL, NULL, NULL, NULL, 30, 'alice', 1000, 1000),
+        ('child done', 'done', NULL, NULL, 3, 'worker', 31, 'alice', 1000, 1000),
+        ('next pending', 'pending', NULL, NULL, NULL, NULL, 40, 'alice', 1000, 1000)
+    `).run();
+    taskDb.prepare('INSERT INTO peers(id, last_seen_at) VALUES (?, ?)').run('old-owner', 1000);
+    taskDb.prepare('INSERT INTO handoffs(task_id, summary) VALUES (?, ?)').run(4, 'child handoff');
+    const claimed = taskStore.claimTaskRowsForPeer(taskDb, 'bob', [1]);
+    const blockedReject = (() => {
+      try {
+        taskStore.takeOverTaskForPeer(taskDb, 'taker', 2, { reason: 'blocked policy', policy: 'blocked' });
+        return false;
+      } catch (err) {
+        return err?.code === 'TAKEOVER_POLICY';
+      }
+    })();
+    const taken = taskStore.takeOverTaskForPeer(taskDb, 'taker', 2, { reason: 'stale policy', policy: 'stale', staleAfter: 60 });
+    const next = taskStore.claimNextTasksForPeer(taskDb, 'next-peer', { count: 1 });
+    const openForBob = taskStore.queryOpenTasks(taskDb, 10, 'bob');
+    const summary = taskStore.teamSummary(taskDb, 3);
+    if (claimed.length !== 1 ||
+        claimed[0].owner !== 'bob' ||
+        !blockedReject ||
+        taken.owner !== 'taker' ||
+        taskMessages.length !== 1 ||
+        !taskMessages[0].body.includes('Task #2 taken over by taker') ||
+        next.tasks.length !== 1 ||
+        next.tasks[0].owner !== 'next-peer' ||
+        openForBob.length !== 1 ||
+        summary.children.length !== 1 ||
+        summary.counts.done !== 1 ||
+        taskEvents.map((event) => event.type).join(',') !== 'task.claimed,task.takeover,task.claimed') {
+      fail('task store smoke test changed expected claim/takeover/next/team behavior');
+    }
+  } finally {
+    taskDb.close();
   }
   for (const helper of [
     'const WEB_CHILD_ENV',
