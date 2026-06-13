@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
@@ -40,12 +40,22 @@ import {
 import {
   contextForProject,
   globalRuntimePath,
-  globalWebTokenPath,
   projectDbPath,
   projectRegistryPath,
   runtimePath,
   webLogPath
 } from '../lib/runtime-paths.mjs';
+import {
+  expectedWebHost,
+  localRuntimeUrl,
+  makeWebToken,
+  publicRuntimeUrl,
+  rememberRuntimeToken,
+  runtimeApiUrl,
+  runtimeBaseUrl,
+  validateWebTokenOpts,
+  webRuntimeMatchesRequest
+} from '../lib/web-runtime.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -391,15 +401,6 @@ function writeGlobalRuntime(runtime) {
   return file;
 }
 
-function runtimeConnectHost(host) {
-  if (host === '0.0.0.0' || host === '::') return '127.0.0.1';
-  return host;
-}
-
-function runtimeBaseUrl(host, port) {
-  return `http://${runtimeConnectHost(host)}:${port}`;
-}
-
 function writeRuntime(ctx, runtime) {
   const file = runtimePath(ctx);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -442,7 +443,7 @@ function readRuntimeFile(ctx) {
 
 async function probeRuntime(runtime) {
   if (!runtime?.base_url) return false;
-  const url = new URL('/api/runtime', runtime.base_url);
+  const url = runtimeApiUrl(runtime, '/api/runtime');
   const headers = {};
   if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
   try {
@@ -497,89 +498,6 @@ function clearRuntime(ctx, pid = process.pid) {
 
 function shellCommand(args) {
   return args.map(shellQuoteArg).join(' ');
-}
-
-function runtimeUrlQuery(runtime, projectRoot = null) {
-  const parts = [];
-  if (runtime.token) parts.push(`token=${encodeURIComponent(runtime.token)}`);
-  if (projectRoot) parts.push(`project=${encodeURIComponent(projectRoot)}`);
-  return parts.length ? `?${parts.join('&')}` : '';
-}
-
-function readStoredWebToken() {
-  const file = globalWebTokenPath();
-  if (!fs.existsSync(file)) return '';
-  try {
-    return fs.readFileSync(file, 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
-
-function writeStoredWebToken(token) {
-  if (!token) return '';
-  const file = globalWebTokenPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${token}\n`, { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return file;
-}
-
-function makeWebToken(opts) {
-  validateWebTokenOpts(opts);
-  if (opts['no-token']) return '';
-  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
-  if (explicitToken) {
-    writeStoredWebToken(explicitToken);
-    return explicitToken;
-  }
-  const stored = readStoredWebToken();
-  if (stored) return stored;
-  const generated = randomBytes(24).toString('base64url');
-  writeStoredWebToken(generated);
-  return generated;
-}
-
-function validateWebTokenOpts(opts) {
-  if (opts['no-token'] && (opts.token || process.env.HCC_WEB_TOKEN)) {
-    throw new CliError('BAD_ARGS', '--no-token cannot be combined with --token or HCC_WEB_TOKEN');
-  }
-}
-
-function expectedWebHost(opts) {
-  return opts.host || (opts.local ? '127.0.0.1' : '0.0.0.0');
-}
-
-function webRuntimeMatchesRequest(runtime, opts) {
-  if (!runtime) return false;
-  if (opts['no-token'] && (opts.token || process.env.HCC_WEB_TOKEN)) return false;
-  const expectedHost = expectedWebHost(opts);
-  if (runtime.host !== expectedHost) return false;
-  const expectedPort = intOpt(opts, 'port', 8787);
-  if (opts.port !== undefined && runtime.port !== expectedPort) return false;
-  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
-  if (opts['no-token']) return !runtime.token;
-  if (explicitToken) return runtime.token === explicitToken;
-  return Boolean(runtime.token);
-}
-
-function rememberRuntimeToken(runtime, opts) {
-  if (!runtime?.token || opts['no-token']) return;
-  const explicitToken = opts.token || process.env.HCC_WEB_TOKEN || '';
-  if (explicitToken && runtime.token !== explicitToken) return;
-  writeStoredWebToken(runtime.token);
-}
-
-function publicRuntimeUrl(runtime, projectRoot = null) {
-  const host = runtime.host === '0.0.0.0' || runtime.host === '::'
-    ? '<machine-ip>'
-    : runtime.host || runtimeConnectHost(runtime.host || '127.0.0.1');
-  return `http://${host}:${runtime.port}/${runtimeUrlQuery(runtime, projectRoot)}`;
-}
-
-function localRuntimeUrl(runtime, projectRoot = null) {
-  const host = runtimeConnectHost(runtime.host || '127.0.0.1');
-  return `http://${host}:${runtime.port}/${runtimeUrlQuery(runtime, projectRoot)}`;
 }
 
 function tailFile(file, maxBytes = 12000) {
@@ -1319,7 +1237,7 @@ function parseCodexCommandArgs(args) {
 
 async function runtimeRequest(ctx, method, route, body = null, runtime = null) {
   const rt = runtime || readRuntime(ctx);
-  const url = new URL(route, rt.base_url);
+  const url = runtimeApiUrl(rt, route);
   const headers = { 'Content-Type': 'application/json' };
   headers['X-HCC-Root'] = ctx.root;
   headers['X-HCC-DB'] = ctx.dbPath;
@@ -7748,12 +7666,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   } finally {
     db.close();
   }
-  const shownHost = host === '0.0.0.0' ? '<machine-ip>' : host;
-  const url = `http://${shownHost}:${actualPort}/${runtimeUrlQuery(runtime, ctx.root)}`;
   console.log(`${PRODUCT_NAME} web listening on ${host}:${actualPort}`);
   console.log(`project: ${ctx.root}`);
   console.log(`database: ${ctx.dbPath}`);
-  console.log(`open: ${url}`);
+  console.log(`open: ${publicRuntimeUrl(runtime, ctx.root)}`);
 }
 
 async function cmdRun(ctx, args) {

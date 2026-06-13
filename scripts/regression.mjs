@@ -2176,7 +2176,7 @@ function oldNameScan() {
   if (rg.status !== 1) fail(`rg failed:\n${rg.stderr || rg.stdout}`);
 }
 
-function syntaxAndHelp() {
+async function syntaxAndHelp() {
   log('[11/12] syntax/help');
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   for (const file of libModuleFiles()) {
@@ -2231,15 +2231,43 @@ function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
+      !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, web runtime helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
       hccSource.includes('function readSchemaVersion')) {
     fail('CLI still embeds DB schema or migration helpers');
   }
+  for (const helper of [
+    'function runtimeBaseUrl',
+    'function runtimeApiUrl',
+    'function runtimeUrlQuery',
+    'function makeWebToken',
+    'function validateWebTokenOpts',
+    'function expectedWebHost',
+    'function webRuntimeMatchesRequest',
+    'function publicRuntimeUrl',
+    'function localRuntimeUrl'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds web runtime helper: ${helper}`);
+  }
+  const webRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
+  const expectEqual = (actual, expected, label) => {
+    if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
+  };
+  const wildcardRuntime = { host: '0.0.0.0', port: 8787, token: 'tok' };
+  const ipv6WildcardRuntime = { host: '::', port: 8788, token: 'tok' };
+  const localRuntime = { host: '127.0.0.1', port: 8789, token: 'tok' };
+  expectEqual(webRuntime.runtimeBaseUrl('0.0.0.0', 8787), 'http://127.0.0.1:8787', 'runtimeBaseUrl 0.0.0.0');
+  expectEqual(webRuntime.runtimeBaseUrl('::', 8788), 'http://127.0.0.1:8788', 'runtimeBaseUrl ::');
+  expectEqual(String(webRuntime.runtimeApiUrl({ base_url: 'http://127.0.0.1:8787/base' }, '/api/state?peer=a b')), 'http://127.0.0.1:8787/api/state?peer=a%20b', 'runtimeApiUrl route');
+  expectEqual(webRuntime.publicRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl wildcard');
+  expectEqual(webRuntime.localRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://127.0.0.1:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'localRuntimeUrl wildcard');
+  expectEqual(webRuntime.publicRuntimeUrl(ipv6WildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8788/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl ipv6 wildcard');
+  expectEqual(webRuntime.localRuntimeUrl(localRuntime, null), 'http://127.0.0.1:8789/?token=tok', 'localRuntimeUrl no project');
   const mainHelp = run(process.execPath, [hccBin, '--help']);
   if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {
     fail(`public help exposes maintenance or removed commands:\n${mainHelp}`);
@@ -2397,7 +2425,7 @@ async function main() {
   await askBroadcastWorkflow();
   await downGcPackWorkflow();
   oldNameScan();
-  syntaxAndHelp();
+  await syntaxAndHelp();
   uninstallWorkflow();
   log('FULL_REGRESSION_OK');
 }
