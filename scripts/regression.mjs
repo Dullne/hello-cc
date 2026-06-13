@@ -2234,6 +2234,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
+      !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
@@ -2245,7 +2246,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, handoff helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2296,6 +2297,42 @@ async function syntaxAndHelp() {
   if (projectContext.hasHccRootSync(contextRoot)) fail('project context detected root before marker file');
   fs.writeFileSync(path.join(contextRoot, '.hello-cc', 'config.json'), '{}');
   if (!projectContext.hasHccRootSync(contextRoot)) fail('project context did not detect config marker');
+  for (const helper of [
+    'function normalizeListText',
+    'function changedFiles'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds handoff helper: ${helper}`);
+  }
+  const handoffModule = await import(path.join(repoRoot, 'lib', 'handoff.mjs'));
+  for (const name of [
+    'normalizeListText',
+    'changedFiles'
+  ]) {
+    if (typeof handoffModule[name] !== 'function') fail(`handoff module missing export: ${name}`);
+  }
+  if (handoffModule.normalizeListText(undefined, ['fallback']) !== JSON.stringify(['fallback'])) {
+    fail('handoff normalizeListText fallback changed');
+  }
+  if (handoffModule.normalizeListText('["kept"]') !== '["kept"]') {
+    fail('handoff normalizeListText JSON passthrough changed');
+  }
+  if (handoffModule.normalizeListText('one, two,, three') !== JSON.stringify(['one', 'two', 'three'])) {
+    fail('handoff normalizeListText CSV parsing changed');
+  }
+  const handoffGitRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-handoff-git-'));
+  run('git', ['init'], { cwd: handoffGitRoot });
+  run('git', ['config', 'user.email', 'hcc-regression@example.invalid'], { cwd: handoffGitRoot });
+  run('git', ['config', 'user.name', 'hcc regression'], { cwd: handoffGitRoot });
+  fs.writeFileSync(path.join(handoffGitRoot, 'tracked.txt'), 'base\n');
+  run('git', ['add', 'tracked.txt'], { cwd: handoffGitRoot });
+  run('git', ['commit', '-m', 'init'], { cwd: handoffGitRoot });
+  fs.writeFileSync(path.join(handoffGitRoot, 'tracked.txt'), 'changed\n');
+  fs.writeFileSync(path.join(handoffGitRoot, 'staged.txt'), 'new\n');
+  run('git', ['add', 'staged.txt'], { cwd: handoffGitRoot });
+  const handoffChanged = handoffModule.changedFiles(handoffGitRoot);
+  if (JSON.stringify(handoffChanged) !== JSON.stringify(['staged.txt', 'tracked.txt'])) {
+    fail(`handoff changedFiles changed: ${JSON.stringify(handoffChanged)}`);
+  }
   for (const helper of [
     'function runTmux',
     'function tmuxInstallHint',
