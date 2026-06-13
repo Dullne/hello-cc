@@ -66,6 +66,12 @@ import {
   uniqueList
 } from '../lib/timeline.mjs';
 import {
+  annotateTasksWithLiveness,
+  formatOpenTaskLine,
+  summarizeTask,
+  taskOwnerStateText
+} from '../lib/task-liveness.mjs';
+import {
   expectedWebHost,
   localRuntimeUrl,
   makeWebToken,
@@ -1085,82 +1091,6 @@ function selectCurrentTask(tasks, peerId) {
   return ownedTasks.find((task) => ['running', 'claimed', 'review', 'blocked'].includes(task.status)) || ownedTasks[0] || null;
 }
 
-function taskRelatedLocks(task, locks) {
-  const taskId = Number(task?.id || 0);
-  const owner = task?.owner || '';
-  return (locks || []).filter((lock) => {
-    if (taskId && Number(lock.task_id || 0) === taskId) return true;
-    return Boolean(owner && lock.owner === owner);
-  });
-}
-
-function taskOwnerLiveness(task, peers, locks, t = now()) {
-  const owner = task?.owner || null;
-  const relatedLocks = taskRelatedLocks(task, locks);
-  if (!owner) {
-    return {
-      owner_known: false,
-      owner_active: null,
-      owner_stale: false,
-      owner_age_sec: null,
-      related_lock_count: relatedLocks.length,
-      takeover_ready: false
-    };
-  }
-  const ownerRow = (peers || []).find((row) => row.id === owner) || null;
-  const ownerAge = ownerRow
-    ? Number(ownerRow.age_sec ?? (t - Number(ownerRow.last_seen_at || 0)))
-    : null;
-  const ownerActive = Boolean(ownerRow && Number.isFinite(ownerAge) && ownerAge <= ACTIVE_PEER_TTL);
-  const ownerStale = !ownerActive;
-  const takeoverStatus = ['claimed', 'running', 'review', 'blocked'].includes(task.status);
-  return {
-    owner_known: Boolean(ownerRow),
-    owner_active: ownerActive,
-    owner_stale: ownerStale,
-    owner_age_sec: Number.isFinite(ownerAge) ? ownerAge : null,
-    related_lock_count: relatedLocks.length,
-    takeover_ready: Boolean(takeoverStatus && ownerStale && relatedLocks.length === 0)
-  };
-}
-
-function annotateTasksWithLiveness(tasks, peers, locks, t = now()) {
-  return (tasks || []).map((task) => ({
-    ...task,
-    ...taskOwnerLiveness(task, peers, locks, t)
-  }));
-}
-
-function taskOwnerStateText(task) {
-  if (!task?.owner) return '';
-  if (task.owner_stale) {
-    if (task.takeover_ready) return 'stale/no-lock';
-    const locks = Number(task.related_lock_count || 0);
-    return locks ? `stale/locks=${locks}` : 'stale';
-  }
-  if (task.owner_active) return 'active';
-  return '';
-}
-
-function summarizeTask(task) {
-  if (!task) return null;
-  return {
-    id: task.id,
-    title: task.title,
-    status: task.status,
-    owner: task.owner || null,
-    assignee: task.assignee || null,
-    parent_id: task.parent_id || null,
-    team_role: task.team_role || null,
-    priority: task.priority,
-    owner_active: task.owner_active ?? null,
-    owner_stale: Boolean(task.owner_stale),
-    owner_age_sec: task.owner_age_sec ?? null,
-    related_lock_count: Number(task.related_lock_count || 0),
-    takeover_ready: Boolean(task.takeover_ready)
-  };
-}
-
 function parseTaskIds(opts) {
   const values = [];
   const addValue = (value) => {
@@ -1478,15 +1408,6 @@ function queryOpenTasks(db, limit, peer = null) {
     : db.prepare(sql).all(limit);
 }
 
-function formatOpenTaskLine(task) {
-  const parts = [`#${task.id}`, task.status];
-  if (task.owner) parts.push(`owner=${task.owner}`);
-  if (task.assignee) parts.push(`assignee=${task.assignee}`);
-  const ownerState = taskOwnerStateText(task);
-  if (ownerState) parts.push(`owner_state=${ownerState}`);
-  return `${parts.join(' ')}: ${task.title}`;
-}
-
 function formatHookEventName(hookType) {
   const known = {
     sessionstart: 'SessionStart',
@@ -1516,7 +1437,7 @@ function collectStateSnapshot(db, ctx, peer = null, opts = {}) {
     ORDER BY resource ASC
     LIMIT 200
   `).all(t);
-  const tasks = annotateTasksWithLiveness(taskRows, peers, locks, t);
+  const tasks = annotateTasksWithLiveness(taskRows, peers, locks, t, ACTIVE_PEER_TTL);
   const messages = peer
     ? queryInbox(db, peer, false, 50)
     : db.prepare(`
@@ -1853,7 +1774,7 @@ async function taskList(ctx, args) {
     FROM peers
   `).all(t);
   const locks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
-  rows = annotateTasksWithLiveness(rows, peers, locks, t);
+  rows = annotateTasksWithLiveness(rows, peers, locks, t, ACTIVE_PEER_TTL);
   printResult(ctx, rows, (data) => table(data, [
     { label: 'id', value: (r) => `#${r.id}` },
     { label: 'status', value: (r) => r.status },

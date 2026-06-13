@@ -2237,6 +2237,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/timeline.mjs'") ||
+      !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
@@ -2248,7 +2249,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2520,6 +2521,70 @@ async function syntaxAndHelp() {
   if (inbound?.direction !== 'in' || inbound?.unread !== true ||
       broadcast?.direction !== 'out' || broadcast?.broadcast !== true) {
     fail(`timelineFromRows message metadata changed: ${JSON.stringify(timelineItems)}`);
+  }
+  for (const helper of [
+    'function taskRelatedLocks',
+    'function taskOwnerLiveness',
+    'function annotateTasksWithLiveness',
+    'function taskOwnerStateText',
+    'function summarizeTask',
+    'function formatOpenTaskLine'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds task liveness helper: ${helper}`);
+  }
+  const taskLivenessModule = await import(path.join(repoRoot, 'lib', 'task-liveness.mjs'));
+  for (const name of [
+    'taskRelatedLocks',
+    'taskOwnerLiveness',
+    'annotateTasksWithLiveness',
+    'taskOwnerStateText',
+    'summarizeTask',
+    'formatOpenTaskLine'
+  ]) {
+    if (typeof taskLivenessModule[name] !== 'function') fail(`task liveness module missing export: ${name}`);
+  }
+  const livenessTasks = taskLivenessModule.annotateTasksWithLiveness([
+    { id: 1, status: 'running', owner: 'active-owner', assignee: '', title: 'Active task', priority: 1 },
+    { id: 2, status: 'running', owner: 'stale-owner', assignee: '', title: 'Stale task', priority: 2 },
+    { id: 3, status: 'running', owner: 'locked-owner', assignee: '', title: 'Locked task', priority: 3 },
+    { id: 4, status: 'pending', owner: 'stale-pending-owner', assignee: '', title: 'Pending stale task', priority: 4 },
+    { id: 5, status: 'pending', owner: '', assignee: 'worker', title: 'Unowned task', priority: 5 }
+  ], [
+    { id: 'active-owner', age_sec: 10 },
+    { id: 'stale-owner', last_seen_at: 100 },
+    { id: 'locked-owner', age_sec: 900 },
+    { id: 'stale-pending-owner', age_sec: 900 }
+  ], [
+    { owner: 'locked-owner', task_id: 3 }
+  ], 1000, 600);
+  const activeTask = livenessTasks.find((task) => task.id === 1);
+  const staleTask = livenessTasks.find((task) => task.id === 2);
+  const lockedTask = livenessTasks.find((task) => task.id === 3);
+  const pendingTask = livenessTasks.find((task) => task.id === 4);
+  const unownedTask = livenessTasks.find((task) => task.id === 5);
+  if (!activeTask.owner_active || activeTask.owner_stale || taskLivenessModule.taskOwnerStateText(activeTask) !== 'active') {
+    fail(`task liveness active owner changed: ${JSON.stringify(activeTask)}`);
+  }
+  if (!staleTask.owner_stale || !staleTask.takeover_ready || staleTask.owner_age_sec !== 900 ||
+      taskLivenessModule.taskOwnerStateText(staleTask) !== 'stale/no-lock') {
+    fail(`task liveness stale takeover changed: ${JSON.stringify(staleTask)}`);
+  }
+  if (!lockedTask.owner_stale || lockedTask.takeover_ready || lockedTask.related_lock_count !== 1 ||
+      taskLivenessModule.taskOwnerStateText(lockedTask) !== 'stale/locks=1') {
+    fail(`task liveness stale locked owner changed: ${JSON.stringify(lockedTask)}`);
+  }
+  if (!pendingTask.owner_stale || pendingTask.takeover_ready) {
+    fail(`task liveness pending takeover changed: ${JSON.stringify(pendingTask)}`);
+  }
+  if (unownedTask.owner_known || unownedTask.owner_active !== null || unownedTask.owner_stale || unownedTask.takeover_ready) {
+    fail(`task liveness unowned task changed: ${JSON.stringify(unownedTask)}`);
+  }
+  const summary = taskLivenessModule.summarizeTask(staleTask);
+  if (!summary.takeover_ready || summary.owner_age_sec !== 900 || summary.related_lock_count !== 0) {
+    fail(`task liveness summarizeTask changed: ${JSON.stringify(summary)}`);
+  }
+  if (taskLivenessModule.formatOpenTaskLine(staleTask) !== '#2 running owner=stale-owner owner_state=stale/no-lock: Stale task') {
+    fail(`task liveness formatOpenTaskLine changed: ${taskLivenessModule.formatOpenTaskLine(staleTask)}`);
   }
   for (const helper of [
     'function runTmux',
