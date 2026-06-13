@@ -2241,6 +2241,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/automation.mjs'") ||
       !hccSource.includes("} from '../lib/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
+      !hccSource.includes("import { createMessageStore } from '../lib/messages.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2253,7 +2254,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2815,6 +2816,78 @@ async function syntaxAndHelp() {
       !factoryUninstallHelp?.includes('hccx uninstall [--purge --yes]') ||
       !factoryWebHelp?.includes("HCC_WEB_TOKEN='long-token' hccx web --port 8787")) {
     fail(`help factory output changed:\n${capturedHelp.join('\n---\n')}`);
+  }
+  for (const helper of [
+    'function sendMessage(',
+    'function queryInbox(',
+    'function queryTimelineMessages(',
+    'function getMessage(',
+    'function queryMessageThread(',
+    'function ackMessage('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds message store helper: ${helper}`);
+  }
+  const messagesModule = await import(path.join(repoRoot, 'lib', 'messages.mjs'));
+  if (typeof messagesModule.createMessageStore !== 'function') fail('messages module missing createMessageStore export');
+  const messageEvents = [];
+  const messageStore = messagesModule.createMessageStore({
+    now: () => 1234,
+    addEvent: (_db, type, actor, taskId, payload) => messageEvents.push({ type, actor, taskId, payload })
+  });
+  for (const name of [
+    'ackMessage',
+    'getMessage',
+    'queryInbox',
+    'queryMessageThread',
+    'queryTimelineMessages',
+    'sendMessage'
+  ]) {
+    if (typeof messageStore[name] !== 'function') fail(`message store missing function: ${name}`);
+  }
+  const messageDb = new DatabaseSync(':memory:');
+  try {
+    messageDb.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        recipient TEXT,
+        task_id INTEGER,
+        kind TEXT NOT NULL DEFAULT 'note',
+        body TEXT NOT NULL,
+        reply_to INTEGER,
+        thread_id INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE message_reads (
+        message_id INTEGER NOT NULL,
+        peer TEXT NOT NULL,
+        read_at INTEGER NOT NULL,
+        PRIMARY KEY (message_id, peer)
+      );
+    `);
+    const firstId = messageStore.sendMessage(messageDb, 'alice', 'bob', 42, 'note', 'hello');
+    const replyId = messageStore.sendMessage(messageDb, 'bob', 'alice', 42, 'reply', 'ack', {
+      reply_to: firstId,
+      thread_id: firstId
+    });
+    const inbox = messageStore.queryInbox(messageDb, 'bob', false, 10);
+    const thread = messageStore.queryMessageThread(messageDb, replyId, 10);
+    messageStore.ackMessage(messageDb, 'bob', inbox[0]);
+    const unread = messageStore.queryInbox(messageDb, 'bob', false, 10);
+    const timeline = messageStore.queryTimelineMessages(messageDb, 'bob', 10);
+    if (firstId !== 1 ||
+        replyId !== 2 ||
+        inbox.length !== 1 ||
+        inbox[0].thread_id !== firstId ||
+        thread.thread_id !== firstId ||
+        thread.messages.length !== 2 ||
+        unread.length !== 0 ||
+        timeline.length !== 2 ||
+        messageEvents.map((event) => event.type).join(',') !== 'message.sent,message.sent,message.ack') {
+      fail('message store smoke test changed expected send/inbox/thread/ack behavior');
+    }
+  } finally {
+    messageDb.close();
   }
   for (const helper of [
     'const WEB_CHILD_ENV',
