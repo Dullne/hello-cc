@@ -2245,6 +2245,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { runtimeRequest } from '../lib/runtime-client.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/messages.mjs'") ||
       !hccSource.includes("import { createTaskStore } from '../lib/task-store.mjs'") ||
+      !hccSource.includes("} from '../lib/task-cli.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
@@ -2257,7 +2258,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -3064,6 +3065,66 @@ async function syntaxAndHelp() {
     }
   } finally {
     taskDb.close();
+  }
+  for (const helper of [
+    'function parseTaskIds(',
+    'function positiveIntOpt(',
+    'function taskRowsText('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds task CLI helper: ${helper}`);
+  }
+  const taskCliModule = await import(path.join(repoRoot, 'lib', 'task-cli.mjs'));
+  for (const name of ['parseTaskIds', 'positiveIntOpt', 'taskRowsText']) {
+    if (typeof taskCliModule[name] !== 'function') fail(`task CLI module missing function: ${name}`);
+  }
+  const parsedTaskIds = taskCliModule.parseTaskIds({
+    id: ['1,2', '2'],
+    ids: '3',
+    _: ['4']
+  });
+  if (parsedTaskIds.join(',') !== '1,2,3,4') {
+    fail(`task CLI parseTaskIds changed expected id normalization: ${parsedTaskIds.join(',')}`);
+  }
+  const parseRejects = (() => {
+    try {
+      taskCliModule.parseTaskIds({ id: 'bad' });
+      return false;
+    } catch (err) {
+      return err?.code === 'BAD_ARGS';
+    }
+  })();
+  const emptyRejects = (() => {
+    try {
+      taskCliModule.parseTaskIds({});
+      return false;
+    } catch (err) {
+      return err?.code === 'BAD_ARGS';
+    }
+  })();
+  const lowRejects = (() => {
+    try {
+      taskCliModule.positiveIntOpt({ count: '0' }, 'count', 1, { max: 5 });
+      return false;
+    } catch (err) {
+      return err?.code === 'BAD_ARGS';
+    }
+  })();
+  const highRejects = (() => {
+    try {
+      taskCliModule.positiveIntOpt({ count: '6' }, 'count', 1, { max: 5 });
+      return false;
+    } catch (err) {
+      return err?.code === 'BAD_ARGS';
+    }
+  })();
+  if (!parseRejects ||
+      !emptyRejects ||
+      !lowRejects ||
+      !highRejects ||
+      taskCliModule.positiveIntOpt({ count: '2' }, 'count', 1, { max: 5 }) !== 2 ||
+      taskCliModule.taskRowsText([], 'claimed') !== 'no pending task' ||
+      taskCliModule.taskRowsText([{ id: 7, title: 'demo' }], 'claimed') !== 'claimed task #7: demo') {
+    fail('task CLI smoke test changed expected parse/count/render behavior');
   }
   for (const helper of [
     'const WEB_CHILD_ENV',
