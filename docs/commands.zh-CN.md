@@ -87,9 +87,9 @@ hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
 ```text
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
 hcc task list [--status S] [--peer ID] [--all]
-hcc task claim [--peer ID] --id N
-hcc task takeover [--peer ID] --id N --reason TEXT
-hcc task next [--peer ID] [--force]
+hcc task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
+hcc task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
+hcc task next [--peer ID] [--force] [--count N]
 hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
 hcc task done [--peer ID] --id N --summary TEXT
@@ -97,8 +97,12 @@ hcc task done [--peer ID] --id N --summary TEXT
 
 任务是项目共享事实。任务会一直可见，直到被标记为 `done` 或 `abandoned`。
 `task next` 会优先返回当前 peer 已经认领、运行、审查或阻塞中的任务；只有明确
-要再接一个 pending 任务时才使用 `--force`。明确要从其他 owner 手里接管未完成
-任务时，使用 `task takeover`；它要求填写 reason，会记录原 owner 并通知对方。
+要再接 pending 任务时才使用 `--force`，并可结合 `--count N` 做显式批量认领。
+`task claim` 也支持重复 `--id`、逗号分隔的 `--id` 或 `--ids` 列表。明确要从
+其他 owner 手里接管未完成任务时，使用 `task takeover`；它要求填写 reason，会
+记录原 owner 并通知对方。需要更保守时，可加 `--policy blocked`、`stale` 或
+`blocked-or-stale`，要求任务符合可审计的阻塞/陈旧条件后才允许接管。默认 policy
+仍是 `any`，以保持兼容。
 
 ## 团队
 

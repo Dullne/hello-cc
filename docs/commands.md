@@ -94,9 +94,9 @@ sender by default. Use `msg thread` to inspect the full thread for one message.
 ```text
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
 hcc task list [--status S] [--peer ID] [--all]
-hcc task claim [--peer ID] --id N
-hcc task takeover [--peer ID] --id N --reason TEXT
-hcc task next [--peer ID] [--force]
+hcc task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
+hcc task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
+hcc task next [--peer ID] [--force] [--count N]
 hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
 hcc task done [--peer ID] --id N --summary TEXT
@@ -105,9 +105,13 @@ hcc task done [--peer ID] --id N --summary TEXT
 Tasks are shared project facts. They remain visible until marked `done` or
 `abandoned`. `task next` returns your existing claimed/running/review/blocked
 task before claiming a new pending task; use `--force` only when intentionally
-taking another pending task. Use `task takeover` when explicitly taking a
+taking additional pending tasks, and combine it with `--count N` for explicit
+batch claims. `task claim` also accepts repeated `--id` values and comma-separated
+`--id` or `--ids` lists. Use `task takeover` when explicitly taking a
 non-complete task from another owner; it records the previous owner, requires a
-reason, and notifies them.
+reason, and notifies them. Add `--policy blocked`, `stale`, or `blocked-or-stale`
+when takeover should only proceed under that auditable precondition. The default
+policy is `any` for compatibility.
 
 ## Teams
 

@@ -2118,6 +2118,144 @@ function summarizeTask(task) {
   };
 }
 
+function parseTaskIds(opts) {
+  const values = [];
+  const addValue = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) addValue(item);
+      return;
+    }
+    if (value === undefined || value === null || value === '') return;
+    for (const part of String(value).split(',')) {
+      const text = part.trim();
+      if (text) values.push(text);
+    }
+  };
+  addValue(opts.id);
+  addValue(opts.ids);
+  addValue(opts._ || []);
+  const seen = new Set();
+  const ids = [];
+  for (const value of values) {
+    if (!/^\d+$/.test(value)) throw new CliError('BAD_ARGS', `task id must be an integer: ${value}`);
+    const id = Number.parseInt(value, 10);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  if (!ids.length) throw new CliError('BAD_ARGS', 'Missing --id');
+  return ids;
+}
+
+function positiveIntOpt(opts, key, fallback, { max = 50 } = {}) {
+  const value = intOpt(opts, key, fallback);
+  if (value < 1) throw new CliError('BAD_ARGS', `--${key} must be >= 1`);
+  if (value > max) throw new CliError('BAD_ARGS', `--${key} must be <= ${max}`);
+  return value;
+}
+
+function taskRowsText(tasks, verb = 'claimed') {
+  const rows = Array.isArray(tasks) ? tasks : [tasks].filter(Boolean);
+  if (!rows.length) return 'no pending task';
+  return rows.map((task) => `${verb} task #${task.id}: ${task.title}`).join('\n');
+}
+
+function claimTaskRowsForPeer(db, peer, ids, { force = false, source = null } = {}) {
+  return tx(db, () => {
+    const tasks = [];
+    for (const id of ids) {
+      const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+      if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
+      if (row.owner && row.owner !== peer && !force) {
+        throw new CliError('TASK_OWNED', `Task #${id} is owned by ${row.owner}`, { owner: row.owner });
+      }
+      if (row.assignee && row.assignee !== peer && !force) {
+        throw new CliError('TASK_ASSIGNED', `Task #${id} is assigned to ${row.assignee}`, { assignee: row.assignee });
+      }
+      if (!['pending', 'blocked', 'claimed', 'running'].includes(row.status) && !force) {
+        throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
+      }
+      const t = now();
+      db.prepare(`
+        UPDATE tasks
+        SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
+        WHERE id = ?
+      `).run(peer, t, t, id);
+      addEvent(db, 'task.claimed', peer, id, {
+        previous_owner: row.owner,
+        force,
+        ...(source ? { source } : {})
+      });
+      tasks.push(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id));
+    }
+    return tasks;
+  });
+}
+
+function takeoverPolicyDetails(db, row, peer, { policy = 'any', staleAfter = ACTIVE_PEER_TTL } = {}) {
+  const normalized = String(policy || 'any').toLowerCase();
+  const allowed = new Set(['any', 'blocked', 'stale', 'blocked-or-stale']);
+  if (!allowed.has(normalized)) {
+    throw new CliError('BAD_ARGS', `Unsupported takeover policy: ${policy}`);
+  }
+  const previousOwner = row.owner || null;
+  const blocked = row.status === 'blocked';
+  const ownerRow = previousOwner ? db.prepare('SELECT id, last_seen_at FROM peers WHERE id = ?').get(previousOwner) : null;
+  const ownerAge = ownerRow ? now() - Number(ownerRow.last_seen_at || 0) : null;
+  const ownerStale = Boolean(previousOwner && previousOwner !== peer && (!ownerRow || ownerAge > staleAfter));
+  const alreadyOwner = previousOwner === peer;
+  const ok = alreadyOwner ||
+    normalized === 'any' ||
+    (normalized === 'blocked' && blocked) ||
+    (normalized === 'stale' && ownerStale) ||
+    (normalized === 'blocked-or-stale' && (blocked || ownerStale));
+  return { policy: normalized, blocked, owner_stale: ownerStale, owner_age_sec: ownerAge, stale_after_sec: staleAfter, ok };
+}
+
+function takeOverTaskForPeer(db, peer, id, { reason, policy = 'any', staleAfter = ACTIVE_PEER_TTL, source = null } = {}) {
+  return tx(db, () => {
+    const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
+    if (['done', 'abandoned'].includes(row.status)) {
+      throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
+    }
+    const policyDetails = takeoverPolicyDetails(db, row, peer, { policy, staleAfter });
+    if (!policyDetails.ok) {
+      throw new CliError('TAKEOVER_POLICY', `Task #${id} does not match takeover policy ${policyDetails.policy}`, {
+        task_id: id,
+        status: row.status,
+        owner: row.owner || null,
+        policy: policyDetails.policy,
+        owner_stale: policyDetails.owner_stale,
+        owner_age_sec: policyDetails.owner_age_sec,
+        stale_after_sec: policyDetails.stale_after_sec
+      });
+    }
+    const previousOwner = row.owner || null;
+    const previousAssignee = row.assignee || null;
+    const t = now();
+    db.prepare(`
+      UPDATE tasks
+      SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
+      WHERE id = ?
+    `).run(peer, t, t, id);
+    addEvent(db, 'task.takeover', peer, id, {
+      previous_owner: previousOwner,
+      previous_assignee: previousAssignee,
+      reason,
+      policy: policyDetails.policy,
+      owner_stale: policyDetails.owner_stale,
+      stale_after_sec: staleAfter,
+      ...(source ? { source } : {})
+    });
+    if (previousOwner && previousOwner !== peer) {
+      sendMessage(db, peer, previousOwner, id, 'task.takeover', `Task #${id} taken over by ${peer}: ${reason}`);
+    }
+    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+  });
+}
+
 function deriveAutomation(snapshot, peer = null, opts = {}) {
   const peerId = peer || '';
   const t = Number(snapshot.now || now());
@@ -2688,35 +2826,14 @@ async function taskList(ctx, args) {
 }
 
 async function taskClaim(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
+  const opts = parseOpts(args, { booleans: ['force'], arrays: ['id', 'ids'] });
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
+  const ids = parseTaskIds(opts);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const task = tx(db, () => {
-    const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
-    if (row.owner && row.owner !== peer && !opts.force) {
-      throw new CliError('TASK_OWNED', `Task #${id} is owned by ${row.owner}`, { owner: row.owner });
-    }
-    if (row.assignee && row.assignee !== peer && !opts.force) {
-      throw new CliError('TASK_ASSIGNED', `Task #${id} is assigned to ${row.assignee}`, { assignee: row.assignee });
-    }
-    if (!['pending', 'blocked', 'claimed', 'running'].includes(row.status) && !opts.force) {
-      throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
-    }
-    const t = now();
-    db.prepare(`
-      UPDATE tasks
-      SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
-      WHERE id = ?
-    `).run(peer, t, t, id);
-    addEvent(db, 'task.claimed', peer, id, { previous_owner: row.owner, force: Boolean(opts.force) });
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-  });
-  printResult(ctx, task, (data) => `claimed task #${data.id}: ${data.title}`);
+  const tasks = claimTaskRowsForPeer(db, peer, ids, { force: Boolean(opts.force) });
+  printResult(ctx, ids.length === 1 ? tasks[0] : tasks, (data) => taskRowsText(Array.isArray(data) ? data : [data], 'claimed'));
 }
 
 async function taskTakeover(ctx, args) {
@@ -2726,32 +2843,11 @@ async function taskTakeover(ctx, args) {
   const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
   if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
   const reason = required(opts, 'reason');
+  const policy = opts.policy || 'any';
+  const staleAfter = positiveIntOpt(opts, 'stale-after', ACTIVE_PEER_TTL, { max: 86400 * 30 });
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const task = tx(db, () => {
-    const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
-    if (['done', 'abandoned'].includes(row.status)) {
-      throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
-    }
-    const previousOwner = row.owner || null;
-    const previousAssignee = row.assignee || null;
-    const t = now();
-    db.prepare(`
-      UPDATE tasks
-      SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
-      WHERE id = ?
-    `).run(peer, t, t, id);
-    addEvent(db, 'task.takeover', peer, id, {
-      previous_owner: previousOwner,
-      previous_assignee: previousAssignee,
-      reason
-    });
-    if (previousOwner && previousOwner !== peer) {
-      sendMessage(db, peer, previousOwner, id, 'task.takeover', `Task #${id} taken over by ${peer}: ${reason}`);
-    }
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-  });
+  const task = takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter });
   printResult(ctx, task, (data) => `took over task #${data.id}: ${data.title}`);
 }
 
@@ -2759,14 +2855,15 @@ async function taskNext(ctx, args) {
   const opts = parseOpts(args, { booleans: ['force'] });
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
+  const count = positiveIntOpt(opts, 'count', 1, { max: 50 });
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const task = claimNextTaskForPeer(db, peer, Boolean(opts.force));
-  printResult(ctx, task, (data) => {
+  const result = claimNextTasksForPeer(db, peer, { force: Boolean(opts.force), count });
+  printResult(ctx, count === 1 ? (result.current ? { current: result.current, tasks: [] } : (result.tasks[0] || null)) : result, (data) => {
     if (!data) return 'no pending task';
-    return data.current
-      ? `current task #${data.id}: ${data.title} (${data.status})`
-      : `claimed task #${data.id}: ${data.title}`;
+    if (data.current) return `current task #${data.current.id}: ${data.current.title} (${data.current.status})`;
+    if (data.tasks) return data.tasks.length ? taskRowsText(data.tasks, 'claimed') : 'no pending task';
+    return `claimed task #${data.id}: ${data.title}`;
   });
 }
 
@@ -4082,7 +4179,7 @@ function webPeerHeartbeat(projectCtx, peer, input = {}) {
   };
 }
 
-function claimNextTaskForPeer(db, peer, force = false) {
+function claimNextTasksForPeer(db, peer, { force = false, count = 1 } = {}) {
   return tx(db, () => {
     if (!force) {
       const current = db.prepare(`
@@ -4101,25 +4198,30 @@ function claimNextTaskForPeer(db, peer, force = false) {
           id ASC
         LIMIT 1
       `).get(peer);
-      if (current) return { ...current, current: true };
+      if (current) return { current: { ...current, current: true }, tasks: [] };
     }
-    const row = db.prepare(`
+    const rows = db.prepare(`
       SELECT * FROM tasks
       WHERE status = 'pending'
         AND owner IS NULL
         AND (assignee IS NULL OR assignee = ?)
       ORDER BY CASE WHEN assignee = ? THEN 0 ELSE 1 END, priority ASC, id ASC
-      LIMIT 1
-    `).get(peer, peer);
-    if (!row) return null;
+      LIMIT ?
+    `).all(peer, peer, count);
+    if (!rows.length) return { current: null, tasks: [] };
     const t = now();
-    db.prepare(`
-      UPDATE tasks
-      SET owner = ?, status = 'claimed', claimed_at = ?, updated_at = ?
-      WHERE id = ? AND owner IS NULL AND status = 'pending'
-    `).run(peer, t, t, row.id);
-    addEvent(db, 'task.claimed', peer, row.id, { next: true });
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id);
+    const claimed = [];
+    for (const row of rows) {
+      const changes = db.prepare(`
+        UPDATE tasks
+        SET owner = ?, status = 'claimed', claimed_at = ?, updated_at = ?
+        WHERE id = ? AND owner IS NULL AND status = 'pending'
+      `).run(peer, t, t, row.id).changes;
+      if (!changes) continue;
+      addEvent(db, 'task.claimed', peer, row.id, { next: true, count });
+      claimed.push(db.prepare('SELECT * FROM tasks WHERE id = ?').get(row.id));
+    }
+    return { current: null, tasks: claimed };
   });
 }
 
@@ -4127,15 +4229,20 @@ function webPeerTaskNext(projectCtx, peer, input = {}) {
   const db = connect(projectCtx);
   try {
     touchPeer(db, peer, 'working');
-    const task = claimNextTaskForPeer(db, peer, Boolean(input.force));
-    if (!task) return { peer, task: null, summary: 'no pending task' };
+    const count = positiveIntOpt(input, 'count', 1, { max: 50 });
+    const result = claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count });
+    const task = result.current || result.tasks[0] || null;
+    if (!task) return { peer, task: null, tasks: [], summary: 'no pending task' };
     return {
       peer,
       task,
-      current: Boolean(task.current),
-      summary: task.current
+      tasks: result.tasks,
+      current: Boolean(result.current),
+      summary: result.current
         ? `current task #${task.id}: ${task.title} (${task.status})`
-        : `claimed task #${task.id}: ${task.title}`
+        : result.tasks.length === 1
+          ? `claimed task #${task.id}: ${task.title}`
+          : `claimed ${result.tasks.length} tasks`
     };
   } finally {
     db.close();
@@ -4146,33 +4253,12 @@ function webPeerTaskTakeover(projectCtx, peer, input = {}) {
   const id = intOpt(input, 'id', intOpt({ id: input.task }, 'id'));
   if (!id) throw new CliError('BAD_REQUEST', 'task id required');
   const reason = required(input, 'reason');
+  const policy = input.policy || 'any';
+  const staleAfter = positiveIntOpt(input, 'stale-after', intOpt(input, 'stale_after', ACTIVE_PEER_TTL), { max: 86400 * 30 });
   const db = connect(projectCtx);
   try {
     touchPeer(db, peer, 'working');
-    const task = tx(db, () => {
-      const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-      if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
-      if (['done', 'abandoned'].includes(row.status)) {
-        throw new CliError('BAD_STATE', `Task #${id} is ${row.status}`);
-      }
-      const previousOwner = row.owner || null;
-      const t = now();
-      db.prepare(`
-        UPDATE tasks
-        SET owner = ?, status = 'claimed', claimed_at = COALESCE(claimed_at, ?), updated_at = ?
-        WHERE id = ?
-      `).run(peer, t, t, id);
-      addEvent(db, 'task.takeover', peer, id, {
-        previous_owner: previousOwner,
-        previous_assignee: row.assignee || null,
-        reason,
-        source: 'web'
-      });
-      if (previousOwner && previousOwner !== peer) {
-        sendMessage(db, peer, previousOwner, id, 'task.takeover', `Task #${id} taken over by ${peer}: ${reason}`);
-      }
-      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    });
+    const task = takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: 'web' });
     return { peer, task, summary: `took over task #${task.id}: ${task.title}` };
   } finally {
     db.close();
@@ -7669,9 +7755,9 @@ Usage:
   ${CLI_NAME} task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
   ${CLI_NAME} task create --title TEXT --parent N [--team-role ROLE]
   ${CLI_NAME} task list [--status pending|claimed|running|review|blocked|done|abandoned] [--peer ID] [--all]
-  ${CLI_NAME} task claim [--peer ID] --id N
-  ${CLI_NAME} task takeover [--peer ID] --id N --reason TEXT
-  ${CLI_NAME} task next [--peer ID] [--force]
+  ${CLI_NAME} task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
+  ${CLI_NAME} task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
+  ${CLI_NAME} task next [--peer ID] [--force] [--count N]
   ${CLI_NAME} task update [--peer ID] --id N --status STATUS [--summary TEXT] [--body TEXT] [--to ID]
   ${CLI_NAME} task done [--peer ID] --id N --summary TEXT
 
@@ -7679,10 +7765,13 @@ Default task list shows all project tasks that are not done or abandoned.
 --peer is an explicit filter; HCC_PEER does not hide other open tasks.
 Messages use per-peer unread ack state; tasks do not.
 task next returns your existing claimed/running/review/blocked task before
-claiming another pending task. Use --force only when intentionally taking
-another pending task.
+claiming another pending task. Use --force when intentionally taking additional
+pending tasks; combine it with --count N for explicit batch claims.
 Use task takeover when explicitly taking over a non-complete task from another
 owner; it records the previous owner, requires a reason, and notifies them.
+Use --policy blocked, stale, or blocked-or-stale to require an auditable
+precondition before takeover. The default policy is any for backward
+compatibility.
 
 If --peer/--from and HCC_PEER are absent, hcc auto-joins the current terminal
 as a stable project-local peer.

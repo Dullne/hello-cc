@@ -1204,6 +1204,89 @@ async function dbWorkflow() {
   if (!nextAgain.includes(`current task #${taskId}`)) {
     fail(`task next did not preserve current task:\n${nextAgain}`);
   }
+  const batchClaimIds = [];
+  for (const title of ['batch claim one', 'batch claim two']) {
+    const out = hcc(['task', 'create', '--from', 'human', '--title', title]);
+    const match = out.match(/created task #(\d+):/);
+    if (!match) fail(`cannot parse batch task id: ${out}`);
+    batchClaimIds.push(match[1]);
+  }
+  const batchClaim = hccJson(['task', 'claim', '--peer', 'batch-a', '--ids', batchClaimIds.join(',')]);
+  if (!Array.isArray(batchClaim) || batchClaim.length !== 2 || !batchClaim.every((task) => task.owner === 'batch-a')) {
+    fail(`batch claim did not claim both tasks:\n${JSON.stringify(batchClaim, null, 2)}`);
+  }
+  for (const task of batchClaim) {
+    hcc(['task', 'done', '--peer', 'batch-a', '--id', String(task.id), '--summary', 'batch claim cleanup']);
+  }
+  const batchNextIds = [];
+  for (const title of ['batch next one', 'batch next two', 'batch next three']) {
+    const out = hcc(['task', 'create', '--from', 'human', '--title', title]);
+    const match = out.match(/created task #(\d+):/);
+    if (!match) fail(`cannot parse batch next task id: ${out}`);
+    batchNextIds.push(match[1]);
+  }
+  const batchNext = hccJson(['task', 'next', '--peer', 'batch-b', '--force', '--count', '2']);
+  if (!batchNext?.tasks || batchNext.tasks.length !== 2 || !batchNext.tasks.every((task) => task.owner === 'batch-b')) {
+    fail(`task next --count did not claim two tasks:\n${JSON.stringify(batchNext, null, 2)}`);
+  }
+  for (const task of batchNext.tasks) {
+    hcc(['task', 'done', '--peer', 'batch-b', '--id', String(task.id), '--summary', 'batch next cleanup']);
+  }
+  hcc(['task', 'update', '--peer', 'human', '--id', batchNextIds[2], '--status', 'abandoned', '--summary', 'batch next leftover cleanup']);
+  const takeoverOpen = hcc(['task', 'create', '--from', 'human', '--to', 'takeover-owner', '--title', 'takeover open']);
+  const takeoverOpenMatch = takeoverOpen.match(/created task #(\d+):/);
+  if (!takeoverOpenMatch) fail(`cannot parse takeover open id: ${takeoverOpen}`);
+  const takeoverOpenId = takeoverOpenMatch[1];
+  hcc(['task', 'claim', '--peer', 'takeover-owner', '--id', takeoverOpenId]);
+  const blockedPolicyReject = hccMaybe(['task', 'takeover', '--peer', 'takeover-a', '--id', takeoverOpenId, '--reason', 'blocked policy smoke', '--policy', 'blocked']);
+  if (blockedPolicyReject.status === 0 || !String(blockedPolicyReject.stderr || blockedPolicyReject.stdout).includes('does not match takeover policy blocked')) {
+    fail(`takeover --policy blocked accepted non-blocked task:\n${blockedPolicyReject.stdout}\n${blockedPolicyReject.stderr}`);
+  }
+  hcc(['task', 'update', '--peer', 'takeover-owner', '--id', takeoverOpenId, '--status', 'blocked', '--summary', 'blocked for takeover smoke']);
+  const blockedTakeover = hccJson(['task', 'takeover', '--peer', 'takeover-a', '--id', takeoverOpenId, '--reason', 'blocked takeover smoke', '--policy', 'blocked']);
+  if (String(blockedTakeover.owner) !== 'takeover-a') {
+    fail(`blocked takeover did not transfer owner:\n${JSON.stringify(blockedTakeover, null, 2)}`);
+  }
+  hcc(['task', 'done', '--peer', 'takeover-a', '--id', takeoverOpenId, '--summary', 'blocked takeover cleanup']);
+  const staleOut = hcc(['task', 'create', '--from', 'human', '--to', 'stale-owner', '--title', 'stale takeover']);
+  const staleMatch = staleOut.match(/created task #(\d+):/);
+  if (!staleMatch) fail(`cannot parse stale takeover id: ${staleOut}`);
+  const staleTaskId = staleMatch[1];
+  hcc(['task', 'claim', '--peer', 'stale-owner', '--id', staleTaskId]);
+  withMeshDb((db) => {
+    const staleAt = Math.floor(Date.now() / 1000) - 7200;
+    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(staleAt, 'stale-owner');
+  });
+  const staleTakeover = hccJson(['task', 'takeover', '--peer', 'takeover-b', '--id', staleTaskId, '--reason', 'stale takeover smoke', '--policy', 'stale', '--stale-after', '60']);
+  if (String(staleTakeover.owner) !== 'takeover-b') {
+    fail(`stale takeover did not transfer owner:\n${JSON.stringify(staleTakeover, null, 2)}`);
+  }
+  const takeoverInbox = hcc(['msg', 'inbox', '--peer', 'stale-owner', '--all']);
+  if (!takeoverInbox.includes(`Task #${staleTaskId} taken over by takeover-b`)) {
+    fail(`stale takeover did not notify previous owner:\n${takeoverInbox}`);
+  }
+  hcc(['task', 'done', '--peer', 'takeover-b', '--id', staleTaskId, '--summary', 'stale takeover cleanup']);
+  const staleLivenessOut = hcc(['task', 'create', '--from', 'human', '--to', 'stale-liveness-owner', '--title', 'stale liveness task']);
+  const staleLivenessMatch = staleLivenessOut.match(/created task #(\d+):/);
+  if (!staleLivenessMatch) fail(`cannot parse stale liveness task id: ${staleLivenessOut}`);
+  const staleLivenessTaskId = staleLivenessMatch[1];
+  hcc(['task', 'claim', '--peer', 'stale-liveness-owner', '--id', staleLivenessTaskId]);
+  withMeshDb((db) => {
+    const staleAt = Math.floor(Date.now() / 1000) - 7200;
+    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(staleAt, 'stale-liveness-owner');
+  });
+  const staleLivenessList = hcc(['task', 'list', '--status', 'claimed']);
+  if (!staleLivenessList.includes(`#${staleLivenessTaskId}`) || !staleLivenessList.includes('owner_state=stale/no-lock')) {
+    fail(`task list did not surface stale/no-lock owner state:\n${staleLivenessList}`);
+  }
+  const staleLivenessState = hccJson(['state', '--peer', 'takeover-ready-peer']);
+  if (staleLivenessState.automation?.phase !== 'takeover_task' ||
+      staleLivenessState.automation?.next_action?.kind !== 'task.takeover' ||
+      !staleLivenessState.automation.next_action.argv.includes('--policy') ||
+      !staleLivenessState.automation.next_action.argv.includes('stale')) {
+    fail(`state automation did not suggest stale takeover:\n${JSON.stringify(staleLivenessState.automation, null, 2)}`);
+  }
+  hcc(['task', 'update', '--peer', 'human', '--force', '--id', staleLivenessTaskId, '--status', 'abandoned', '--summary', 'stale liveness cleanup']);
   hcc(['task', 'update', '--peer', 'human', '--id', queuedTaskId, '--status', 'abandoned', '--summary', 'queued task cleanup']);
   hcc(['handoff', 'create', '--from', 'codex-a', '--to', 'claude-a', '--task', taskId, '--summary', 'handoff summary', '--tests', 'full script', '--risks', 'none']);
   if (!hcc(['handoff', 'list', '--task', taskId]).includes('handoff summary')) fail('handoff missing');
@@ -1325,9 +1408,9 @@ async function dbWorkflow() {
   if (!takeoverRow || takeoverRow.owner !== 'codex-taker' || takeoverRow.status !== 'claimed') {
     fail(`takeover task row wrong:\n${JSON.stringify(takeoverRow, null, 2)}`);
   }
-  const takeoverInbox = hcc(['msg', 'inbox', '--peer', 'codex-owner']);
-  if (!takeoverInbox.includes(`Task #${takeoverTaskId} taken over by codex-taker`)) {
-    fail(`takeover did not notify previous owner:\n${takeoverInbox}`);
+  const takeoverOwnerInbox = hcc(['msg', 'inbox', '--peer', 'codex-owner']);
+  if (!takeoverOwnerInbox.includes(`Task #${takeoverTaskId} taken over by codex-taker`)) {
+    fail(`takeover did not notify previous owner:\n${takeoverOwnerInbox}`);
   }
   hcc(['task', 'done', '--peer', 'codex-taker', '--id', takeoverTaskId, '--summary', 'takeover done']);
 
@@ -2109,7 +2192,8 @@ function syntaxAndHelp() {
   }
   for (const expected of [
     'function webPeerAction(projectCtx, peer, action, input = {})',
-    'function claimNextTaskForPeer(db, peer, force = false)',
+    'function claimNextTasksForPeer(db, peer, { force = false, count = 1 } = {})',
+    'function takeOverTaskForPeer(db, peer, id, { reason, policy = ',
     'function statusSummary(ctx, peer = null, identity = null)',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
@@ -2159,8 +2243,11 @@ function syntaxAndHelp() {
   }
   const taskHelp = run(process.execPath, [hccBin, 'task', '--help']);
   if (!taskHelp.includes('task next [--peer ID] [--force]') ||
+      !taskHelp.includes('[--count N]') ||
       !taskHelp.includes('existing claimed/running/review/blocked task') ||
       !taskHelp.includes('task takeover [--peer ID] --id N --reason TEXT') ||
+      !taskHelp.includes('[--policy any|blocked|stale|blocked-or-stale]') ||
+      !taskHelp.includes('task claim [--peer ID] --id N[,N]') ||
       !taskHelp.includes('task create --title TEXT --parent N')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
