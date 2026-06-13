@@ -2235,6 +2235,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
+      !hccSource.includes("} from '../lib/timeline.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
@@ -2246,7 +2247,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, handoff helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, handoff helpers, timeline helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2332,6 +2333,77 @@ async function syntaxAndHelp() {
   const handoffChanged = handoffModule.changedFiles(handoffGitRoot);
   if (JSON.stringify(handoffChanged) !== JSON.stringify(['staged.txt', 'tracked.txt'])) {
     fail(`handoff changedFiles changed: ${JSON.stringify(handoffChanged)}`);
+  }
+  for (const helper of [
+    'function parseEventPayload',
+    'function uniqueList',
+    'function messageParticipants',
+    'function taskParticipants',
+    'function payloadParticipants',
+    'function peerMatchesTimelineItem',
+    'function shouldHideTimelineMessage',
+    'function shouldHideTimelineEvent',
+    'function timelineDirection',
+    'function timelineFromRows'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds timeline helper: ${helper}`);
+  }
+  if (hccSource.includes('const TIMELINE_EVENT_ALLOW')) fail('CLI still embeds timeline event allow list');
+  const timelineModule = await import(path.join(repoRoot, 'lib', 'timeline.mjs'));
+  for (const name of [
+    'parseEventPayload',
+    'uniqueList',
+    'messageParticipants',
+    'taskParticipants',
+    'payloadParticipants',
+    'peerMatchesTimelineItem',
+    'shouldHideTimelineMessage',
+    'shouldHideTimelineEvent',
+    'timelineDirection',
+    'timelineFromRows'
+  ]) {
+    if (typeof timelineModule[name] !== 'function') fail(`timeline module missing export: ${name}`);
+  }
+  if (JSON.stringify(timelineModule.uniqueList(['a', '', null, 'a', 7])) !== JSON.stringify(['a', '7'])) {
+    fail('timeline uniqueList behavior changed');
+  }
+  if (JSON.stringify(timelineModule.parseEventPayload({ payload: '{bad' })) !== JSON.stringify({})) {
+    fail('timeline parseEventPayload invalid JSON behavior changed');
+  }
+  if (!timelineModule.shouldHideTimelineMessage({ kind: 'task', body: 'Task #12 assigned: do work' }) ||
+      !timelineModule.shouldHideTimelineEvent({ type: 'message.sent' }) ||
+      timelineModule.shouldHideTimelineEvent({ type: 'task.done' })) {
+    fail('timeline hide filters changed');
+  }
+  const timelineItems = timelineModule.timelineFromRows({
+    messages: [
+      { id: 1, sender: 'system', recipient: 'peer-b', task_id: 1, kind: 'task', body: 'Task #1 assigned: hidden', created_at: 1, read_at: null },
+      { id: 2, sender: 'peer-a', recipient: 'peer-b', task_id: 2, kind: 'note', body: 'hello timeline', created_at: 2, read_at: null },
+      { id: 3, sender: 'peer-b', recipient: 'all', task_id: null, kind: 'note', body: 'broadcast timeline', created_at: 3, read_at: 3 }
+    ],
+    handoffs: [
+      { id: 4, from_peer: 'peer-a', to_peer: 'peer-b', task_id: 2, summary: 'handoff summary', created_at: 4, tests: 'tests', risks: 'risks' }
+    ],
+    tasks: [
+      { id: 5, status: 'running', created_by: 'human', owner: 'peer-b', assignee: '', title: 'task title', created_at: 5, updated_at: 5, parent_id: null }
+    ],
+    locks: [
+      { resource: 'bin/hcc.mjs', base_resource: 'bin/hcc.mjs', scope: 'timeline', owner: 'peer-a', task_id: 2, reason: 'hidden from peer-b', created_at: 6 }
+    ],
+    events: [
+      { id: 7, type: 'message.sent', actor: 'peer-a', task_id: 2, payload: '{}', created_at: 7 },
+      { id: 8, type: 'task.done', actor: 'peer-a', task_id: 2, payload: JSON.stringify({ owner: 'peer-b', summary: 'done summary' }), created_at: 8 }
+    ]
+  }, 'peer-b');
+  const timelineIds = timelineItems.map((item) => item.id);
+  if (JSON.stringify(timelineIds) !== JSON.stringify(['message:2', 'message:3', 'handoff:4', 'task:5', 'event:8'])) {
+    fail(`timelineFromRows filtering/order changed: ${JSON.stringify(timelineItems)}`);
+  }
+  const inbound = timelineItems.find((item) => item.id === 'message:2');
+  const broadcast = timelineItems.find((item) => item.id === 'message:3');
+  if (inbound?.direction !== 'in' || inbound?.unread !== true ||
+      broadcast?.direction !== 'out' || broadcast?.broadcast !== true) {
+    fail(`timelineFromRows message metadata changed: ${JSON.stringify(timelineItems)}`);
   }
   for (const helper of [
     'function runTmux',
