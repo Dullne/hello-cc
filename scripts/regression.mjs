@@ -1961,6 +1961,8 @@ async function downGcPackWorkflow() {
     'CHANGELOG.md',
     'docs/commands.md',
     'docs/commands.zh-CN.md',
+    'lib/cli-args.mjs',
+    'lib/errors.mjs',
     'lib/guidance.mjs',
     'lib/package-meta.mjs',
     'lib/release-notes.mjs',
@@ -2035,6 +2037,8 @@ function syntaxAndHelp() {
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'setup.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'discover.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'cli-args.mjs')]);
+  run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'errors.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'guidance.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'package-meta.mjs')]);
   run(process.execPath, ['--check', path.join(repoRoot, 'lib', 'release-notes.mjs')]);
@@ -2066,9 +2070,11 @@ function syntaxAndHelp() {
     fail(`CLI version ${cliVersion} does not match package.json ${packageVersion}`);
   }
   if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
+      !hccSource.includes("} from '../lib/cli-args.mjs'") ||
+      !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, or guidance wiring');
   }
   const mainHelp = run(process.execPath, [hccBin, '--help']);
   if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {

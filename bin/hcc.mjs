@@ -10,6 +10,15 @@ import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { CliError } from '../lib/errors.mjs';
+import {
+  intOpt,
+  parseOpts,
+  required,
+  splitGlobalArgs,
+  validateOpts,
+  wantsHelp
+} from '../lib/cli-args.mjs';
 import { readPackageMeta } from '../lib/package-meta.mjs';
 import {
   removeGuidanceBlocks as removeGuidanceBlocksForRoot,
@@ -32,14 +41,6 @@ const DB_SCHEMA_VERSION = 4;
 // Directory under .hello-cc/ for optional external PTY buffer files.
 const BUFS_DIR_NAME = 'bufs';
 const WEB_CHILD_ENV = 'HCC_WEB_CHILD';
-
-class CliError extends Error {
-  constructor(code, message, extra = {}) {
-    super(message);
-    this.code = code;
-    this.extra = extra;
-  }
-}
 
 function now() {
   return Math.floor(Date.now() / 1000);
@@ -76,86 +77,6 @@ function detectRoot(cwd, explicitRoot) {
 
 function detectBranch(cwd) {
   return runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd) || '';
-}
-
-function splitGlobalArgs(argv) {
-  const global = { json: false, root: null, db: null };
-  const rest = [];
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === '--json') {
-      global.json = true;
-    } else if (arg === '--root') {
-      global.root = argv[++i];
-    } else if (arg.startsWith('--root=')) {
-      global.root = arg.slice('--root='.length);
-    } else if (arg === '--db') {
-      global.db = argv[++i];
-    } else if (arg.startsWith('--db=')) {
-      global.db = arg.slice('--db='.length);
-    } else {
-      rest.push(arg);
-    }
-  }
-  return { global, rest };
-}
-
-function parseOpts(args, spec = {}) {
-  const booleans = new Set(spec.booleans || []);
-  const arrays = new Set(spec.arrays || []);
-  const opts = { _: [] };
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (!arg.startsWith('--') || arg === '--') {
-      opts._.push(arg);
-      continue;
-    }
-    let key;
-    let value;
-    const eq = arg.indexOf('=');
-    if (eq >= 0) {
-      key = arg.slice(2, eq);
-      value = arg.slice(eq + 1);
-    } else {
-      key = arg.slice(2);
-      if (booleans.has(key)) {
-        value = true;
-      } else {
-        value = args[++i];
-      }
-    }
-    if (!key) throw new CliError('BAD_ARGS', `Invalid option: ${arg}`);
-    if (value === undefined) throw new CliError('BAD_ARGS', `Missing value for --${key}`);
-    if (arrays.has(key)) {
-      if (!opts[key]) opts[key] = [];
-      opts[key].push(value);
-    } else {
-      opts[key] = value;
-    }
-  }
-  return opts;
-}
-
-function wantsHelp(args) {
-  const stop = args.indexOf('--');
-  const scan = stop >= 0 ? args.slice(0, stop) : args;
-  const index = scan.findIndex((arg) => arg === '--help' || arg === '-h');
-  if (index < 0) return false;
-  return index <= 1 || !String(scan[index - 1] || '').startsWith('--');
-}
-
-function validateOpts(command, opts, allowed = []) {
-  const allowedSet = new Set(['_', ...allowed]);
-  for (const key of Object.keys(opts)) {
-    if (!allowedSet.has(key)) throw new CliError('BAD_ARGS', `${command}: unknown option --${key}`);
-  }
-  if (opts._?.length) throw new CliError('BAD_ARGS', `${command}: unexpected argument ${opts._[0]}`);
-}
-
-function required(opts, key, envName = null) {
-  const value = opts[key] || (envName ? process.env[envName] : null);
-  if (!value) throw new CliError('BAD_ARGS', `Missing --${key}${envName ? ` or $${envName}` : ''}`);
-  return value;
 }
 
 function sanitizePeerPart(value, fallback = 'peer') {
@@ -364,13 +285,6 @@ function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
     status,
     capabilities: 'auto-shell'
   };
-}
-
-function intOpt(opts, key, fallback = null) {
-  if (opts[key] === undefined || opts[key] === null || opts[key] === '') return fallback;
-  const value = Number.parseInt(String(opts[key]), 10);
-  if (!Number.isFinite(value)) throw new CliError('BAD_ARGS', `--${key} must be an integer`);
-  return value;
 }
 
 function createContext(global) {
