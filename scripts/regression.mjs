@@ -2233,6 +2233,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
+      !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
@@ -2244,13 +2245,57 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, project context helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
       hccSource.includes('function readSchemaVersion')) {
     fail('CLI still embeds DB schema or migration helpers');
   }
+  for (const helper of [
+    'function runGit',
+    'function hasHccRootSync',
+    'function detectRoot',
+    'function detectBranch'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds project context helper: ${helper}`);
+  }
+  const projectContext = await import(path.join(repoRoot, 'lib', 'project-context.mjs'));
+  for (const name of [
+    'runGit',
+    'hasHccRootSync',
+    'detectRoot',
+    'detectBranch'
+  ]) {
+    if (typeof projectContext[name] !== 'function') fail(`project context module missing export: ${name}`);
+  }
+  const gitTop = projectContext.runGit(['rev-parse', '--show-toplevel'], repoRoot);
+  if (path.resolve(gitTop || '') !== repoRoot) fail(`project context runGit changed: ${gitTop}`);
+  const gitBranch = projectContext.runGit(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot) || '';
+  const detectedBranch = projectContext.detectBranch(repoRoot);
+  if (detectedBranch !== gitBranch) {
+    fail(`project context detectBranch changed: ${detectedBranch} != ${gitBranch}`);
+  }
+  const savedHccRoot = process.env.HCC_ROOT;
+  try {
+    delete process.env.HCC_ROOT;
+    if (projectContext.detectRoot('/tmp/hcc-a', '') !== path.resolve('/tmp/hcc-a')) {
+      fail('project context detectRoot cwd fallback changed');
+    }
+    process.env.HCC_ROOT = '/tmp/hcc-env-root';
+    if (projectContext.detectRoot('/tmp/hcc-a', '') !== path.resolve('/tmp/hcc-env-root') ||
+        projectContext.detectRoot('/tmp/hcc-a', '/tmp/hcc-explicit-root') !== path.resolve('/tmp/hcc-explicit-root')) {
+      fail('project context detectRoot precedence changed');
+    }
+  } finally {
+    if (savedHccRoot === undefined) delete process.env.HCC_ROOT;
+    else process.env.HCC_ROOT = savedHccRoot;
+  }
+  const contextRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-project-context-'));
+  fs.mkdirSync(path.join(contextRoot, '.hello-cc'), { recursive: true });
+  if (projectContext.hasHccRootSync(contextRoot)) fail('project context detected root before marker file');
+  fs.writeFileSync(path.join(contextRoot, '.hello-cc', 'config.json'), '{}');
+  if (!projectContext.hasHccRootSync(contextRoot)) fail('project context did not detect config marker');
   for (const helper of [
     'function runTmux',
     'function tmuxInstallHint',

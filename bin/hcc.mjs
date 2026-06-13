@@ -44,6 +44,11 @@ import {
   webLogPath
 } from '../lib/runtime-paths.mjs';
 import {
+  detectBranch,
+  detectRoot,
+  runGit
+} from '../lib/project-context.mjs';
+import {
   expectedWebHost,
   localRuntimeUrl,
   makeWebToken,
@@ -136,34 +141,6 @@ function now() {
 function iso(ts) {
   if (!ts) return '';
   return new Date(ts * 1000).toISOString();
-}
-
-function runGit(args, cwd) {
-  const result = spawnSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore']
-  });
-  if (result.status !== 0) return null;
-  return result.stdout.trim();
-}
-
-function hasHccRootSync(cwd) {
-  if (!cwd) return null;
-  const dir = path.resolve(cwd);
-  const hccDir = path.join(dir, '.hello-cc');
-  return fs.existsSync(path.join(hccDir, 'mesh.db')) ||
-    fs.existsSync(path.join(hccDir, 'config.json'));
-}
-
-function detectRoot(cwd, explicitRoot) {
-  if (explicitRoot) return path.resolve(explicitRoot);
-  if (process.env.HCC_ROOT) return path.resolve(process.env.HCC_ROOT);
-  return path.resolve(cwd);
-}
-
-function detectBranch(cwd) {
-  return runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd) || '';
 }
 
 function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
