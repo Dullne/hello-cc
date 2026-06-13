@@ -24,6 +24,13 @@ import {
   wantsHelp
 } from '../lib/cli-args.mjs';
 import {
+  commandPath,
+  createContext as createCliContext,
+  packageRoot,
+  shellCommand as shellCommandWithQuote,
+  tailFile
+} from '../lib/cli-runtime.mjs';
+import {
   formatJson,
   printResult,
   shellExports,
@@ -268,32 +275,8 @@ function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
   };
 }
 
-function createContext(global) {
-  const cwd = process.cwd();
-  const root = detectRoot(cwd, global.root);
-  const dbPath = path.resolve(global.db || process.env.HCC_DB || projectDbPath(root));
-  return { cwd, root, dbPath, json: global.json, explicitRoot: Boolean(global.root || process.env.HCC_ROOT) };
-}
-
 function shellCommand(args) {
-  return args.map(shellQuoteArg).join(' ');
-}
-
-function tailFile(file, maxBytes = 12000) {
-  try {
-    const stat = fs.statSync(file);
-    const size = Math.min(stat.size, maxBytes);
-    const fd = fs.openSync(file, 'r');
-    try {
-      const buf = Buffer.alloc(size);
-      fs.readSync(fd, buf, 0, size, Math.max(0, stat.size - size));
-      return buf.toString('utf8').trim();
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return '';
-  }
+  return shellCommandWithQuote(args, shellQuoteArg);
 }
 
 let projectMigrationFanoutDepth = 0;
@@ -602,15 +585,6 @@ function writeGuidance(ctx) {
 
 function removeGuidanceBlocks(ctx) {
   return removeGuidanceBlocksForRoot(ctx.root);
-}
-
-function commandPath() {
-  try { return fs.realpathSync(process.argv[1]); }
-  catch { return path.resolve(process.argv[1]); }
-}
-
-function packageRoot() {
-  return path.resolve(path.dirname(commandPath()), '..');
 }
 
 async function cmdInit(ctx, args) {
@@ -4271,7 +4245,7 @@ async function dispatch(ctx, rest) {
 
 async function main() {
   const { global, rest } = splitGlobalArgs(process.argv.slice(2));
-  const ctx = createContext(global);
+  const ctx = createCliContext(global, { detectRoot });
   try {
     await dispatch(ctx, rest);
   } catch (err) {

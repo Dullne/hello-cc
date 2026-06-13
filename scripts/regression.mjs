@@ -2232,6 +2232,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/cli-args.mjs'") ||
       !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
       !hccSource.includes("} from '../lib/db-schema.mjs'") ||
+      !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
       !hccSource.includes("} from '../lib/runtime-state.mjs'") ||
@@ -2259,12 +2260,46 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
       hccSource.includes('function readSchemaVersion')) {
     fail('CLI still embeds DB schema or migration helpers');
+  }
+  for (const helper of [
+    'function createContext(',
+    'function tailFile(',
+    'function commandPath(',
+    'function packageRoot('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds CLI runtime helper: ${helper}`);
+  }
+  if (!hccSource.includes('function shellCommand(args)') ||
+      hccSource.includes('return args.map(shellQuoteArg).join')) {
+    fail('CLI shellCommand wrapper no longer delegates to cli-runtime shellCommand helper');
+  }
+  const cliRuntime = await import(path.join(repoRoot, 'lib', 'cli-runtime.mjs'));
+  for (const name of ['commandPath', 'createContext', 'packageRoot', 'shellCommand', 'tailFile']) {
+    if (typeof cliRuntime[name] !== 'function') fail(`CLI runtime module missing function: ${name}`);
+  }
+  const runtimeCtx = cliRuntime.createContext(
+    { root: '/tmp/project', db: '.hello-cc/test.db', json: true },
+    { cwd: '/tmp/project/subdir', detectRoot: (_cwd, rootHint) => rootHint || '/tmp/project' }
+  );
+  if (runtimeCtx.cwd !== '/tmp/project/subdir' ||
+      runtimeCtx.root !== '/tmp/project' ||
+      !runtimeCtx.dbPath.endsWith('/.hello-cc/test.db') ||
+      runtimeCtx.json !== true ||
+      runtimeCtx.explicitRoot !== true) {
+    fail(`CLI runtime createContext changed: ${JSON.stringify(runtimeCtx)}`);
+  }
+  const quotedCommand = cliRuntime.shellCommand(['alpha', 'two words'], (value) => `[${value}]`);
+  if (quotedCommand !== '[alpha] [two words]') fail(`CLI runtime shellCommand changed: ${quotedCommand}`);
+  const tailPath = path.join(outDir, 'tail-smoke.txt');
+  fs.writeFileSync(tailPath, '0123456789\n');
+  if (cliRuntime.tailFile(tailPath, 4) !== '789' || cliRuntime.tailFile(path.join(outDir, 'missing-tail')) !== '') {
+    fail('CLI runtime tailFile behavior changed');
   }
   for (const helper of [
     'function readGlobalRuntimeFile',
