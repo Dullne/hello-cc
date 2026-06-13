@@ -2248,6 +2248,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
+      !hccSource.includes("} from '../lib/peer-bindings.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/locks.mjs'") ||
       !hccSource.includes("} from '../lib/team-planning.mjs'") ||
@@ -2258,7 +2259,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -3356,6 +3357,133 @@ async function syntaxAndHelp() {
       parsedClaude.resume_arg !== 'claude-session' ||
       parsedClaude.session.provider_session_name !== null) {
     fail(`provider command module parsed Claude fork resume args wrong: ${JSON.stringify(parsedClaude)}`);
+  }
+  for (const helper of [
+    'function bindingFromDetected(',
+    'function peerBindingRuntimeRank(',
+    'function comparePeerBindings(',
+    'function dedupePeerBindingRows(',
+    'function dedupeProviderSessionColumn(',
+    'function dedupeRuntimeTargets(',
+    'function dedupePeerBindings(',
+    'function bindingHasProviderSession(',
+    'function bindingProviderSessionValue(',
+    'function bindingHasRuntime(',
+    'function mergeRuntimeBinding(',
+    'function findProviderSessionBinding(',
+    'function canonicalizePeerBinding(',
+    'function upsertPeerBinding(',
+    'function upsertCanonicalPeerBinding('
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds peer binding helper: ${helper}`);
+  }
+  const peerBindings = await import(path.join(repoRoot, 'lib', 'peer-bindings.mjs'));
+  for (const name of [
+    'bindingFromDetected',
+    'peerBindingRuntimeRank',
+    'comparePeerBindings',
+    'bindingHasProviderSession',
+    'bindingProviderSessionValue',
+    'bindingHasRuntime',
+    'mergeRuntimeBinding',
+    'createPeerBindingStore'
+  ]) {
+    if (typeof peerBindings[name] !== 'function') fail(`peer binding module missing export: ${name}`);
+  }
+  const detectedBinding = peerBindings.bindingFromDetected({
+    id: 'detected-peer',
+    kind: 'claude',
+    sessionId: 'detected-session',
+    command: 'claude'
+  });
+  if (detectedBinding.peer !== 'detected-peer' ||
+      detectedBinding.provider !== 'claude' ||
+      detectedBinding.provider_session_name !== 'detected-session' ||
+      detectedBinding.resume_mode !== 'detected' ||
+      detectedBinding.runtime_session_id !== 'detected-peer') {
+    fail(`peer binding module built wrong detected binding: ${JSON.stringify(detectedBinding)}`);
+  }
+  if (peerBindings.peerBindingRuntimeRank({ transport: 'tmux', runtime_target: '%1' }) <= peerBindings.peerBindingRuntimeRank({ transport: 'detected' })) {
+    fail('peer binding runtime rank no longer prefers tmux runtime bindings over detected bindings');
+  }
+  const mergedRuntime = peerBindings.mergeRuntimeBinding(
+    { peer: 'runtime-peer', command: 'codex resume old', transport: 'tmux', runtime_session_id: 'runtime-peer', runtime_target: '%9' },
+    { peer: 'runtime-peer', provider: 'codex', provider_session_name: 'session-a', transport: 'hook', runtime_session_id: 'runtime-peer' }
+  );
+  if (mergedRuntime.transport !== 'tmux' || mergedRuntime.runtime_target !== '%9' || mergedRuntime.command !== 'codex resume old') {
+    fail(`peer binding module did not preserve existing runtime binding: ${JSON.stringify(mergedRuntime)}`);
+  }
+  const peerBindingEvents = [];
+  const peerBindingStore = peerBindings.createPeerBindingStore({
+    now: () => 2000,
+    addEvent: (_db, type, actor, taskId, payload) => peerBindingEvents.push({ type, actor, taskId, payload })
+  });
+  for (const name of [
+    'canonicalizePeerBinding',
+    'dedupePeerBindings',
+    'dedupePeerBindingRows',
+    'dedupeProviderSessionColumn',
+    'dedupeRuntimeTargets',
+    'findProviderSessionBinding',
+    'upsertCanonicalPeerBinding',
+    'upsertPeerBinding'
+  ]) {
+    if (typeof peerBindingStore[name] !== 'function') fail(`peer binding store missing function: ${name}`);
+  }
+  const peerBindingDb = new DatabaseSync(':memory:');
+  try {
+    peerBindingDb.exec(`
+      CREATE TABLE peer_bindings (
+        peer TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_session_id TEXT,
+        provider_session_name TEXT,
+        resume_mode TEXT NOT NULL DEFAULT 'new',
+        resume_arg TEXT,
+        command TEXT,
+        transport TEXT NOT NULL,
+        runtime_session_id TEXT,
+        runtime_target TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    const insertBinding = peerBindingDb.prepare(`
+      INSERT INTO peer_bindings(
+        peer, provider, provider_session_id, provider_session_name, resume_mode,
+        resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertBinding.run('detected-old', 'codex', 'same-session', 'detected', null, null, 'detected', 'detected-old', null, 1000, 1000);
+    insertBinding.run('runtime-new', 'codex', 'same-session', 'resume', 'same-session', 'codex resume same-session', 'tmux', 'runtime-new', '%pane', 1000, 1100);
+    const deleted = peerBindingStore.dedupePeerBindings(peerBindingDb);
+    const dedupedRows = peerBindingDb.prepare('SELECT peer FROM peer_bindings ORDER BY peer').all();
+    if (deleted !== undefined || dedupedRows.length !== 1 || dedupedRows[0].peer !== 'runtime-new') {
+      fail(`peer binding dedupe did not keep runtime binding: ${JSON.stringify(dedupedRows)}`);
+    }
+    const canonical = peerBindingStore.upsertCanonicalPeerBinding(peerBindingDb, {
+      peer: 'hook-peer',
+      provider: 'codex',
+      provider_session_id: null,
+      provider_session_name: 'same-session',
+      resume_mode: 'detected',
+      resume_arg: null,
+      command: null,
+      transport: 'hook',
+      runtime_session_id: 'hook-peer'
+    }, true);
+    if (canonical.peer !== 'runtime-new' || canonical.merged_from !== 'hook-peer') {
+      fail(`peer binding canonicalization did not merge hook peer into runtime peer: ${JSON.stringify(canonical)}`);
+    }
+    const canonicalRow = peerBindingDb.prepare('SELECT peer, transport, runtime_target, provider_session_name FROM peer_bindings WHERE peer = ?').get('runtime-new');
+    if (canonicalRow.transport !== 'tmux' || canonicalRow.runtime_target !== '%pane' || canonicalRow.provider_session_name !== 'same-session') {
+      fail(`peer binding canonical upsert lost runtime fields: ${JSON.stringify(canonicalRow)}`);
+    }
+    if (!peerBindingEvents.some((event) => event.type === 'provider.session.deduped')) {
+      fail(`peer binding dedupe did not emit provider.session.deduped: ${JSON.stringify(peerBindingEvents)}`);
+    }
+  } finally {
+    peerBindingDb.close();
   }
   for (const helper of [
     'const WHOLE_LOCK_SCOPE',
