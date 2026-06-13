@@ -40,7 +40,6 @@ import {
   contextForProject,
   globalRuntimePath,
   projectDbPath,
-  projectRegistryPath,
   runtimePath,
   webLogPath
 } from '../lib/runtime-paths.mjs';
@@ -106,6 +105,13 @@ import {
   sanitizePeerPart,
   shortHash
 } from '../lib/peer-identity.mjs';
+import {
+  projectRecord,
+  readProjectRegistry,
+  registerProject,
+  registerProjectActivity,
+  writeProjectRegistry
+} from '../lib/project-registry.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -179,63 +185,6 @@ function createContext(global) {
   const root = detectRoot(cwd, global.root);
   const dbPath = path.resolve(global.db || process.env.HCC_DB || projectDbPath(root));
   return { cwd, root, dbPath, json: global.json, explicitRoot: Boolean(global.root || process.env.HCC_ROOT) };
-}
-
-function projectRecord(ctx) {
-  return {
-    root: ctx.root,
-    db: ctx.dbPath,
-    name: path.basename(ctx.root) || ctx.root,
-    last_seen_at: now()
-  };
-}
-
-function readProjectRegistry() {
-  const file = projectRegistryPath();
-  if (!fs.existsSync(file)) return [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const rows = Array.isArray(parsed?.projects) ? parsed.projects : [];
-    return rows
-      .filter((p) => p && typeof p.root === 'string')
-      .map((p) => ({
-        root: path.resolve(p.root),
-        db: path.resolve(p.db || projectDbPath(p.root)),
-        name: String(p.name || path.basename(p.root) || p.root),
-        last_seen_at: Number.parseInt(p.last_seen_at || '0', 10) || 0
-      }));
-  } catch {
-    return [];
-  }
-}
-
-function writeProjectRegistry(projects) {
-  const file = projectRegistryPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const unique = new Map();
-  for (const project of projects) {
-    if (!project?.root) continue;
-    unique.set(path.resolve(project.root), {
-      root: path.resolve(project.root),
-      db: path.resolve(project.db || projectDbPath(project.root)),
-      name: String(project.name || path.basename(project.root) || project.root),
-      last_seen_at: Number.parseInt(project.last_seen_at || '0', 10) || 0
-    });
-  }
-  const rows = [...unique.values()].sort((a, b) => (b.last_seen_at || 0) - (a.last_seen_at || 0));
-  fs.writeFileSync(file, JSON.stringify({ projects: rows }, null, 2), { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return rows;
-}
-
-function registerProject(ctx) {
-  const rows = readProjectRegistry().filter((p) => path.resolve(p.root) !== ctx.root);
-  rows.unshift(projectRecord(ctx));
-  return writeProjectRegistry(rows);
-}
-
-function registerProjectActivity(ctx) {
-  try { registerProject(ctx); } catch {}
 }
 
 function readGlobalRuntimeFile() {

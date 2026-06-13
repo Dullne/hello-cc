@@ -2238,12 +2238,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/locks.mjs'") ||
       !hccSource.includes("} from '../lib/team-planning.mjs'") ||
       !hccSource.includes("} from '../lib/peer-identity.mjs'") ||
+      !hccSource.includes("} from '../lib/project-registry.mjs'") ||
       !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web-http.mjs'") ||
       !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
-    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, web runtime/HTTP/UI helpers, or guidance wiring');
+    fail('CLI still has duplicated package metadata, cli args, DB schema helpers, format helpers, runtime paths, provider command helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   if (hccSource.includes('function createBaseSchema') ||
       hccSource.includes('function runSchemaMigrations') ||
@@ -2537,6 +2538,69 @@ async function syntaxAndHelp() {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+  for (const helper of [
+    'function projectRecord',
+    'function readProjectRegistry',
+    'function writeProjectRegistry',
+    'function registerProject',
+    'function registerProjectActivity'
+  ]) {
+    if (hccSource.includes(helper)) fail(`CLI still embeds project registry helper: ${helper}`);
+  }
+  const projectRegistry = await import(path.join(repoRoot, 'lib', 'project-registry.mjs'));
+  for (const name of [
+    'projectRecord',
+    'readProjectRegistry',
+    'writeProjectRegistry',
+    'registerProject',
+    'registerProjectActivity'
+  ]) {
+    if (typeof projectRegistry[name] !== 'function') fail(`project registry module missing export: ${name}`);
+  }
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const registryRootA = path.join(root, 'registry-a');
+    const registryRootB = path.join(root, 'registry-b');
+    const written = projectRegistry.writeProjectRegistry([
+      { root: registryRootA, db: '', name: '', last_seen_at: '5' },
+      { root: registryRootB, db: path.join(registryRootB, 'custom.db'), name: 'Bee', last_seen_at: '10' },
+      { root: registryRootA, db: path.join(registryRootA, 'new.db'), name: 'Aye', last_seen_at: '15' }
+    ]);
+    if (written.length !== 2 ||
+        written[0].root !== path.resolve(registryRootA) ||
+        written[0].db !== path.resolve(path.join(registryRootA, 'new.db')) ||
+        written[0].name !== 'Aye' ||
+        written[0].last_seen_at !== 15 ||
+        written[1].root !== path.resolve(registryRootB)) {
+      fail(`project registry write/dedupe/sort changed: ${JSON.stringify(written)}`);
+    }
+    const readBack = projectRegistry.readProjectRegistry();
+    if (JSON.stringify(readBack) !== JSON.stringify(written)) {
+      fail(`project registry read changed: ${JSON.stringify(readBack)} vs ${JSON.stringify(written)}`);
+    }
+    const recorded = projectRegistry.projectRecord({
+      root: path.resolve(registryRootB),
+      dbPath: path.join(registryRootB, 'mesh.db')
+    }, () => 123);
+    if (recorded.root !== path.resolve(registryRootB) ||
+        recorded.db !== path.join(registryRootB, 'mesh.db') ||
+        recorded.name !== 'registry-b' ||
+        recorded.last_seen_at !== 123) {
+      fail(`project registry record changed: ${JSON.stringify(recorded)}`);
+    }
+    const registered = projectRegistry.registerProject({
+      root: path.resolve(registryRootB),
+      dbPath: path.join(registryRootB, 'mesh.db')
+    });
+    if (registered[0].root !== path.resolve(registryRootB) ||
+        registered.filter((p) => p.root === path.resolve(registryRootB)).length !== 1) {
+      fail(`project registry register changed: ${JSON.stringify(registered)}`);
+    }
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
   }
   for (const helper of [
     'function runtimeBaseUrl',
