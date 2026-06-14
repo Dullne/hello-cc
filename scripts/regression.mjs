@@ -1184,7 +1184,7 @@ function assertNoRealProjectRegistryLeak() {
 }
 
 async function setupRegression() {
-  log('[1/12] web bootstrap/hooks/shims');
+  log('[1/13] web bootstrap/hooks/shims');
   writeFakeTools();
   fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
@@ -1368,7 +1368,7 @@ async function setupRegression() {
 }
 
 async function dbWorkflow() {
-  log('[3/12] db workflow');
+  log('[3/13] db workflow');
   hcc(['register', '--peer', 'human', '--kind', 'human', '--role', 'operator']);
   const created = hcc(['task', 'create', '--from', 'human', '--to', 'codex-a', '--title', 'full regression task', '--body', 'exercise hcc bus']);
   const taskMatch = created.match(/created task #(\d+):/);
@@ -1535,7 +1535,8 @@ async function dbWorkflow() {
       !staleLivenessState.automation.next_action.argv.includes('stale')) {
     fail(`state automation did not suggest stale takeover:\n${JSON.stringify(staleLivenessState.automation, null, 2)}`);
   }
-  hcc(['task', 'update', '--peer', 'human', '--force', '--id', staleLivenessTaskId, '--status', 'abandoned', '--summary', 'stale liveness cleanup']);
+  hcc(['task', 'takeover', '--peer', 'human', '--id', staleLivenessTaskId, '--reason', 'stale liveness cleanup', '--policy', 'stale', '--stale-after', '60']);
+  hcc(['task', 'update', '--peer', 'human', '--id', staleLivenessTaskId, '--status', 'abandoned', '--summary', 'stale liveness cleanup']);
   hcc(['task', 'update', '--peer', 'human', '--id', queuedTaskId, '--status', 'abandoned', '--summary', 'queued task cleanup']);
   hcc(['handoff', 'create', '--from', 'codex-a', '--to', 'claude-a', '--task', taskId, '--summary', 'handoff summary', '--tests', 'full script', '--risks', 'none']);
   if (!hcc(['handoff', 'list', '--task', taskId]).includes('handoff summary')) fail('handoff missing');
@@ -1757,7 +1758,7 @@ async function dbWorkflow() {
 }
 
 async function multiProjectWebWorkflow() {
-  log('[4/12] multi-project web');
+  log('[4/13] multi-project web');
   const otherRoot = path.join(root, 'second-project');
   fs.mkdirSync(otherRoot, { recursive: true });
   const output = hccFrom(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance'], otherRoot);
@@ -2099,11 +2100,11 @@ async function multiProjectWebWorkflow() {
 
 async function tmuxBackedStartWorkflow() {
   if (!tmuxAvailable()) {
-    log('[5/12] tmux-backed start skipped (tmux not installed)');
+    log('[5/13] tmux-backed start skipped (tmux not installed)');
     return;
   }
 
-  log('[5/12] tmux-backed start + websocket + restore');
+  log('[5/13] tmux-backed start + websocket + restore');
   const file = path.join(outDir, 'pty-ok');
   const started = hcc(['peer', 'start', 'shell-a', '--kind', 'shell', '--', 'bash']);
   const pane = parsePane(started);
@@ -2208,11 +2209,11 @@ async function tmuxBackedStartWorkflow() {
 
 async function shimTmuxWorkflow() {
   if (!tmuxAvailable()) {
-    log('[6/12] shim tmux-backed launch skipped (tmux not installed)');
+    log('[6/13] shim tmux-backed launch skipped (tmux not installed)');
     return;
   }
 
-  log('[6/12] shim tmux-backed launch');
+  log('[6/13] shim tmux-backed launch');
   const shim = path.join(home, '.hcc-shims', 'claude');
   const codexShim = path.join(home, '.hcc-shims', 'codex');
   const claudeVersion = run(shim, ['--version'], { cwd: root, env });
@@ -2322,11 +2323,11 @@ async function shimTmuxWorkflow() {
 async function tmuxWorkflow() {
   const tmuxVersion = runMaybe('tmux', ['-V']);
   if (tmuxVersion.status !== 0) {
-    log('[7/12] tmux skipped (tmux not installed)');
+    log('[7/13] tmux skipped (tmux not installed)');
     return;
   }
 
-  log('[7/12] tmux attach + websocket + force');
+  log('[7/13] tmux attach + websocket + force');
   run('tmux', ['new-session', '-d', '-s', tmuxSession, '-c', os.tmpdir(), 'bash --noprofile --norc']);
   tmuxStarted = true;
   const pane = run('tmux', ['display-message', '-p', '-t', `${tmuxSession}:0.0`, '#{pane_id}']).trim();
@@ -2348,11 +2349,11 @@ async function tmuxWorkflow() {
 
 async function askBroadcastWorkflow() {
   if (!tmuxAvailable()) {
-    log('[8/12] ask/broadcast injection skipped (tmux not installed)');
+    log('[8/13] ask/broadcast injection skipped (tmux not installed)');
     return;
   }
 
-  log('[8/12] ask/broadcast injection');
+  log('[8/13] ask/broadcast injection');
   const askFile = path.join(outDir, 'ask-ok');
   parsePane(hcc(['peer', 'start', 'shell-b', '--kind', 'shell', '--', 'bash']));
   hcc(['ask', 'shell-b', `echo ASK_OK > ${askFile}`, '--from', 'human', '--inject']);
@@ -2364,7 +2365,7 @@ async function askBroadcastWorkflow() {
 }
 
 async function downGcPackWorkflow() {
-  log('[9/12] down/gc/pack');
+  log('[9/13] down/gc/pack');
   hccMaybe(['peer', 'stop', 'shell-a']);
   hccMaybe(['peer', 'stop', 'shell-b']);
   await stopRuntime();
@@ -2421,7 +2422,7 @@ async function downGcPackWorkflow() {
 }
 
 function oldNameScan() {
-  log('[10/12] old-name scan');
+  log('[10/13] old-name scan');
   const oldNamePattern = [
     'agent' + 'mesh',
     'Agent' + 'mesh',
@@ -2444,8 +2445,80 @@ function oldNameScan() {
   if (rg.status !== 1) fail(`rg failed:\n${rg.stderr || rg.stdout}`);
 }
 
+function identityEnforcementWorkflow() {
+  log('[11/13] identity enforcement');
+  const identityRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-identity-root-${testId}-`));
+  const identityHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-identity-home-${testId}-`));
+  const identityEnv = {
+    ...env,
+    HOME: identityHome,
+    HCC_PEER: 'real-peer'
+  };
+  delete identityEnv.HCC_ROOT;
+  delete identityEnv.HCC_DB;
+  try {
+    hccFrom(['register', '--peer', 'fake-peer', '--kind', 'codex', '--role', 'peer'], identityRoot, { env: identityEnv });
+    const envOut = hccFrom(['env', '--peer', 'fake-peer'], identityRoot, { env: identityEnv });
+    if (!envOut.includes('HCC_PEER=real-peer')) {
+      fail(`env did not keep system peer identity:\n${envOut}`);
+    }
+    const created = hccFrom(['task', 'create', '--from', 'fake-peer', '--title', 'identity guard'], identityRoot, { env: identityEnv });
+    const match = created.match(/created task #(\d+):/);
+    if (!match) fail(`cannot parse identity task id:\n${created}`);
+    const taskId = match[1];
+    hccFrom(['task', 'claim', '--peer', 'fake-peer', '--id', taskId], identityRoot, { env: identityEnv });
+
+    const dbPath = path.join(identityRoot, '.hello-cc', 'mesh.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      const task = db.prepare('SELECT owner, created_by FROM tasks WHERE id = ?').get(Number(taskId));
+      const fakePeer = db.prepare('SELECT id FROM peers WHERE id = ?').get('fake-peer');
+      if (task?.owner !== 'real-peer' || task?.created_by !== 'real-peer' || fakePeer) {
+        fail(`system peer identity was not enforced:\n${JSON.stringify({ task, fakePeer }, null, 2)}`);
+      }
+      db.prepare(`
+        INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+        VALUES ('owner-peer', 'codex', 'peer', ?, '', NULL, 'working', '', 1, 1)
+      `).run(identityRoot);
+      db.prepare(`
+        INSERT INTO tasks(title, body, status, assignee, owner, priority, created_by, created_at, updated_at)
+        VALUES ('owned identity guard', '', 'claimed', NULL, 'owner-peer', 100, 'owner-peer', 1, 1)
+      `).run();
+    } finally {
+      db.close();
+    }
+
+    const owned = hccFromMaybe(['task', 'done', '--peer', 'owner-peer', '--id', '2', '--summary', 'should not pass'], identityRoot, { env: identityEnv });
+    if (owned.status === 0 || !`${owned.stdout}\n${owned.stderr}`.includes('Task #2 is owned by owner-peer')) {
+      fail(`owned task mutation was not rejected:\nstdout=${owned.stdout}\nstderr=${owned.stderr}`);
+    }
+    const forcedOwned = hccFromMaybe(['task', 'done', '--force', '--peer', 'owner-peer', '--id', '2', '--summary', 'should not pass'], identityRoot, { env: identityEnv });
+    if (forcedOwned.status === 0 || !`${forcedOwned.stdout}\n${forcedOwned.stderr}`.includes('Task #2 is owned by owner-peer')) {
+      fail(`forced owned task mutation was not rejected:\nstdout=${forcedOwned.stdout}\nstderr=${forcedOwned.stderr}`);
+    }
+    const db2 = new DatabaseSync(dbPath);
+    try {
+      const task = db2.prepare('SELECT owner, status FROM tasks WHERE id = 2').get();
+      const notice = db2.prepare(`
+        SELECT sender, recipient, kind
+        FROM messages
+        WHERE task_id = 2 AND kind = 'task.owner-conflict'
+      `).get();
+      if (task?.owner !== 'owner-peer' || task?.status !== 'claimed' ||
+          !notice || notice.sender !== 'real-peer' || notice.recipient !== 'owner-peer') {
+        fail(`owned task mutation did not preserve owner and notify:\n${JSON.stringify({ task, notice }, null, 2)}`);
+      }
+    } finally {
+      db2.close();
+    }
+  } finally {
+    try { fs.rmSync(identityRoot, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(identityHome, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function syntaxAndHelp() {
-  log('[11/12] syntax/help');
+  log('[12/13] syntax/help');
   run(process.execPath, ['--check', path.join(repoRoot, 'bin', 'hcc.mjs')]);
   for (const file of libModuleFiles()) {
     run(process.execPath, ['--check', path.join(repoRoot, file)]);
@@ -4575,6 +4648,10 @@ async function syntaxAndHelp() {
     if (integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell').id !== 'env-peer') {
       fail('peer identity resolveCurrentPeer ignored HCC_PEER');
     }
+    const correctedPeer = integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, { peer: 'manual-peer' }, 'peer', 'shell');
+    if (correctedPeer.id !== 'env-peer' || correctedPeer.corrected_from !== 'manual-peer') {
+      fail(`peer identity did not correct explicit peer to HCC_PEER: ${JSON.stringify(correctedPeer)}`);
+    }
     delete process.env.HCC_PEER;
     delete process.env.CLAUDE_CODE_SESSION_ID;
     delete process.env.CLAUDECODE;
@@ -4894,7 +4971,7 @@ async function syntaxAndHelp() {
 }
 
 function uninstallWorkflow() {
-  log('[12/12] maintenance cleanup');
+  log('[13/13] maintenance cleanup');
   const uninstallRoot = path.join(os.tmpdir(), `hcc-reg-uninstall-root-${testId}`);
   const uninstallHome = path.join(os.tmpdir(), `hcc-reg-uninstall-home-${testId}`);
   fs.mkdirSync(uninstallRoot, { recursive: true });
@@ -4948,7 +5025,7 @@ async function main() {
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
 
   await setupRegression();
-  log('[2/12] runtime');
+  log('[2/13] runtime');
   startRuntime();
   await waitRuntime();
   hcc(['peer', 'list']);
@@ -4960,6 +5037,7 @@ async function main() {
   await askBroadcastWorkflow();
   await downGcPackWorkflow();
   oldNameScan();
+  identityEnforcementWorkflow();
   await syntaxAndHelp();
   uninstallWorkflow();
   assertNoRealProjectRegistryLeak();

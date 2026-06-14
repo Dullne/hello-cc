@@ -291,6 +291,7 @@ const {
   sendMessage
 } = createMessageStore({ now, addEvent });
 const {
+  assertTaskOwnerForMutation,
   claimNextTasksForPeer,
   claimTaskRowsForPeer,
   queryOpenTasks,
@@ -583,7 +584,8 @@ async function cmdInit(ctx, args) {
 async function cmdRegister(ctx, args) {
   registerProjectActivity(ctx);
   const opts = parseOpts(args, { arrays: ['cap'] });
-  const id = required(opts, 'peer', 'HCC_PEER');
+  const identity = resolveCurrentPeer(ctx, opts, 'peer', opts.kind || 'shell');
+  const id = identity.id;
   const db = connect(ctx);
   const peer = {
     id,
@@ -603,7 +605,7 @@ async function cmdRegister(ctx, args) {
 async function cmdEnv(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpEnv();
   const opts = parseOpts(args);
-  const peer = required(opts, 'peer', 'HCC_PEER');
+  const peer = resolveCurrentPeer(ctx, opts, 'peer', 'shell').id;
   const values = {
     HCC_PEER: peer,
     HCC_ROOT: ctx.root,
@@ -616,7 +618,8 @@ async function cmdJoin(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpJoin();
   registerProjectActivity(ctx);
   const opts = parseOpts(args, { arrays: ['cap'] });
-  const id = required(opts, 'peer', 'HCC_PEER');
+  const identity = resolveCurrentPeer(ctx, opts, 'peer', opts.kind || 'shell');
+  const id = identity.id;
   const peer = {
     id,
     kind: opts.kind || 'other',
@@ -794,8 +797,37 @@ async function taskClaim(ctx, args) {
   const ids = parseTaskIds(opts);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const tasks = claimTaskRowsForPeer(db, peer, ids, { force: Boolean(opts.force) });
+  let tasks;
+  try {
+    tasks = claimTaskRowsForPeer(db, peer, ids, { force: Boolean(opts.force) });
+  } catch (err) {
+    notifyTaskOwnerConflict(ctx, err);
+    throw err;
+  }
   printResult(ctx, ids.length === 1 ? tasks[0] : tasks, (data) => taskRowsText(Array.isArray(data) ? data : [data], 'claimed'));
+}
+
+function notifyTaskOwnerConflict(ctx, err) {
+  if (err?.code !== 'TASK_OWNED' || !err.extra?.notify_owner) return;
+  const { owner, task_id: taskId, attempted_by: attemptedBy, action } = err.extra;
+  if (!owner || !attemptedBy || owner === attemptedBy) return;
+  let db = null;
+  try {
+    db = connect(ctx);
+    sendMessage(
+      db,
+      attemptedBy,
+      owner,
+      taskId || null,
+      'task.owner-conflict',
+      `Task #${taskId} is owned by ${owner}; ${attemptedBy} attempted ${action || 'modify'} and hello-cc left ownership unchanged.`
+    );
+    err.extra.notified = true;
+  } catch {
+    err.extra.notified = false;
+  } finally {
+    try { db?.close(); } catch {}
+  }
 }
 
 async function taskTakeover(ctx, args) {
@@ -842,25 +874,29 @@ async function taskUpdate(ctx, args) {
   if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, status === 'done' ? 'idle' : 'working', 'shell');
-  const task = tx(db, () => {
-    const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
-    if (row.owner && row.owner !== peer && !opts.force) {
-      throw new CliError('TASK_OWNED', `Task #${id} is owned by ${row.owner}`, { owner: row.owner });
-    }
-    const t = now();
-    const completedAt = status === 'done' ? t : row.completed_at;
-    db.prepare(`
-      UPDATE tasks
-      SET status = ?, completed_at = ?, updated_at = ?
-      WHERE id = ?
-    `).run(status, completedAt, t, id);
-    addEvent(db, `task.${status}`, peer, id, { summary: opts.summary || opts.reason || '' });
-    if (opts.body) {
-      sendMessage(db, peer, opts.to || 'all', id, 'task.update', opts.body);
-    }
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-  });
+  let task;
+  try {
+    task = tx(db, () => {
+      const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+      if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
+      assertTaskOwnerForMutation(db, peer, row, `update:${status}`);
+      const t = now();
+      const completedAt = status === 'done' ? t : row.completed_at;
+      db.prepare(`
+        UPDATE tasks
+        SET status = ?, completed_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(status, completedAt, t, id);
+      addEvent(db, `task.${status}`, peer, id, { summary: opts.summary || opts.reason || '' });
+      if (opts.body) {
+        sendMessage(db, peer, opts.to || 'all', id, 'task.update', opts.body);
+      }
+      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    });
+  } catch (err) {
+    notifyTaskOwnerConflict(ctx, err);
+    throw err;
+  }
   printResult(ctx, task, (data) => `task #${data.id} -> ${data.status}`);
 }
 
@@ -1360,35 +1396,46 @@ async function lockAcquire(ctx, args) {
   const reason = opts.reason || '';
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const lock = tx(db, () => {
-    const t = now();
-    const activeLocks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
-    const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
-    if (conflict) {
-      throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
-        resource: requested.base_resource,
-        scope: requested.scope,
-        lock_resource: conflict.resource,
-        lock_scope: lockScope(conflict),
-        owner: conflict.owner,
-        expires_at: iso(conflict.expires_at)
-      });
-    }
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
-    db.prepare(`
-      INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(resource) DO UPDATE SET
-        base_resource = excluded.base_resource,
-        scope = excluded.scope,
-        owner = excluded.owner,
-        task_id = excluded.task_id,
-        reason = excluded.reason,
-        expires_at = excluded.expires_at
-    `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
-    addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
-    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
-  });
+  let lock;
+  try {
+    lock = tx(db, () => {
+      const t = now();
+      if (taskId) {
+        const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+        if (!task) throw new CliError('NOT_FOUND', `Task #${taskId} does not exist`);
+        assertTaskOwnerForMutation(db, peer, task, 'lock-acquire');
+      }
+      const activeLocks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+      const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
+      if (conflict) {
+        throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
+          resource: requested.base_resource,
+          scope: requested.scope,
+          lock_resource: conflict.resource,
+          lock_scope: lockScope(conflict),
+          owner: conflict.owner,
+          expires_at: iso(conflict.expires_at)
+        });
+      }
+      const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+      db.prepare(`
+        INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(resource) DO UPDATE SET
+          base_resource = excluded.base_resource,
+          scope = excluded.scope,
+          owner = excluded.owner,
+          task_id = excluded.task_id,
+          reason = excluded.reason,
+          expires_at = excluded.expires_at
+      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
+      addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
+      return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+    });
+  } catch (err) {
+    notifyTaskOwnerConflict(ctx, err);
+    throw err;
+  }
   printResult(ctx, lock, (data) => `locked ${lockLabel(data)} by ${data.owner} until ${iso(data.expires_at)}`);
 }
 
