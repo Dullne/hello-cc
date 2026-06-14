@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -2186,8 +2187,8 @@ async function syntaxAndHelp() {
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
-  const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-peer-actions.mjs'), 'utf8');
-  const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web-ui-template.mjs'), 'utf8');
+  const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
+  const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
     "runTmux(['pipe-pane', '-t', session.pane]);",
@@ -2215,7 +2216,7 @@ async function syntaxAndHelp() {
     fail('detected peer action rendering still depends on status === running instead of liveness');
   }
   for (const expected of [
-    'import { createWebPeerActions } from \'../lib/web-peer-actions.mjs\'',
+    'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
     '} = createWebPeerActions({',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
@@ -2251,47 +2252,87 @@ async function syntaxAndHelp() {
   if (cliVersion !== packageVersion) {
     fail(`CLI version ${cliVersion} does not match package.json ${packageVersion}`);
   }
+  const releasePackageMeta = await import(path.join(repoRoot, 'lib', 'release', 'package-meta.mjs'));
+  const releaseNotesModule = await import(path.join(repoRoot, 'lib', 'release', 'release-notes.mjs'));
+  const compatPackageMeta = await import(path.join(repoRoot, 'lib', 'package-meta.mjs'));
+  const compatReleaseNotes = await import(path.join(repoRoot, 'lib', 'release-notes.mjs'));
+  for (const [moduleName, mod, names] of [
+    ['release/package-meta', releasePackageMeta, ['packageRoot', 'readJson', 'readPackageJson', 'readPackageMeta']],
+    ['release/release-notes', releaseNotesModule, ['normalizeVersion', 'releaseSection', 'validateReleaseSection', 'repoFromPackage']],
+    ['package-meta compat', compatPackageMeta, ['packageRoot', 'readJson', 'readPackageJson', 'readPackageMeta']],
+    ['release-notes compat', compatReleaseNotes, ['normalizeVersion', 'releaseSection', 'validateReleaseSection', 'repoFromPackage']]
+  ]) {
+    for (const name of names) {
+      if (typeof mod[name] !== 'function') fail(`${moduleName} missing export: ${name}`);
+    }
+  }
+  const releaseScriptRoot = releasePackageMeta.packageRoot(
+    pathToFileURL(path.join(repoRoot, 'scripts', 'release-notes.mjs')).href
+  );
+  if (releaseScriptRoot !== repoRoot) {
+    fail(`release packageRoot resolved ${releaseScriptRoot}, expected ${repoRoot}`);
+  }
+  const releaseNotesScriptSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'release-notes.mjs'), 'utf8');
+  const githubReleaseScriptSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'github-release.mjs'), 'utf8');
+  if (!releaseNotesScriptSource.includes("../lib/release/package-meta.mjs") ||
+      !releaseNotesScriptSource.includes("../lib/release/release-notes.mjs") ||
+      !githubReleaseScriptSource.includes("../lib/release/package-meta.mjs") ||
+      !githubReleaseScriptSource.includes("../lib/release/release-notes.mjs")) {
+    fail('release scripts do not import release helpers from lib/release');
+  }
+  const dbSchema = await import(path.join(repoRoot, 'lib', 'db', 'schema.mjs'));
+  const compatDbSchema = await import(path.join(repoRoot, 'lib', 'db-schema.mjs'));
+  for (const [moduleName, mod] of [
+    ['db/schema', dbSchema],
+    ['db-schema compat', compatDbSchema]
+  ]) {
+    if (typeof mod.DB_SCHEMA_VERSION !== 'number') fail(`${moduleName} missing DB_SCHEMA_VERSION export`);
+    for (const name of ['execWithBusyRetry', 'initSchema', 'readSchemaVersion', 'tx']) {
+      if (typeof mod[name] !== 'function') fail(`${moduleName} missing export: ${name}`);
+    }
+  }
   if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
       !hccSource.includes("} from '../lib/cli-args.mjs'") ||
       !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
-      !hccSource.includes("} from '../lib/db-schema.mjs'") ||
+      !hccSource.includes("} from '../lib/db/schema.mjs'") ||
       !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
       !hccSource.includes("import { createCoordinationState } from '../lib/coordination-state.mjs'") ||
-      !hccSource.includes("import { createWebPeerActions } from '../lib/web-peer-actions.mjs'") ||
+      !hccSource.includes("import { createWebPeerActions } from '../lib/web/peer-actions.mjs'") ||
       !hccSource.includes("} from '../lib/format.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime-paths.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime-state.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime/paths.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime/state.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
       !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
-      !hccSource.includes("} from '../lib/state-render.mjs'") ||
-      !hccSource.includes("import { createHelpFunctions } from '../lib/help.mjs'") ||
-      !hccSource.includes("import { runtimeRequest } from '../lib/runtime-client.mjs'") ||
-      !hccSource.includes("import { createMessageStore } from '../lib/messages.mjs'") ||
-      !hccSource.includes("import { createTaskStore } from '../lib/task-store.mjs'") ||
+      !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
+      !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
+      !hccSource.includes("import { runtimeRequest } from '../lib/runtime/client.mjs'") ||
+      !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
+      !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
       !hccSource.includes("} from '../lib/peer-bindings.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
-      !hccSource.includes("} from '../lib/locks.mjs'") ||
-      !hccSource.includes("} from '../lib/team-planning.mjs'") ||
+      !hccSource.includes("} from '../lib/core/coordination/locks.mjs'") ||
+      !hccSource.includes("} from '../lib/core/coordination/teams.mjs'") ||
       !hccSource.includes("} from '../lib/peer-identity.mjs'") ||
-      !hccSource.includes("} from '../lib/project-registry.mjs'") ||
-      !hccSource.includes("} from '../lib/web-runtime.mjs'") ||
-      !hccSource.includes("} from '../lib/web-http.mjs'") ||
-      !hccSource.includes("import { webIndexHtml } from '../lib/web-ui-template.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
+      !hccSource.includes("} from '../lib/web/runtime.mjs'") ||
+      !hccSource.includes("} from '../lib/web/http.mjs'") ||
+      !hccSource.includes("import { webIndexHtml } from '../lib/web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
     fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   for (const expected of [
     "renderAutomationContext",
-    "from './automation.mjs'",
+    "from './core/coordination/automation.mjs'",
     "formatOpenTaskLine",
     "from './task-liveness.mjs'",
     "timelineFromRows",
-    "from './timeline.mjs'"
+    "from './core/coordination/timeline.mjs'",
+    "from './core/coordination/locks.mjs'"
   ]) {
     if (!coordinationStateSource.includes(expected)) fail(`coordination state dependency missing: ${expected}`);
   }
@@ -2369,7 +2410,28 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds runtime state helper: ${helper}`);
   }
-  const runtimeState = await import(path.join(repoRoot, 'lib', 'runtime-state.mjs'));
+  const runtimePaths = await import(path.join(repoRoot, 'lib', 'runtime', 'paths.mjs'));
+  const compatRuntimePaths = await import(path.join(repoRoot, 'lib', 'runtime-paths.mjs'));
+  for (const [moduleName, mod] of [
+    ['runtime/paths', runtimePaths],
+    ['runtime-paths compat', compatRuntimePaths]
+  ]) {
+    for (const name of [
+      'contextForProject',
+      'globalRuntimePath',
+      'globalStateDir',
+      'globalWebTokenPath',
+      'projectDbPath',
+      'projectRegistryPath',
+      'projectStateDir',
+      'runtimePath',
+      'webLogPath'
+    ]) {
+      if (typeof mod[name] !== 'function') fail(`${moduleName} missing export: ${name}`);
+    }
+  }
+  const runtimeState = await import(path.join(repoRoot, 'lib', 'runtime', 'state.mjs'));
+  const compatRuntimeState = await import(path.join(repoRoot, 'lib', 'runtime-state.mjs'));
   for (const name of [
     'readGlobalRuntimeFile',
     'writeGlobalRuntime',
@@ -2382,6 +2444,7 @@ async function syntaxAndHelp() {
     'clearRuntime'
   ]) {
     if (typeof runtimeState[name] !== 'function') fail(`runtime state module missing export: ${name}`);
+    if (typeof compatRuntimeState[name] !== 'function') fail(`runtime state compat module missing export: ${name}`);
   }
   const savedRuntimeEnv = {
     HOME: process.env.HOME,
@@ -2472,8 +2535,10 @@ async function syntaxAndHelp() {
     }
   }
   if (hccSource.includes('async function runtimeRequest')) fail('CLI still embeds runtime request client helper');
-  const runtimeClient = await import(path.join(repoRoot, 'lib', 'runtime-client.mjs'));
+  const runtimeClient = await import(path.join(repoRoot, 'lib', 'runtime', 'client.mjs'));
+  const compatRuntimeClient = await import(path.join(repoRoot, 'lib', 'runtime-client.mjs'));
   if (typeof runtimeClient.runtimeRequest !== 'function') fail('runtime client module missing runtimeRequest export');
+  if (typeof compatRuntimeClient.runtimeRequest !== 'function') fail('runtime client compat module missing runtimeRequest export');
   const savedFetch = globalThis.fetch;
   const runtimeFetchCalls = [];
   try {
@@ -2632,7 +2697,8 @@ async function syntaxAndHelp() {
     if (hccSource.includes(helper)) fail(`CLI still embeds timeline helper: ${helper}`);
   }
   if (hccSource.includes('const TIMELINE_EVENT_ALLOW')) fail('CLI still embeds timeline event allow list');
-  const timelineModule = await import(path.join(repoRoot, 'lib', 'timeline.mjs'));
+  const timelineModule = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'timeline.mjs'));
+  const compatTimelineModule = await import(path.join(repoRoot, 'lib', 'timeline.mjs'));
   for (const name of [
     'parseEventPayload',
     'uniqueList',
@@ -2646,6 +2712,7 @@ async function syntaxAndHelp() {
     'timelineFromRows'
   ]) {
     if (typeof timelineModule[name] !== 'function') fail(`timeline module missing export: ${name}`);
+    if (typeof compatTimelineModule[name] !== 'function') fail(`timeline compat module missing export: ${name}`);
   }
   if (JSON.stringify(timelineModule.uniqueList(['a', '', null, 'a', 7])) !== JSON.stringify(['a', '7'])) {
     fail('timeline uniqueList behavior changed');
@@ -2762,7 +2829,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds automation helper: ${helper}`);
   }
-  const automationModule = await import(path.join(repoRoot, 'lib', 'automation.mjs'));
+  const automationModule = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'automation.mjs'));
+  const compatAutomationModule = await import(path.join(repoRoot, 'lib', 'automation.mjs'));
   for (const name of [
     'actionCommand',
     'makeAction',
@@ -2772,6 +2840,7 @@ async function syntaxAndHelp() {
     'renderAutomationContext'
   ]) {
     if (typeof automationModule[name] !== 'function') fail(`automation module missing export: ${name}`);
+    if (typeof compatAutomationModule[name] !== 'function') fail(`automation compat module missing export: ${name}`);
   }
   if (!automationModule.looksLikeMultiTask({ title: 'split', body: '- one\n- two' })) {
     fail('automation looksLikeMultiTask bullet detection changed');
@@ -2850,13 +2919,15 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds state render helper: ${helper}`);
   }
-  const stateRender = await import(path.join(repoRoot, 'lib', 'state-render.mjs'));
+  const stateRender = await import(path.join(repoRoot, 'lib', 'ui', 'state-render.mjs'));
+  const compatStateRender = await import(path.join(repoRoot, 'lib', 'state-render.mjs'));
   for (const name of [
     'renderStatusSummary',
     'normalizeStateResources',
     'renderStateSummary'
   ]) {
     if (typeof stateRender[name] !== 'function') fail(`state render module missing export: ${name}`);
+    if (typeof compatStateRender[name] !== 'function') fail(`state render compat module missing export: ${name}`);
   }
   const normalizedResources = stateRender.normalizeStateResources(['bin/hcc.mjs,scripts/regression.mjs', 'bin/hcc.mjs', '', null]);
   if (JSON.stringify(normalizedResources) !== JSON.stringify(['bin/hcc.mjs', 'scripts/regression.mjs'])) {
@@ -2927,8 +2998,10 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds help text helper: ${helper}`);
   }
-  const helpModule = await import(path.join(repoRoot, 'lib', 'help.mjs'));
+  const helpModule = await import(path.join(repoRoot, 'lib', 'ui', 'help.mjs'));
+  const compatHelpModule = await import(path.join(repoRoot, 'lib', 'help.mjs'));
   if (typeof helpModule.createHelpFunctions !== 'function') fail('help module missing createHelpFunctions export');
+  if (typeof compatHelpModule.createHelpFunctions !== 'function') fail('help compat module missing createHelpFunctions export');
   const capturedHelp = [];
   const savedConsoleLog = console.log;
   try {
@@ -2988,8 +3061,10 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds message store helper: ${helper}`);
   }
-  const messagesModule = await import(path.join(repoRoot, 'lib', 'messages.mjs'));
+  const messagesModule = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'messages.mjs'));
+  const compatMessagesModule = await import(path.join(repoRoot, 'lib', 'messages.mjs'));
   if (typeof messagesModule.createMessageStore !== 'function') fail('messages module missing createMessageStore export');
+  if (typeof compatMessagesModule.createMessageStore !== 'function') fail('messages compat module missing createMessageStore export');
   const messageEvents = [];
   const messageStore = messagesModule.createMessageStore({
     now: () => 1234,
@@ -3062,8 +3137,10 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds task store helper: ${helper}`);
   }
-  const taskStoreModule = await import(path.join(repoRoot, 'lib', 'task-store.mjs'));
+  const taskStoreModule = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'tasks.mjs'));
+  const compatTaskStoreModule = await import(path.join(repoRoot, 'lib', 'task-store.mjs'));
   if (typeof taskStoreModule.createTaskStore !== 'function') fail('task store module missing createTaskStore export');
+  if (typeof compatTaskStoreModule.createTaskStore !== 'function') fail('task store compat module missing createTaskStore export');
   const taskEvents = [];
   const taskMessages = [];
   const taskStore = taskStoreModule.createTaskStore({
@@ -3587,7 +3664,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds lock helper: ${helper}`);
   }
-  const locksModule = await import(path.join(repoRoot, 'lib', 'locks.mjs'));
+  const locksModule = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'locks.mjs'));
+  const compatLocksModule = await import(path.join(repoRoot, 'lib', 'locks.mjs'));
   for (const name of [
     'normalizeLockScope',
     'scopedLockResource',
@@ -3598,6 +3676,7 @@ async function syntaxAndHelp() {
     'locksConflict'
   ]) {
     if (typeof locksModule[name] !== 'function') fail(`locks module missing export: ${name}`);
+    if (typeof compatLocksModule[name] !== 'function') fail(`locks compat module missing export: ${name}`);
   }
   const wholeLock = locksModule.scopedLockResource('bin/hcc.mjs', '');
   const scopedLock = locksModule.scopedLockResource('bin/hcc.mjs', 'provider-commands');
@@ -3626,7 +3705,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds team planning helper: ${helper}`);
   }
-  const teamPlanning = await import(path.join(repoRoot, 'lib', 'team-planning.mjs'));
+  const teamPlanning = await import(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs'));
+  const compatTeamPlanning = await import(path.join(repoRoot, 'lib', 'team-planning.mjs'));
   for (const name of [
     'splitCsvList',
     'parseTeamItems',
@@ -3635,6 +3715,7 @@ async function syntaxAndHelp() {
     'assignTeamWorkers'
   ]) {
     if (typeof teamPlanning[name] !== 'function') fail(`team planning module missing export: ${name}`);
+    if (typeof compatTeamPlanning[name] !== 'function') fail(`team planning compat module missing export: ${name}`);
   }
   const splitTeam = teamPlanning.splitCsvList(['codex:2, claude-a', ' docs-a ']);
   if (JSON.stringify(splitTeam) !== JSON.stringify(['codex:2', 'claude-a', 'docs-a'])) {
@@ -3677,12 +3758,12 @@ async function syntaxAndHelp() {
       peerFormat.shortHash('hello') !== 'aaf4c61d') {
     fail('peer format module behavior changed');
   }
-  for (const [label, source] of [
-    ['provider commands', fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8')],
-    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'team-planning.mjs'), 'utf8')],
-    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'peer-identity.mjs'), 'utf8')]
+  for (const [label, source, expectedImport] of [
+    ['provider commands', fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8'), "from './peer-format.mjs'"],
+    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs'), 'utf8'), "from '../../peer-format.mjs'"],
+    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'peer-identity.mjs'), 'utf8'), "from './peer-format.mjs'"]
   ]) {
-    if (!source.includes("from './peer-format.mjs'")) fail(`${label} module does not import peer format helpers`);
+    if (!source.includes(expectedImport)) fail(`${label} module does not import peer format helpers`);
     if (source.includes('function sanitizePeerPart') || source.includes('function shortHash')) {
       fail(`${label} module still embeds peer format helpers`);
     }
@@ -3783,7 +3864,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds project registry helper: ${helper}`);
   }
-  const projectRegistry = await import(path.join(repoRoot, 'lib', 'project-registry.mjs'));
+  const projectRegistry = await import(path.join(repoRoot, 'lib', 'runtime', 'projects.mjs'));
+  const compatProjectRegistry = await import(path.join(repoRoot, 'lib', 'project-registry.mjs'));
   for (const name of [
     'projectRecord',
     'readProjectRegistry',
@@ -3792,6 +3874,7 @@ async function syntaxAndHelp() {
     'registerProjectActivity'
   ]) {
     if (typeof projectRegistry[name] !== 'function') fail(`project registry module missing export: ${name}`);
+    if (typeof compatProjectRegistry[name] !== 'function') fail(`project registry compat module missing export: ${name}`);
   }
   const savedHome = process.env.HOME;
   process.env.HOME = home;
@@ -3866,9 +3949,26 @@ async function syntaxAndHelp() {
   }
   if (hccSource.includes('new URL(req.url')) fail('CLI still embeds raw server request URL parsing');
   if (hccSource.includes('function webIndexHtml()')) fail('CLI still embeds the web UI template');
-  const webRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
-  const webHttp = await import(path.join(repoRoot, 'lib', 'web-http.mjs'));
-  const webUiTemplate = await import(path.join(repoRoot, 'lib', 'web-ui-template.mjs'));
+  const webRuntime = await import(path.join(repoRoot, 'lib', 'web', 'runtime.mjs'));
+  const webHttp = await import(path.join(repoRoot, 'lib', 'web', 'http.mjs'));
+  const webUiTemplate = await import(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'));
+  const compatWebRuntime = await import(path.join(repoRoot, 'lib', 'web-runtime.mjs'));
+  const compatWebHttp = await import(path.join(repoRoot, 'lib', 'web-http.mjs'));
+  const compatWebPeerActions = await import(path.join(repoRoot, 'lib', 'web-peer-actions.mjs'));
+  const compatWebUiTemplate = await import(path.join(repoRoot, 'lib', 'web-ui-template.mjs'));
+  for (const [moduleName, mod, names] of [
+    ['web/runtime', webRuntime, ['runtimeConnectHost', 'runtimeBaseUrl', 'runtimeApiUrl', 'requestUrl', 'isLoopbackHost', 'nextSessionId', 'listenServer', 'publicRuntimeUrl', 'localRuntimeUrl', 'makeWebToken', 'expectedWebHost', 'webRuntimeMatchesRequest', 'rememberRuntimeToken']],
+    ['web-runtime compat', compatWebRuntime, ['runtimeConnectHost', 'runtimeBaseUrl', 'runtimeApiUrl', 'requestUrl', 'isLoopbackHost', 'nextSessionId', 'listenServer', 'publicRuntimeUrl', 'localRuntimeUrl', 'makeWebToken', 'expectedWebHost', 'webRuntimeMatchesRequest', 'rememberRuntimeToken']],
+    ['web/http', webHttp, ['readJsonRequest', 'sendHttp', 'sendJson', 'sendFile', 'authOk']],
+    ['web-http compat', compatWebHttp, ['readJsonRequest', 'sendHttp', 'sendJson', 'sendFile', 'authOk']],
+    ['web-peer-actions compat', compatWebPeerActions, ['createWebPeerActions']],
+    ['web/ui-template', webUiTemplate, ['webIndexHtml']],
+    ['web-ui-template compat', compatWebUiTemplate, ['webIndexHtml']]
+  ]) {
+    for (const name of names) {
+      if (typeof mod[name] !== 'function') fail(`${moduleName} missing export: ${name}`);
+    }
+  }
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
   };

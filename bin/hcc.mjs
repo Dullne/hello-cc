@@ -14,7 +14,7 @@ import {
   execWithBusyRetry,
   initSchema,
   tx
-} from '../lib/db-schema.mjs';
+} from '../lib/db/schema.mjs';
 import {
   intOpt,
   parseOpts,
@@ -49,7 +49,7 @@ import {
   projectDbPath,
   runtimePath,
   webLogPath
-} from '../lib/runtime-paths.mjs';
+} from '../lib/runtime/paths.mjs';
 import {
   clearRuntime,
   readGlobalRuntimeFile,
@@ -59,8 +59,8 @@ import {
   readRuntimeFile,
   writeGlobalRuntime,
   writeRuntime
-} from '../lib/runtime-state.mjs';
-import { runtimeRequest } from '../lib/runtime-client.mjs';
+} from '../lib/runtime/state.mjs';
+import { runtimeRequest } from '../lib/runtime/client.mjs';
 import {
   detectBranch,
   detectRoot
@@ -77,10 +77,10 @@ import {
   normalizeStateResources,
   renderStateSummary,
   renderStatusSummary
-} from '../lib/state-render.mjs';
-import { createHelpFunctions } from '../lib/help.mjs';
-import { createMessageStore } from '../lib/messages.mjs';
-import { createTaskStore } from '../lib/task-store.mjs';
+} from '../lib/ui/state-render.mjs';
+import { createHelpFunctions } from '../lib/ui/help.mjs';
+import { createMessageStore } from '../lib/core/coordination/messages.mjs';
+import { createTaskStore } from '../lib/core/coordination/tasks.mjs';
 import {
   parseTaskIds,
   positiveIntOpt,
@@ -112,16 +112,16 @@ import {
   runtimeBaseUrl,
   validateWebTokenOpts,
   webRuntimeMatchesRequest
-} from '../lib/web-runtime.mjs';
+} from '../lib/web/runtime.mjs';
 import {
   authOk,
   readJsonRequest,
   sendFile,
   sendHttp,
   sendJson
-} from '../lib/web-http.mjs';
-import { createWebPeerActions } from '../lib/web-peer-actions.mjs';
-import { webIndexHtml } from '../lib/web-ui-template.mjs';
+} from '../lib/web/http.mjs';
+import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
+import { webIndexHtml } from '../lib/web/ui-template.mjs';
 import {
   bindingFromRun,
   buildPeerCommand,
@@ -156,12 +156,12 @@ import {
   locksConflict,
   normalizeLockScope,
   scopedLockResource
-} from '../lib/locks.mjs';
+} from '../lib/core/coordination/locks.mjs';
 import {
   assignTeamWorkers,
   expandTeamWorkers,
   inferTeamItems
-} from '../lib/team-planning.mjs';
+} from '../lib/core/coordination/teams.mjs';
 import {
   autoPeerBasis,
   autoPeerKind,
@@ -179,7 +179,7 @@ import {
   registerProject,
   registerProjectActivity,
   writeProjectRegistry
-} from '../lib/project-registry.mjs';
+} from '../lib/runtime/projects.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');

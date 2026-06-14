@@ -3,8 +3,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { packageRoot, readPackageJson } from '../lib/package-meta.mjs';
-import { normalizeVersion, releaseSection, validateReleaseSection } from '../lib/release-notes.mjs';
+import { packageRoot, readPackageJson } from '../lib/release/package-meta.mjs';
+import { normalizeVersion, releaseSection, validateReleaseSection } from '../lib/release/release-notes.mjs';
 
 const repoRoot = packageRoot(import.meta.url);
 
