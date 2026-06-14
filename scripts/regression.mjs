@@ -2188,8 +2188,10 @@ async function syntaxAndHelp() {
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
   const setupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'setup.mjs'), 'utf8');
+  const shimScriptCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shim-script.mjs'), 'utf8');
   const integrationHooksSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'), 'utf8');
   const integrationShimsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'), 'utf8');
+  const integrationShimScriptSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'), 'utf8');
   const shellPathSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shell-path.mjs'), 'utf8');
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
@@ -2398,11 +2400,19 @@ async function syntaxAndHelp() {
       !integrationHooksSource.includes("const CODEX_HOOKS_PATH")) {
     fail('integrations hook module is missing expected hook storage wiring');
   }
-  if (!integrationShimsSource.includes("from '../shim-script.mjs'") ||
+  if (!integrationShimsSource.includes("from './shims/script.mjs'") ||
       !integrationShimsSource.includes("const SHIM_DIR") ||
       !integrationShimsSource.includes('function findRealBinary') ||
       !integrationShimsSource.includes("spawnSync('which'")) {
     fail('integrations shim module is missing expected shim wiring');
+  }
+  if (!shimScriptCompatSource.includes("from './integrations/shims/script.mjs'")) {
+    fail('shim script compatibility module does not re-export from integrations/shims/script.mjs');
+  }
+  if (!integrationShimScriptSource.includes('function generateShim') ||
+      !integrationShimScriptSource.includes('hello-cc shim for ${tool.name}') ||
+      !integrationShimScriptSource.includes('HCC_SHIM_ENSURED')) {
+    fail('integrations shim script module is missing expected generateShim wiring');
   }
   if (!shellPathSource.includes('function installPathEntry') ||
       !shellPathSource.includes('function uninstallPathEntry') ||
@@ -2412,6 +2422,8 @@ async function syntaxAndHelp() {
   const setupModule = await import(path.join(repoRoot, 'lib', 'setup.mjs'));
   const integrationHooks = await import(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'));
   const integrationShims = await import(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'));
+  const integrationShimScript = await import(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'));
+  const shimScriptCompat = await import(path.join(repoRoot, 'lib', 'shim-script.mjs'));
   const shellPath = await import(path.join(repoRoot, 'lib', 'shell-path.mjs'));
   for (const name of [
     'installClaudeHooks',
@@ -2432,6 +2444,8 @@ async function syntaxAndHelp() {
     fail(`integrations shim module has unexpected SHIM_DIR: ${integrationShims.SHIM_DIR}`);
   }
   if (setupModule.SHIM_DIR !== integrationShims.SHIM_DIR) fail('setup shim dir export mismatch');
+  if (typeof integrationShimScript.generateShim !== 'function') fail('integrations shim script module missing generateShim export');
+  if (shimScriptCompat.generateShim !== integrationShimScript.generateShim) fail('shim script compatibility export mismatch');
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
     if (setupModule[name] !== shellPath[name]) fail(`setup shell path export mismatch: ${name}`);
