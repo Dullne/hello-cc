@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { CliError } from '../lib/errors.mjs';
+import { CliError } from '../lib/shared/errors.mjs';
 import {
   DB_SCHEMA_VERSION,
   execWithBusyRetry,

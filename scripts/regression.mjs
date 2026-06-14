@@ -2187,6 +2187,8 @@ async function syntaxAndHelp() {
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
+  const errorsCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'errors.mjs'), 'utf8');
+  const sharedErrorsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shared', 'errors.mjs'), 'utf8');
   const setupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'setup.mjs'), 'utf8');
   const shimScriptCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shim-script.mjs'), 'utf8');
   const integrationHooksSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'), 'utf8');
@@ -2299,7 +2301,7 @@ async function syntaxAndHelp() {
   }
   if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
       !hccSource.includes("} from '../lib/cli-args.mjs'") ||
-      !hccSource.includes("import { CliError } from '../lib/errors.mjs'") ||
+      !hccSource.includes("import { CliError } from '../lib/shared/errors.mjs'") ||
       !hccSource.includes("} from '../lib/db/schema.mjs'") ||
       !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
       !hccSource.includes("import { createCoordinationState } from '../lib/coordination-state.mjs'") ||
@@ -2357,6 +2359,24 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds CLI runtime helper: ${helper}`);
   }
+  if (errorsCompatSource.includes('class CliError')) {
+    fail('errors compatibility module still embeds CliError');
+  }
+  if (!errorsCompatSource.includes("from './shared/errors.mjs'") ||
+      !sharedErrorsSource.includes('class CliError')) {
+    fail('CliError is not wired through lib/shared/errors.mjs');
+  }
+  const oldErrorImportPattern = /from ['"](?:\.\.\/lib\/errors|\.\/errors|\.\.\/errors|\.\.\/\.\.\/errors)\.mjs['"]/;
+  for (const file of ['bin/hcc.mjs', ...libModuleFiles()]) {
+    const source = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+    if (file !== 'lib/errors.mjs' && oldErrorImportPattern.test(source)) {
+      fail(`${file} still imports CliError through the old errors module`);
+    }
+  }
+  const sharedErrors = await import(path.join(repoRoot, 'lib', 'shared', 'errors.mjs'));
+  const compatErrors = await import(path.join(repoRoot, 'lib', 'errors.mjs'));
+  if (typeof sharedErrors.CliError !== 'function') fail('shared errors module missing CliError');
+  if (compatErrors.CliError !== sharedErrors.CliError) fail('errors compatibility export mismatch');
   if (!hccSource.includes('function shellCommand(args)') ||
       hccSource.includes('return args.map(shellQuoteArg).join')) {
     fail('CLI shellCommand wrapper no longer delegates to cli-runtime shellCommand helper');
