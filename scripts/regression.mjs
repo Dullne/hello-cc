@@ -22,6 +22,8 @@ const fakeBin = path.join(os.tmpdir(), `hcc-reg-bin-${testId}`);
 const outDir = path.join(os.tmpdir(), `hcc-reg-out-${testId}`);
 const tmuxSession = `hcc-reg-${process.pid}`;
 const tmuxSocketName = `hcc-reg-${testId}`.replace(/[^A-Za-z0-9_-]/g, '-');
+const realHome = process.env.HOME || os.homedir();
+const realRegistryFile = path.join(realHome, '.hello-cc', 'projects.json');
 const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'ignore']
@@ -1150,6 +1152,34 @@ function cleanup() {
   }
   for (const dir of [root, home, fakeBin, outDir]) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function assertNoRealProjectRegistryLeak() {
+  const after = fs.existsSync(realRegistryFile)
+    ? fs.readFileSync(realRegistryFile, 'utf8')
+    : null;
+  if (!after) return;
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(after);
+  } catch {
+    fail(`regression changed real project registry with invalid JSON: ${realRegistryFile}`);
+  }
+  const leakedRoots = (parsed?.projects || [])
+    .map((project) => String(project?.root || ''))
+    .filter((projectRoot) => {
+      if (!projectRoot) return false;
+      if (projectRoot === root || projectRoot === home || projectRoot === fakeBin || projectRoot === outDir) return true;
+      return projectRoot.startsWith(`${root}${path.sep}`) ||
+        projectRoot.startsWith(`${home}${path.sep}`) ||
+        projectRoot.startsWith(`${fakeBin}${path.sep}`) ||
+        projectRoot.startsWith(`${outDir}${path.sep}`) ||
+        projectRoot.includes(`hcc-reg-${testId}`);
+    });
+  if (leakedRoots.length) {
+    fail(`regression leaked temporary projects into real registry ${realRegistryFile}:\n${leakedRoots.join('\n')}`);
   }
 }
 
@@ -4932,13 +4962,21 @@ async function main() {
   oldNameScan();
   await syntaxAndHelp();
   uninstallWorkflow();
+  assertNoRealProjectRegistryLeak();
   log('FULL_REGRESSION_OK');
 }
 
 main().catch((err) => {
+  try { assertNoRealProjectRegistryLeak(); } catch (leakErr) {
+    process.stderr.write(`${leakErr.stack || leakErr.message}\n`);
+  }
   cleanup();
   process.stderr.write(`${err.stack || err.message}\n`);
   process.exit(1);
 }).finally(() => {
-  cleanup();
+  try {
+    assertNoRealProjectRegistryLeak();
+  } finally {
+    cleanup();
+  }
 });
