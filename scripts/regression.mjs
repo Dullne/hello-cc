@@ -2310,7 +2310,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
       !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
-      !hccSource.includes("} from '../lib/session-launch.mjs'") ||
+      !hccSource.includes("} from '../lib/core/sessions/launch.mjs'") ||
       !hccSource.includes("} from '../lib/integrations/providers.mjs'") ||
       !hccSource.includes("} from '../lib/core/peers/session.mjs'") ||
       !hccSource.includes("} from '../lib/core/peers/bindings.mjs'") ||
@@ -3316,7 +3316,20 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds session launch helper: ${helper}`);
   }
-  const sessionLaunch = await import(path.join(repoRoot, 'lib', 'session-launch.mjs'));
+  const sessionLaunchSource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'sessions', 'launch.mjs'), 'utf8');
+  const compatSessionLaunchSource = fs.readFileSync(path.join(repoRoot, 'lib', 'session-launch.mjs'), 'utf8');
+  if (sessionLaunchSource.includes("from '../../terminal/") ||
+      sessionLaunchSource.includes("from '../terminal/") ||
+      sessionLaunchSource.includes('tmuxSessionEnvironmentValue')) {
+    fail('core session launch module depends on terminal/tmux helpers');
+  }
+  if (!compatSessionLaunchSource.includes("from './core/sessions/launch.mjs'") ||
+      !compatSessionLaunchSource.includes("from './terminal/tmux.mjs'")) {
+    fail('session launch compatibility module does not re-export from the new boundaries');
+  }
+  const sessionLaunch = await import(path.join(repoRoot, 'lib', 'core', 'sessions', 'launch.mjs'));
+  const compatSessionLaunch = await import(path.join(repoRoot, 'lib', 'session-launch.mjs'));
+  const tmuxModuleForSessionLaunch = await import(path.join(repoRoot, 'lib', 'tmux.mjs'));
   for (const name of [
     'childSessionEnv',
     'launchEnvironmentFingerprint',
@@ -3324,12 +3337,20 @@ async function syntaxAndHelp() {
     'isLikelyShellCommand',
     'isProviderFallbackWrapper',
     'isRelaunchableProviderSession',
-    'tmuxProviderState',
-    'tmuxManagedSessionName',
-    'tmuxEnvironmentArgs',
     'isolatedEnvCommandArgs'
   ]) {
     if (typeof sessionLaunch[name] !== 'function') fail(`session launch module missing export: ${name}`);
+    if (compatSessionLaunch[name] !== sessionLaunch[name]) fail(`session launch compat export mismatch: ${name}`);
+  }
+  for (const name of [
+    'tmuxProviderState',
+    'tmuxManagedSessionName',
+    'tmuxEnvironmentArgs'
+  ]) {
+    if (typeof tmuxModuleForSessionLaunch[name] !== 'function') fail(`tmux module missing session launch adapter: ${name}`);
+    if (compatSessionLaunch[name] !== tmuxModuleForSessionLaunch[name]) {
+      fail(`session launch compat terminal export mismatch: ${name}`);
+    }
   }
   if (sessionLaunch.WEB_CHILD_ENV !== 'HCC_WEB_CHILD' ||
       sessionLaunch.LAUNCH_FINGERPRINT_ENV !== 'HCC_LAUNCH_FINGERPRINT' ||
@@ -3372,13 +3393,13 @@ async function syntaxAndHelp() {
       sessionLaunch.isRelaunchableProviderSession('codex', 'node script.js', {})) {
     fail('session launch relaunchable provider detection changed');
   }
-  const managedSessionName = sessionLaunch.tmuxManagedSessionName({ root: '/tmp/hcc root' }, 'Bad Peer!');
+  const managedSessionName = tmuxModuleForSessionLaunch.tmuxManagedSessionName({ root: '/tmp/hcc root' }, 'Bad Peer!');
   if (!managedSessionName.startsWith('hcc-') ||
       !managedSessionName.endsWith('-bad-peer') ||
       managedSessionName.length > 80) {
     fail(`session launch tmux session name changed: ${managedSessionName}`);
   }
-  const tmuxEnvArgs = sessionLaunch.tmuxEnvironmentArgs({
+  const tmuxEnvArgs = tmuxModuleForSessionLaunch.tmuxEnvironmentArgs({
     A: '1',
     TMUX: 'ignored',
     'BAD-NAME': 'ignored',
@@ -3437,6 +3458,7 @@ async function syntaxAndHelp() {
     'tmuxSessionHasClients',
     'tmuxKillSession',
     'tmuxSessionEnvironmentValue',
+    'tmuxLaunchFingerprint',
     'tmuxPaneInfo',
     'tmuxCapturePane',
     'tmuxCursorInfo',

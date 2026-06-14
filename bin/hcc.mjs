@@ -94,11 +94,8 @@ import {
   isolatedEnvCommandArgs,
   isLikelyShellCommand,
   isRelaunchableProviderSession,
-  launchFingerprint,
-  tmuxEnvironmentArgs,
-  tmuxManagedSessionName,
-  tmuxProviderState
-} from '../lib/session-launch.mjs';
+  launchFingerprint
+} from '../lib/core/sessions/launch.mjs';
 import {
   expectedWebHost,
   isLoopbackHost,
@@ -143,11 +140,14 @@ import {
   tmuxCapturePane,
   tmuxCursorInfo,
   tmuxCursorPayload,
+  tmuxEnvironmentArgs,
   tmuxHasSession,
   tmuxKillSession,
+  tmuxLaunchFingerprint,
+  tmuxManagedSessionName,
   tmuxPaneInfo,
+  tmuxProviderState,
   tmuxSendLiteral,
-  tmuxSessionEnvironmentValue,
   tmuxSessionHasClients
 } from '../lib/tmux.mjs';
 import {
@@ -2418,7 +2418,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
 
     if (hasSession && input.restartOnEnvChange) {
-      const existingFingerprint = tmuxSessionEnvironmentValue(sessionName, LAUNCH_FINGERPRINT_ENV);
+      const existingFingerprint = tmuxLaunchFingerprint(sessionName);
       if (existingFingerprint !== env[LAUNCH_FINGERPRINT_ENV]) {
         restartExistingTmuxSession('launch_environment_changed');
       }
