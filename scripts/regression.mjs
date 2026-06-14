@@ -2189,6 +2189,8 @@ async function syntaxAndHelp() {
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
   const setupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'setup.mjs'), 'utf8');
   const integrationHooksSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'), 'utf8');
+  const integrationShimsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'), 'utf8');
+  const shellPathSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shell-path.mjs'), 'utf8');
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   for (const expected of [
@@ -2375,13 +2377,42 @@ async function syntaxAndHelp() {
   if (!setupSource.includes("from './integrations/hooks.mjs'")) {
     fail('setup module does not re-export hook helpers from integrations/hooks.mjs');
   }
+  for (const helper of [
+    'const SHIM_DIR',
+    'function installShims',
+    'function uninstallShims',
+    'function verifyShims',
+    'function findRealBinary',
+    'function fsExists'
+  ]) {
+    if (setupSource.includes(helper)) fail(`setup module still embeds shim helper: ${helper}`);
+  }
+  if (!setupSource.includes("from './integrations/shims.mjs'")) {
+    fail('setup module does not re-export shim helpers from integrations/shims.mjs');
+  }
+  if (!setupSource.includes("from './shell-path.mjs'")) {
+    fail('setup module does not re-export shell path helpers from shell-path.mjs');
+  }
   if (!integrationHooksSource.includes("from '../shared/json-file.mjs'") ||
       !integrationHooksSource.includes("const CLAUDE_SETTINGS_PATH") ||
       !integrationHooksSource.includes("const CODEX_HOOKS_PATH")) {
     fail('integrations hook module is missing expected hook storage wiring');
   }
+  if (!integrationShimsSource.includes("from '../shim-script.mjs'") ||
+      !integrationShimsSource.includes("const SHIM_DIR") ||
+      !integrationShimsSource.includes('function findRealBinary') ||
+      !integrationShimsSource.includes("spawnSync('which'")) {
+    fail('integrations shim module is missing expected shim wiring');
+  }
+  if (!shellPathSource.includes('function installPathEntry') ||
+      !shellPathSource.includes('function uninstallPathEntry') ||
+      !shellPathSource.includes('.hcc-shims')) {
+    fail('shell path module is missing expected setup path helpers');
+  }
   const setupModule = await import(path.join(repoRoot, 'lib', 'setup.mjs'));
   const integrationHooks = await import(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'));
+  const integrationShims = await import(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'));
+  const shellPath = await import(path.join(repoRoot, 'lib', 'shell-path.mjs'));
   for (const name of [
     'installClaudeHooks',
     'uninstallClaudeHooks',
@@ -2392,6 +2423,18 @@ async function syntaxAndHelp() {
   ]) {
     if (typeof integrationHooks[name] !== 'function') fail(`integrations hook module missing export: ${name}`);
     if (setupModule[name] !== integrationHooks[name]) fail(`setup hook export mismatch: ${name}`);
+  }
+  for (const name of ['installShims', 'uninstallShims', 'verifyShims', 'findRealBinary']) {
+    if (typeof integrationShims[name] !== 'function') fail(`integrations shim module missing export: ${name}`);
+    if (setupModule[name] !== integrationShims[name]) fail(`setup shim export mismatch: ${name}`);
+  }
+  if (typeof integrationShims.SHIM_DIR !== 'string' || !integrationShims.SHIM_DIR.endsWith('.hcc-shims')) {
+    fail(`integrations shim module has unexpected SHIM_DIR: ${integrationShims.SHIM_DIR}`);
+  }
+  if (setupModule.SHIM_DIR !== integrationShims.SHIM_DIR) fail('setup shim dir export mismatch');
+  for (const name of ['installPathEntry', 'uninstallPathEntry']) {
+    if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
+    if (setupModule[name] !== shellPath[name]) fail(`setup shell path export mismatch: ${name}`);
   }
   const cliRuntime = await import(path.join(repoRoot, 'lib', 'cli-runtime.mjs'));
   for (const name of ['commandPath', 'createContext', 'packageRoot', 'shellCommand', 'tailFile']) {
