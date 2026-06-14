@@ -16,6 +16,81 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.6
+
+### Summary
+
+hello-cc 0.1.6 publishes the current architecture-layout cleanup that followed
+0.1.5 and records the split-stack audit that reviewed it. The installed CLI
+behavior remains the public API, while internal helpers now live closer to their
+product boundaries under `core/`, `runtime/`, `web/`, `terminal/`,
+`integrations/`, `ui/`, `release/`, and `shared/`. This release keeps the
+current master history as the publish path; teams that want cleaner refactor
+history should use the documented rebuild-branch option instead.
+
+### Highlights
+
+- Added architecture guidance for the target module layout and documented the
+  package-surface policy: `hcc` and `hello-cc` are the supported public
+  interfaces; deep `lib/` imports are compatibility paths, not user workflows.
+- Added `docs/layout-split-stack-audit.md`, which classifies the local
+  `origin/master..HEAD` stack, calls out the early flat-helper extraction phase,
+  and records the package-surface and follow-up cleanup decisions before
+  publish.
+- Moved peer, task, lock, message, team, timeline, automation, and session
+  helpers into `core/`, `db/`, `runtime/`, `terminal/`, and `integrations/`
+  boundaries while keeping compatibility entrypoints for already-exposed paths.
+- Moved Web runtime, HTTP, UI template, and peer action helpers into `lib/web/`
+  while preserving existing Web console behavior.
+- Moved provider command helpers and Claude/Codex hook and shim setup helpers
+  into `lib/integrations/`, including shim script generation under
+  `lib/integrations/shims/`.
+- Moved JSON and CLI error helpers into `lib/shared/`, release metadata helpers
+  into `lib/release/`, and CLI-facing state/help rendering into `lib/ui/`.
+- Expanded regression guards so module moves verify both the new primary
+  boundary and the compatibility re-export identity.
+
+### Compatibility Notes
+
+- `@logicseek/hello-cc@0.1.5` was already published from git head `4969100`.
+  This release uses a new package version and does not republish `0.1.5`.
+- Top-level `lib/*.mjs` files that were already published in `0.1.5` remain
+  available for this release cycle to avoid breaking deep imports exposed by the
+  package's `files` list.
+- New top-level re-export-only helper paths introduced during the local layout
+  migration are treated as compatibility-only deep-import paths for this
+  release, not as target architecture. New code should prefer the
+  product-boundary modules documented in `docs/architecture.md`.
+- The audit records remaining cleanup items for later focused work, including
+  moving SQL-heavy task store operations out of pure core, removing core/runtime
+  reverse dependencies on top-level formatting or Web helpers, and continuing to
+  split `cmdWeb()` by subsystem instead of by incidental helper names.
+- No breaking CLI command changes are intended in this release.
+
+### Validation
+
+The 0.1.6 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+find lib -name '*.mjs' -print0 | xargs -0 -n1 node --check
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.6
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.5
 
 ### Summary
