@@ -131,8 +131,10 @@ import {
   providerSessionPeerId
 } from '../lib/core/peers/session.mjs';
 import {
+  bindingHasRuntime,
   bindingFromDetected
 } from '../lib/core/peers/bindings.mjs';
+import { reconcileRunningPeerBindings } from '../lib/core/peers/reconcile.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import {
   ensureTmuxAvailable,
@@ -148,6 +150,7 @@ import {
   tmuxPaneInfo,
   tmuxProviderState,
   tmuxSendLiteral,
+  tmuxSessionEnvironmentValue,
   tmuxSessionHasClients
 } from '../lib/tmux.mjs';
 import {
@@ -176,6 +179,7 @@ import {
   sanitizePeerPart,
   shortHash
 } from '../lib/integrations/peers/identity.mjs';
+import { inspectProviderProcess } from '../lib/integrations/peers/processes.mjs';
 import {
   projectRecord,
   readProjectRegistry,
@@ -196,6 +200,10 @@ const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = PACKAGE_META.name;
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
+// Detected peers older than this (seconds, last_seen) or already exited are
+// hidden from the Web "Detected" list so it reflects recent activity instead of
+// accumulating every peer/test fixture that ever registered.
+const DETECTED_PEER_MAX_AGE = 3600;
 
 const {
   helpMain,
@@ -209,6 +217,7 @@ const {
   helpBroadcast,
   helpInject,
   helpPeer,
+  helpTmux,
   helpLock,
   helpHandoff,
   helpEvent,
@@ -224,6 +233,54 @@ const {
   cliName: CLI_NAME,
   npmPackageName: NPM_PACKAGE_NAME
 });
+
+function isProjectManagedTmuxSession(projectCtx, sessionName) {
+  return Boolean(sessionName) && sessionName.startsWith(`hcc-${shortHash(projectCtx.root)}-`);
+}
+
+function splitProcessArgs(line) {
+  const args = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  for (const ch of String(line || '')) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        args.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += '\\';
+  if (current) args.push(current);
+  return args;
+}
+
+function sameResolvedPath(a, b) {
+  if (!a || !b) return false;
+  return path.resolve(a) === path.resolve(b);
+}
+
 const {
   ackMessage,
   getMessage,
@@ -368,8 +425,31 @@ function addEvent(db, type, actor, taskId, payload) {
   `).run(type, actor || null, taskId || null, JSON.stringify(payload || {}), now());
 }
 
+function latestHookProviderSession(db, peer) {
+  if (!peer) return null;
+  try {
+    const row = db.prepare(`
+      SELECT COALESCE(
+        json_extract(payload, '$.session_id'),
+        json_extract(payload, '$.sessionId'),
+        json_extract(payload, '$.conversation_id'),
+        json_extract(payload, '$.conversationId')
+      ) AS session_id
+      FROM events
+      WHERE actor = ?
+        AND type LIKE 'hook.%'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(peer);
+    return row?.session_id || null;
+  } catch {
+    return null;
+  }
+}
+
 const {
   dedupePeerBindings,
+  findProviderSessionBinding,
   upsertCanonicalPeerBinding
 } = createPeerBindingStore({ now, addEvent });
 
@@ -1169,6 +1249,17 @@ async function peerStart(ctx, args) {
   const db = connect(ctx);
   try {
     tx(db, () => {
+      if (!opts.force) {
+        const conflict = findProviderSessionBinding(db, binding);
+        if (bindingHasRuntime(conflict)) {
+          const providerSession = binding.provider_session_id || binding.provider_session_name || '';
+          throw new CliError('PROVIDER_SESSION_IN_USE', `${binding.provider} session ${providerSession} is already bound to ${conflict.peer}`, {
+            peer: conflict.peer,
+            provider: conflict.provider,
+            provider_session: providerSession
+          });
+        }
+      }
       upsertPeer(db, {
         id, kind, role,
         worktree: cwd,
@@ -1177,7 +1268,6 @@ async function peerStart(ctx, args) {
         status: 'starting',
         capabilities: 'tmux'
       });
-      upsertCanonicalPeerBinding(db, binding, Boolean(opts.force), { override: Boolean(opts.force) });
     });
   } finally {
     db.close();
@@ -1190,7 +1280,8 @@ async function peerStart(ctx, args) {
     cwd,
     binding,
     env: childSessionEnv(),
-    restartOnEnvChange: Boolean(opts['restart-env'])
+    restartOnEnvChange: Boolean(opts['restart-env']),
+    providerForce: Boolean(opts.force)
   }, runtime);
   printResult(ctx, data.session, (session) =>
     `started ${session.id} (${session.kind}, ${session.role})${session.pane ? ` pane=${session.pane}` : ` pid=${session.pid}`}`);
@@ -1583,6 +1674,53 @@ async function prepareLocalBus(ctx, opts = {}) {
   };
 }
 
+function hccWebProcessMatches(line, ctx) {
+  const args = splitProcessArgs(line);
+  const hccIndex = args.findIndex((arg) => sameResolvedPath(arg, commandPath()) || arg.endsWith('/hcc.mjs'));
+  if (hccIndex < 0) return false;
+  const hccArgs = args.slice(hccIndex + 1);
+  const { global, rest } = splitGlobalArgs(hccArgs);
+  if (rest[0] !== 'web') return false;
+  return sameResolvedPath(global.root, ctx.root) ||
+    sameResolvedPath(global.db, ctx.dbPath);
+}
+
+async function stopOrphanWebRuntimes(ctx, keepPid = null) {
+  if (process.platform === 'win32') return;
+  let output = '';
+  try {
+    output = spawnSync('ps', ['-eo', 'pid=,args='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).stdout || '';
+  } catch {
+    return;
+  }
+
+  const pids = [];
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = trimmed.match(/^(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(pid) || pid === process.pid || pid === keepPid) continue;
+    if (hccWebProcessMatches(match[2], ctx)) pids.push(pid);
+  }
+  if (!pids.length) return;
+
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+  await sleep(250);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 0);
+      process.kill(pid, 'SIGKILL');
+    } catch {}
+  }
+}
+
 async function startWebBackground(ctx, args) {
   const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
   validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
@@ -1594,6 +1732,7 @@ async function startWebBackground(ctx, args) {
   const existing = await readHealthyGlobalRuntime();
   if (existing) {
     if (webRuntimeMatchesRequest(existing, opts)) {
+      await stopOrphanWebRuntimes(ctx, existing.pid || null);
       rememberRuntimeToken(existing, opts);
       try {
         await runtimeRequest(ctx, 'POST', '/api/projects', { root: ctx.root, db: ctx.dbPath }, existing);
@@ -1604,6 +1743,7 @@ async function startWebBackground(ctx, args) {
     try { await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, existing); } catch {}
     await sleep(250);
   }
+  await stopOrphanWebRuntimes(ctx);
 
   try { fs.rmSync(runtimePath(ctx), { force: true }); } catch {}
   try { fs.rmSync(globalRuntimePath(), { force: true }); } catch {}
@@ -1921,43 +2061,142 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   } catch {}
 
   // ── Auto-attach detected peers that are in tmux panes ─────────────────────
+  function listTmuxPanesOnce() {
+    const result = runTmux([
+      'list-panes',
+      '-a',
+      '-F',
+      '#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_name}'
+    ]);
+    return result.trim().split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [pane, panePid, command, cwd, sessionName] = line.split('\t');
+        return {
+          pane,
+          pid: Number.parseInt(panePid || '0', 10) || null,
+          command: command || '',
+          cwd: cwd || '',
+          sessionName: sessionName || ''
+        };
+      })
+      .filter((pane) => pane.pane && pane.pid);
+  }
+
+  function attachedTmuxState(projectCtx, db) {
+    const peers = new Set();
+    const panes = new Set();
+    for (const session of sessionsForProject(projectCtx)) {
+      if (session.status !== 'running') continue;
+      peers.add(session.id);
+      if (session.peerId) peers.add(session.peerId);
+      const resolved = resolveSessionPeerId(db, session);
+      if (resolved) peers.add(resolved);
+      if (session.type === 'tmux' && session.pane) panes.add(session.pane);
+    }
+    return { peers, panes };
+  }
+
+  function reconcileRunningBindings(projectCtx = ctx, panes = null) {
+    const db = connect(projectCtx);
+    try {
+      const tmuxPanes = Array.isArray(panes) ? panes : listTmuxPanesOnce();
+      return reconcileRunningPeerBindings(db, projectCtx, {
+        panes: tmuxPanes,
+        inspectProcess: inspectProviderProcess,
+        latestProviderSessionForPeer: (peer) => latestHookProviderSession(db, peer),
+        addEvent,
+        now
+      });
+    } catch {
+      return null;
+    } finally {
+      db.close();
+    }
+  }
+
+  let autoAttachScanInFlight = false;
+
   function scanAndAttachDetectedPeers() {
+    if (autoAttachScanInFlight) return;
+    autoAttachScanInFlight = true;
     const db = connect(ctx);
     try {
       const rows = db.prepare(`
-        SELECT id, kind, pid FROM peers
-        WHERE status IN ('running', 'working', 'busy')
-          AND pid IS NOT NULL
-          AND last_seen_at >= ? - ?
-        ORDER BY last_seen_at DESC
+        SELECT p.id, p.kind, p.role, p.worktree, p.pid,
+               b.peer AS binding_peer, b.provider, b.provider_session_id,
+               b.provider_session_name, b.resume_mode, b.resume_arg,
+               b.command AS binding_command, b.runtime_session_id,
+               b.runtime_target
+        FROM peers p
+        LEFT JOIN peer_bindings b ON b.peer = p.id
+        WHERE p.status IN ('running', 'working', 'busy')
+          AND p.pid IS NOT NULL
+          AND p.last_seen_at >= ? - ?
+        ORDER BY p.last_seen_at DESC
       `).all(now(), ACTIVE_PEER_TTL);
+      if (!rows.length) return;
+
+      let panes;
+      try {
+        panes = listTmuxPanesOnce();
+      } catch {
+        return;
+      }
+      if (!panes.length) return;
+      const paneByPid = new Map();
+      for (const pane of panes) {
+        if (!paneByPid.has(pane.pid)) paneByPid.set(pane.pid, pane);
+      }
+      reconcileRunningPeerBindings(db, ctx, {
+        panes,
+        inspectProcess: inspectProviderProcess,
+        latestProviderSessionForPeer: (peer) => latestHookProviderSession(db, peer),
+        addEvent,
+        now
+      });
+      const attached = attachedTmuxState(ctx, db);
 
       for (const row of rows) {
-        const key = sessionKey(ctx, row.id);
-        if (sessions.has(key)) continue;
+        if (attached.peers.has(row.id)) continue;
+        if (row.binding_peer && attached.peers.has(row.binding_peer)) continue;
+        if (row.runtime_session_id && attached.peers.has(row.runtime_session_id)) continue;
 
+        const pane = paneByPid.get(Number(row.pid));
+        if (!pane || attached.panes.has(pane.pane)) continue;
+
+        const binding = row.binding_peer ? {
+          provider: row.provider,
+          provider_session_id: row.provider_session_id,
+          provider_session_name: row.provider_session_name,
+          resume_mode: row.resume_mode,
+          resume_arg: row.resume_arg,
+          command: row.binding_command,
+          runtime_session_id: row.runtime_session_id || row.id,
+          runtime_target: pane.pane
+        } : null;
         try {
-          const result = runTmux(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}']);
-          for (const line of result.trim().split('\n')) {
-            const [pane, panePid, command, cwd] = line.split('\t');
-            if (parseInt(panePid) === row.pid) {
-              try {
-                attachTmuxSession({
-                  id: row.id,
-                  pane,
-                  kind: row.kind || inferPeerKind(row.id, null, command),
-                  role: 'peer',
-                  cwd: cwd || ctx.root,
-                  force: false,
-                  projectCtx: ctx
-                });
-              } catch {}
-              break;
-            }
-          }
+          const session = attachTmuxSession({
+            id: row.id,
+            pane: pane.pane,
+            kind: row.kind || inferPeerKind(row.id, null, pane.command),
+            role: row.role || 'peer',
+            cwd: pane.cwd || row.worktree || ctx.root,
+            command: row.binding_command || null,
+            force: false,
+            projectCtx: ctx,
+            binding,
+            autoAttach: true
+          });
+          attached.peers.add(row.id);
+          if (session.peerId) attached.peers.add(session.peerId);
+          attached.panes.add(pane.pane);
         } catch {}
       }
-    } finally { db.close(); }
+    } finally {
+      db.close();
+      autoAttachScanInFlight = false;
+    }
   }
 
   scanAndAttachDetectedPeers();
@@ -2011,8 +2250,69 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return session.peerId;
   }
 
+  function sessionBindingForSerialize(db, session, peerId) {
+    if (!session) return null;
+    if (!db) return session.binding || null;
+
+    if (session.type === 'tmux' && session.pane) {
+      const byTarget = db.prepare(`
+        SELECT *
+        FROM peer_bindings
+        WHERE runtime_target = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `).get(session.pane);
+      if (byTarget) return byTarget;
+    }
+
+    for (const peer of [peerId, session.peerId, session.id]) {
+      if (!peer) continue;
+      const byPeer = db.prepare(`
+        SELECT *
+        FROM peer_bindings
+        WHERE peer = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `).get(peer);
+      if (byPeer) return byPeer;
+    }
+
+    if (session.id) {
+      const byRuntime = db.prepare(`
+        SELECT *
+        FROM peer_bindings
+        WHERE runtime_session_id = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `).get(session.id);
+      if (byRuntime) return byRuntime;
+    }
+
+    return session.binding || null;
+  }
+
+  function serializeBindingSummary(binding, session) {
+    if (!binding) return null;
+    return {
+      peer: binding.peer || session?.peerId || session?.id || null,
+      provider: binding.provider || session?.kind || 'other',
+      provider_session_id: binding.provider_session_id || null,
+      provider_session_name: binding.provider_session_name || null,
+      resume_mode: binding.resume_mode || null,
+      resume_arg: binding.resume_arg || null,
+      command: binding.command || null,
+      transport: binding.transport || session?.type || null,
+      runtime_session_id: binding.runtime_session_id || session?.id || null,
+      runtime_target: binding.runtime_target || session?.pane || null,
+      created_at: binding.created_at || null,
+      updated_at: binding.updated_at || null
+    };
+  }
+
   function serializeSession(session, db = null) {
     const peerId = resolveSessionPeerId(db, session);
+    const binding = serializeBindingSummary(sessionBindingForSerialize(db, session, peerId), session);
+    const providerSessionLabel = binding?.provider_session_id || binding?.provider_session_name || null;
     return {
       id: session.id,
       peer_id: peerId,
@@ -2026,7 +2326,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       status: session.status,
       type: session.type || 'pty',
       created_at: session.createdAt,
-      exited_at: session.exitedAt || null
+      exited_at: session.exitedAt || null,
+      binding,
+      provider_session_known: Boolean(providerSessionLabel),
+      provider_session_label: providerSessionLabel,
+      warning: session.warning || null
     };
   }
 
@@ -2219,6 +2523,329 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (session.pipeFile) { try { fs.unlinkSync(session.pipeFile); } catch {} session.pipeFile = null; }
   }
 
+  function tmuxSessionNameForPane(pane) {
+    if (!pane) return null;
+    try {
+      return runTmux(['display-message', '-p', '-t', pane, '#{session_name}']).trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function detachRuntimeSessionForPane(projectCtx, pane, status = 'detached') {
+    if (!pane) return;
+    for (const session of [...sessionsForProject(projectCtx)]) {
+      if (session.type === 'tmux' && session.pane === pane) {
+        detachTmuxSession(session, status);
+      }
+    }
+  }
+
+  function openClientCountForPane(projectCtx, pane) {
+    let count = 0;
+    for (const session of [...sessionsForProject(projectCtx)]) {
+      if (session.type === 'tmux' && session.pane === pane && hasOpenClients(session)) count += 1;
+    }
+    return count;
+  }
+
+  function addRebindCleanupFailedEvent(db, actor, payload) {
+    if (!db) return;
+    addEvent(db, 'tmux.session.rebind_cleanup_failed', actor, null, payload);
+  }
+
+  function oldTmuxRebindTarget(projectCtx, oldTarget, newTarget) {
+    if (!oldTarget || oldTarget === newTarget) return false;
+    const oldSessionName = tmuxSessionNameForPane(oldTarget);
+    if (!isProjectManagedTmuxSession(projectCtx, oldSessionName)) return false;
+    const newSessionName = tmuxSessionNameForPane(newTarget);
+    if (oldSessionName === newSessionName) return false;
+    return { oldSessionName, newSessionName };
+  }
+
+  function tmuxSessionClientCountForStop(sessionName) {
+    if (!sessionName) return 0;
+    try {
+      const output = runTmux(['list-clients', '-t', sessionName, '-F', '#{client_tty}']);
+      return output.trim().split('\n').filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  function safeTmuxKillPlan(projectCtx, db, peerId, expectedTarget) {
+    if (!peerId) {
+      throw new CliError('BAD_REQUEST', 'peer id required for tmux kill');
+    }
+    const binding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(peerId);
+    if (!binding || binding.transport !== 'tmux' || !binding.runtime_target) {
+      throw new CliError('TMUX_KILL_NOT_MANAGED', `No DB-proven tmux runtime binding for ${peerId}`);
+    }
+    if (expectedTarget && binding.runtime_target !== expectedTarget) {
+      throw new CliError('TMUX_KILL_TARGET_CHANGED', `tmux runtime target for ${peerId} changed`, {
+        peer: peerId,
+        expected_runtime_target: expectedTarget,
+        runtime_target: binding.runtime_target
+      });
+    }
+
+    const actualSession = tmuxSessionNameForPane(binding.runtime_target);
+    const actualPane = tmuxPaneForTarget(binding.runtime_target);
+    if (!actualSession || !actualPane) {
+      throw new CliError('TMUX_KILL_TARGET_MISSING', `tmux runtime target for ${peerId} is not running`);
+    }
+
+    const expectedSession = tmuxManagedSessionName(projectCtx, peerId);
+    if (actualSession !== expectedSession) {
+      throw new CliError('TMUX_KILL_NOT_HCC_MANAGED', `Refusing to kill non-managed tmux session ${actualSession}`, {
+        peer: peerId,
+        expected_session: expectedSession,
+        actual_session: actualSession,
+        runtime_target: binding.runtime_target
+      });
+    }
+
+    const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');
+    if (hccRoot && path.resolve(hccRoot) !== path.resolve(projectCtx.root)) {
+      throw new CliError('TMUX_KILL_ROOT_MISMATCH', `Refusing to kill tmux session ${actualSession} for a different HCC_ROOT`, {
+        peer: peerId,
+        tmux_session: actualSession,
+        hcc_root: hccRoot,
+        root: projectCtx.root
+      });
+    }
+
+    const clientCount = tmuxSessionClientCountForStop(actualSession);
+    if (clientCount > 0) {
+      throw new CliError('TMUX_KILL_HAS_CLIENTS', `Refusing to kill tmux session ${actualSession} with attached clients`, {
+        peer: peerId,
+        tmux_session: actualSession,
+        client_count: clientCount
+      });
+    }
+
+    return {
+      binding,
+      session: actualSession,
+      pane: actualPane,
+      runtime_target: binding.runtime_target,
+      hcc_root: hccRoot || null
+    };
+  }
+
+  function killDbProvenTmuxSession(projectCtx, db, peerId, expectedTarget = null) {
+    const plan = safeTmuxKillPlan(projectCtx, db, peerId, expectedTarget);
+    tmuxKillSession(plan.session);
+    return plan;
+  }
+
+  function safeOldTmuxRebindPlan(projectCtx, db, oldPeer, oldTarget, newTarget, actor, opts = {}) {
+    const target = oldTmuxRebindTarget(projectCtx, oldTarget, newTarget);
+    if (!target) return null;
+    const { oldSessionName, newSessionName } = target;
+    const actualPane = tmuxPaneForTarget(oldTarget);
+    if (!actualPane) return null;
+    if (!oldPeer) {
+      throw new CliError('TMUX_REBIND_OLD_PEER_REQUIRED', 'old peer id required for tmux rebind cleanup');
+    }
+    if (db) {
+      const oldBinding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(oldPeer);
+      if (!oldBinding || oldBinding.transport !== 'tmux' || oldBinding.runtime_target !== oldTarget) {
+        addRebindCleanupFailedEvent(db, actor, {
+          reason: 'old_binding_runtime_target_changed',
+          old_peer: oldPeer,
+          old_runtime_target: oldTarget,
+          new_runtime_target: newTarget,
+          current_runtime_target: oldBinding?.runtime_target || null,
+          old_tmux_session: oldSessionName,
+          new_tmux_session: newSessionName || null
+        });
+        throw new CliError('TMUX_REBIND_OLD_TARGET_CHANGED', `tmux runtime target for ${oldPeer} changed before rebind cleanup`, {
+          old_peer: oldPeer,
+          expected_runtime_target: oldTarget,
+          runtime_target: oldBinding?.runtime_target || null
+        });
+      }
+    }
+    const expectedSession = tmuxManagedSessionName(projectCtx, oldPeer);
+    const allowedSession = opts.allowedSessionName || null;
+    if (oldSessionName !== expectedSession && oldSessionName !== allowedSession) {
+      addRebindCleanupFailedEvent(db, actor, {
+        reason: 'not_hcc_managed_peer_session',
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        expected_tmux_session: expectedSession,
+        allowed_tmux_session: allowedSession,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null
+      });
+      throw new CliError('TMUX_REBIND_NOT_HCC_MANAGED', `Refusing to rebind-cleanup non-managed tmux session ${oldSessionName}`, {
+        old_peer: oldPeer,
+        expected_session: expectedSession,
+        allowed_session: allowedSession,
+        actual_session: oldSessionName,
+        runtime_target: oldTarget
+      });
+    }
+    const hccRoot = tmuxSessionEnvironmentValue(oldSessionName, 'HCC_ROOT');
+    if (hccRoot && path.resolve(hccRoot) !== path.resolve(projectCtx.root)) {
+      addRebindCleanupFailedEvent(db, actor, {
+        reason: 'hcc_root_mismatch',
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null,
+        hcc_root: hccRoot,
+        root: projectCtx.root
+      });
+      throw new CliError('TMUX_REBIND_ROOT_MISMATCH', `Refusing to rebind-cleanup tmux session ${oldSessionName} for a different HCC_ROOT`, {
+        old_peer: oldPeer,
+        tmux_session: oldSessionName,
+        hcc_root: hccRoot,
+        root: projectCtx.root
+      });
+    }
+    const webClientCount = openClientCountForPane(projectCtx, oldTarget);
+    const tmuxClientCount = tmuxSessionClientCount(oldSessionName);
+    if ((webClientCount > 0 || tmuxClientCount > 0) && !opts.force) {
+      addRebindCleanupFailedEvent(db, actor, {
+        reason: 'has_clients',
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null,
+        web_client_count: webClientCount,
+        tmux_client_count: tmuxClientCount
+      });
+      throw new CliError('TMUX_REBIND_OLD_SESSION_IN_USE',
+        `Old tmux session ${oldSessionName} still has clients; detach clients or run ${CLI_NAME} tmux gc later.`,
+        {
+          old_runtime_target: oldTarget,
+          new_runtime_target: newTarget,
+          old_tmux_session: oldSessionName,
+          web_client_count: webClientCount,
+          tmux_client_count: tmuxClientCount
+        });
+    }
+    if (db) {
+      addEvent(db, 'tmux.session.rebind_cleanup_pending', actor, null, {
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null,
+        expected_tmux_session: expectedSession,
+        allowed_tmux_session: allowedSession,
+        hcc_root: hccRoot || null
+      });
+    }
+    return {
+      oldPeer,
+      oldTarget,
+      newTarget,
+      oldSessionName,
+      newSessionName,
+      oldPane: actualPane,
+      expectedSession,
+      allowedSession,
+      hccRoot: hccRoot || null,
+      webClientCount,
+      tmuxClientCount,
+      force: Boolean(opts.force)
+    };
+  }
+
+  function assertOldTmuxCanRebind(projectCtx, oldPeer, oldTarget, newTarget, actor, db = null, opts = {}) {
+    return safeOldTmuxRebindPlan(projectCtx, db, oldPeer, oldTarget, newTarget, actor, opts);
+  }
+
+  function killOldTmuxForRebind(projectCtx, plan, actor, db = null) {
+    if (!plan) return false;
+    const {
+      oldPeer,
+      oldTarget,
+      newTarget,
+      oldSessionName,
+      newSessionName,
+      webClientCount,
+      tmuxClientCount
+    } = plan;
+    const force = Boolean(plan.force);
+    let latestWebClientCount = webClientCount;
+    let latestTmuxClientCount = tmuxClientCount;
+
+    try {
+      const currentSession = tmuxSessionNameForPane(oldTarget);
+      const currentPane = tmuxPaneForTarget(oldTarget);
+      if (currentSession !== oldSessionName || currentPane !== plan.oldPane) {
+        throw new CliError('TMUX_REBIND_OLD_TARGET_CHANGED', `tmux runtime target for ${oldPeer} changed during rebind cleanup`, {
+          old_peer: oldPeer,
+          expected_runtime_target: oldTarget,
+          expected_tmux_session: oldSessionName,
+          runtime_target: currentPane,
+          tmux_session: currentSession
+        });
+      }
+      const hccRoot = tmuxSessionEnvironmentValue(oldSessionName, 'HCC_ROOT');
+      if (hccRoot && path.resolve(hccRoot) !== path.resolve(projectCtx.root)) {
+        throw new CliError('TMUX_REBIND_ROOT_MISMATCH', `Refusing to rebind-cleanup tmux session ${oldSessionName} for a different HCC_ROOT`, {
+          old_peer: oldPeer,
+          tmux_session: oldSessionName,
+          hcc_root: hccRoot,
+          root: projectCtx.root
+        });
+      }
+      latestWebClientCount = openClientCountForPane(projectCtx, oldTarget);
+      latestTmuxClientCount = tmuxSessionClientCount(oldSessionName);
+      if ((latestWebClientCount > 0 || latestTmuxClientCount > 0) && !force) {
+        throw new CliError('TMUX_REBIND_OLD_SESSION_IN_USE',
+          `Old tmux session ${oldSessionName} still has clients; detach clients or run ${CLI_NAME} tmux gc later.`,
+          {
+            old_runtime_target: oldTarget,
+            new_runtime_target: newTarget,
+            old_tmux_session: oldSessionName,
+            web_client_count: latestWebClientCount,
+            tmux_client_count: latestTmuxClientCount
+          });
+      }
+      detachRuntimeSessionForPane(projectCtx, oldTarget, 'detached');
+      tmuxKillSession(oldSessionName);
+    } catch (err) {
+      addRebindCleanupFailedEvent(db, actor, {
+        reason: err?.code || 'cleanup_failed',
+        error: err?.message || String(err),
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null,
+        web_client_count: latestWebClientCount,
+        tmux_client_count: latestTmuxClientCount
+      });
+      throw err;
+    }
+    if (db) {
+      addEvent(db, 'tmux.session.rebound', actor, null, {
+        old_peer: oldPeer,
+        old_runtime_target: oldTarget,
+        new_runtime_target: newTarget,
+        old_tmux_session: oldSessionName,
+        new_tmux_session: newSessionName || null
+      });
+    }
+    return true;
+  }
+
+  function providerSessionBindingMatches(a, b) {
+    if (!a || !b || a.provider !== b.provider) return false;
+    if (b.provider_session_id) return a.provider_session_id === b.provider_session_id;
+    if (b.provider_session_name) return a.provider_session_name === b.provider_session_name;
+    return false;
+  }
+
   function attachTmuxSession(input) {
     const pctx = input.projectCtx || ctx;
     const id = input.id;
@@ -2277,6 +2904,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     };
     sessions.set(key, session);
     startTmuxStream(session);
+    let rebindOldTarget = null;
+    let rebindOldPeer = null;
+    let rebindOldPlan = null;
 
     // Detect pane death (retry 3 times before detaching — handles Ctrl+C transient states)
     let deadCount = 0;
@@ -2305,7 +2935,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         capabilities: 'tmux'
       });
       const binding = input.binding || {};
-      const canonical = upsertCanonicalPeerBinding(db, {
+      const nextBinding = {
         peer: id,
         provider: binding.provider || kind,
         provider_session_id: binding.provider_session_id || null,
@@ -2316,11 +2946,60 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         transport: 'tmux',
         runtime_session_id: id,
         runtime_target: info.pane
-      }, Boolean(input.force));
+      };
+      if (input.rebindOldTmux && !input.skipProviderRebindCleanup && (nextBinding.provider_session_id || nextBinding.provider_session_name)) {
+        const existingPeerBinding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(id);
+        const conflictBinding = findProviderSessionBinding(db, nextBinding);
+        const oldBinding = [existingPeerBinding, conflictBinding]
+          .filter((row) => providerSessionBindingMatches(row, nextBinding))
+          .find((row) => row?.transport === 'tmux' && row.runtime_target && row.runtime_target !== info.pane);
+        if (oldBinding) {
+          rebindOldTarget = oldBinding.runtime_target;
+          rebindOldPeer = oldBinding.peer;
+          rebindOldPlan = assertOldTmuxCanRebind(pctx, rebindOldPeer, rebindOldTarget, info.pane, id, db, {
+            force: Boolean(input.providerForce)
+          });
+        }
+      }
+      const providerForce = Boolean(input.providerForce);
+      const canonical = upsertCanonicalPeerBinding(db, nextBinding, providerForce, {
+        override: Boolean(input.rebindOldTmux && providerForce)
+      });
       session.peerId = canonical.peer;
+      session.binding = { ...canonical.binding };
       addEvent(db, 'tmux.session.attached', id, null, { pane: info.pane, command, cwd, pid: info.pid });
+    } catch (err) {
+      stopTmuxStream(session);
+      if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
+      sessions.delete(key);
+      throw err;
     } finally {
       db.close();
+    }
+    if (rebindOldTarget) {
+      try {
+        const eventDb = connect(pctx);
+        try {
+          killOldTmuxForRebind(pctx, rebindOldPlan, session.peerId || id, eventDb);
+          if (rebindOldPeer && rebindOldPeer !== id) {
+            addEvent(eventDb, 'provider.session.rebound', session.peerId || id, null, {
+              from_peer: rebindOldPeer,
+              to_peer: id,
+              old_runtime_target: rebindOldTarget,
+              new_runtime_target: info.pane
+            });
+          }
+        } finally {
+          eventDb.close();
+        }
+      } catch (err) {
+        session.warning = {
+          code: err?.code || 'TMUX_REBIND_CLEANUP_FAILED',
+          message: err?.message || String(err),
+          old_peer: rebindOldPeer,
+          old_runtime_target: rebindOldTarget
+        };
+      }
     }
     return session;
   }
@@ -2388,6 +3067,17 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     env[LAUNCH_FINGERPRINT_ENV] = launchFingerprint({ command, cwd, env });
     let hasSession = tmuxHasSession(sessionName);
     const relaunchableProvider = isRelaunchableProviderSession(kind, command, input.binding || {});
+    const oldTmuxTargetsForRebind = [];
+    const parkedOldTmuxSessions = [];
+    let createdTmuxSession = false;
+
+    function restoreParkedOldTmuxSessions() {
+      for (const parked of [...parkedOldTmuxSessions].reverse()) {
+        if (!tmuxHasSession(parked.parkedName)) continue;
+        if (tmuxHasSession(parked.originalName)) continue;
+        try { runTmux(['rename-session', '-t', parked.parkedName, parked.originalName]); } catch {}
+      }
+    }
 
     function restartExistingTmuxSession(reason) {
       const existing = getSession(pctx, id);
@@ -2406,12 +3096,38 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             reason
           });
       }
-      if (existing) detachTmuxSession(existing, 'detached');
-      tmuxKillSession(sessionName);
+      let oldTarget = null;
+      try {
+        oldTarget = tmuxPaneInfo(paneTarget).pane;
+      } catch {}
+      const parkedName = `${sessionName}-old-${Date.now().toString(36)}`.slice(0, 80);
+      try {
+        runTmux(['rename-session', '-t', sessionName, parkedName]);
+      } catch (err) {
+        throw new CliError('TMUX_REBIND_PREPARE_FAILED', `Could not park old tmux session ${sessionName} before rebind: ${err.message}`, {
+          peer: id,
+          tmux_session: sessionName,
+          reason
+        });
+      }
+      parkedOldTmuxSessions.push({ oldTarget, originalName: sessionName, parkedName });
+      if (oldTarget) oldTmuxTargetsForRebind.push({ oldPeer: id, oldTarget, allowedSessionName: parkedName });
+      if (existing) {
+        oldTarget = oldTarget || existing.pane || null;
+        stopTmuxStream(existing);
+        if (existing.exitPoller) { clearInterval(existing.exitPoller); existing.exitPoller = null; }
+        existing.status = 'detached';
+        existing.exitedAt = now();
+        sessions.delete(sessionKey(pctx, existing.id));
+      }
       hasSession = false;
       const db = connect(pctx);
       try {
-        addEvent(db, 'tmux.session.restarted', id, null, { reason });
+        addEvent(db, 'tmux.session.restarted', id, null, {
+          reason,
+          old_runtime_target: oldTarget,
+          old_tmux_session: parkedName
+        });
       } finally {
         db.close();
       }
@@ -2436,33 +3152,80 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }
 
-    if (!hasSession) {
-      const shell = callerEnv.SHELL || process.env.SHELL || 'bash';
-      const launch = shellCommand([...isolatedEnvCommandArgs(env), shell, '-c', command]);
-      const tmuxEnv = { [LAUNCH_FINGERPRINT_ENV]: env[LAUNCH_FINGERPRINT_ENV] };
-      if (relaunchableProvider) tmuxEnv[PROVIDER_STATE_ENV] = 'starting';
-      runTmux(['new-session', '-d', '-s', sessionName, '-c', cwd, ...tmuxEnvironmentArgs(tmuxEnv), launch]);
-    }
+    let session;
+    let pane = null;
+    try {
+      if (!hasSession) {
+        const shell = callerEnv.SHELL || process.env.SHELL || 'bash';
+        const launch = shellCommand([...isolatedEnvCommandArgs(env), shell, '-c', command]);
+        const tmuxEnv = {
+          HCC_ROOT: pctx.root,
+          HCC_DB: pctx.dbPath,
+          [LAUNCH_FINGERPRINT_ENV]: env[LAUNCH_FINGERPRINT_ENV]
+        };
+        if (relaunchableProvider) tmuxEnv[PROVIDER_STATE_ENV] = 'starting';
+        runTmux(['new-session', '-d', '-s', sessionName, '-c', cwd, ...tmuxEnvironmentArgs(tmuxEnv), launch]);
+        createdTmuxSession = true;
+      }
 
-    const pane = tmuxPaneInfo(paneTarget).pane;
-    return attachTmuxSession({
-      ...input,
-      id,
-      kind,
-      role,
-      cwd,
-      command,
-      pane,
-      projectCtx: pctx,
-      binding: {
-        ...(input.binding || {}),
-        command: input.binding?.command || command,
-        transport: 'tmux',
-        runtime_session_id: id,
-        runtime_target: pane
-      },
-      force: true
-    });
+      pane = tmuxPaneInfo(paneTarget).pane;
+      for (const oldInfo of oldTmuxTargetsForRebind) {
+        const eventDb = connect(pctx);
+        try {
+          oldInfo.plan = assertOldTmuxCanRebind(pctx, oldInfo.oldPeer, oldInfo.oldTarget, pane, id, eventDb, {
+            force: Boolean(input.providerForce),
+            allowedSessionName: oldInfo.allowedSessionName || null
+          });
+        } finally {
+          eventDb.close();
+        }
+      }
+      session = attachTmuxSession({
+        ...input,
+        id,
+        kind,
+        role,
+        cwd,
+        command,
+        pane,
+        projectCtx: pctx,
+        binding: {
+          ...(input.binding || {}),
+          command: input.binding?.command || command,
+          transport: 'tmux',
+          runtime_session_id: id,
+          runtime_target: pane
+        },
+        providerForce: Boolean(input.providerForce),
+        rebindOldTmux: true,
+        skipProviderRebindCleanup: oldTmuxTargetsForRebind.length > 0,
+        force: true
+      });
+    } catch (err) {
+      if (createdTmuxSession) {
+        try { tmuxKillSession(sessionName); } catch {}
+      }
+      restoreParkedOldTmuxSessions();
+      throw err;
+    }
+    for (const oldInfo of oldTmuxTargetsForRebind) {
+      try {
+        const eventDb = connect(pctx);
+        try {
+          killOldTmuxForRebind(pctx, oldInfo.plan, session.peerId || id, eventDb);
+        } finally {
+          eventDb.close();
+        }
+      } catch (err) {
+        session.warning = {
+          code: err?.code || 'TMUX_REBIND_CLEANUP_FAILED',
+          message: err?.message || String(err),
+          old_peer: oldInfo.oldPeer,
+          old_runtime_target: oldInfo.oldTarget
+        };
+      }
+    }
+    return session;
   }
 
   function restoreTmuxManagedSessions(projectCtx = ctx) {
@@ -2578,6 +3341,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         runtime_session_id: id
       }, Boolean(input.force));
       session.peerId = canonical.peer;
+      session.binding = { ...canonical.binding };
       addEvent(db, 'web.session.started', id, null, { command, cwd, pid: child.pid });
     } finally {
       db.close();
@@ -2658,8 +3422,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return startTmuxManagedSession(normalized);
   }
 
+  const restoredTmuxDbs = new Set();
   for (const projectCtx of projectContexts.values()) {
+    const dbKey = path.resolve(projectCtx.dbPath);
+    if (restoredTmuxDbs.has(dbKey)) continue;
+    restoredTmuxDbs.add(dbKey);
     restoreTmuxManagedSessions(projectCtx);
+    reconcileRunningBindings(projectCtx);
   }
 
   const server = http.createServer(async (req, res) => {
@@ -2752,9 +3521,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             SELECT id, kind, role, status, worktree, branch, pid, capabilities,
                    created_at, last_seen_at, (? - last_seen_at) AS age_sec
             FROM peers
+            WHERE status != 'exited' AND last_seen_at >= ?
             ORDER BY last_seen_at DESC, id ASC
             LIMIT 100
-          `).all(t);
+          `).all(t, t - DETECTED_PEER_MAX_AGE);
           for (const session of sessionsForProject(reqCtx)) {
             managedIds.add(session.id);
             const peerId = resolveSessionPeerId(db, session);
@@ -2903,15 +3673,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           } else if (session.type === 'tmux') {
             let input = {};
             try { input = await readJsonRequest(req); } catch {}
-            detachTmuxSession(session, 'detached');
-            if (input.kill_tmux) {
-              try {
-                const sessName = runTmux(['display-message', '-p', '-t', session.pane, '#{session_name}']).trim();
-                if (sessName) tmuxKillSession(sessName);
-              } catch {
-                // Pane or session already gone; no fallback needed.
+            let killPlan = null;
+            const stopDb = connect(reqCtx);
+            try {
+              const peerId = resolveSessionPeerId(stopDb, session) || session.peerId || session.id;
+              if (input.kill_tmux) {
+                killPlan = safeTmuxKillPlan(reqCtx, stopDb, peerId, session.pane || null);
               }
+            } finally {
+              stopDb.close();
             }
+            if (killPlan) tmuxKillSession(killPlan.session);
+            detachTmuxSession(session, 'detached');
           } else {
             session.pty.kill();
           }
@@ -2946,18 +3719,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const db = connect(reqCtx);
         try {
           const now_ = now();
-          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now_, peerId);
-          const binding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(peerId);
-          if (binding && input.kill_tmux && binding.runtime_target) {
-            try {
-              const sessName = runTmux(['display-message', '-p', '-t', binding.runtime_target, '#{session_name}']).trim();
-              if (sessName) tmuxKillSession(sessName);
-            } catch {
-              // Session already gone.
-            }
+          let killPlan = null;
+          if (input.kill_tmux) {
+            killPlan = killDbProvenTmuxSession(reqCtx, db, peerId);
           }
+          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now_, peerId);
           db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now_, peerId);
-          addEvent(db, 'peer.stopped', 'web', null, { peer: peerId });
+          addEvent(db, 'peer.stopped', 'web', null, {
+            peer: peerId,
+            kill_tmux: Boolean(killPlan),
+            tmux_session: killPlan?.session || null,
+            runtime_target: killPlan?.runtime_target || null
+          });
         } finally {
           db.close();
         }
@@ -3433,6 +4206,14 @@ async function cmdHook(ctx, args) {
       });
     }
     addEvent(db, `hook.${hookKey}`, peerId, null, { session_id: sessionId, cwd: hookCwd });
+    try {
+      reconcileRunningPeerBindings(db, hookCtx, {
+        inspectProcess: inspectProviderProcess,
+        latestProviderSessionForPeer: (peer) => latestHookProviderSession(db, peer),
+        addEvent,
+        now
+      });
+    } catch {}
 
     if (['sessionstart', 'userpromptsubmit'].includes(hookKey)) {
       const snapshot = buildHookCoordinationContext(db, hookCtx, peerId);
@@ -3758,6 +4539,332 @@ async function cmdScan(ctx, args) {
   });
 }
 
+// ─── hcc tmux ────────────────────────────────────────────────────────────────
+
+function tmuxSessionNameForTarget(target) {
+  if (!target) return null;
+  try {
+    return runTmux(['display-message', '-p', '-t', target, '#{session_name}']).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function tmuxPaneForTarget(target) {
+  if (!target) return null;
+  try {
+    return runTmux(['display-message', '-p', '-t', target, '#{pane_id}']).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function tmuxSessionClientCount(sessionName) {
+  if (!sessionName) return 0;
+  try {
+    const output = runTmux(['list-clients', '-t', sessionName, '-F', '#{client_tty}']);
+    return output.trim().split('\n').filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function managedRuntimeSessions(ctx) {
+  try {
+    const runtime = readRuntime(ctx);
+    const data = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
+    return data.sessions || [];
+  } catch {
+    return [];
+  }
+}
+
+async function planTmuxGc(ctx, opts) {
+  ensureTmuxAvailable({ autoInstall: false });
+  const olderThanDays = intOpt(opts, 'older-than', 14);
+  if (olderThanDays < 0) throw new CliError('BAD_ARGS', '--older-than must be zero or greater');
+  const targetPeer = opts.peer || null;
+  const cutoff = now() - olderThanDays * 86400;
+  const runtimeSessions = await managedRuntimeSessions(ctx);
+  const managedPanes = new Set(runtimeSessions.map((s) => s.pane).filter(Boolean));
+  const managedPeers = new Set();
+  for (const session of runtimeSessions) {
+    if (session.id) managedPeers.add(session.id);
+    if (session.peer_id) managedPeers.add(session.peer_id);
+  }
+
+  const db = connect(ctx);
+  let rows = [];
+  let cleanupFailureRows = [];
+  try {
+    rows = db.prepare(`
+      SELECT p.id AS peer, p.kind, p.status, p.last_seen_at,
+             b.provider, b.provider_session_id, b.provider_session_name,
+             b.resume_mode, b.resume_arg, b.command, b.transport,
+             b.runtime_session_id, b.runtime_target, b.updated_at
+      FROM peer_bindings b
+      JOIN peers p ON p.id = b.peer
+      WHERE b.transport = 'tmux'
+        AND b.runtime_target IS NOT NULL
+      ORDER BY b.updated_at ASC, p.last_seen_at ASC, p.id ASC
+    `).all();
+    cleanupFailureRows = db.prepare(`
+      SELECT actor AS peer, type, created_at,
+             json_extract(payload, '$.old_peer') AS old_peer,
+             json_extract(payload, '$.old_tmux_session') AS old_tmux_session,
+             json_extract(payload, '$.old_runtime_target') AS old_runtime_target,
+             json_extract(payload, '$.new_runtime_target') AS new_runtime_target,
+             json_extract(payload, '$.reason') AS cleanup_reason
+      FROM events
+      WHERE type IN ('tmux.session.rebind_cleanup_failed', 'tmux.session.rebind_cleanup_pending')
+        AND created_at < ?
+      ORDER BY created_at ASC, id ASC
+    `).all(cutoff);
+  } finally {
+    db.close();
+  }
+
+  const seenSessions = new Set();
+  const candidates = [];
+  const skipped = [];
+  for (const row of rows) {
+    if (targetPeer && row.peer !== targetPeer) continue;
+    const expectedSession = tmuxManagedSessionName(ctx, row.peer);
+    const actualSession = tmuxSessionNameForTarget(row.runtime_target);
+    const actualPane = tmuxPaneForTarget(row.runtime_target);
+    const ageSeconds = Math.max(0, now() - Math.max(Number(row.last_seen_at || 0), Number(row.updated_at || 0)));
+    const base = {
+      peer: row.peer,
+      kind: row.kind || '',
+      provider: row.provider,
+      session: actualSession || expectedSession,
+      expected_session: expectedSession,
+      pane: actualPane || row.runtime_target,
+      runtime_target: row.runtime_target,
+      runtime_session_id: row.runtime_session_id || null,
+      last_seen_at: row.last_seen_at || null,
+      updated_at: row.updated_at || null,
+      age_days: Math.floor(ageSeconds / 86400)
+    };
+    const skip = (reason, extra = {}) => skipped.push({ ...base, reason, ...extra });
+
+    if (!actualSession || !actualPane) {
+      skip('tmux_target_missing');
+      continue;
+    }
+    if (actualSession !== expectedSession) {
+      skip('not_hcc_managed_name');
+      continue;
+    }
+    const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');
+    if (hccRoot && path.resolve(hccRoot) !== path.resolve(ctx.root)) {
+      skip('hcc_root_mismatch', { hcc_root: hccRoot });
+      continue;
+    }
+    if (seenSessions.has(actualSession)) {
+      skip('duplicate_db_binding');
+      continue;
+    }
+    seenSessions.add(actualSession);
+    if (managedPanes.has(actualPane) || managedPanes.has(row.runtime_target) || managedPeers.has(row.peer) || managedPeers.has(row.runtime_session_id)) {
+      skip('runtime_managed');
+      continue;
+    }
+    const clientCount = tmuxSessionClientCount(actualSession);
+    if (clientCount > 0) {
+      skip('has_tmux_clients', { client_count: clientCount });
+      continue;
+    }
+    if (Math.max(Number(row.last_seen_at || 0), Number(row.updated_at || 0)) >= cutoff) {
+      skip('not_old_enough');
+      continue;
+    }
+    candidates.push({
+      ...base,
+      source: 'binding',
+      reason: 'stale_hcc_managed_session',
+      hcc_root: hccRoot || null,
+      client_count: clientCount
+    });
+  }
+  for (const row of cleanupFailureRows) {
+    const rowPeer = row.old_peer || row.peer || '';
+    if (targetPeer && rowPeer !== targetPeer) continue;
+    const expectedSession = row.old_tmux_session || null;
+    const actualSession = tmuxSessionNameForTarget(row.old_runtime_target);
+    const actualPane = tmuxPaneForTarget(row.old_runtime_target);
+    const ageSeconds = Math.max(0, now() - Number(row.created_at || 0));
+    const base = {
+      peer: rowPeer,
+      kind: '',
+      provider: '',
+      session: actualSession || expectedSession || '',
+      expected_session: expectedSession || '',
+      pane: actualPane || row.old_runtime_target || '',
+      runtime_target: row.old_runtime_target || null,
+      last_seen_at: null,
+      updated_at: row.created_at || null,
+      age_days: Math.floor(ageSeconds / 86400),
+      cleanup_reason: row.cleanup_reason || null
+    };
+    const skip = (reason, extra = {}) => skipped.push({ ...base, reason, ...extra });
+
+    if (!expectedSession || !actualSession || !actualPane) {
+      skip('tmux_target_missing');
+      continue;
+    }
+    if (actualSession !== expectedSession) {
+      skip('old_runtime_target_changed', { actual_session: actualSession });
+      continue;
+    }
+    if (!isProjectManagedTmuxSession(ctx, expectedSession)) {
+      skip('not_hcc_managed_name');
+      continue;
+    }
+    const hccRoot = tmuxSessionEnvironmentValue(expectedSession, 'HCC_ROOT');
+    if (hccRoot && path.resolve(hccRoot) !== path.resolve(ctx.root)) {
+      skip('hcc_root_mismatch', { hcc_root: hccRoot });
+      continue;
+    }
+    if (seenSessions.has(expectedSession)) {
+      skip('duplicate_db_binding');
+      continue;
+    }
+    seenSessions.add(expectedSession);
+    if (managedPanes.has(actualPane) || managedPanes.has(row.old_runtime_target)) {
+      skip('runtime_managed');
+      continue;
+    }
+    const clientCount = tmuxSessionClientCount(expectedSession);
+    if (clientCount > 0) {
+      skip('has_tmux_clients', { client_count: clientCount });
+      continue;
+    }
+    candidates.push({
+      ...base,
+      source: row.type === 'tmux.session.rebind_cleanup_pending' ? 'rebind_cleanup_pending' : 'rebind_cleanup_failed',
+      reason: row.type === 'tmux.session.rebind_cleanup_pending'
+        ? 'stale_rebind_cleanup_pending_session'
+        : 'stale_rebind_cleanup_failed_session',
+      session: expectedSession,
+      hcc_root: hccRoot || null,
+      client_count: clientCount
+    });
+  }
+  return { older_than_days: olderThanDays, cutoff, peer: targetPeer, candidates, skipped };
+}
+
+function validateTmuxGcCandidate(ctx, candidate, runtimeSessions = []) {
+  const target = candidate.runtime_target || candidate.session || '';
+  const actualSession = tmuxSessionNameForTarget(target);
+  const actualPane = tmuxPaneForTarget(target);
+  const skip = (reason, extra = {}) => ({ ok: false, reason, ...extra });
+  if (!candidate.session || !actualSession || !actualPane) return skip('tmux_target_missing');
+  if (actualSession !== candidate.session) {
+    return skip('tmux_target_changed', { session: actualSession, pane: actualPane });
+  }
+  if (!isProjectManagedTmuxSession(ctx, actualSession)) return skip('not_hcc_managed_name');
+  const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');
+  if (hccRoot && path.resolve(hccRoot) !== path.resolve(ctx.root)) {
+    return skip('hcc_root_mismatch', { hcc_root: hccRoot });
+  }
+
+  const managedPanes = new Set(runtimeSessions.map((s) => s.pane).filter(Boolean));
+  const managedPeers = new Set();
+  for (const session of runtimeSessions) {
+    if (session.id) managedPeers.add(session.id);
+    if (session.peer_id) managedPeers.add(session.peer_id);
+  }
+  if (managedPanes.has(actualPane) || managedPanes.has(candidate.runtime_target)) {
+    return skip('runtime_managed');
+  }
+  if (candidate.source === 'binding' && (managedPeers.has(candidate.peer) || managedPeers.has(candidate.runtime_session_id))) {
+    return skip('runtime_managed');
+  }
+  const clientCount = tmuxSessionClientCount(actualSession);
+  if (clientCount > 0) return skip('has_tmux_clients', { client_count: clientCount });
+  return {
+    ok: true,
+    session: actualSession,
+    pane: actualPane,
+    hcc_root: hccRoot || null,
+    client_count: clientCount
+  };
+}
+
+async function cmdTmux(ctx, args) {
+  const sub = args[0];
+  if (!sub || wantsHelp(args)) return helpTmux();
+  if (sub !== 'gc') throw new CliError('BAD_ARGS', `Unknown tmux command: ${sub}`);
+
+  const opts = parseOpts(args.slice(1), { booleans: ['yes', 'dry-run'] });
+  validateOpts('tmux gc', opts, ['peer', 'older-than', 'yes', 'dry-run']);
+  if (opts.yes && opts['dry-run']) throw new CliError('BAD_ARGS', 'Use either --yes or --dry-run, not both');
+
+  const dryRun = !opts.yes;
+  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
+  const plan = await planTmuxGc(ctx, opts);
+  const removed = [];
+  if (!dryRun) {
+    const runtimeSessions = await managedRuntimeSessions(ctx);
+    const db = connect(ctx);
+    try {
+      for (const candidate of plan.candidates) {
+        const valid = validateTmuxGcCandidate(ctx, candidate, runtimeSessions);
+        if (!valid.ok) {
+          plan.skipped.push({ ...candidate, reason: valid.reason, revalidated: true });
+          continue;
+        }
+        tmuxKillSession(valid.session);
+        tx(db, () => {
+          const t = now();
+          if (candidate.source === 'binding' && candidate.runtime_target) {
+            db.prepare(`
+              UPDATE peer_bindings
+              SET transport = 'detached',
+                  runtime_target = NULL,
+                  updated_at = ?
+              WHERE peer = ?
+                AND runtime_target = ?
+            `).run(t, candidate.peer, candidate.runtime_target);
+            db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('detached', t, candidate.peer);
+          }
+          addEvent(db, 'tmux.session.gc', actor, null, {
+            peer: candidate.peer,
+            tmux_session: candidate.session,
+            runtime_target: candidate.runtime_target,
+            reason: candidate.reason,
+            older_than_days: plan.older_than_days
+          });
+          removed.push(candidate);
+        });
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  const data = { dry_run: dryRun, older_than_days: plan.older_than_days, peer: plan.peer, candidates: plan.candidates, skipped: plan.skipped, removed };
+  printResult(ctx, data, (r) => {
+    const rows = dryRun ? r.candidates : r.removed;
+    const title = dryRun
+      ? `tmux gc dry-run: ${rows.length} removable hcc-managed session${rows.length === 1 ? '' : 's'}`
+      : `tmux gc removed ${rows.length} hcc-managed session${rows.length === 1 ? '' : 's'}`;
+    if (!rows.length) return `${title}\n  nothing to clean`;
+    return [
+      title,
+      table(rows, [
+        { label: 'peer', value: (row) => row.peer },
+        { label: 'session', value: (row) => row.session },
+        { label: 'pane', value: (row) => row.pane },
+        { label: 'age', value: (row) => `${row.age_days}d` },
+        { label: 'reason', value: (row) => row.reason }
+      ]),
+      dryRun ? 'run again with --yes to delete only these DB-proven hcc-managed tmux sessions' : ''
+    ].filter(Boolean).join('\n');
+  });
+}
+
 // ─── hcc gc ───────────────────────────────────────────────────────────────────
 
 async function cmdGc(ctx, args) {
@@ -3870,6 +4977,7 @@ async function dispatch(ctx, rest) {
   if (command === 'prompt') return cmdPrompt(ctx, args);
   if (command === 'run') return cmdRun(ctx, args);
   if (command === 'peer') return cmdPeer(ctx, args);
+  if (command === 'tmux') return cmdTmux(ctx, args);
   if (command === 'inject') return cmdInject(ctx, args);
   if (command === 'ask') return cmdAsk(ctx, args);
   if (command === 'broadcast') return cmdBroadcast(ctx, args);

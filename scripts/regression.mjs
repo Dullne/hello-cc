@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
@@ -20,6 +21,11 @@ const home = path.join(os.tmpdir(), `hcc-reg-home-${testId}`);
 const fakeBin = path.join(os.tmpdir(), `hcc-reg-bin-${testId}`);
 const outDir = path.join(os.tmpdir(), `hcc-reg-out-${testId}`);
 const tmuxSession = `hcc-reg-${process.pid}`;
+const tmuxSocketName = `hcc-reg-${testId}`.replace(/[^A-Za-z0-9_-]/g, '-');
+const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
+  encoding: 'utf8',
+  stdio: ['ignore', 'pipe', 'ignore']
+}).stdout.trim();
 const port = 22000 + (process.pid % 10000);
 
 let tmuxStarted = false;
@@ -34,6 +40,8 @@ const env = {
 for (const key of Object.keys(env)) {
   if (key.startsWith('HCC_')) delete env[key];
 }
+delete env.TMUX;
+delete env.TMUX_PANE;
 
 function log(message) {
   process.stdout.write(`${message}\n`);
@@ -49,6 +57,19 @@ function commandText(command, args) {
 
 function sh(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function shortHash(value) {
+  return crypto.createHash('sha1').update(String(value)).digest('hex').slice(0, 8);
+}
+
+function sanitizePeerPart(value, fallback = 'peer') {
+  const cleaned = String(value || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned || fallback;
+}
+
+function tmuxManagedSession(projectRoot, peer) {
+  return `hcc-${shortHash(projectRoot)}-${sanitizePeerPart(peer, 'peer')}`.slice(0, 80);
 }
 
 function run(command, args, options = {}) {
@@ -185,6 +206,14 @@ function insertRuntimeTargetBinding(peer, provider, sessionName, runtimeTarget) 
   });
 }
 
+function peerBindingRow(peer) {
+  return withMeshDb((db) => db.prepare(`
+    SELECT peer, transport, runtime_target, updated_at
+    FROM peer_bindings
+    WHERE peer = ?
+  `).get(peer));
+}
+
 function moveRuntimeBindingPeer(fromPeer, toPeer) {
   withMeshDb((db) => {
     const peer = db.prepare('SELECT * FROM peers WHERE id = ?').get(fromPeer);
@@ -270,6 +299,162 @@ function assertPeerBindingUniqueConstraints() {
 
   cleanupBindingPeers(providerPrefix);
   cleanupBindingPeers(runtimePrefix);
+}
+
+async function assertTmuxGcPolicy() {
+  const stalePeer = 'tmux-gc-stale';
+  const peerFilterPeer = 'tmux-gc-peer-filter';
+  const attachedPeer = 'tmux-gc-attached';
+  const eventPeer = 'tmux-gc-event';
+  const reusedEventPeer = 'tmux-gc-event-reused';
+  const manualSession = `hcc-${shortHash(root)}-manual-lookalike`;
+  const staleSession = tmuxManagedSession(root, stalePeer);
+  const peerFilterSession = tmuxManagedSession(root, peerFilterPeer);
+  const attachedSession = tmuxManagedSession(root, attachedPeer);
+  const eventSession = `${tmuxManagedSession(root, eventPeer)}-old-regression`;
+  const reusedEventSession = tmuxManagedSession(root, reusedEventPeer);
+  for (const session of [staleSession, peerFilterSession, attachedSession, eventSession, reusedEventSession, manualSession]) {
+    runMaybe('tmux', ['kill-session', '-t', session]);
+  }
+  cleanupBindingPeers('tmux-gc-');
+  managedTmuxSessions.add(peerFilterSession);
+  managedTmuxSessions.add(attachedSession);
+  managedTmuxSessions.add(eventSession);
+  managedTmuxSessions.add(reusedEventSession);
+  managedTmuxSessions.add(manualSession);
+
+  run('tmux', ['new-session', '-d', '-s', staleSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', peerFilterSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', attachedSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', eventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', reusedEventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', manualSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  const stalePane = run('tmux', ['display-message', '-p', '-t', `${staleSession}:0.0`, '#{pane_id}']).trim();
+  const peerFilterPane = run('tmux', ['display-message', '-p', '-t', `${peerFilterSession}:0.0`, '#{pane_id}']).trim();
+  const attachedPane = run('tmux', ['display-message', '-p', '-t', `${attachedSession}:0.0`, '#{pane_id}']).trim();
+  const eventPane = run('tmux', ['display-message', '-p', '-t', `${eventSession}:0.0`, '#{pane_id}']).trim();
+  const reusedEventPane = run('tmux', ['display-message', '-p', '-t', `${reusedEventSession}:0.0`, '#{pane_id}']).trim();
+  const manualPane = run('tmux', ['display-message', '-p', '-t', `${manualSession}:0.0`, '#{pane_id}']).trim();
+  insertRuntimeTargetBinding(stalePeer, 'shell', 'tmux-gc-stale-session', stalePane);
+  insertRuntimeTargetBinding(peerFilterPeer, 'shell', 'tmux-gc-peer-filter-session', peerFilterPane);
+  insertRuntimeTargetBinding(attachedPeer, 'shell', 'tmux-gc-attached-session', attachedPane);
+  const eventActivePane = parsePane(hcc(['peer', 'start', eventPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
+  const eventActiveSession = run('tmux', ['display-message', '-p', '-t', eventActivePane, '#{session_name}']).trim();
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000) - 30 * 86400;
+    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
+    db.prepare('UPDATE peer_bindings SET updated_at = ? WHERE peer IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(eventPeer, JSON.stringify({
+      reason: 'has_clients',
+      old_peer: eventPeer,
+      old_runtime_target: eventPane,
+      new_runtime_target: eventActivePane,
+      old_tmux_session: eventSession
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(reusedEventPeer, JSON.stringify({
+      reason: 'has_clients',
+      old_peer: reusedEventPeer,
+      old_runtime_target: `%dead-old-${process.pid}`,
+      new_runtime_target: `%new-${process.pid}`,
+      old_tmux_session: reusedEventSession
+    }), t);
+  });
+
+  const client = spawnSync('tmux', ['new-session', '-d', '-s', `${tmuxSession}-gc-client`, '-e', `HCC_ROOT=${root}`, 'sh', '-lc', `unset TMUX; exec tmux attach-session -t ${sh(attachedSession)}`], {
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  if (client.status !== 0) fail(`could not attach client for tmux gc policy test:\n${client.stderr || client.stdout}`);
+  try {
+    await waitFor(() => Boolean(run('tmux', ['list-clients', '-t', attachedSession, '-F', '#{client_tty}']).trim()), 'tmux gc attached-client setup');
+    const dryRun = hcc(['tmux', 'gc', '--older-than', '14']);
+    if (!dryRun.includes(stalePeer) || !dryRun.includes('stale_hcc_managed_session') ||
+        !dryRun.includes(peerFilterPeer) ||
+        !dryRun.includes(eventPeer) || !dryRun.includes('stale_rebind_cleanup_failed_session')) {
+      fail(`tmux gc dry-run did not list stale DB-proven managed session:\n${dryRun}`);
+    }
+    if (dryRun.includes(reusedEventPeer)) {
+      fail(`tmux gc dry-run treated stale event session-name reuse as removable:\n${dryRun}`);
+    }
+    if (runMaybe('tmux', ['has-session', '-t', staleSession]).status !== 0) {
+      fail('tmux gc dry-run deleted stale managed session');
+    }
+    const filteredDryRun = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer]);
+    if (!filteredDryRun.includes(peerFilterPeer) || filteredDryRun.includes(stalePeer) || filteredDryRun.includes(eventPeer)) {
+      fail(`tmux gc --peer dry-run did not filter to requested peer:\n${filteredDryRun}`);
+    }
+    const filteredRemoved = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer, '--yes']);
+    if (!filteredRemoved.includes(peerFilterPeer) || filteredRemoved.includes(stalePeer) || filteredRemoved.includes(eventPeer)) {
+      fail(`tmux gc --peer --yes did not remove only requested peer:\n${filteredRemoved}`);
+    }
+    if (runMaybe('tmux', ['has-session', '-t', peerFilterSession]).status === 0) {
+      fail('tmux gc --peer --yes did not delete requested stale managed session');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', staleSession]).status !== 0 ||
+        runMaybe('tmux', ['has-session', '-t', eventSession]).status !== 0) {
+      fail('tmux gc --peer --yes deleted an unrequested stale managed session');
+    }
+
+    const removed = hcc(['tmux', 'gc', '--older-than', '14', '--yes']);
+    if (!removed.includes(stalePeer) || !removed.includes(eventPeer) || removed.includes(peerFilterPeer) || removed.includes(attachedPeer) || removed.includes(manualPane)) {
+      fail(`tmux gc --yes output wrong:\n${removed}`);
+    }
+    if (runMaybe('tmux', ['has-session', '-t', staleSession]).status === 0) {
+      fail('tmux gc --yes did not delete stale DB-proven managed session');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', eventSession]).status === 0) {
+      fail('tmux gc --yes did not delete stale rebind cleanup-failed session');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', eventActiveSession]).status !== 0) {
+      fail('tmux gc deleted the active replacement session for the same peer');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', reusedEventSession]).status !== 0) {
+      fail('tmux gc deleted a same-name session whose old runtime target no longer matched');
+    }
+    if (run('tmux', ['display-message', '-p', '-t', `${reusedEventSession}:0.0`, '#{pane_id}']).trim() !== reusedEventPane) {
+      fail('tmux gc touched the wrong same-name rebind cleanup session');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', attachedSession]).status !== 0) {
+      fail('tmux gc deleted managed session with attached tmux client');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', manualSession]).status !== 0) {
+      fail('tmux gc deleted manual lookalike tmux session without DB binding');
+    }
+    const staleBinding = peerBindingRow(stalePeer);
+    if (!staleBinding || staleBinding.transport !== 'detached' || staleBinding.runtime_target !== null) {
+      fail(`tmux gc did not detach deleted binding:\n${JSON.stringify(staleBinding, null, 2)}`);
+    }
+    const peerFilterBinding = peerBindingRow(peerFilterPeer);
+    if (!peerFilterBinding || peerFilterBinding.transport !== 'detached' || peerFilterBinding.runtime_target !== null) {
+      fail(`tmux gc --peer did not detach requested deleted binding:\n${JSON.stringify(peerFilterBinding, null, 2)}`);
+    }
+    const attachedBinding = peerBindingRow(attachedPeer);
+    if (!attachedBinding || attachedBinding.runtime_target !== attachedPane) {
+      fail(`tmux gc changed attached-client binding:\n${JSON.stringify(attachedBinding, null, 2)}`);
+    }
+    const eventBinding = peerBindingRow(eventPeer);
+    if (!eventBinding || eventBinding.runtime_target !== eventActivePane) {
+      fail(`tmux gc changed active replacement binding for event-backed stale session:\n${JSON.stringify(eventBinding, null, 2)}`);
+    }
+  } finally {
+    hccMaybe(['peer', 'stop', eventPeer, '--kill-tmux']);
+    runMaybe('tmux', ['kill-session', '-t', `${tmuxSession}-gc-client`]);
+    runMaybe('tmux', ['kill-session', '-t', peerFilterSession]);
+    runMaybe('tmux', ['kill-session', '-t', attachedSession]);
+    runMaybe('tmux', ['kill-session', '-t', eventSession]);
+    runMaybe('tmux', ['kill-session', '-t', reusedEventSession]);
+    runMaybe('tmux', ['kill-session', '-t', eventActiveSession]);
+    runMaybe('tmux', ['kill-session', '-t', manualSession]);
+    runMaybe('tmux', ['kill-session', '-t', staleSession]);
+    cleanupBindingPeers('tmux-gc-');
+  }
 }
 
 function createLegacyBindingDb(dbPath) {
@@ -594,6 +779,26 @@ function trackTmuxPane(pane) {
   if (result.status === 0) managedTmuxSessions.add(result.stdout.trim());
 }
 
+function tmuxEnvironmentValue(session, key) {
+  const result = runMaybe('tmux', ['show-environment', '-t', session, key]);
+  if (result.status !== 0) return null;
+  const line = (result.stdout || '').trim();
+  const prefix = `${key}=`;
+  return line.startsWith(prefix) ? line.slice(prefix.length) : null;
+}
+
+function assertHccManagedTmuxEnv(pane, expectedRoot = root) {
+  const session = run('tmux', ['display-message', '-p', '-t', pane, '#{session_name}']).trim();
+  const hccRoot = tmuxEnvironmentValue(session, 'HCC_ROOT');
+  const hccDb = tmuxEnvironmentValue(session, 'HCC_DB');
+  const expectedDb = path.join(expectedRoot, '.hello-cc', 'mesh.db');
+  if (path.resolve(hccRoot || '') !== path.resolve(expectedRoot) ||
+      path.resolve(hccDb || '') !== path.resolve(expectedDb)) {
+    fail(`hcc-managed tmux session missing root/db markers: ${session} HCC_ROOT=${hccRoot} HCC_DB=${hccDb}`);
+  }
+  return session;
+}
+
 function parsePane(output) {
   const match = String(output).match(/\bpane=(%\d+)/);
   if (!match) fail(`cannot parse tmux pane from:\n${output}`);
@@ -890,6 +1095,10 @@ async function expectBoundedTmuxStream(label) {
 
 function writeFakeTools() {
   fs.mkdirSync(fakeBin, { recursive: true });
+  if (realTmuxBin) {
+    const tmuxWrapper = path.join(fakeBin, 'tmux');
+    fs.writeFileSync(tmuxWrapper, `#!/usr/bin/env bash\nexec ${sh(realTmuxBin)} -L ${sh(tmuxSocketName)} "$@"\n`, { mode: 0o755 });
+  }
   for (const name of ['claude', 'codex']) {
     const file = path.join(fakeBin, name);
     fs.writeFileSync(file, `#!/usr/bin/env bash\necho fake-${name} "$@"\nif [ -n "\${HCC_FAKE_LOG:-}" ]; then echo fake-${name} "$@" >> "$HCC_FAKE_LOG"; fi\nif [ "\${HCC_FAKE_STAY_ALIVE:-}" = "1" ]; then exec bash --noprofile --norc; fi\n`, { mode: 0o755 });
@@ -935,6 +1144,9 @@ function cleanup() {
   }
   for (const session of managedTmuxSessions) {
     runMaybe('tmux', ['kill-session', '-t', session]);
+  }
+  if (fs.existsSync(path.join(fakeBin, 'tmux'))) {
+    runMaybe('tmux', ['kill-server']);
   }
   for (const dir of [root, home, fakeBin, outDir]) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
@@ -1689,6 +1901,11 @@ async function multiProjectWebWorkflow() {
   if (!(otherSessions.sessions || []).some((s) => s.id === 'other-shell')) {
     fail(`second project API did not see its session:\n${JSON.stringify(otherSessions)}`);
   }
+  const otherShellSession = (otherSessions.sessions || []).find((s) => s.id === 'other-shell');
+  if (!otherShellSession?.binding || otherShellSession.binding.runtime_target !== otherShellSession.pane ||
+      otherShellSession.provider_session_known !== false || otherShellSession.provider_session_label !== null) {
+    fail(`sessions API did not expose unknown provider binding without marking it shared/known:\n${JSON.stringify(otherShellSession, null, 2)}`);
+  }
 
   hcc(['register', '--peer', 'web-action-peer', '--kind', 'codex', '--role', 'peer']);
   hcc(['msg', 'send', '--from', 'human', '--to', 'web-action-peer', '--body', 'web action inbox ok']);
@@ -1755,6 +1972,9 @@ async function multiProjectWebWorkflow() {
   if (claudeResume.id !== expectedClaudePeer || claudeResume.peer_id !== expectedClaudePeer) {
     fail(`web claude resume did not use canonical provider peer id ${expectedClaudePeer}:\n${JSON.stringify(claudeResume, null, 2)}`);
   }
+  if (!claudeResume.binding || !claudeResume.provider_session_known || claudeResume.provider_session_label !== claudeResumeName) {
+    fail(`web claude resume session response did not include known provider binding:\n${JSON.stringify(claudeResume, null, 2)}`);
+  }
   const claudeRows = providerBindingRows('claude', claudeResumeName);
   if (claudeRows.length !== 1 ||
       claudeRows[0].peer !== claudeResume.peer_id ||
@@ -1774,6 +1994,9 @@ async function multiProjectWebWorkflow() {
   }
   if (codexResume.id !== expectedCodexPeer || codexResume.peer_id !== expectedCodexPeer) {
     fail(`web codex resume did not use canonical provider peer id ${expectedCodexPeer}:\n${JSON.stringify(codexResume, null, 2)}`);
+  }
+  if (!codexResume.binding || !codexResume.provider_session_known || codexResume.provider_session_label !== codexResumeName) {
+    fail(`web codex resume session response did not include known provider binding:\n${JSON.stringify(codexResume, null, 2)}`);
   }
   const codexRows = providerBindingRows('codex', codexResumeName);
   if (codexRows.length !== 1 ||
@@ -1854,6 +2077,7 @@ async function tmuxBackedStartWorkflow() {
   const file = path.join(outDir, 'pty-ok');
   const started = hcc(['peer', 'start', 'shell-a', '--kind', 'shell', '--', 'bash']);
   const pane = parsePane(started);
+  assertHccManagedTmuxEnv(pane);
   const list = hcc(['peer', 'list']);
   if (!list.includes('shell-a') || !list.includes('tmux')) fail(`tmux-backed peer missing from list:\n${list}`);
   hcc(['inject', 'shell-a', `echo PTY_OK > ${file}`]);
@@ -1895,6 +2119,7 @@ async function tmuxBackedStartWorkflow() {
     env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
   });
   const canonicalPane = parsePane(canonicalStarted);
+  assertHccManagedTmuxEnv(canonicalPane);
   const canonicalRows = providerBindingRows('claude', canonicalSession);
   if (canonicalRows.length !== 1 ||
       canonicalRows[0].peer !== 'claude-live-canonical' ||
@@ -1908,23 +2133,31 @@ async function tmuxBackedStartWorkflow() {
   const forceFirst = hcc(['peer', 'start', 'claude-force-a', '--kind', 'claude', '--resume', forceSession], {
     env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
   });
-  parsePane(forceFirst);
+  const forceFirstPane = parsePane(forceFirst);
+  const forceFirstSession = run('tmux', ['display-message', '-p', '-t', forceFirstPane, '#{session_name}']).trim();
   const forceConflict = hccMaybe(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession], {
     env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
   });
   if (forceConflict.status === 0 || !String(forceConflict.stderr || forceConflict.stdout).includes('already bound to claude-force-a')) {
     fail(`provider session duplicate start was not rejected:\n${forceConflict.stdout}\n${forceConflict.stderr}`);
   }
+  if (runMaybe('tmux', ['has-session', '-t', tmuxManagedSession(root, 'claude-force-b')]).status === 0) {
+    fail('failed duplicate provider start left a new claude-force-b tmux session behind');
+  }
   const forceSecond = hcc(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession, '--force'], {
     env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
   });
   const forcePane = parsePane(forceSecond);
+  assertHccManagedTmuxEnv(forcePane);
   const forceRows = providerBindingRows('claude', forceSession);
   if (forceRows.length !== 1 ||
       forceRows[0].peer !== 'claude-force-b' ||
       forceRows[0].transport !== 'tmux' ||
       forceRows[0].runtime_target !== forcePane) {
     fail(`--force did not move provider binding to replacement tmux peer:\n${JSON.stringify(forceRows, null, 2)}`);
+  }
+  if (runMaybe('tmux', ['has-session', '-t', forceFirstSession]).status === 0) {
+    fail('--force provider rebind did not remove old hcc-managed tmux session');
   }
   hccMaybe(['peer', 'stop', 'claude-force-a']);
   hcc(['peer', 'stop', 'claude-force-b']);
@@ -1933,12 +2166,14 @@ async function tmuxBackedStartWorkflow() {
   startRuntime({ env: envWithoutProvider({ HCC_REG_VALUE: 'runtime-old', ANTHROPIC_BASE_URL: 'runtime-old-url' }) });
   await waitRuntime();
   const envFile = path.join(outDir, 'caller-env-ok');
-  parsePane(hcc(['peer', 'start', 'env-a', '--kind', 'shell', '--', 'bash', '--noprofile', '--norc'], {
+  const envPane = parsePane(hcc(['peer', 'start', 'env-a', '--kind', 'shell', '--', 'bash', '--noprofile', '--norc'], {
     env: envWithoutProvider({ HCC_REG_VALUE: 'caller-new' })
   }));
+  assertHccManagedTmuxEnv(envPane);
   hcc(['inject', 'env-a', `printf '%s|%s\\n' "$HCC_REG_VALUE" "\${ANTHROPIC_BASE_URL:-}" > ${envFile}`]);
   await waitForFile(envFile, 'caller-new|', 'caller env propagation');
   hcc(['peer', 'stop', 'env-a']);
+  await assertTmuxGcPolicy();
 }
 
 async function shimTmuxWorkflow() {
@@ -2209,10 +2444,133 @@ async function syntaxAndHelp() {
     if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
   for (const expected of [
+    'function listTmuxPanesOnce()',
+    'let autoAttachScanInFlight = false;',
+    'if (autoAttachScanInFlight) return;',
+    'const paneByPid = new Map();',
+    'const attached = attachedTmuxState(ctx, db);',
+    'function killOldTmuxForRebind(',
+    'function providerSessionBindingMatches(',
+    'function hccWebProcessMatches(',
+    'function splitProcessArgs(line)',
+    'const { global, rest } = splitGlobalArgs(hccArgs);',
+    "if (rest[0] !== 'web') return false;",
+    'sameResolvedPath(global.root, ctx.root)',
+    'sameResolvedPath(global.db, ctx.dbPath)',
+    'sameResolvedPath(',
+    'async function stopOrphanWebRuntimes(',
+    'await stopOrphanWebRuntimes(ctx, existing.pid || null);',
+    'await stopOrphanWebRuntimes(ctx);',
+    'const restoredTmuxDbs = new Set();',
+    'if (restoredTmuxDbs.has(dbKey)) continue;',
+    'input.rebindOldTmux',
+    'rebindOldTmux: true',
+    'skipProviderRebindCleanup:',
+    'function safeOldTmuxRebindPlan(',
+    'function assertOldTmuxCanRebind(',
+    'TMUX_REBIND_NOT_HCC_MANAGED',
+    'TMUX_REBIND_ROOT_MISMATCH',
+    "addEvent(db, 'tmux.session.rebind_cleanup_pending'",
+    'TMUX_REBIND_OLD_SESSION_IN_USE',
+    "addEvent(db, 'tmux.session.rebind_cleanup_failed'",
+    'function restoreParkedOldTmuxSessions()',
+    'restoreParkedOldTmuxSessions();',
+    'parkedOldTmuxSessions.push',
+    "addEvent(db, 'tmux.session.rebound'",
+    "addEvent(eventDb, 'provider.session.rebound'"
+  ]) {
+    if (!hccSource.includes(expected)) fail(`tmux auto-attach/rebind guard missing: ${expected}`);
+  }
+  if (hccSource.includes("return line.includes(`--root ${root}`) || line.includes(`--db ${db}`);")) {
+    fail('orphan web runtime cleanup still uses substring matching for --root/--db');
+  }
+  for (const expected of [
+    'function safeTmuxKillPlan(projectCtx, db, peerId, expectedTarget)',
+    "binding.transport !== 'tmux'",
+    'const expectedSession = tmuxManagedSessionName(projectCtx, peerId);',
+    "throw new CliError('TMUX_KILL_NOT_HCC_MANAGED'",
+    "throw new CliError('TMUX_KILL_ROOT_MISMATCH'",
+    "throw new CliError('TMUX_KILL_HAS_CLIENTS'",
+    'killDbProvenTmuxSession(reqCtx, db, peerId)',
+    'safeTmuxKillPlan(reqCtx, stopDb, peerId, session.pane || null)'
+  ]) {
+    if (!hccSource.includes(expected)) fail(`tmux kill safety guard missing: ${expected}`);
+  }
+  if (hccSource.includes("if (sessName) tmuxKillSession(sessName);")) {
+    fail('web stop kill_tmux still kills tmux by session name without DB-proven guard');
+  }
+  for (const expected of [
+    'async function cmdTmux(',
+    'async function planTmuxGc(',
+    "validateOpts('tmux gc'",
+    'const dryRun = !opts.yes;',
+    'const targetPeer = opts.peer || null;',
+    'if (targetPeer && row.peer !== targetPeer) continue;',
+    'if (targetPeer && rowPeer !== targetPeer) continue;',
+    "b.transport = 'tmux'",
+    'b.runtime_target IS NOT NULL',
+    'actualSession !== expectedSession',
+    "const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');",
+    "skip('hcc_root_mismatch'",
+    "skip('runtime_managed')",
+    "skip('has_tmux_clients'",
+    "reason: 'stale_hcc_managed_session'",
+    "type IN ('tmux.session.rebind_cleanup_failed', 'tmux.session.rebind_cleanup_pending')",
+    "'stale_rebind_cleanup_failed_session'",
+    "'rebind_cleanup_failed'",
+    "'rebind_cleanup_pending'",
+    "'stale_rebind_cleanup_pending_session'",
+    "SET transport = 'detached'",
+    "addEvent(db, 'tmux.session.gc'"
+  ]) {
+    if (!hccSource.includes(expected)) fail(`tmux gc guard missing: ${expected}`);
+  }
+  const autoAttachSource = hccSource.slice(
+    hccSource.indexOf('function scanAndAttachDetectedPeers()'),
+    hccSource.indexOf('scanAndAttachDetectedPeers();')
+  );
+  if ((autoAttachSource.match(/runTmux\(\['list-panes'/g) || []).length > 0) {
+    fail('auto-attach scan calls tmux list-panes inside scanAndAttachDetectedPeers instead of using listTmuxPanesOnce');
+  }
+  if (!autoAttachSource.includes('panes = listTmuxPanesOnce();')) {
+    fail('auto-attach scan no longer uses one tmux pane listing per tick');
+  }
+  const managedStartSource = hccSource.slice(
+    hccSource.indexOf('function startTmuxManagedSession(input)'),
+    hccSource.indexOf('function restoreTmuxManagedSessions')
+  );
+  if (!managedStartSource.includes('rebindOldTmux: true')) {
+    fail('managed tmux start no longer marks explicit rebind cleanup');
+  }
+  if (!managedStartSource.includes('skipProviderRebindCleanup: oldTmuxTargetsForRebind.length > 0')) {
+    fail('managed tmux start no longer avoids duplicate provider rebind cleanup planning');
+  }
+  for (const expected of [
+    'HCC_ROOT: pctx.root',
+    'HCC_DB: pctx.dbPath',
+    '[LAUNCH_FINGERPRINT_ENV]: env[LAUNCH_FINGERPRINT_ENV]'
+  ]) {
+    if (!managedStartSource.includes(expected)) fail(`managed tmux start no longer marks session env: ${expected}`);
+  }
+  const restoreSource = hccSource.slice(
+    hccSource.indexOf('function restoreTmuxManagedSessions'),
+    hccSource.indexOf('function startPtySession')
+  );
+  if (restoreSource.includes('rebindOldTmux')) {
+    fail('restore path must not kill old tmux sessions as a rebind');
+  }
+  for (const expected of [
     'function detectedPeerCanStop(peer)',
     "if (['exited', 'detached'].includes(status)) return false;",
     'const canStop = detectedPeerCanStop(p);',
     '${canStop ?',
+    'function providerSessionKnown(session)',
+    "tr('providerSession') + '=' + sessionProvider(session) + ':' + (value || tr('unknown'))",
+    'sessionCardDetailText(s)',
+    'const activeDetectedPeers = visibleDetected.filter((p) => peerIsActive(p));',
+    'const staleDetectedPeers = visibleDetected.filter((p) => !peerIsActive(p));',
+    "localStorage.setItem('hcc.showStaleDetected'",
+    'id="toggleStaleDetected"',
     "if (e.target.closest('[data-action]')) return;",
     'id="stopKillLabel" data-i18n="dialog.killTmux"',
     'id="stopCancelBtn" type="button" data-i18n="dialog.cancel"',
@@ -2222,6 +2580,21 @@ async function syntaxAndHelp() {
   }
   if (webUiTemplateSource.includes("p.status === 'running' ?")) {
     fail('detected peer action rendering still depends on status === running instead of liveness');
+  }
+  if (webUiTemplateSource.indexOf("const stopDialog = document.getElementById('stopDialog');") >
+      webUiTemplateSource.indexOf("document.getElementById('stopBtn').addEventListener('click'")) {
+    fail('stop dialog DOM references are declared after the stop button handler uses them');
+  }
+  if (webUiTemplateSource.includes("sessionRuntimeNote(s) + (s.command || '')")) {
+    fail('managed session display still uses command text as the primary runtime identity');
+  }
+  for (const expected of [
+    'function sessionBindingForSerialize(db, session, peerId)',
+    'function serializeBindingSummary(binding, session)',
+    'provider_session_known: Boolean(providerSessionLabel)',
+    'provider_session_label: providerSessionLabel'
+  ]) {
+    if (!hccSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
   }
   for (const expected of [
     'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
@@ -3695,6 +4068,7 @@ async function syntaxAndHelp() {
     'function bindingHasProviderSession(',
     'function bindingProviderSessionValue(',
     'function bindingHasRuntime(',
+    'function mergePeerBinding(',
     'function mergeRuntimeBinding(',
     'function findProviderSessionBinding(',
     'function canonicalizePeerBinding(',
@@ -3704,6 +4078,7 @@ async function syntaxAndHelp() {
     if (hccSource.includes(helper)) fail(`CLI still embeds peer binding helper: ${helper}`);
   }
   const peerBindings = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'bindings.mjs'));
+  const peerReconcile = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'reconcile.mjs'));
   const peerBindingStoreModule = await import(path.join(repoRoot, 'lib', 'db', 'stores', 'peers.mjs'));
   const compatPeerBindings = await import(path.join(repoRoot, 'lib', 'peer-bindings.mjs'));
   for (const name of [
@@ -3713,6 +4088,7 @@ async function syntaxAndHelp() {
     'bindingHasProviderSession',
     'bindingProviderSessionValue',
     'bindingHasRuntime',
+    'mergePeerBinding',
     'mergeRuntimeBinding'
   ]) {
     if (typeof peerBindings[name] !== 'function') fail(`peer binding module missing export: ${name}`);
@@ -3720,6 +4096,9 @@ async function syntaxAndHelp() {
   }
   if (typeof peerBindingStoreModule.createPeerBindingStore !== 'function') {
     fail('peer binding store module missing createPeerBindingStore');
+  }
+  if (typeof peerReconcile.reconcileRunningPeerBindings !== 'function') {
+    fail('peer reconcile module missing reconcileRunningPeerBindings');
   }
   if (typeof compatPeerBindings.createPeerBindingStore !== 'function') {
     fail('peer binding compat module missing createPeerBindingStore');
@@ -3746,6 +4125,16 @@ async function syntaxAndHelp() {
   );
   if (mergedRuntime.transport !== 'tmux' || mergedRuntime.runtime_target !== '%9' || mergedRuntime.command !== 'codex resume old') {
     fail(`peer binding module did not preserve existing runtime binding: ${JSON.stringify(mergedRuntime)}`);
+  }
+  const mergedProviderSession = peerBindings.mergePeerBinding(
+    { peer: 'session-peer', provider: 'claude', provider_session_id: '00000000-0000-0000-0000-000000000000', provider_session_name: null, resume_mode: 'detected', resume_arg: null, transport: 'hook', runtime_session_id: 'session-peer' },
+    { peer: 'session-peer', provider: 'claude', provider_session_id: null, provider_session_name: null, resume_mode: 'attached', resume_arg: '%pane', command: 'tmux %pane (claude)', transport: 'tmux', runtime_session_id: 'session-peer', runtime_target: '%pane' }
+  );
+  if (mergedProviderSession.provider_session_id !== '00000000-0000-0000-0000-000000000000' ||
+      mergedProviderSession.transport !== 'tmux' ||
+      mergedProviderSession.runtime_target !== '%pane' ||
+      mergedProviderSession.resume_mode !== 'detected') {
+    fail(`peer binding module did not preserve known provider session during runtime attach: ${JSON.stringify(mergedProviderSession)}`);
   }
   const peerBindingEvents = [];
   const peerBindingStore = peerBindingStoreModule.createPeerBindingStore({
@@ -3818,6 +4207,135 @@ async function syntaxAndHelp() {
     }
   } finally {
     peerBindingDb.close();
+  }
+  const reconcileDb = new DatabaseSync(':memory:');
+  try {
+    reconcileDb.exec(`
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        role TEXT,
+        worktree TEXT,
+        branch TEXT,
+        pid INTEGER,
+        status TEXT NOT NULL DEFAULT 'idle',
+        capabilities TEXT,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE peer_bindings (
+        peer TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_session_id TEXT,
+        provider_session_name TEXT,
+        resume_mode TEXT NOT NULL DEFAULT 'new',
+        resume_arg TEXT,
+        command TEXT,
+        transport TEXT NOT NULL,
+        runtime_session_id TEXT,
+        runtime_target TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        actor TEXT,
+        task_id INTEGER,
+        payload TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_reconcile_provider_session_id
+        ON peer_bindings(provider, provider_session_id)
+        WHERE provider_session_id IS NOT NULL;
+      CREATE UNIQUE INDEX idx_reconcile_provider_session_name
+        ON peer_bindings(provider, provider_session_name)
+        WHERE provider_session_name IS NOT NULL;
+    `);
+    const t = 3000;
+    const insertPeer = reconcileDb.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES (?, ?, 'peer', ?, 'master', ?, ?, '', ?, ?)
+    `);
+    const insertBinding = reconcileDb.prepare(`
+      INSERT INTO peer_bindings(
+        peer, provider, provider_session_id, provider_session_name, resume_mode,
+        resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'tmux', ?, ?, ?, ?)
+    `);
+    insertPeer.run('hook-known-peer', 'claude', root, 111, 'running', t, t);
+    insertBinding.run('hook-known-peer', 'claude', null, null, 'attached', '%1', 'tmux %1 (claude)', 'hook-known-peer', '%1', t, t);
+    insertPeer.run('argv-peer', 'codex', root, 222, 'running', t, t);
+    insertBinding.run('argv-peer', 'codex', null, null, 'unknown', '%2', 'codex resume', 'argv-peer', '%2', t, t);
+    insertPeer.run('weak-peer', 'codex', root, 333, 'running', t, t);
+    insertBinding.run('weak-peer', 'codex', null, null, 'unknown', '%3', 'codex resume', 'weak-peer', '%3', t, t);
+    insertPeer.run('known-peer', 'claude', root, 444, 'running', t, t);
+    insertBinding.run('known-peer', 'claude', '11111111-1111-1111-1111-111111111111', null, 'detected', null, null, 'known-peer', '%4', t, t);
+    insertPeer.run('conflict-peer', 'claude', root, 555, 'running', t, t);
+    insertBinding.run('conflict-peer', 'claude', '33333333-3333-3333-3333-333333333333', null, 'detected', null, null, 'conflict-peer', '%5', t, t);
+    insertPeer.run('conflict-new-peer', 'claude', root, 556, 'running', t, t);
+    insertBinding.run('conflict-new-peer', 'claude', null, null, 'attached', '%6', 'tmux %6 (claude)', 'conflict-new-peer', '%6', t, t);
+    insertPeer.run('provider-mismatch-conflict', 'codex', root, 666, 'running', t, t);
+    insertBinding.run('provider-mismatch-conflict', 'codex', null, 'mismatch-session', 'detected', null, null, 'provider-mismatch-conflict', '%7', t, t);
+    insertPeer.run('provider-mismatch-new', 'shell', root, 667, 'running', t, t);
+    insertBinding.run('provider-mismatch-new', 'shell', null, null, 'attached', '%8', 'tmux %8 (bash)', 'provider-mismatch-new', '%8', t, t);
+
+    const reconcileEvents = [];
+    const reconciled = peerReconcile.reconcileRunningPeerBindings(reconcileDb, { root }, {
+      now: () => 4000,
+      panes: [
+        { pane: '%1', pid: 111, cwd: root },
+        { pane: '%2', pid: 222, cwd: root },
+        { pane: '%3', pid: 333, cwd: root },
+        { pane: '%4', pid: 444, cwd: root },
+        { pane: '%5', pid: 555, cwd: root },
+        { pane: '%6', pid: 556, cwd: root },
+        { pane: '%7', pid: 666, cwd: root },
+        { pane: '%8', pid: 667, cwd: root }
+      ],
+      latestProviderSessionForPeer: (peer) => {
+        if (peer === 'hook-known-peer') return '22222222-2222-2222-2222-222222222222';
+        if (peer === 'conflict-new-peer') return '33333333-3333-3333-3333-333333333333';
+        return null;
+      },
+      inspectProcess: (pid) => {
+        if (pid === 222) return { kind: 'codex', provider_session: 'argv-session', source: 'process.argv.codex' };
+        if (pid === 667) return { kind: 'codex', provider_session: 'mismatch-session', source: 'process.argv.codex' };
+        return null;
+      },
+      addEvent: (_db, type, actor, taskId, payload) => reconcileEvents.push({ type, actor, taskId, payload })
+    });
+    if (reconciled.backfilled !== 2) {
+      fail(`peer binding reconcile did not backfill exactly two strong-evidence rows: ${JSON.stringify(reconciled, null, 2)}`);
+    }
+    const hookKnown = reconcileDb.prepare('SELECT provider_session_id, provider_session_name, resume_mode, resume_arg FROM peer_bindings WHERE peer = ?').get('hook-known-peer');
+    if (hookKnown.provider_session_id !== '22222222-2222-2222-2222-222222222222' || hookKnown.provider_session_name !== null) {
+      fail(`peer binding reconcile did not backfill hook event session id: ${JSON.stringify(hookKnown)}`);
+    }
+    const argvKnown = reconcileDb.prepare('SELECT provider_session_id, provider_session_name, resume_mode, resume_arg FROM peer_bindings WHERE peer = ?').get('argv-peer');
+    if (argvKnown.provider_session_id !== null || argvKnown.provider_session_name !== 'argv-session') {
+      fail(`peer binding reconcile did not backfill process argv session name: ${JSON.stringify(argvKnown)}`);
+    }
+    const weakKnown = reconcileDb.prepare('SELECT provider_session_id, provider_session_name FROM peer_bindings WHERE peer = ?').get('weak-peer');
+    if (weakKnown.provider_session_id !== null || weakKnown.provider_session_name !== null) {
+      fail(`peer binding reconcile wrote weak-evidence provider session: ${JSON.stringify(weakKnown)}`);
+    }
+    const conflictNew = reconcileDb.prepare('SELECT provider_session_id, provider_session_name FROM peer_bindings WHERE peer = ?').get('conflict-new-peer');
+    if (conflictNew.provider_session_id !== null || conflictNew.provider_session_name !== null ||
+        !reconciled.results.some((result) => result.peer === 'conflict-new-peer' && result.reason === 'provider_session_conflict')) {
+      fail(`peer binding reconcile did not skip conflicting provider session safely: ${JSON.stringify({ conflictNew, reconciled }, null, 2)}`);
+    }
+    const mismatchNew = reconcileDb.prepare('SELECT provider, provider_session_id, provider_session_name FROM peer_bindings WHERE peer = ?').get('provider-mismatch-new');
+    if (mismatchNew.provider !== 'shell' || mismatchNew.provider_session_id !== null || mismatchNew.provider_session_name !== null ||
+        !reconciled.results.some((result) => result.peer === 'provider-mismatch-new' && result.provider === 'codex' && result.reason === 'provider_session_conflict')) {
+      fail(`peer binding reconcile did not use candidate provider for conflict detection: ${JSON.stringify({ mismatchNew, reconciled }, null, 2)}`);
+    }
+    if (!reconcileEvents.some((event) => event.type === 'provider.session.backfilled' && event.actor === 'hook-known-peer') ||
+        !reconcileEvents.some((event) => event.type === 'provider.session.backfilled' && event.actor === 'argv-peer')) {
+      fail(`peer binding reconcile did not emit backfill events: ${JSON.stringify(reconcileEvents)}`);
+    }
+  } finally {
+    reconcileDb.close();
   }
   for (const helper of [
     'const WHOLE_LOCK_SCOPE',
@@ -4246,6 +4764,9 @@ async function syntaxAndHelp() {
   if (!mainHelp.includes('  uninstall                    Remove hooks, shims, and optional project data')) {
     fail(`main help missing uninstall command:\n${mainHelp}`);
   }
+  if (!mainHelp.includes('  tmux gc [--yes]              Clean stale DB-proven hcc-managed tmux sessions')) {
+    fail(`main help missing tmux gc command:\n${mainHelp}`);
+  }
   const msgHelp = run(process.execPath, [hccBin, 'msg', '--help']);
   if (!msgHelp.includes('msg reply') || !msgHelp.includes('msg thread')) {
     fail(`msg help missing reply/thread commands:\n${msgHelp}`);
@@ -4281,6 +4802,13 @@ async function syntaxAndHelp() {
   if (!updateHelp.includes('hcc update') || !updateHelp.includes('npm install -g @logicseek/hello-cc@TAG')) {
     fail(`update help missing expected content:\n${updateHelp}`);
   }
+  const tmuxHelp = run(process.execPath, [hccBin, 'tmux', '--help']);
+  if (!tmuxHelp.includes('hcc tmux') ||
+      !tmuxHelp.includes('tmux gc [--peer ID] [--older-than DAYS]') ||
+      !tmuxHelp.includes('peer_bindings.transport must be tmux') ||
+      !tmuxHelp.includes('deletion requires --yes')) {
+    fail(`tmux help missing DB-backed gc semantics:\n${tmuxHelp}`);
+  }
   const uninstallHelp = run(process.execPath, [hccBin, 'uninstall', '--help']);
   if (!uninstallHelp.includes('hcc uninstall') || !uninstallHelp.includes('hcc uninstall [--purge --yes]')) {
     fail(`uninstall help missing expected content:\n${uninstallHelp}`);
@@ -4303,6 +4831,7 @@ async function syntaxAndHelp() {
     ['task', 'done', 'hcc task done'],
     ['msg', 'reply', 'hcc msg reply'],
     ['peer', 'attach', 'peer attach'],
+    ['tmux', 'gc', 'hcc tmux'],
     ['lock', 'release', 'hcc lock release'],
     ['handoff', 'create', 'hcc handoff create'],
     ['event', 'tail', 'hcc event tail']
