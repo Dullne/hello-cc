@@ -211,6 +211,37 @@ GitHub release 工具应共享这里的 helper。
 
 `lib/shared/` 只放少量低依赖通用工具，不能变成新的杂物箱。
 
+## 包发布面策略
+
+受支持的公共接口是安装后的 CLI：`hcc` 和 `hello-cc`。`package.json` 包含
+`lib/` 是因为 CLI 运行时会 import 这些文件，不表示每个 `lib/*` 路径都是稳定
+library API。
+
+不要在用户文档里新增 `@logicseek/hello-cc/lib/*` 这类导入用法。主实现应该放在
+目标产品目录里；顶层 `lib/*.mjs` 文件只有在有明确兼容理由时，才作为
+compatibility entrypoint 保留。
+
+`@logicseek/hello-cc@0.1.5` 已经从 git head `4969100` 发布。这个已发布包因为
+没有定义 `exports` map，已经暴露了一些顶层 `lib/*.mjs` helper 路径。常规 cleanup
+提交里不要删除或重命名这些已发布路径；除非项目明确选择破坏性 package surface
+变更，否则至少保留一个 release cycle，作为 compatibility re-export。
+
+对于 `0.1.5` 之后的本地迁移提交，默认不要继续增加顶层 compatibility shim。如果
+某个尚未发布的顶层 shim 要保留到下一版，需要在 release notes 里说明它只是
+compatibility-only，并在再下一版前重新评估是否删除。不要让 compatibility shim
+变成目标架构。
+
+发行前，把顶层 `lib/*.mjs` 路径分成三类：
+
+- A 类：已发布过，或 CLI 面向用户需要稳定的 helper 路径，本次发行必须保留。
+- B 类：目录迁移产生的 compatibility path，只是 re-export 已移动实现；如确有
+  需要可保留一个版本，但 release notes 要说明它只是 compatibility-only 的
+  deep-import 路径。
+- C 类：尚未发布、内部也不用、没有兼容价值的 shim，发布前删除。
+
+因为 npm 上已经存在 `0.1.5`，任何包含 `4969100` 之后本地提交的发行都必须使用新
+package 版本。不要尝试重新发布 `0.1.5`。
+
 ## 依赖方向
 
 目标依赖方向：

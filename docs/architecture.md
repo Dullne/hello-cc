@@ -221,6 +221,43 @@ and GitHub release tooling should share these helpers.
 `lib/shared/` is only for small, dependency-light utilities used across several
 boundaries. It should not become a dumping ground.
 
+## Package Surface Policy
+
+The supported public interface is the installed CLI: `hcc` and `hello-cc`.
+`package.json` includes `lib/` because the CLI imports those files at runtime,
+not because every `lib/*` path is a stable library API.
+
+Do not document new user workflows that import `@logicseek/hello-cc/lib/*`.
+Primary implementations should live in the target product directories, and
+top-level `lib/*.mjs` files should be treated as compatibility entrypoints only
+when there is a concrete compatibility reason.
+
+`@logicseek/hello-cc@0.1.5` has already been published from git head
+`4969100`. That published package exposed several top-level `lib/*.mjs` helper
+paths because the package does not define an `exports` map. Do not remove or
+rename those already-published paths in a routine cleanup commit; keep them as
+compatibility re-exports for at least one release cycle unless the project
+explicitly chooses a breaking package-surface change.
+
+For local migration commits after `0.1.5`, avoid adding more top-level
+compatibility shims by default. If an unpublished top-level shim is kept for the
+next release, mention it in the release notes as compatibility-only and revisit
+whether it can be removed before the following release. Do not let
+compatibility shims become the target architecture.
+
+Before release, classify top-level `lib/*.mjs` paths into three groups:
+
+- Group A: already-published or CLI-facing helper paths that must stay stable
+  for this release.
+- Group B: migration compatibility paths that re-export moved implementations;
+  keep them for one release if needed, but describe them as compatibility-only
+  deep-import paths.
+- Group C: unpublished shims with no internal use and no compatibility value;
+  remove these before publishing.
+
+Because `0.1.5` is already on npm, any release that includes local commits after
+`4969100` must use a new package version. Do not try to republish `0.1.5`.
+
 ## Dependency Direction
 
 The intended dependency direction is:

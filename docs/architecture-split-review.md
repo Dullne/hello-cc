@@ -86,10 +86,28 @@ include `lib/tmux.mjs`, `lib/provider-commands.mjs`, `lib/web-runtime.mjs`,
 
 Before publish:
 
-- If deep `lib/` imports are not treated as public API yet, remove or reduce
-  unnecessary shims in a cleanup commit.
-- If deep `lib/` imports may already be used externally, keep the shims for at
-  least one release cycle and document them as compatibility surface.
+- Treat the installed CLI commands as the public API. Do not document new
+  `@logicseek/hello-cc/lib/*` imports as user-facing API.
+- `@logicseek/hello-cc@0.1.5` is already published from git head `4969100`, and
+  that package exposed several top-level `lib/*.mjs` helper paths because the
+  package includes `lib/` and has no `exports` map.
+- Keep already-published top-level `lib/*.mjs` paths as compatibility
+  re-exports for at least one release cycle unless the project explicitly
+  chooses a breaking package-surface change.
+- For compatibility shims added only in local commits after `0.1.5`, either
+  remove them before the next publish or document them in the release notes as
+  compatibility-only and revisit removal before the following release.
+- Do not let compatibility shims become the target architecture. Primary
+  implementations should live under the product-boundary directories.
+
+Classify top-level shims before release:
+
+- Group A: already-published or CLI-facing helper paths that stay stable for
+  this release.
+- Group B: migration compatibility paths that re-export moved implementations;
+  keep only if needed and describe them as compatibility-only deep-import paths.
+- Group C: unpublished shims with no internal use and no compatibility value;
+  remove before publishing.
 
 ### CLI Boundary
 
@@ -170,6 +188,15 @@ The safer default is Path A: keep current history and add cleanup commits.
 
 Choose Path B only if the project explicitly values a clean local commit stack
 more than the time and risk of rebuilding and revalidating the entire series.
+
+The current safety refs are:
+
+- `safety/layout-split-20260614-at-ffc42a7`, protecting the earlier split stack.
+- `safety/layout-split-20260614-at-11fd4f6`, protecting the split stack through
+  `11fd4f6` before this package-surface policy update.
+
+Because `0.1.5` is already on npm, the next publish that includes the current
+local commits must bump the package version. Do not republish `0.1.5`.
 
 ## Coordination Notes
 
