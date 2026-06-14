@@ -72,7 +72,7 @@ import {
 import {
   annotateTasksWithLiveness,
   taskOwnerStateText
-} from '../lib/task-liveness.mjs';
+} from '../lib/core/peers/liveness.mjs';
 import {
   normalizeStateResources,
   renderStateSummary,
@@ -127,14 +127,16 @@ import {
   buildPeerCommand,
   defaultSessionCommand,
   hasResumeOpts,
-  inferPeerKind,
-  providerSessionParts,
-  providerSessionPeerId
+  inferPeerKind
 } from '../lib/provider-commands.mjs';
 import {
-  bindingFromDetected,
-  createPeerBindingStore
-} from '../lib/peer-bindings.mjs';
+  providerSessionParts,
+  providerSessionPeerId
+} from '../lib/core/peers/session.mjs';
+import {
+  bindingFromDetected
+} from '../lib/core/peers/bindings.mjs';
+import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import {
   ensureTmuxAvailable,
   runTmux,
@@ -170,9 +172,10 @@ import {
   autoPeerSessionId,
   readAncestorCliInfo,
   resolveCurrentPeer,
+  resumeIdFromArgs,
   sanitizePeerPart,
   shortHash
-} from '../lib/peer-identity.mjs';
+} from '../lib/integrations/peers/identity.mjs';
 import {
   projectRecord,
   readProjectRegistry,
@@ -3320,14 +3323,7 @@ function readParentResumeId(kind) {
   try {
     const raw = fs.readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8');
     const args = raw.split('\0').filter(Boolean);
-    if (kind === 'claude') {
-      for (let i = 0; i < args.length; i++) {
-        if ((args[i] === '--resume' || args[i] === '-r') && args[i + 1]) return args[i + 1];
-      }
-    } else if (kind === 'codex') {
-      const ri = args.indexOf('resume');
-      if (ri >= 0 && args[ri + 1] && !args[ri + 1].startsWith('-')) return args[ri + 1];
-    }
+    return resumeIdFromArgs(kind, args);
   } catch {}
   return null;
 }

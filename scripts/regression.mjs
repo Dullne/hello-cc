@@ -2303,7 +2303,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/runtime/state.mjs'") ||
       !hccSource.includes("} from '../lib/project-context.mjs'") ||
       !hccSource.includes("} from '../lib/handoff.mjs'") ||
-      !hccSource.includes("} from '../lib/task-liveness.mjs'") ||
+      !hccSource.includes("} from '../lib/core/peers/liveness.mjs'") ||
       !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
       !hccSource.includes("import { runtimeRequest } from '../lib/runtime/client.mjs'") ||
@@ -2312,11 +2312,13 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
       !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
-      !hccSource.includes("} from '../lib/peer-bindings.mjs'") ||
+      !hccSource.includes("} from '../lib/core/peers/session.mjs'") ||
+      !hccSource.includes("} from '../lib/core/peers/bindings.mjs'") ||
+      !hccSource.includes("import { createPeerBindingStore } from '../lib/db/stores/peers.mjs'") ||
       !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/core/coordination/locks.mjs'") ||
       !hccSource.includes("} from '../lib/core/coordination/teams.mjs'") ||
-      !hccSource.includes("} from '../lib/peer-identity.mjs'") ||
+      !hccSource.includes("} from '../lib/integrations/peers/identity.mjs'") ||
       !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
       !hccSource.includes("} from '../lib/web/runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web/http.mjs'") ||
@@ -2329,7 +2331,7 @@ async function syntaxAndHelp() {
     "renderAutomationContext",
     "from './core/coordination/automation.mjs'",
     "formatOpenTaskLine",
-    "from './task-liveness.mjs'",
+    "from './core/peers/liveness.mjs'",
     "timelineFromRows",
     "from './core/coordination/timeline.mjs'",
     "from './core/coordination/locks.mjs'"
@@ -2765,7 +2767,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds task liveness helper: ${helper}`);
   }
-  const taskLivenessModule = await import(path.join(repoRoot, 'lib', 'task-liveness.mjs'));
+  const taskLivenessModule = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'liveness.mjs'));
+  const compatTaskLivenessModule = await import(path.join(repoRoot, 'lib', 'task-liveness.mjs'));
   for (const name of [
     'taskRelatedLocks',
     'taskOwnerLiveness',
@@ -2775,6 +2778,7 @@ async function syntaxAndHelp() {
     'formatOpenTaskLine'
   ]) {
     if (typeof taskLivenessModule[name] !== 'function') fail(`task liveness module missing export: ${name}`);
+    if (typeof compatTaskLivenessModule[name] !== 'function') fail(`task liveness compat module missing export: ${name}`);
   }
   const livenessTasks = taskLivenessModule.annotateTasksWithLiveness([
     { id: 1, status: 'running', owner: 'active-owner', assignee: '', title: 'Active task', priority: 1 },
@@ -3477,7 +3481,14 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds provider command helper: ${helper}`);
   }
+  const providerCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8');
+  if (!providerCommandsSource.includes("from './core/peers/session.mjs'") ||
+      providerCommandsSource.includes('function providerSessionPeerId') ||
+      providerCommandsSource.includes('function providerSessionParts')) {
+    fail('provider command module no longer delegates peer session helpers to core/peers/session.mjs');
+  }
   const providerCommands = await import(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
+  const peerSession = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'));
   for (const name of [
     'providerSessionPeerId',
     'providerSessionParts',
@@ -3493,11 +3504,15 @@ async function syntaxAndHelp() {
   ]) {
     if (typeof providerCommands[name] !== 'function') fail(`provider command module missing export: ${name}`);
   }
-  const providerNameSession = providerCommands.providerSessionParts('named-session');
+  for (const name of ['providerSessionPeerId', 'providerSessionParts']) {
+    if (typeof peerSession[name] !== 'function') fail(`peer session module missing export: ${name}`);
+    if (providerCommands[name] !== peerSession[name]) fail(`provider command module no longer re-exports peer session helper: ${name}`);
+  }
+  const providerNameSession = peerSession.providerSessionParts('named-session');
   if (providerNameSession.provider_session_name !== 'named-session' || providerNameSession.provider_session_id !== null) {
     fail(`provider command module misclassified named session: ${JSON.stringify(providerNameSession)}`);
   }
-  const providerUuidSession = providerCommands.providerSessionParts('00000000-0000-0000-0000-000000000000');
+  const providerUuidSession = peerSession.providerSessionParts('00000000-0000-0000-0000-000000000000');
   if (providerUuidSession.provider_session_id !== '00000000-0000-0000-0000-000000000000' || providerUuidSession.provider_session_name !== null) {
     fail(`provider command module misclassified UUID session: ${JSON.stringify(providerUuidSession)}`);
   }
@@ -3544,7 +3559,9 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds peer binding helper: ${helper}`);
   }
-  const peerBindings = await import(path.join(repoRoot, 'lib', 'peer-bindings.mjs'));
+  const peerBindings = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'bindings.mjs'));
+  const peerBindingStoreModule = await import(path.join(repoRoot, 'lib', 'db', 'stores', 'peers.mjs'));
+  const compatPeerBindings = await import(path.join(repoRoot, 'lib', 'peer-bindings.mjs'));
   for (const name of [
     'bindingFromDetected',
     'peerBindingRuntimeRank',
@@ -3552,10 +3569,16 @@ async function syntaxAndHelp() {
     'bindingHasProviderSession',
     'bindingProviderSessionValue',
     'bindingHasRuntime',
-    'mergeRuntimeBinding',
-    'createPeerBindingStore'
+    'mergeRuntimeBinding'
   ]) {
     if (typeof peerBindings[name] !== 'function') fail(`peer binding module missing export: ${name}`);
+    if (typeof compatPeerBindings[name] !== 'function') fail(`peer binding compat module missing export: ${name}`);
+  }
+  if (typeof peerBindingStoreModule.createPeerBindingStore !== 'function') {
+    fail('peer binding store module missing createPeerBindingStore');
+  }
+  if (typeof compatPeerBindings.createPeerBindingStore !== 'function') {
+    fail('peer binding compat module missing createPeerBindingStore');
   }
   const detectedBinding = peerBindings.bindingFromDetected({
     id: 'detected-peer',
@@ -3581,7 +3604,7 @@ async function syntaxAndHelp() {
     fail(`peer binding module did not preserve existing runtime binding: ${JSON.stringify(mergedRuntime)}`);
   }
   const peerBindingEvents = [];
-  const peerBindingStore = peerBindings.createPeerBindingStore({
+  const peerBindingStore = peerBindingStoreModule.createPeerBindingStore({
     now: () => 2000,
     addEvent: (_db, type, actor, taskId, payload) => peerBindingEvents.push({ type, actor, taskId, payload })
   });
@@ -3750,23 +3773,32 @@ async function syntaxAndHelp() {
   if (assignedTeam[0].assignee !== 'codex-team-42-1' || assignedTeam[1].assignee !== 'codex-a') {
     fail(`team planning worker assignment changed: ${JSON.stringify(assignedTeam)}`);
   }
-  const peerFormat = await import(path.join(repoRoot, 'lib', 'peer-format.mjs'));
+  const peerFormat = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'format.mjs'));
+  const compatPeerFormat = await import(path.join(repoRoot, 'lib', 'peer-format.mjs'));
   if (typeof peerFormat.sanitizePeerPart !== 'function' ||
       typeof peerFormat.shortHash !== 'function' ||
+      typeof compatPeerFormat.sanitizePeerPart !== 'function' ||
+      typeof compatPeerFormat.shortHash !== 'function' ||
       peerFormat.sanitizePeerPart('Bad Peer!', 'fallback') !== 'bad-peer' ||
       peerFormat.sanitizePeerPart('!!!', 'fallback') !== 'fallback' ||
       peerFormat.shortHash('hello') !== 'aaf4c61d') {
     fail('peer format module behavior changed');
   }
   for (const [label, source, expectedImport] of [
-    ['provider commands', fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8'), "from './peer-format.mjs'"],
-    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs'), 'utf8'), "from '../../peer-format.mjs'"],
-    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'peer-identity.mjs'), 'utf8'), "from './peer-format.mjs'"]
+    ['peer session', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'), 'utf8'), "from './format.mjs'"],
+    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs'), 'utf8'), "from '../peers/format.mjs'"],
+    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'), 'utf8'), "from './format.mjs'"]
   ]) {
     if (!source.includes(expectedImport)) fail(`${label} module does not import peer format helpers`);
     if (source.includes('function sanitizePeerPart') || source.includes('function shortHash')) {
       fail(`${label} module still embeds peer format helpers`);
     }
+  }
+  const corePeerIdentitySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'), 'utf8');
+  if (corePeerIdentitySource.includes('process.env') ||
+      corePeerIdentitySource.includes('spawnSync(') ||
+      corePeerIdentitySource.includes('/proc/')) {
+    fail('core peer identity still contains process or procfs observation logic');
   }
   for (const helper of [
     'function sanitizePeerPart',
@@ -3790,7 +3822,23 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds peer identity helper: ${helper}`);
   }
-  const peerIdentity = await import(path.join(repoRoot, 'lib', 'peer-identity.mjs'));
+  const peerIdentity = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'));
+  const integrationPeerIdentity = await import(path.join(repoRoot, 'lib', 'integrations', 'peers', 'identity.mjs'));
+  const compatPeerIdentity = await import(path.join(repoRoot, 'lib', 'peer-identity.mjs'));
+  for (const name of [
+    'sanitizePeerPart',
+    'shortHash',
+    'autoPeerProviderSession',
+    'autoPeerSessionId',
+    'autoPeerResumeId',
+    'autoPeerKind',
+    'autoPeerBasis',
+    'autoPeerId',
+    'resolveCurrentPeer',
+    'currentPeer'
+  ]) {
+    if (typeof peerIdentity[name] !== 'function') fail(`peer identity core module missing export: ${name}`);
+  }
   for (const name of [
     'sanitizePeerPart',
     'shortHash',
@@ -3806,18 +3854,19 @@ async function syntaxAndHelp() {
     'resolveCurrentPeer',
     'currentPeer'
   ]) {
-    if (typeof peerIdentity[name] !== 'function') fail(`peer identity module missing export: ${name}`);
+    if (typeof integrationPeerIdentity[name] !== 'function') fail(`peer identity integration module missing export: ${name}`);
+    if (typeof compatPeerIdentity[name] !== 'function') fail(`peer identity compat module missing export: ${name}`);
   }
   if (peerIdentity.sanitizePeerPart('Bad Peer!', 'fallback') !== 'bad-peer' ||
       peerIdentity.sanitizePeerPart('!!!', 'fallback') !== 'fallback' ||
       peerIdentity.shortHash('hello') !== 'aaf4c61d') {
     fail('peer identity sanitize/hash behavior changed');
   }
-  if (peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session']) !== 'named-session' ||
-      peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume=inline-session']) !== 'inline-session' ||
-      peerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session', '--fork-session']) !== null ||
-      peerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', 'codex-session']) !== 'codex-session' ||
-      peerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', '--last']) !== null) {
+  if (integrationPeerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session']) !== 'named-session' ||
+      integrationPeerIdentity.resumeIdFromArgs('claude', ['claude', '--resume=inline-session']) !== 'inline-session' ||
+      integrationPeerIdentity.resumeIdFromArgs('claude', ['claude', '--resume', 'named-session', '--fork-session']) !== null ||
+      integrationPeerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', 'codex-session']) !== 'codex-session' ||
+      integrationPeerIdentity.resumeIdFromArgs('codex', ['codex', 'resume', '--last']) !== null) {
     fail('peer identity resume id parsing changed');
   }
   const savedPeerEnv = {
@@ -3831,7 +3880,7 @@ async function syntaxAndHelp() {
   };
   try {
     process.env.HCC_PEER = 'env-peer';
-    if (peerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell').id !== 'env-peer') {
+    if (integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell').id !== 'env-peer') {
       fail('peer identity resolveCurrentPeer ignored HCC_PEER');
     }
     delete process.env.HCC_PEER;
@@ -3841,11 +3890,11 @@ async function syntaxAndHelp() {
     delete process.env.CODEX_THREAD_ID;
     delete process.env.CODEX_MANAGED_BY_NPM;
     delete process.env.CODEX_MANAGED_BY_BUN;
-    const autoPeer = peerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell');
+    const autoPeer = integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell');
     if (!autoPeer.auto || autoPeer.id !== 'codex-01234567') {
       fail(`peer identity auto peer id changed: ${JSON.stringify(autoPeer)}`);
     }
-    const explicitPeer = peerIdentity.resolveCurrentPeer({ root: repoRoot }, { peer: 'manual-peer' }, 'peer', 'shell');
+    const explicitPeer = integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, { peer: 'manual-peer' }, 'peer', 'shell');
     if (explicitPeer.auto || explicitPeer.id !== 'manual-peer') {
       fail(`peer identity explicit peer resolution changed: ${JSON.stringify(explicitPeer)}`);
     }
