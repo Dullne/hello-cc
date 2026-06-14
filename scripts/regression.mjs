@@ -2187,6 +2187,8 @@ async function syntaxAndHelp() {
   }
   const hccSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
+  const setupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'setup.mjs'), 'utf8');
+  const integrationHooksSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'), 'utf8');
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   for (const expected of [
@@ -2354,6 +2356,42 @@ async function syntaxAndHelp() {
   if (!hccSource.includes('function shellCommand(args)') ||
       hccSource.includes('return args.map(shellQuoteArg).join')) {
     fail('CLI shellCommand wrapper no longer delegates to cli-runtime shellCommand helper');
+  }
+  for (const helper of [
+    'const CLAUDE_SETTINGS_PATH',
+    'const CODEX_HOOKS_PATH',
+    'function installClaudeHooks',
+    'function uninstallClaudeHooks',
+    'function verifyClaudeHooks',
+    'function installCodexHooks',
+    'function uninstallCodexHooks',
+    'function verifyCodexHooks',
+    'function mergeCodexHookEntry',
+    'function mergeHookEntry',
+    'function isHccHookCmd'
+  ]) {
+    if (setupSource.includes(helper)) fail(`setup module still embeds hook helper: ${helper}`);
+  }
+  if (!setupSource.includes("from './integrations/hooks.mjs'")) {
+    fail('setup module does not re-export hook helpers from integrations/hooks.mjs');
+  }
+  if (!integrationHooksSource.includes("from '../shared/json-file.mjs'") ||
+      !integrationHooksSource.includes("const CLAUDE_SETTINGS_PATH") ||
+      !integrationHooksSource.includes("const CODEX_HOOKS_PATH")) {
+    fail('integrations hook module is missing expected hook storage wiring');
+  }
+  const setupModule = await import(path.join(repoRoot, 'lib', 'setup.mjs'));
+  const integrationHooks = await import(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'));
+  for (const name of [
+    'installClaudeHooks',
+    'uninstallClaudeHooks',
+    'verifyClaudeHooks',
+    'installCodexHooks',
+    'uninstallCodexHooks',
+    'verifyCodexHooks'
+  ]) {
+    if (typeof integrationHooks[name] !== 'function') fail(`integrations hook module missing export: ${name}`);
+    if (setupModule[name] !== integrationHooks[name]) fail(`setup hook export mismatch: ${name}`);
   }
   const cliRuntime = await import(path.join(repoRoot, 'lib', 'cli-runtime.mjs'));
   for (const name of ['commandPath', 'createContext', 'packageRoot', 'shellCommand', 'tailFile']) {
