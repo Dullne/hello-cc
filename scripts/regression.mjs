@@ -4592,22 +4592,30 @@ async function syntaxAndHelp() {
   try {
     const registryRootA = path.join(root, 'registry-a');
     const registryRootB = path.join(root, 'registry-b');
+    const missingRegistryRoot = path.join(root, 'registry-missing');
+    fs.mkdirSync(registryRootA, { recursive: true });
+    fs.mkdirSync(registryRootB, { recursive: true });
     const written = projectRegistry.writeProjectRegistry([
       { root: registryRootA, db: '', name: '', last_seen_at: '5' },
+      { root: missingRegistryRoot, db: path.join(missingRegistryRoot, 'stale.db'), name: 'Gone', last_seen_at: '20' },
       { root: registryRootB, db: path.join(registryRootB, 'custom.db'), name: 'Bee', last_seen_at: '10' },
       { root: registryRootA, db: path.join(registryRootA, 'new.db'), name: 'Aye', last_seen_at: '15' }
     ]);
-    if (written.length !== 2 ||
-        written[0].root !== path.resolve(registryRootA) ||
-        written[0].db !== path.resolve(path.join(registryRootA, 'new.db')) ||
-        written[0].name !== 'Aye' ||
-        written[0].last_seen_at !== 15 ||
-        written[1].root !== path.resolve(registryRootB)) {
+    if (written.length !== 3 ||
+        written[0].root !== path.resolve(missingRegistryRoot) ||
+        written[1].root !== path.resolve(registryRootA) ||
+        written[1].db !== path.resolve(path.join(registryRootA, 'new.db')) ||
+        written[1].name !== 'Aye' ||
+        written[1].last_seen_at !== 15 ||
+        written[2].root !== path.resolve(registryRootB)) {
       fail(`project registry write/dedupe/sort changed: ${JSON.stringify(written)}`);
     }
     const readBack = projectRegistry.readProjectRegistry();
-    if (JSON.stringify(readBack) !== JSON.stringify(written)) {
-      fail(`project registry read changed: ${JSON.stringify(readBack)} vs ${JSON.stringify(written)}`);
+    if (readBack.length !== 2 ||
+        readBack[0].root !== path.resolve(registryRootA) ||
+        readBack[1].root !== path.resolve(registryRootB) ||
+        readBack.some((p) => p.root === path.resolve(missingRegistryRoot))) {
+      fail(`project registry kept missing root: ${JSON.stringify(readBack)}`);
     }
     const recorded = projectRegistry.projectRecord({
       root: path.resolve(registryRootB),
@@ -4808,6 +4816,12 @@ async function syntaxAndHelp() {
       !tmuxHelp.includes('peer_bindings.transport must be tmux') ||
       !tmuxHelp.includes('deletion requires --yes')) {
     fail(`tmux help missing DB-backed gc semantics:\n${tmuxHelp}`);
+  }
+  const gcHelp = run(process.execPath, [hccBin, 'gc', '--help']);
+  if (!gcHelp.includes('hcc gc') ||
+      !gcHelp.includes('gc [--older-than DAYS] [--yes]') ||
+      !gcHelp.includes('deletion requires --yes')) {
+    fail(`gc help missing cleanup semantics:\n${gcHelp}`);
   }
   const uninstallHelp = run(process.execPath, [hccBin, 'uninstall', '--help']);
   if (!uninstallHelp.includes('hcc uninstall') || !uninstallHelp.includes('hcc uninstall [--purge --yes]')) {

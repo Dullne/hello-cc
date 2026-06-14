@@ -218,6 +218,7 @@ const {
   helpInject,
   helpPeer,
   helpTmux,
+  helpGc,
   helpLock,
   helpHandoff,
   helpEvent,
@@ -4868,6 +4869,7 @@ async function cmdTmux(ctx, args) {
 // ─── hcc gc ───────────────────────────────────────────────────────────────────
 
 async function cmdGc(ctx, args) {
+  if (wantsHelp(args)) return helpGc();
   const opts = parseOpts(args, { booleans: ['yes', 'force'] });
   const olderThanDays = intOpt(opts, 'older-than', 7);
   const dryRun = !opts.yes && !opts.force;
