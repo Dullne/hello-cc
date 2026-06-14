@@ -128,7 +128,7 @@ import {
   defaultSessionCommand,
   hasResumeOpts,
   inferPeerKind
-} from '../lib/provider-commands.mjs';
+} from '../lib/integrations/providers.mjs';
 import {
   providerSessionParts,
   providerSessionPeerId

@@ -2311,7 +2311,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
       !hccSource.includes("} from '../lib/session-launch.mjs'") ||
-      !hccSource.includes("} from '../lib/provider-commands.mjs'") ||
+      !hccSource.includes("} from '../lib/integrations/providers.mjs'") ||
       !hccSource.includes("} from '../lib/core/peers/session.mjs'") ||
       !hccSource.includes("} from '../lib/core/peers/bindings.mjs'") ||
       !hccSource.includes("import { createPeerBindingStore } from '../lib/db/stores/peers.mjs'") ||
@@ -3481,13 +3481,18 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds provider command helper: ${helper}`);
   }
-  const providerCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8');
-  if (!providerCommandsSource.includes("from './core/peers/session.mjs'") ||
+  const providerCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'providers.mjs'), 'utf8');
+  const compatProviderCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8');
+  if (!providerCommandsSource.includes("from '../core/peers/session.mjs'") ||
       providerCommandsSource.includes('function providerSessionPeerId') ||
       providerCommandsSource.includes('function providerSessionParts')) {
-    fail('provider command module no longer delegates peer session helpers to core/peers/session.mjs');
+    fail('integrations provider module no longer delegates peer session helpers to core/peers/session.mjs');
   }
-  const providerCommands = await import(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
+  if (!compatProviderCommandsSource.includes("from './integrations/providers.mjs'")) {
+    fail('provider command compat module no longer re-exports integrations/providers.mjs');
+  }
+  const providerCommands = await import(path.join(repoRoot, 'lib', 'integrations', 'providers.mjs'));
+  const compatProviderCommands = await import(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
   const peerSession = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'));
   for (const name of [
     'providerSessionPeerId',
@@ -3503,10 +3508,12 @@ async function syntaxAndHelp() {
     'parseCodexCommandArgs'
   ]) {
     if (typeof providerCommands[name] !== 'function') fail(`provider command module missing export: ${name}`);
+    if (typeof compatProviderCommands[name] !== 'function') fail(`provider command compat module missing export: ${name}`);
   }
   for (const name of ['providerSessionPeerId', 'providerSessionParts']) {
     if (typeof peerSession[name] !== 'function') fail(`peer session module missing export: ${name}`);
     if (providerCommands[name] !== peerSession[name]) fail(`provider command module no longer re-exports peer session helper: ${name}`);
+    if (compatProviderCommands[name] !== providerCommands[name]) fail(`provider command compat module no longer re-exports helper: ${name}`);
   }
   const providerNameSession = peerSession.providerSessionParts('named-session');
   if (providerNameSession.provider_session_name !== 'named-session' || providerNameSession.provider_session_id !== null) {
