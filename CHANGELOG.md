@@ -16,6 +16,61 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.7
+
+### Summary
+
+hello-cc 0.1.7 publishes the post-0.1.6 Web and coordination hardening work
+alongside the README product screenshot. It keeps the 0.1.6 package surface and
+adds stricter peer identity behavior, audited Web peer actions, cleaner tmux
+test isolation, and clearer first-run documentation for the Web console.
+
+### Highlights
+
+- Enforced system-peer identity handling so internal coordination actions stay
+  attributable and do not accidentally inherit a user peer identity.
+- Audited Web peer action flows and expanded regression coverage around task,
+  message, lock, and tmux cleanup paths used by the browser console.
+- Cleaned tmux-focused regression tests so runtime cleanup and test isolation
+  stay stable across repeated local runs.
+- Added a sanitized Web console screenshot to both English and Chinese README
+  files, showing sessions, terminal output, project state, messages, peers,
+  tasks, and locks.
+- Documented that `hcc web` defaults to a LAN-facing `0.0.0.0` bind, requests
+  port `8787`, prints both `open:` and `local:` token URLs, and auto-tries later
+  ports when `--port` is not explicit.
+
+### Compatibility Notes
+
+- No breaking CLI command changes are intended in this release.
+- The Web access model remains token-in-URL based; use `--local` when the Web
+  console should bind only to `127.0.0.1`.
+- This release does not change the public package surface introduced in 0.1.6.
+
+### Validation
+
+The 0.1.7 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+find lib -name '*.mjs' -print0 | xargs -0 -n1 node --check
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.7
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.6
 
 ### Summary
