@@ -18,6 +18,14 @@ CLI sessions. It gives every terminal in one project a shared task board,
 mailbox, lock table, and browser console while keeping the real local terminal
 as the source of interaction.
 
+<p align="center">
+  <img src="assets/screenshots/web-console.png" width="900" alt="hello-cc Web console showing agent sessions, task state, locks, messages, and terminal output">
+</p>
+
+<p align="center">
+  <em>One local Web console for tmux-backed Claude Code, Codex, tasks, locks, messages, and handoffs.</em>
+</p>
+
 It is built for developers who run multiple AI coding agents in the same repo
 and need them to coordinate instead of guessing what the other sessions are
 doing.
@@ -81,9 +89,19 @@ hcc web
 ```
 
 Then open the printed URL. By default, `hcc web` listens on LAN interfaces and
-uses a saved URL token, generating one on first use. It initializes the project bus, installs
-Claude/Codex hooks and shims, starts or reuses the Web console, and returns the
-terminal to you.
+requests `0.0.0.0:8787`, using a saved URL token generated on first use. If
+port 8787 is already busy and you did not pass `--port`, it automatically tries
+the next available port. The command prints both the LAN login URL and the local
+loopback URL:
+
+```text
+open: http://<machine-ip>:8787/?token=<saved-token>&project=/path/to/project
+local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
+```
+
+Use `--local` to bind only to `127.0.0.1`, or `--port N` to request a specific
+port. `hcc web` initializes the project bus, installs Claude/Codex hooks and
+shims, starts or reuses the Web console, and returns the terminal to you.
 
 After the first shim install, open a new terminal or reload your shell:
 

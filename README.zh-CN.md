@@ -15,6 +15,14 @@
 
 `hello-cc` 是 Claude Code、Codex 和其他编程 CLI 会话的本地控制平面。它让同一个项目里的终端共享任务板、消息、锁、交接和浏览器控制台，同时保留真实本地终端作为主要交互入口。
 
+<p align="center">
+  <img src="assets/screenshots/web-console.png" width="900" alt="hello-cc Web 控制台，展示 agent 会话、任务状态、锁、消息和终端输出">
+</p>
+
+<p align="center">
+  <em>一个本地 Web 控制台，统一管理 tmux-backed Claude Code、Codex、任务、锁、消息和交接。</em>
+</p>
+
 它适合在同一个仓库里同时运行多个 AI 编程 agent 的场景：让它们知道彼此在做什么，而不是各自猜测。
 
 ## 特色
@@ -69,9 +77,19 @@ cd /path/to/project
 hcc web
 ```
 
-然后打开命令输出里的 URL。默认情况下，`hcc web` 会监听内网地址，并在 URL
-里附带固定 token；首次使用时自动生成并保存，之后默认复用。它会初始化项目总线，
-安装 Claude/Codex hooks 和 shims，启动或复用 Web 控制台，然后把终端还给你。
+然后打开命令输出里的 URL。默认情况下，`hcc web` 会监听内网地址，请求
+`0.0.0.0:8787`，并在 URL 里附带首次自动生成并保存的稳定 token。如果 8787
+端口已被占用，且你没有显式传 `--port`，它会自动尝试后续可用端口。启动时会同时
+打印内网登录地址和本机 loopback 地址：
+
+```text
+open: http://<machine-ip>:8787/?token=<saved-token>&project=/path/to/project
+local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
+```
+
+使用 `--local` 可以只绑定 `127.0.0.1`，使用 `--port N` 可以指定请求端口。
+`hcc web` 会初始化项目总线，安装 Claude/Codex hooks 和 shims，启动或复用 Web
+控制台，然后把终端还给你。
 
 第一次安装 shim 后，打开新终端或重新加载 shell：
 
