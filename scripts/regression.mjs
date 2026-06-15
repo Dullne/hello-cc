@@ -22,6 +22,7 @@ const fakeBin = path.join(os.tmpdir(), `hcc-reg-bin-${testId}`);
 const outDir = path.join(os.tmpdir(), `hcc-reg-out-${testId}`);
 const tmuxSession = `hcc-reg-${process.pid}`;
 const tmuxSocketName = `hcc-reg-${testId}`.replace(/[^A-Za-z0-9_-]/g, '-');
+const secondProjectRoot = path.join(root, 'second-project');
 const realHome = process.env.HOME || os.homedir();
 const realRegistryFile = path.join(realHome, '.hello-cc', 'projects.json');
 const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
@@ -72,6 +73,10 @@ function sanitizePeerPart(value, fallback = 'peer') {
 
 function tmuxManagedSession(projectRoot, peer) {
   return `hcc-${shortHash(projectRoot)}-${sanitizePeerPart(peer, 'peer')}`.slice(0, 80);
+}
+
+function tmuxManagedSessionPrefix(projectRoot) {
+  return `hcc-${shortHash(projectRoot)}-`;
 }
 
 function run(command, args, options = {}) {
@@ -140,6 +145,33 @@ function providerBindingRows(provider, sessionName) {
     WHERE provider = ? AND provider_session_name = ?
     ORDER BY peer
   `).all(provider, sessionName));
+}
+
+function parsePayloadJson(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function eventPayloads(type, limit = 20, dbPath = path.join(root, '.hello-cc', 'mesh.db')) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db.prepare(`
+      SELECT actor, payload
+      FROM events
+      WHERE type = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(type, limit).map((row) => ({
+      actor: row.actor,
+      payload: parsePayloadJson(row.payload)
+    }));
+  } finally {
+    db.close();
+  }
 }
 
 function peerBindingIndexNames(dbPath = path.join(root, '.hello-cc', 'mesh.db')) {
@@ -775,6 +807,48 @@ function tmuxAvailable() {
   return runMaybe('tmux', ['-V']).status === 0;
 }
 
+function tmuxCleanupEndpoints() {
+  if (!realTmuxBin) return [{ label: 'default', command: 'tmux', args: [] }];
+  return [
+    { label: 'test-socket', command: realTmuxBin, args: ['-L', tmuxSocketName] },
+    { label: 'default', command: realTmuxBin, args: [] }
+  ];
+}
+
+function runMaybeTmuxEndpoint(endpoint, args) {
+  return runMaybe(endpoint.command, [...endpoint.args, ...args]);
+}
+
+function listTmuxSessionsMatching(prefixes, endpoint) {
+  const output = runMaybeTmuxEndpoint(endpoint, ['list-sessions', '-F', '#{session_name}']);
+  if (output.status !== 0) return [];
+  return (output.stdout || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((session) => prefixes.some((prefix) => session.startsWith(prefix)));
+}
+
+function killTmuxSessionOnEndpoint(endpoint, session) {
+  runMaybeTmuxEndpoint(endpoint, ['kill-session', '-t', session]);
+}
+
+function assertNoRegressionTmuxSessionLeak() {
+  const prefixes = [
+    tmuxManagedSessionPrefix(root),
+    tmuxManagedSessionPrefix(secondProjectRoot)
+  ];
+  const leaks = [];
+  for (const endpoint of tmuxCleanupEndpoints()) {
+    for (const session of listTmuxSessionsMatching(prefixes, endpoint)) {
+      leaks.push(`${endpoint.label}:${session}`);
+    }
+  }
+  if (leaks.length) {
+    fail(`regression leaked hcc-managed tmux sessions:\n${leaks.join('\n')}`);
+  }
+}
+
 function trackTmuxPane(pane) {
   if (!pane) return;
   const result = runMaybe('tmux', ['display-message', '-p', '-t', pane, '#S']);
@@ -1141,11 +1215,20 @@ function cleanup() {
   if (runtimePid) {
     try { process.kill(runtimePid, 'SIGTERM'); } catch {}
   }
-  if (tmuxStarted) {
-    runMaybe('tmux', ['kill-session', '-t', tmuxSession]);
-  }
-  for (const session of managedTmuxSessions) {
-    runMaybe('tmux', ['kill-session', '-t', session]);
+  const managedPrefixes = [
+    tmuxManagedSessionPrefix(root),
+    tmuxManagedSessionPrefix(secondProjectRoot)
+  ];
+  for (const endpoint of tmuxCleanupEndpoints()) {
+    for (const session of listTmuxSessionsMatching(managedPrefixes, endpoint)) {
+      managedTmuxSessions.add(session);
+    }
+    if (tmuxStarted) {
+      killTmuxSessionOnEndpoint(endpoint, tmuxSession);
+    }
+    for (const session of managedTmuxSessions) {
+      killTmuxSessionOnEndpoint(endpoint, session);
+    }
   }
   if (fs.existsSync(path.join(fakeBin, 'tmux'))) {
     runMaybe('tmux', ['kill-server']);
@@ -1759,7 +1842,7 @@ async function dbWorkflow() {
 
 async function multiProjectWebWorkflow() {
   log('[4/13] multi-project web');
-  const otherRoot = path.join(root, 'second-project');
+  const otherRoot = secondProjectRoot;
   fs.mkdirSync(otherRoot, { recursive: true });
   const output = hccFrom(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance'], otherRoot);
   if (!output.includes('web already running in background')) fail(`second project did not reuse global web:\n${output}`);
@@ -1938,40 +2021,6 @@ async function multiProjectWebWorkflow() {
     fail(`sessions API did not expose unknown provider binding without marking it shared/known:\n${JSON.stringify(otherShellSession, null, 2)}`);
   }
 
-  hcc(['register', '--peer', 'web-action-peer', '--kind', 'codex', '--role', 'peer']);
-  hcc(['msg', 'send', '--from', 'human', '--to', 'web-action-peer', '--body', 'web action inbox ok']);
-  const actionStatus = await (await runtimeFetch('/api/peers/web-action-peer/actions/status', {}, { root })).json();
-  if (!actionStatus.ok || actionStatus.action !== 'status' || actionStatus.peer !== 'web-action-peer' || !actionStatus.data || typeof actionStatus.data.unread !== 'number') {
-    fail(`web status action did not return structured status:\n${JSON.stringify(actionStatus, null, 2)}`);
-  }
-  const actionInbox = await (await runtimeFetch('/api/peers/web-action-peer/actions/inbox', {}, { root })).json();
-  if (!actionInbox.ok || actionInbox.action !== 'inbox' || !(actionInbox.data?.messages || []).some((m) => m.body === 'web action inbox ok')) {
-    fail(`web inbox action did not return unread messages:\n${JSON.stringify(actionInbox, null, 2)}`);
-  }
-  const actionState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
-  if (!actionState.ok || actionState.action !== 'state' || actionState.data?.automation?.peer?.id !== 'web-action-peer') {
-    fail(`web state action did not return peer automation:\n${JSON.stringify(actionState, null, 2)}`);
-  }
-  const taskOutput = hcc(['task', 'create', '--title', 'web action task', '--body', 'claim through web action']);
-  const taskMatch = taskOutput.match(/created task #(\d+):/);
-  if (!taskMatch) fail(`cannot parse web action task id:\n${taskOutput}`);
-  const actionNext = await (await runtimeFetch('/api/peers/web-action-peer/actions/task-next', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}'
-  }, { root })).json();
-  if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
-    fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
-  }
-  const actionHeartbeat = await (await runtimeFetch('/api/peers/web-action-peer/actions/heartbeat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ renew_locks: true })
-  }, { root })).json();
-  if (!actionHeartbeat.ok || actionHeartbeat.action !== 'heartbeat' || actionHeartbeat.data?.peer !== 'web-action-peer') {
-    fail(`web heartbeat action did not return structured result:\n${JSON.stringify(actionHeartbeat, null, 2)}`);
-  }
-
   const startProvider = async (payload) => {
     const response = await runtimeFetch('/api/sessions', {
       method: 'POST',
@@ -1990,9 +2039,147 @@ async function multiProjectWebWorkflow() {
     if (!response.ok) fail(`web provider session start failed: ${JSON.stringify(json)}`);
     return json.session;
   };
-  const stopSession = async (id) => {
-    await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' }, { root });
+  const stopSession = async (id, payload = null) => {
+    const options = payload
+      ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }
+      : { method: 'POST' };
+    const response = await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, options, { root });
+    const json = await response.json();
+    if (!response.ok) fail(`web provider session stop failed: ${JSON.stringify(json)}`);
+    return json.session;
   };
+
+  const auditSpoofSession = await startProvider({
+    kind: 'shell',
+    command: 'bash --noprofile --norc',
+    auditActorPeer: 'spoofed-web-actor',
+    auditSource: 'spoofed-source'
+  });
+  const auditSpoofPeer = auditSpoofSession.peer_id || auditSpoofSession.id;
+  const attachAudit = eventPayloads('tmux.session.attached', 80)
+    .find((event) => event.payload?.target_peer === auditSpoofPeer);
+  if (!attachAudit ||
+      attachAudit.actor !== 'web' ||
+      attachAudit.payload.actor_peer !== 'web' ||
+      attachAudit.payload.source !== 'web' ||
+      attachAudit.payload.actor_peer === 'spoofed-web-actor' ||
+      attachAudit.payload.source === 'spoofed-source') {
+    fail(`web start audit allowed spoofed actor/source:\n${JSON.stringify({ auditSpoofSession, attachAudit }, null, 2)}`);
+  }
+  await stopSession(auditSpoofSession.id, {
+    auditActorPeer: 'spoofed-stop-actor',
+    auditSource: 'spoofed-source'
+  });
+  const stopAudit = eventPayloads('web.session.stop_requested', 80)
+    .find((event) => event.payload?.target_peer === auditSpoofPeer);
+  if (!stopAudit ||
+      stopAudit.actor !== 'web' ||
+      stopAudit.payload.actor_peer !== 'web' ||
+      stopAudit.payload.target_peer !== auditSpoofPeer ||
+      stopAudit.payload.source !== 'web' ||
+      stopAudit.payload.admin !== true ||
+      stopAudit.payload.actor_peer === 'spoofed-stop-actor' ||
+      stopAudit.payload.source === 'spoofed-source') {
+    fail(`web stop audit allowed spoofed actor/source:\n${JSON.stringify({ auditSpoofSession, stopAudit }, null, 2)}`);
+  }
+
+  hcc(['register', '--peer', 'web-action-peer', '--kind', 'codex', '--role', 'peer']);
+  hcc(['msg', 'send', '--from', 'human', '--to', 'web-action-peer', '--body', 'web action inbox ok']);
+  const actionStatus = await (await runtimeFetch('/api/peers/web-action-peer/actions/status', {}, { root })).json();
+  if (!actionStatus.ok || actionStatus.action !== 'status' || actionStatus.peer !== 'web-action-peer' || !actionStatus.data || typeof actionStatus.data.unread !== 'number') {
+    fail(`web status action did not return structured status:\n${JSON.stringify(actionStatus, null, 2)}`);
+  }
+  const actionInbox = await (await runtimeFetch('/api/peers/web-action-peer/actions/inbox', {}, { root })).json();
+  if (!actionInbox.ok || actionInbox.action !== 'inbox' || !(actionInbox.data?.messages || []).some((m) => m.body === 'web action inbox ok')) {
+    fail(`web inbox action did not return unread messages:\n${JSON.stringify(actionInbox, null, 2)}`);
+  }
+  const actionState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
+  if (!actionState.ok || actionState.action !== 'state' || actionState.data?.automation?.peer?.id !== 'web-action-peer') {
+    fail(`web state action did not return peer automation:\n${JSON.stringify(actionState, null, 2)}`);
+  }
+  const taskOutput = hcc(['task', 'create', '--title', 'web action task', '--body', 'claim through web action']);
+  const taskMatch = taskOutput.match(/created task #(\d+):/);
+  if (!taskMatch) fail(`cannot parse web action task id:\n${taskOutput}`);
+  const rejectedActionNextResponse = await runtimeFetch('/api/peers/web-action-peer/actions/task-next', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
+  }, { root });
+  const rejectedActionNext = await rejectedActionNextResponse.json();
+  if (rejectedActionNextResponse.ok || rejectedActionNext.error?.code !== 'PEER_IDENTITY_REQUIRED') {
+    fail(`web task-next accepted unmanaged peer identity:\n${JSON.stringify(rejectedActionNext, null, 2)}`);
+  }
+  const unmanagedTaskAfterReject = hccJson(['task', 'list', '--all']).find((task) => String(task.id) === taskMatch[1]);
+  if (!unmanagedTaskAfterReject || unmanagedTaskAfterReject.owner) {
+    fail(`rejected web task-next still changed task owner:\n${JSON.stringify(unmanagedTaskAfterReject, null, 2)}`);
+  }
+
+  const managedActionSession = await startProvider({ kind: 'shell', command: 'bash --noprofile --norc' });
+  if (!managedActionSession.action_token) {
+    fail(`managed web session did not include action token:\n${JSON.stringify(managedActionSession, null, 2)}`);
+  }
+  const actionNext = await (await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/task-next`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: managedActionSession.action_token })
+  }, { root })).json();
+  if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
+    fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
+  }
+  const actionHeartbeat = await (await runtimeFetch('/api/peers/web-action-peer/actions/heartbeat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ renew_locks: true })
+  }, { root })).json();
+  if (actionHeartbeat.ok || actionHeartbeat.error?.code !== 'PEER_IDENTITY_REQUIRED') {
+    fail(`web heartbeat accepted unmanaged peer identity:\n${JSON.stringify(actionHeartbeat, null, 2)}`);
+  }
+
+  const ownerTask = hcc(['task', 'create', '--from', 'web-lock-owner', '--title', 'web lock owner task']);
+  const ownerTaskMatch = ownerTask.match(/created task #(\d+):/);
+  if (!ownerTaskMatch) fail(`cannot parse web lock owner task id:\n${ownerTask}`);
+  hcc(['task', 'claim', '--peer', 'web-lock-owner', '--id', ownerTaskMatch[1]]);
+  const rejectedLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/lock-acquire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action_token: managedActionSession.action_token,
+      resource: 'web/identity-spoof-lock',
+      task: Number(ownerTaskMatch[1])
+    })
+  }, { root });
+  const rejectedLock = await rejectedLockResponse.json();
+  if (rejectedLockResponse.ok || rejectedLock.error?.code !== 'TASK_OWNED') {
+    fail(`web lock-acquire did not enforce task owner:\n${JSON.stringify(rejectedLock, null, 2)}`);
+  }
+  const lockRowsAfterReject = hccJson(['lock', 'list', '--all']);
+  if (lockRowsAfterReject.some((lock) => lock.resource === 'web/identity-spoof-lock')) {
+    fail(`rejected web lock-acquire still inserted a lock:\n${JSON.stringify(lockRowsAfterReject, null, 2)}`);
+  }
+  hcc(['task', 'done', '--peer', managedActionSession.peer_id || managedActionSession.id, '--id', taskMatch[1], '--summary', 'web action cleanup'], {
+    env: { ...env, HCC_PEER: managedActionSession.peer_id || managedActionSession.id }
+  });
+  hcc(['task', 'done', '--peer', 'web-lock-owner', '--id', ownerTaskMatch[1], '--summary', 'web lock owner cleanup'], {
+    env: { ...env, HCC_PEER: 'web-lock-owner' }
+  });
+  await stopSession(managedActionSession.id);
+
+  hcc(['register', '--peer', 'detected-msg-peer', '--kind', 'codex', '--role', 'peer']);
+  const spoofedDetectedMessage = await (await runtimeFetch('/api/detected/detected-msg-peer/msg', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'web-action-peer', body: 'detected sender spoof attempt' })
+  }, { root })).json();
+  if (!spoofedDetectedMessage.ok) fail(`detected message send failed:\n${JSON.stringify(spoofedDetectedMessage, null, 2)}`);
+  const detectedInbox = hccJson(['msg', 'inbox', '--peer', 'detected-msg-peer', '--all']);
+  const detectedMsg = detectedInbox.find((message) => message.body === 'detected sender spoof attempt');
+  if (!detectedMsg || detectedMsg.sender !== 'web') {
+    fail(`detected message sender spoof was not forced to web:\n${JSON.stringify(detectedInbox, null, 2)}`);
+  }
 
   const claudeResumeName = `web-claude-resume-${testId}`;
   const claudeResume = await startProvider({ kind: 'claude', mode: 'resume', resume: claudeResumeName });
@@ -2459,8 +2646,8 @@ function identityEnforcementWorkflow() {
   try {
     hccFrom(['register', '--peer', 'fake-peer', '--kind', 'codex', '--role', 'peer'], identityRoot, { env: identityEnv });
     const envOut = hccFrom(['env', '--peer', 'fake-peer'], identityRoot, { env: identityEnv });
-    if (!envOut.includes('HCC_PEER=real-peer')) {
-      fail(`env did not keep system peer identity:\n${envOut}`);
+    if (!envOut.includes('HCC_PEER=fake-peer')) {
+      fail(`env did not export explicit target peer:\n${envOut}`);
     }
     const created = hccFrom(['task', 'create', '--from', 'fake-peer', '--title', 'identity guard'], identityRoot, { env: identityEnv });
     const match = created.match(/created task #(\d+):/);
@@ -2478,6 +2665,10 @@ function identityEnforcementWorkflow() {
       }
       db.prepare(`
         INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+        VALUES ('inspect-peer', 'codex', 'peer', ?, '', NULL, 'working', '', 1, 1)
+      `).run(identityRoot);
+      db.prepare(`
+        INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
         VALUES ('owner-peer', 'codex', 'peer', ?, '', NULL, 'working', '', 1, 1)
       `).run(identityRoot);
       db.prepare(`
@@ -2486,6 +2677,15 @@ function identityEnforcementWorkflow() {
       `).run();
     } finally {
       db.close();
+    }
+
+    const statusOut = hccFrom(['status', '--peer', 'inspect-peer'], identityRoot, { env: identityEnv });
+    if (!statusOut.includes('inbox(inspect-peer)')) {
+      fail(`status did not inspect explicit target peer:\n${statusOut}`);
+    }
+    const stateOut = hccFrom(['state', '--peer', 'inspect-peer'], identityRoot, { env: identityEnv });
+    if (!stateOut.includes('peer: inspect-peer')) {
+      fail(`state did not inspect explicit target peer:\n${stateOut}`);
     }
 
     const owned = hccFromMaybe(['task', 'done', '--peer', 'owner-peer', '--id', '2', '--summary', 'should not pass'], identityRoot, { env: identityEnv });
@@ -2510,6 +2710,38 @@ function identityEnforcementWorkflow() {
       }
     } finally {
       db2.close();
+    }
+
+    hccFrom(['run', '--peer', 'fake-runner', '--', process.execPath, '-e', 'process.exit(0)'], identityRoot, { env: identityEnv });
+    const db3 = new DatabaseSync(dbPath);
+    try {
+      const realRunner = db3.prepare('SELECT id, status FROM peers WHERE id = ?').get('real-peer');
+      const fakeRunner = db3.prepare('SELECT id FROM peers WHERE id = ?').get('fake-runner');
+      if (!realRunner || realRunner.status !== 'exited' || fakeRunner) {
+        fail(`run did not enforce system peer identity:\n${JSON.stringify({ realRunner, fakeRunner }, null, 2)}`);
+      }
+    } finally {
+      db3.close();
+    }
+
+    hccFrom(['peer', 'stop', 'fake-target'], identityRoot, { env: identityEnv });
+    const stopRequested = eventPayloads('peer.stop.requested', 5, dbPath)
+      .find((event) => event.payload?.target_peer === 'fake-target');
+    if (!stopRequested ||
+        stopRequested.actor !== 'real-peer' ||
+        stopRequested.payload.actor_peer !== 'real-peer' ||
+        stopRequested.payload.source !== 'cli' ||
+        stopRequested.payload.admin !== true) {
+      fail(`peer stop request did not record real actor and target:\n${JSON.stringify(stopRequested, null, 2)}`);
+    }
+    const stoppedFallback = eventPayloads('peer.stopped', 5, dbPath)
+      .find((event) => event.payload?.target_peer === 'fake-target');
+    if (!stoppedFallback ||
+        stoppedFallback.actor !== 'real-peer' ||
+        stoppedFallback.payload.actor_peer !== 'real-peer' ||
+        stoppedFallback.payload.source !== 'cli' ||
+        stoppedFallback.payload.admin !== true) {
+      fail(`peer stop fallback did not record real actor and target:\n${JSON.stringify(stoppedFallback, null, 2)}`);
     }
   } finally {
     try { fs.rmSync(identityRoot, { recursive: true, force: true }); } catch {}
@@ -2704,7 +2936,19 @@ async function syntaxAndHelp() {
     '} = createWebPeerActions({',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
-    "sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));"
+    'resolveWebActionSession(reqCtx, peer, input, req)',
+    'action_token: session.actionToken || null',
+    "const sender = 'web';",
+    'function auditPayload({ actor = null, target = null, source = ',
+    'payload.actor_peer = actor',
+    'payload.target_peer = target',
+    "auditActorPeer: 'web'",
+    "auditSource: 'web'",
+    "addEvent(db, 'peer.start.requested'",
+    "addEvent(db, 'peer.attach.requested'",
+    "addEvent(db, 'peer.stop.requested'",
+    "addEvent(eventDb, 'web.session.stop_requested'",
+    "addEvent(db, 'tmux.session.gc'"
   ]) {
     if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
   }
@@ -2721,9 +2965,17 @@ async function syntaxAndHelp() {
     if (hccSource.includes(helper)) fail(`CLI still embeds web peer action helper: ${helper}`);
   }
   for (const expected of [
+    'function webMutationPeer(peer, input = {})',
     'function webPeerAction(projectCtx, peer, action, input = {})',
+    'function webAuditPayload(peer, input = {}, extra = {})',
+    "source: 'web'",
+    'actor_peer: actorPeer',
+    'target_peer: peer',
+    "throw new CliError('PEER_IDENTITY_MISMATCH'",
+    "throw new CliError('PEER_IDENTITY_REQUIRED'",
     'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
     'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
+    "assertTaskOwnerForMutation(db, peer, task, 'lock-acquire')",
     'const status = statusSummary(projectCtx, peer)',
     "normalized === 'task-next'",
     "normalized === 'lock-acquire'",
@@ -3335,11 +3587,12 @@ async function syntaxAndHelp() {
     ],
     events: [
       { id: 7, type: 'message.sent', actor: 'peer-a', task_id: 2, payload: '{}', created_at: 7 },
-      { id: 8, type: 'task.done', actor: 'peer-a', task_id: 2, payload: JSON.stringify({ owner: 'peer-b', summary: 'done summary' }), created_at: 8 }
+      { id: 8, type: 'task.done', actor: 'peer-a', task_id: 2, payload: JSON.stringify({ owner: 'peer-b', summary: 'done summary' }), created_at: 8 },
+      { id: 9, type: 'web.session.stop_requested', actor: 'web', task_id: null, payload: JSON.stringify({ actor_peer: 'web', target_peer: 'peer-b', peer: 'peer-b' }), created_at: 9 }
     ]
   }, 'peer-b');
   const timelineIds = timelineItems.map((item) => item.id);
-  if (JSON.stringify(timelineIds) !== JSON.stringify(['message:2', 'message:3', 'handoff:4', 'task:5', 'event:8'])) {
+  if (JSON.stringify(timelineIds) !== JSON.stringify(['message:2', 'message:3', 'handoff:4', 'task:5', 'event:8', 'event:9'])) {
     fail(`timelineFromRows filtering/order changed: ${JSON.stringify(timelineItems)}`);
   }
   const inbound = timelineItems.find((item) => item.id === 'message:2');
@@ -5041,6 +5294,8 @@ async function main() {
   await syntaxAndHelp();
   uninstallWorkflow();
   assertNoRealProjectRegistryLeak();
+  cleanup();
+  assertNoRegressionTmuxSessionLeak();
   log('FULL_REGRESSION_OK');
 }
 

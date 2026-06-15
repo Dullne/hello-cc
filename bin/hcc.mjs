@@ -326,6 +326,7 @@ const {
 } = createWebPeerActions({
   activePeerTtl: ACTIVE_PEER_TTL,
   addEvent,
+  assertTaskOwnerForMutation,
   claimNextTasksForPeer,
   connect,
   defaultLockTtl: DEFAULT_LOCK_TTL,
@@ -352,6 +353,15 @@ function iso(ts) {
   return new Date(ts * 1000).toISOString();
 }
 
+function webErrorStatus(err) {
+  if (!(err instanceof CliError)) return 500;
+  if (['BAD_ARGS', 'BAD_REQUEST', 'PEER_IDENTITY_REQUIRED', 'REQUEST_TOO_LARGE'].includes(err.code)) return 400;
+  if (['PEER_IDENTITY_MISMATCH', 'TASK_OWNED', 'LOCK_OWNED'].includes(err.code)) return 403;
+  if (['NOT_FOUND'].includes(err.code)) return 404;
+  if (['LOCK_HELD', 'SESSION_NOT_RUNNING'].includes(err.code)) return 409;
+  return 500;
+}
+
 function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
   const kind = autoPeerKind(kindHint);
   const ancestor = readAncestorCliInfo();
@@ -368,6 +378,11 @@ function autoPeerDefaults(ctx, kindHint = 'shell', status = 'working') {
 
 function shellCommand(args) {
   return shellCommandWithQuote(args, shellQuoteArg);
+}
+
+function resolveTargetPeer(ctx, opts = {}, key = 'peer', kindHint = 'shell') {
+  if (opts[key]) return { id: opts[key], auto: false, target: true };
+  return resolveCurrentPeer(ctx, opts, key, kindHint);
 }
 
 let projectMigrationFanoutDepth = 0;
@@ -425,6 +440,22 @@ function addEvent(db, type, actor, taskId, payload) {
     INSERT INTO events(type, actor, task_id, payload, created_at)
     VALUES (?, ?, ?, ?, ?)
   `).run(type, actor || null, taskId || null, JSON.stringify(payload || {}), now());
+}
+
+function auditPayload({ actor = null, target = null, source = 'cli', admin = false, ...extra } = {}) {
+  const payload = { ...extra, source };
+  if (actor) payload.actor_peer = actor;
+  if (target) payload.target_peer = target;
+  if (admin) payload.admin = true;
+  return payload;
+}
+
+function requestActorPeer(input = {}, fallback = 'web') {
+  return String(input.auditActorPeer || fallback || 'web').trim() || 'web';
+}
+
+function requestSource(input = {}, fallback = 'web') {
+  return String(input.auditSource || fallback || 'web').trim() || fallback;
 }
 
 function latestHookProviderSession(db, peer) {
@@ -605,7 +636,7 @@ async function cmdRegister(ctx, args) {
 async function cmdEnv(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpEnv();
   const opts = parseOpts(args);
-  const peer = resolveCurrentPeer(ctx, opts, 'peer', 'shell').id;
+  const peer = resolveTargetPeer(ctx, opts, 'peer', 'shell').id;
   const values = {
     HCC_PEER: peer,
     HCC_ROOT: ctx.root,
@@ -1196,7 +1227,25 @@ async function cmdBroadcast(ctx, args) {
 }
 
 async function injectPeer(ctx, peer, text, enter = true, runtime = null) {
-  return runtimeRequest(ctx, 'POST', `/api/sessions/${encodeURIComponent(peer)}/input`, { text, enter }, runtime);
+  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
+  const db = connect(ctx);
+  try {
+    addEvent(db, 'web.session.input.requested', actor, null, auditPayload({
+      actor,
+      target: peer,
+      peer,
+      source: 'cli',
+      admin: actor !== peer,
+      bytes: text.length,
+      enter
+    }));
+  } finally {
+    db.close();
+  }
+  return runtimeRequest(ctx, 'POST', `/api/sessions/${encodeURIComponent(peer)}/input`, {
+    text,
+    enter
+  }, runtime);
 }
 
 async function cmdInject(ctx, args) {
@@ -1263,6 +1312,7 @@ async function peerStart(ctx, args) {
   const optArgs = sep >= 0 ? args.slice(0, sep) : args;
   const cmdArgs = sep >= 0 ? args.slice(sep + 1) : [];
   const opts = parseOpts(optArgs, { booleans: ['last', 'continue', 'fork', 'force', 'restart-env'] });
+  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
   const id = opts.peer || opts._[0];
   if (!id) throw new CliError('BAD_ARGS', 'Missing peer');
   const firstCommand = cmdArgs[0] || '';
@@ -1305,6 +1355,17 @@ async function peerStart(ctx, args) {
         status: 'starting',
         capabilities: 'tmux'
       });
+      addEvent(db, 'peer.start.requested', actor, null, auditPayload({
+        actor,
+        target: id,
+        peer: id,
+        source: 'cli',
+        admin: actor !== id,
+        kind,
+        role,
+        command,
+        cwd
+      }));
     });
   } finally {
     db.close();
@@ -1326,6 +1387,7 @@ async function peerStart(ctx, args) {
 
 async function peerAttach(ctx, args) {
   const opts = parseOpts(args, { booleans: ['force'] });
+  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
   const id = opts.peer || opts._[0];
   if (!id) throw new CliError('BAD_ARGS', 'Missing peer');
   const pane = opts.pane || process.env.TMUX_PANE || null;
@@ -1342,6 +1404,22 @@ async function peerAttach(ctx, args) {
     throw e;
   }
   await runtimeRequest(ctx, 'GET', '/api/runtime', null, runtime);
+  const db = connect(ctx);
+  try {
+    addEvent(db, 'peer.attach.requested', actor, null, auditPayload({
+      actor,
+      target: id,
+      peer: id,
+      source: 'cli',
+      admin: actor !== id,
+      pane,
+      kind,
+      role,
+      cwd
+    }));
+  } finally {
+    db.close();
+  }
   const data = await runtimeRequest(ctx, 'POST', '/api/sessions/attach', {
     id,
     kind,
@@ -1355,10 +1433,23 @@ async function peerAttach(ctx, args) {
 
 async function peerStop(ctx, args) {
   const opts = parseOpts(args);
+  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
   const id = opts.peer || opts._[0];
   if (!id) throw new CliError('BAD_ARGS', 'Missing peer');
   let data;
   try {
+    const db = connect(ctx);
+    try {
+      addEvent(db, 'peer.stop.requested', actor, null, auditPayload({
+        actor,
+        target: id,
+        peer: id,
+        source: 'cli',
+        admin: actor !== id
+      }));
+    } finally {
+      db.close();
+    }
     data = await runtimeRequest(ctx, 'POST', `/api/sessions/${encodeURIComponent(id)}/stop`, {});
   } catch (err) {
     if (err instanceof CliError && err.code === 'RUNTIME_NOT_RUNNING') {
@@ -1366,7 +1457,12 @@ async function peerStop(ctx, args) {
       const db = connect(ctx);
       try {
         db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
-        addEvent(db, 'peer.stopped', process.env.HCC_PEER || 'human', null, { peer: id });
+        addEvent(db, 'peer.stopped', actor, null, auditPayload({
+          actor,
+          target: id,
+          peer: id,
+          admin: actor !== id
+        }));
       } finally { db.close(); }
       printResult(ctx, { id, status: 'exited' }, (s) => `stopped ${s.id} (no server running — DB marked exited)`);
       return;
@@ -1570,7 +1666,7 @@ async function eventTail(ctx, args) {
 
 async function cmdStatus(ctx, args) {
   const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
+  const identity = resolveTargetPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const data = statusSummary(ctx, peer, identity);
   printResult(ctx, data, (s) => renderStatusSummary(s, peer));
@@ -1579,7 +1675,7 @@ async function cmdStatus(ctx, args) {
 async function cmdState(ctx, args) {
   if (wantsHelp(args)) return helpState();
   const opts = parseOpts(args, { arrays: ['resource'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
+  const identity = resolveTargetPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const resources = normalizeStateResources(opts.resource || opts.resources || []);
   const snapshot = statusSnapshot(ctx, peer, { resources, intent: opts.intent || null, scope: opts.scope || null });
@@ -1932,6 +2028,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const projectContexts = new Map();
   const prepared = await prepareLocalBus(ctx, opts);
 
+  function newSessionActionToken() {
+    return makeWebToken({ token: null });
+  }
+
   function rememberProject(projectCtx) {
     const normalized = contextForProject(projectCtx.root, projectCtx.dbPath, { cwd: projectCtx.cwd, json: ctx.json });
     projectContexts.set(normalized.root, normalized);
@@ -1983,6 +2083,38 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return null;
   }
 
+  function readActionToken(input, req) {
+    const headerToken = req.headers['x-hcc-session-token'];
+    return String(input.action_token || input.actionToken || headerToken || '').trim();
+  }
+
+  function resolveWebActionSession(projectCtx, peer, input, req) {
+    const db = connect(projectCtx);
+    let session;
+    try {
+      session = getSession(projectCtx, peer, db);
+    } finally {
+      db.close();
+    }
+    if (!session || session.status !== 'running') {
+      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action requires a running managed session for ${peer}`, { peer });
+    }
+    const actorPeer = session.peerId || peer;
+    if (actorPeer !== peer && session.id !== peer) {
+      throw new CliError('PEER_IDENTITY_MISMATCH', `Web peer action target ${peer} does not match managed session ${actorPeer}`, {
+        peer,
+        actor_peer: actorPeer,
+        session_id: session.id
+      });
+    }
+    const expected = session.actionToken || '';
+    const provided = readActionToken(input, req);
+    if (!expected || provided !== expected) {
+      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action for ${peer} requires the managed session action token`, { peer });
+    }
+    return actorPeer;
+  }
+
   function knownPeerIds(projectCtx) {
     const db = connect(projectCtx);
     try {
@@ -2024,6 +2156,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const session = {
       id,
       peerId: id,
+      actionToken: newSessionActionToken(),
       root: pctx.root,
       ctx: pctx,
       kind: meta.kind || 'external',
@@ -2234,7 +2367,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             force: false,
             projectCtx: ctx,
             binding,
-            autoAttach: true
+            autoAttach: true,
+            auditActorPeer: 'web-runtime',
+            auditSource: 'runtime'
           });
           attached.peers.add(row.id);
           if (session.peerId) attached.peers.add(session.peerId);
@@ -2378,6 +2513,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       binding,
       provider_session_known: Boolean(providerSessionLabel),
       provider_session_label: providerSessionLabel,
+      action_token: session.actionToken || null,
       warning: session.warning || null
     };
   }
@@ -2423,10 +2559,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
            OR runtime_session_id = ?
            OR (? IS NOT NULL AND runtime_target = ?)
       `).run(t, session.id, peerId, session.id, session.pane || null, session.pane || null);
-      addEvent(db, status === 'exited' ? 'tmux.session.exited' : 'tmux.session.detached', peerId, null, {
+      addEvent(db, status === 'exited' ? 'tmux.session.exited' : 'tmux.session.detached', peerId, null, auditPayload({
+        actor: peerId,
+        target: peerId,
+        source: session.auditSource || 'runtime',
         runtime_session_id: session.id,
         pane: session.pane
-      });
+      }));
     } finally {
       db.close();
     }
@@ -2599,7 +2738,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   function addRebindCleanupFailedEvent(db, actor, payload) {
     if (!db) return;
-    addEvent(db, 'tmux.session.rebind_cleanup_failed', actor, null, payload);
+    addEvent(db, 'tmux.session.rebind_cleanup_failed', actor, null, auditPayload({
+      actor,
+      target: payload.old_peer || payload.target_peer || null,
+      admin: true,
+      ...payload
+    }));
   }
 
   function oldTmuxRebindTarget(projectCtx, oldTarget, newTarget) {
@@ -2779,7 +2923,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         });
     }
     if (db) {
-      addEvent(db, 'tmux.session.rebind_cleanup_pending', actor, null, {
+      addEvent(db, 'tmux.session.rebind_cleanup_pending', actor, null, auditPayload({
+        actor,
+        target: oldPeer,
+        admin: true,
         old_peer: oldPeer,
         old_runtime_target: oldTarget,
         new_runtime_target: newTarget,
@@ -2788,7 +2935,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         expected_tmux_session: expectedSession,
         allowed_tmux_session: allowedSession,
         hcc_root: hccRoot || null
-      });
+      }));
     }
     return {
       oldPeer,
@@ -2876,13 +3023,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       throw err;
     }
     if (db) {
-      addEvent(db, 'tmux.session.rebound', actor, null, {
+      addEvent(db, 'tmux.session.rebound', actor, null, auditPayload({
+        actor,
+        target: oldPeer,
+        admin: true,
         old_peer: oldPeer,
         old_runtime_target: oldTarget,
         new_runtime_target: newTarget,
         old_tmux_session: oldSessionName,
         new_tmux_session: newSessionName || null
-      });
+      }));
     }
     return true;
   }
@@ -2898,6 +3048,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const pctx = input.projectCtx || ctx;
     const id = input.id;
     if (!id) throw new CliError('BAD_REQUEST', 'id required');
+    const actorPeer = requestActorPeer(input, id);
+    const auditSource = requestSource(input, input.autoAttach ? 'runtime' : 'web');
     const info = tmuxPaneInfo(input.pane || null);
     if (info.dead) throw new CliError('TMUX_PANE_DEAD', `tmux pane is not running: ${info.pane}`);
 
@@ -2929,6 +3081,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const session = {
       id,
       peerId: id,
+      actorPeer,
+      auditSource,
+      actionToken: newSessionActionToken(),
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -3015,7 +3170,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       });
       session.peerId = canonical.peer;
       session.binding = { ...canonical.binding };
-      addEvent(db, 'tmux.session.attached', id, null, { pane: info.pane, command, cwd, pid: info.pid });
+      addEvent(db, 'tmux.session.attached', actorPeer, null, auditPayload({
+        actor: actorPeer,
+        target: session.peerId || id,
+        source: auditSource,
+        admin: actorPeer !== (session.peerId || id),
+        pane: info.pane,
+        command,
+        cwd,
+        pid: info.pid
+      }));
     } catch (err) {
       stopTmuxStream(session);
       if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
@@ -3030,12 +3194,17 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         try {
           killOldTmuxForRebind(pctx, rebindOldPlan, session.peerId || id, eventDb);
           if (rebindOldPeer && rebindOldPeer !== id) {
-            addEvent(eventDb, 'provider.session.rebound', session.peerId || id, null, {
+            const actor = actorPeer || session.peerId || id;
+            addEvent(eventDb, 'provider.session.rebound', actor, null, auditPayload({
+              actor,
+              target: rebindOldPeer,
+              source: auditSource,
+              admin: true,
               from_peer: rebindOldPeer,
               to_peer: id,
               old_runtime_target: rebindOldTarget,
               new_runtime_target: info.pane
-            });
+            }));
           }
         } finally {
           eventDb.close();
@@ -3100,6 +3269,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const pctx = input.projectCtx || ctx;
     const kind = input.kind || 'shell';
     const id = input.id || nextProjectSessionId(pctx, kind);
+    const actorPeer = requestActorPeer(input, id);
+    const auditSource = requestSource(input, 'web');
     const role = input.role || 'peer';
     const command = input.command || defaultSessionCommand(kind);
     const cwd = path.resolve(input.cwd || pctx.root);
@@ -3171,11 +3342,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       hasSession = false;
       const db = connect(pctx);
       try {
-        addEvent(db, 'tmux.session.restarted', id, null, {
+        addEvent(db, 'tmux.session.restarted', actorPeer, null, auditPayload({
+          actor: actorPeer,
+          target: id,
+          source: auditSource,
+          admin: true,
           reason,
           old_runtime_target: oldTarget,
           old_tmux_session: parkedName
-        });
+        }));
       } finally {
         db.close();
       }
@@ -3260,7 +3435,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try {
         const eventDb = connect(pctx);
         try {
-          killOldTmuxForRebind(pctx, oldInfo.plan, session.peerId || id, eventDb);
+          killOldTmuxForRebind(pctx, oldInfo.plan, actorPeer, eventDb);
         } finally {
           eventDb.close();
         }
@@ -3304,6 +3479,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           pane: row.runtime_target,
           projectCtx,
           force: true,
+          auditActorPeer: 'web-runtime',
+          auditSource: 'runtime',
           binding: {
             provider: row.provider,
             provider_session_id: row.provider_session_id,
@@ -3324,6 +3501,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const pctx = input.projectCtx || ctx;
     const kind = input.kind || 'shell';
     const id = input.id || nextProjectSessionId(pctx, kind);
+    const actorPeer = requestActorPeer(input, id);
+    const auditSource = requestSource(input, 'web');
     const key = sessionKey(pctx, id);
     if (sessions.has(key) && sessions.get(key).status === 'running') {
       return sessions.get(key);
@@ -3350,6 +3529,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const session = {
       id,
       peerId: id,
+      actorPeer,
+      auditSource,
+      actionToken: newSessionActionToken(),
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -3390,7 +3572,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }, Boolean(input.force));
       session.peerId = canonical.peer;
       session.binding = { ...canonical.binding };
-      addEvent(db, 'web.session.started', id, null, { command, cwd, pid: child.pid });
+      addEvent(db, 'web.session.started', actorPeer, null, auditPayload({
+        actor: actorPeer,
+        target: session.peerId || id,
+        source: auditSource,
+        admin: actorPeer !== (session.peerId || id),
+        command,
+        cwd,
+        pid: child.pid
+      }));
     } finally {
       db.close();
     }
@@ -3405,7 +3595,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const db = connect(pctx);
       try {
         db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
-        addEvent(db, 'web.session.exited', id, null, event);
+        addEvent(db, 'web.session.exited', session.actorPeer || id, null, auditPayload({
+          actor: session.actorPeer || id,
+          target: session.peerId || id,
+          source: session.auditSource || 'web',
+          ...event
+        }));
       } finally {
         db.close();
       }
@@ -3555,7 +3750,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
               resource: url.searchParams.getAll('resource')
             }
           : await readJsonRequest(req);
-        sendJson(res, 200, webPeerAction(reqCtx, peer, action, input));
+        const actionInput = readOnly
+          ? input
+          : { ...input, actorPeer: resolveWebActionSession(reqCtx, peer, input, req) };
+        sendJson(res, 200, webPeerAction(reqCtx, peer, action, actionInput));
         return;
       }
       // Detected sessions: peers registered via hooks/watcher but without PTY
@@ -3657,13 +3855,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/sessions') {
         const input = await readJsonRequest(req);
-        const session = startSession({ ...input, projectCtx: reqCtx });
+        const session = startSession({ ...input, projectCtx: reqCtx, auditActorPeer: 'web', auditSource: 'web' });
         sendJson(res, 200, { session: serializeSession(session) });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/sessions/attach') {
         const input = await readJsonRequest(req);
-        const session = attachTmuxSession({ ...input, projectCtx: reqCtx });
+        const session = attachTmuxSession({ ...input, projectCtx: reqCtx, auditActorPeer: 'web', auditSource: 'web' });
         sendJson(res, 200, { session: serializeSession(session) });
         return;
       }
@@ -3691,7 +3889,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         writeSessionInput(session, data);
         const db = connect(session.ctx || reqCtx);
         try {
-          addEvent(db, 'web.session.input', id, null, { bytes: data.length, enter: input.enter !== false });
+          addEvent(db, 'web.session.input', 'web', null, auditPayload({
+            actor: 'web',
+            target: session.peerId || id,
+            source: 'web',
+            admin: true,
+            peer: session.peerId || id,
+            runtime_session_id: session.id,
+            bytes: data.length,
+            enter: input.enter !== false
+          }));
         } finally {
           db.close();
         }
@@ -3701,6 +3908,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const stopMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/);
       if (req.method === 'POST' && stopMatch) {
         const id = decodeURIComponent(stopMatch[1]);
+        let stopInput = {};
+        try { stopInput = await readJsonRequest(req); } catch {}
         const lookupDb = connect(reqCtx);
         let session;
         try {
@@ -3719,13 +3928,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             if (session.wrapperPid) { try { process.kill(session.wrapperPid, 'SIGTERM'); } catch {} }
             if (session.pid && session.pid !== session.wrapperPid) { try { process.kill(session.pid, 'SIGTERM'); } catch {} }
           } else if (session.type === 'tmux') {
-            let input = {};
-            try { input = await readJsonRequest(req); } catch {}
             let killPlan = null;
             const stopDb = connect(reqCtx);
             try {
               const peerId = resolveSessionPeerId(stopDb, session) || session.peerId || session.id;
-              if (input.kill_tmux) {
+              if (stopInput.kill_tmux) {
                 killPlan = safeTmuxKillPlan(reqCtx, stopDb, peerId, session.pane || null);
               }
             } finally {
@@ -3737,6 +3944,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             session.pty.kill();
           }
         }
+        const eventDb = connect(reqCtx);
+        try {
+          const peerId = resolveSessionPeerId(eventDb, session) || session.peerId || id;
+          addEvent(eventDb, 'web.session.stop_requested', 'web', null, auditPayload({
+            actor: 'web',
+            target: peerId,
+            source: 'web',
+            admin: true,
+            peer: peerId,
+            runtime_session_id: session.id,
+            kill_tmux: Boolean(stopInput.kill_tmux)
+          }));
+        } finally {
+          eventDb.close();
+        }
         sendJson(res, 200, { session: serializeSession(session) });
         return;
       }
@@ -3746,7 +3968,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const peerId = decodeURIComponent(detectedMsgMatch[1]);
         const input = await readJsonRequest(req);
         const body = String(input.body || '');
-        const sender = String(input.from || 'web');
+        const sender = 'web';
         const taskId = input.task ? Number(input.task) : null;
         if (!body) { sendJson(res, 400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body required' } }); return; }
         const db = connect(reqCtx);
@@ -3773,12 +3995,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           }
           db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now_, peerId);
           db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now_, peerId);
-          addEvent(db, 'peer.stopped', 'web', null, {
+          addEvent(db, 'peer.stopped', 'web', null, auditPayload({
+            actor: 'web',
+            target: peerId,
+            source: 'web',
+            admin: true,
             peer: peerId,
             kill_tmux: Boolean(killPlan),
             tmux_session: killPlan?.session || null,
             runtime_target: killPlan?.runtime_target || null
-          });
+          }));
         } finally {
           db.close();
         }
@@ -3792,7 +4018,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         try {
           const now_ = now();
           db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('running', now_, peerId);
-          addEvent(db, 'peer.restarted', 'web', null, { peer: peerId });
+          addEvent(db, 'peer.restarted', 'web', null, auditPayload({
+            actor: 'web',
+            target: peerId,
+            source: 'web',
+            admin: true,
+            peer: peerId
+          }));
         } finally {
           db.close();
         }
@@ -3802,7 +4034,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
     } catch (err) {
       const detail = err instanceof CliError || process.env.HCC_DEBUG ? err.message : 'internal server error';
-      sendJson(res, 500, { ok: false, error: { code: err.code || 'SERVER_ERROR', message: detail } });
+      sendJson(res, webErrorStatus(err), { ok: false, error: { code: err.code || 'SERVER_ERROR', message: detail } });
     }
   });
 
@@ -3897,7 +4129,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   registerProject(ctx);
   const db = connect(ctx);
   try {
-    addEvent(db, startMeta.eventType || 'web.started', 'human', null, {
+    addEvent(db, startMeta.eventType || 'web.started', 'human', null, auditPayload({
+      actor: 'human',
+      source: 'cli',
       root: ctx.root,
       db: ctx.dbPath,
       host,
@@ -3905,7 +4139,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       requested_port: port,
       guidance: startMeta.guidance || prepared.guidance || null,
       runtime: runtimeFile
-    });
+    }));
   } finally {
     db.close();
   }
@@ -3923,8 +4157,9 @@ async function cmdRun(ctx, args) {
   const cmdArgs = sep >= 0 ? args.slice(sep + 1) : [];
   const opts = parseOpts(optArgs, { booleans: ['force', 'web-managed'] });
   validateOpts('run', opts, ['peer', 'kind', 'role', 'cwd', 'force']);
-  const id = required(opts, 'peer', 'HCC_PEER');
   const kind = opts.kind || 'other';
+  const identity = resolveCurrentPeer(ctx, opts, 'peer', kind);
+  const id = identity.id;
   const role = opts.role || 'peer';
   const cwd = path.resolve(opts.cwd || ctx.cwd);
   const command = cmdArgs.length ? cmdArgs[0] : defaultSessionCommand(kind);
@@ -3942,7 +4177,12 @@ async function cmdRun(ctx, args) {
       capabilities: 'run-wrapper'
     });
     upsertCanonicalPeerBinding(db, binding, Boolean(opts.force));
-    addEvent(db, 'run.session.started', id, null, { command: [command, ...commandArgs].join(' '), cwd });
+    addEvent(db, 'run.session.started', id, null, auditPayload({
+      actor: id,
+      target: id,
+      command: [command, ...commandArgs].join(' '),
+      cwd
+    }));
   } finally {
     db.close();
   }
@@ -3962,7 +4202,11 @@ async function cmdRun(ctx, args) {
   const db2 = connect(ctx);
   try {
     db2.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
-    addEvent(db2, 'run.session.exited', id, null, exitCode);
+    addEvent(db2, 'run.session.exited', id, null, auditPayload({
+      actor: id,
+      target: id,
+      ...exitCode
+    }));
   } finally {
     db2.close();
   }
@@ -4005,7 +4249,13 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
       capabilities: 'run-pty'
     });
     upsertCanonicalPeerBinding(db, binding, force);
-    addEvent(db, 'run.session.started', id, null, { command: [command, ...commandArgs].join(' '), cwd, webManaged: true });
+    addEvent(db, 'run.session.started', id, null, auditPayload({
+      actor: id,
+      target: id,
+      command: [command, ...commandArgs].join(' '),
+      cwd,
+      webManaged: true
+    }));
   } finally {
     db.close();
   }
@@ -4122,7 +4372,11 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
   const db2 = connect(ctx);
   try {
     db2.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
-    addEvent(db2, 'run.session.exited', id, null, exitCode);
+    addEvent(db2, 'run.session.exited', id, null, auditPayload({
+      actor: id,
+      target: id,
+      ...exitCode
+    }));
   } finally {
     db2.close();
   }
@@ -4247,13 +4501,22 @@ async function cmdHook(ctx, args) {
         SET last_seen_at = ?, status = COALESCE(?, status)
         WHERE id = ?
       `).run(now(), status, peerId);
-      addEvent(db, 'provider.session.merged', peerId, null, {
+      addEvent(db, 'provider.session.merged', peerId, null, auditPayload({
+        actor: peerId,
+        target: peerId,
+        source: 'hook',
         from_peer: previousPeer,
         provider: kind,
         session_id: sessionId || resumeId || null
-      });
+      }));
     }
-    addEvent(db, `hook.${hookKey}`, peerId, null, { session_id: sessionId, cwd: hookCwd });
+    addEvent(db, `hook.${hookKey}`, peerId, null, auditPayload({
+      actor: peerId,
+      target: peerId,
+      source: 'hook',
+      session_id: sessionId,
+      cwd: hookCwd
+    }));
     try {
       reconcileRunningPeerBindings(db, hookCtx, {
         inspectProcess: inspectProviderProcess,
@@ -4877,13 +5140,16 @@ async function cmdTmux(ctx, args) {
             `).run(t, candidate.peer, candidate.runtime_target);
             db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('detached', t, candidate.peer);
           }
-          addEvent(db, 'tmux.session.gc', actor, null, {
+          addEvent(db, 'tmux.session.gc', actor, null, auditPayload({
+            actor,
+            target: candidate.peer,
+            admin: true,
             peer: candidate.peer,
             tmux_session: candidate.session,
             runtime_target: candidate.runtime_target,
             reason: candidate.reason,
             older_than_days: plan.older_than_days
-          });
+          }));
           removed.push(candidate);
         });
       }
