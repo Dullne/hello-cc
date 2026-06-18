@@ -86,6 +86,8 @@ hcc broadcast MESSAGE [--from ID] [--task N] [--inject]
 
 ```text
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
+hcc task dispatch --to ID --title TEXT [--body TEXT] [--from ID] [--message TEXT] [--no-inject] [--force]
+hcc task dispatch --to ID --id N [--from ID] [--message TEXT] [--no-inject] [--force]
 hcc task list [--status S] [--peer ID] [--all]
 hcc task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
 hcc task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
@@ -98,11 +100,14 @@ hcc task done [--peer ID] --id N --summary TEXT
 任务是项目共享事实。任务会一直可见，直到被标记为 `done` 或 `abandoned`。
 `task next` 会优先返回当前 peer 已经认领、运行、审查或阻塞中的任务；只有明确
 要再接 pending 任务时才使用 `--force`，并可结合 `--count N` 做显式批量认领。
-`task claim` 也支持重复 `--id`、逗号分隔的 `--id` 或 `--ids` 列表。明确要从
-其他 owner 手里接管未完成任务时，使用 `task takeover`；它要求填写 reason，会
-记录原 owner 并通知对方。需要更保守时，可加 `--policy blocked`、`stale` 或
-`blocked-or-stale`，要求任务符合可审计的阻塞/陈旧条件后才允许接管。默认 policy
-仍是 `any`，以保持兼容。
+`task claim` 也支持重复 `--id`、逗号分隔的 `--id` 或 `--ids` 列表。`task
+dispatch` 是显式的一步分发：创建或指定已有任务并分配给目标 peer、发送持久任务
+消息，并且只在目标 peer 有正在运行的托管 Claude/Codex 终端时注入启动提示。只想
+发消息时使用 `--no-inject`；目标已经拥有其他活动任务但仍要注入时，才使用
+`--force`。明确要从其他 owner 手里接管未完成任务时，使用 `task takeover`；它要求
+填写 reason，会记录原 owner 并通知对方。需要更保守时，可加 `--policy blocked`、
+`stale` 或 `blocked-or-stale`，要求任务符合可审计的阻塞/陈旧条件后才允许接管。
+默认 policy 仍是 `any`，以保持兼容。
 
 ## 团队
 

@@ -731,6 +731,7 @@ async function cmdTask(ctx, args) {
   const sub = args[0];
   if (!sub || wantsHelp(args)) return helpTask();
   if (sub === 'create') return taskCreate(ctx, args.slice(1));
+  if (sub === 'dispatch') return taskDispatch(ctx, args.slice(1));
   if (sub === 'list') return taskList(ctx, args.slice(1));
   if (sub === 'claim') return taskClaim(ctx, args.slice(1));
   if (sub === 'takeover') return taskTakeover(ctx, args.slice(1));
@@ -770,6 +771,201 @@ async function taskCreate(ctx, args) {
   });
   printResult(ctx, { id, title, assignee, priority, parent_id: parentId, team_role: teamRole },
     (data) => `created task #${data.id}: ${data.title}${data.assignee ? ` -> ${data.assignee}` : ''}${data.parent_id ? ` (child of #${data.parent_id})` : ''}`);
+}
+
+function dispatchPromptText(task, customMessage = null) {
+  if (customMessage) return customMessage;
+  return [
+    `Please pick up hello-cc task #${task.id}: ${task.title}.`,
+    `Run hcc task claim --id ${task.id}, then follow project coordination rules, create a handoff, and mark the task done when finished.`
+  ].join(' ');
+}
+
+function currentOwnedTaskForPeer(db, peer) {
+  return db.prepare(`
+    SELECT *
+    FROM tasks
+    WHERE owner = ?
+      AND status IN ('claimed', 'running', 'review', 'blocked')
+    ORDER BY
+      CASE status
+        WHEN 'running' THEN 0
+        WHEN 'claimed' THEN 1
+        WHEN 'review' THEN 2
+        WHEN 'blocked' THEN 3
+        ELSE 4
+      END,
+      priority ASC,
+      id ASC
+    LIMIT 1
+  `).get(peer);
+}
+
+function findRuntimeSessionForPeer(runtimeData, peer) {
+  return (runtimeData?.sessions || []).find((session) => {
+    const sessionPeer = session.peer_id || session.id;
+    return session.status === 'running' && (session.id === peer || sessionPeer === peer);
+  }) || null;
+}
+
+function sessionLooksProviderInteractive(session) {
+  if (!['claude', 'codex'].includes(session?.kind)) return false;
+  if (session.provider_session_known) return true;
+  const command = String(session.command || '');
+  if (/^tmux\s+%/.test(command)) return false;
+  return /\b(?:claude|codex)(?:\s|$)/.test(command);
+}
+
+async function taskDispatch(ctx, args) {
+  const opts = parseOpts(args, { booleans: ['force', 'no-inject'] });
+  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
+  const actor = identity.id;
+  const target = required(opts, 'to');
+  const requestedTaskId = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
+  const title = requestedTaskId ? (opts.title || null) : required(opts, 'title');
+  const body = opts.body || '';
+  const priority = intOpt(opts, 'priority', 100);
+  const customMessage = opts.message ? String(opts.message) : null;
+  const injectAllowed = !Boolean(opts['no-inject']);
+
+  let task = null;
+  let messageId = null;
+  let currentTask = null;
+  let previousAssignee = null;
+  const db = connect(ctx);
+  try {
+    touchCurrentPeer(db, ctx, identity, null, 'shell');
+    const t = now();
+    task = tx(db, () => {
+      if (requestedTaskId) {
+        const existing = db.prepare('SELECT * FROM tasks WHERE id = ?').get(requestedTaskId);
+        if (!existing) throw new CliError('NOT_FOUND', `Task #${requestedTaskId} does not exist`);
+        if (['done', 'abandoned'].includes(existing.status)) {
+          throw new CliError('BAD_STATE', `Task #${requestedTaskId} is ${existing.status}`);
+        }
+        if (existing.owner && existing.owner !== target) {
+          throw new CliError('TASK_OWNED', `Task #${requestedTaskId} is owned by ${existing.owner}`, {
+            owner: existing.owner,
+            task_id: requestedTaskId,
+            attempted_by: actor,
+            target
+          });
+        }
+        previousAssignee = existing.assignee || null;
+        db.prepare('UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?').run(target, t, requestedTaskId);
+        return db.prepare('SELECT * FROM tasks WHERE id = ?').get(requestedTaskId);
+      }
+      const info = db.prepare(`
+        INSERT INTO tasks(title, body, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
+        VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, ?, ?, ?)
+      `).run(title, body, target, priority, actor, t, t);
+      const taskId = Number(info.lastInsertRowid);
+      addEvent(db, 'task.created', actor, taskId, { title, assignee: target, priority, parent_id: null, team_role: null });
+      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+    });
+    const durableMessage = dispatchPromptText(task, customMessage);
+    messageId = sendMessage(db, actor, target, task.id, 'task', durableMessage);
+    currentTask = currentOwnedTaskForPeer(db, target);
+  } finally {
+    db.close();
+  }
+
+  const durableMessage = dispatchPromptText(task, customMessage);
+  let session = null;
+  let injected = false;
+  let injectionReason = injectAllowed ? 'runtime_unavailable' : 'no_inject';
+  const busyTask = currentTask && Number(currentTask.id) !== Number(task.id) ? currentTask : null;
+  if (injectAllowed) {
+    let runtime = null;
+    let runtimeData = null;
+    try {
+      runtime = readRuntime(ctx);
+      runtimeData = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
+    } catch (err) {
+      if (!(err instanceof CliError) || !['RUNTIME_NOT_RUNNING', 'RUNTIME_UNREACHABLE'].includes(err.code)) throw err;
+    }
+    session = runtimeData ? findRuntimeSessionForPeer(runtimeData, target) : null;
+    if (!session) {
+      injectionReason = runtimeData ? 'session_not_running' : 'runtime_unavailable';
+    } else if (!customMessage && !sessionLooksProviderInteractive(session)) {
+      injectionReason = 'unsupported_session_kind';
+    } else if (busyTask && !Boolean(opts.force)) {
+      injectionReason = 'target_busy';
+    } else {
+      try {
+        await injectPeer(ctx, target, durableMessage, true, runtime, actor);
+        injected = true;
+        injectionReason = 'injected';
+      } catch (err) {
+        if (!(err instanceof CliError)) throw err;
+        if (['RUNTIME_NOT_RUNNING', 'RUNTIME_UNREACHABLE'].includes(err.code)) {
+          injectionReason = 'runtime_unavailable';
+        } else if (['NOT_FOUND', 'SESSION_NOT_RUNNING'].includes(err.code)) {
+          injectionReason = 'session_not_running';
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+
+  const eventDb = connect(ctx);
+  try {
+    addEvent(eventDb, 'task.dispatched', actor, task.id, auditPayload({
+      actor,
+      target,
+      source: 'cli',
+      admin: actor !== target,
+      peer: target,
+      title: task.title,
+      message_id: messageId,
+      injected,
+      delivery: injected ? 'message+inject' : 'message-only',
+      injection_reason: injectionReason,
+      session_id: session?.id || null,
+      session_kind: session?.kind || null,
+      previous_assignee: previousAssignee,
+      blocked_by_task_id: busyTask?.id || null
+    }));
+  } finally {
+    eventDb.close();
+  }
+
+  const result = {
+    task,
+    target,
+    message_id: messageId,
+    message: durableMessage,
+    injected,
+    delivery: injected ? 'message+inject' : 'message-only',
+    injection_reason: injectionReason,
+    session: session ? {
+      id: session.id,
+      peer_id: session.peer_id || session.id,
+      kind: session.kind,
+      status: session.status
+    } : null,
+    previous_assignee: previousAssignee,
+    blocked_by_task: busyTask ? {
+      id: busyTask.id,
+      status: busyTask.status,
+      title: busyTask.title
+    } : null
+  };
+  printResult(ctx, result, (data) => {
+    const base = `dispatched task #${data.task.id} to ${data.target} with message #${data.message_id}`;
+    if (data.injected) return `${base} and injected live input`;
+    if (data.injection_reason === 'target_busy' && data.blocked_by_task) {
+      return `${base} (not injected: ${data.target} already owns task #${data.blocked_by_task.id})`;
+    }
+    if (data.injection_reason === 'unsupported_session_kind' && data.session) {
+      return `${base} (not injected: managed ${data.session.kind} session needs an explicit shell-safe message)`;
+    }
+    if (data.injection_reason === 'session_not_running') return `${base} (not injected: target is not a running managed session)`;
+    if (data.injection_reason === 'runtime_unavailable') return `${base} (not injected: web runtime is unavailable)`;
+    if (data.injection_reason === 'no_inject') return `${base} (message only)`;
+    return `${base} (not injected: ${data.injection_reason})`;
+  });
 }
 
 async function taskList(ctx, args) {
@@ -1195,7 +1391,7 @@ async function cmdAsk(ctx, args) {
   const id = sendMessage(db, sender, recipient, taskId, kind, body);
   let injected = false;
   if (opts.inject) {
-    await injectPeer(ctx, recipient, body, !opts['no-enter'], runtime);
+    await injectPeer(ctx, recipient, body, !opts['no-enter'], runtime, sender);
     injected = true;
   }
   printResult(ctx, { id, sender, recipient, task_id: taskId, kind, body, injected }, (data) => `asked ${data.recipient} with message #${data.id}${data.injected ? ' and injected terminal input' : ''}`);
@@ -1219,15 +1415,15 @@ async function cmdBroadcast(ctx, args) {
     const sessions = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
     const running = (sessions.sessions || []).filter((session) => session.status === 'running');
     for (const session of running) {
-      await injectPeer(ctx, session.id, body, !opts['no-enter'], runtime);
+      await injectPeer(ctx, session.id, body, !opts['no-enter'], runtime, sender);
       injected += 1;
     }
   }
   printResult(ctx, { id, sender, recipient: 'all', task_id: taskId, kind, body, injected }, (data) => `broadcast message #${data.id}${data.injected ? ` and injected ${data.injected} terminal(s)` : ''}`);
 }
 
-async function injectPeer(ctx, peer, text, enter = true, runtime = null) {
-  const actor = resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
+async function injectPeer(ctx, peer, text, enter = true, runtime = null, auditActor = null) {
+  const actor = auditActor || resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
   const db = connect(ctx);
   try {
     addEvent(db, 'web.session.input.requested', actor, null, auditPayload({
@@ -2536,6 +2732,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }
     return open;
+  }
+
+  function closeSessionClients(session) {
+    if (!session?.clients?.size) return;
+    for (const client of [...session.clients]) {
+      try {
+        if (client.readyState === client.OPEN || client.readyState === 1) client.close(1001, 'runtime stopping');
+        else if (typeof client.terminate === 'function') client.terminate();
+      } catch {
+        try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
+      }
+    }
   }
 
   function detachTmuxSession(session, status = 'detached') {
@@ -4089,11 +4297,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
   });
 
+  let shuttingDown = false;
   function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
     clearRuntime(ctx);
     clearInterval(externalScanPoller);
     clearInterval(autoAttachPoller);
     for (const session of sessions.values()) {
+      closeSessionClients(session);
       if (session.status !== 'running') continue;
       if (session.type === 'external') {
         try { if (session.outputFd) fs.closeSync(session.outputFd); } catch {}
@@ -4106,7 +4318,28 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         try { session.pty.kill(); } catch {}
       }
     }
-    server.close(() => process.exit(0));
+    try { wss.close(); } catch {}
+    const terminateClients = setTimeout(() => {
+      for (const session of sessions.values()) {
+        for (const client of [...(session.clients || [])]) {
+          try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
+        }
+      }
+      try { server.closeAllConnections?.(); } catch {}
+    }, 250);
+    const forceExit = setTimeout(() => process.exit(0), 1500);
+    try {
+      server.close(() => {
+        clearTimeout(terminateClients);
+        clearTimeout(forceExit);
+        process.exit(0);
+      });
+      try { server.closeIdleConnections?.(); } catch {}
+    } catch {
+      clearTimeout(terminateClients);
+      clearTimeout(forceExit);
+      process.exit(0);
+    }
   }
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);

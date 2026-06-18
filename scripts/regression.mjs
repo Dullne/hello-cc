@@ -1051,6 +1051,19 @@ async function waitRuntime() {
   }, 'runtime');
 }
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid, label, timeoutMs = 5000) {
+  await waitFor(() => !processIsAlive(pid), label, timeoutMs);
+}
+
 async function expectWebSocketMarker(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
@@ -1074,6 +1087,21 @@ async function expectWebSocketMarker(peer, marker) {
       }
     });
     ws.on('error', reject);
+  });
+}
+
+async function openTerminalWebSocket(peer) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(runtimeWsUrl(peer));
+    const timer = setTimeout(() => reject(new Error(`${peer} websocket open timeout`)), 5000);
+    ws.on('open', () => {
+      clearTimeout(timer);
+      resolve(ws);
+    });
+    ws.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -1196,17 +1224,20 @@ function startRuntime(options = {}) {
 
 async function stopRuntime() {
   if (!runtimePid) return;
+  const pid = runtimePid;
   hccMaybe(['down']);
-  await waitFor(() => {
+  try {
+    await waitForProcessExit(pid, 'runtime process exit', 5000);
+  } catch (err) {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
     try {
-      process.kill(runtimePid, 0);
-      return false;
+      await waitForProcessExit(pid, 'runtime process exit after SIGTERM', 2000);
     } catch {
-      return true;
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+      try { await waitForProcessExit(pid, 'runtime process exit after SIGKILL', 2000); } catch {}
+      throw err;
     }
-  }, 'runtime process exit', 5000).catch(() => {
-    try { process.kill(runtimePid, 'SIGTERM'); } catch {}
-  });
+  }
   runtimePid = null;
 }
 
@@ -1565,6 +1596,38 @@ async function dbWorkflow() {
     hcc(['task', 'done', '--peer', 'batch-b', '--id', String(task.id), '--summary', 'batch next cleanup']);
   }
   hcc(['task', 'update', '--peer', 'human', '--id', batchNextIds[2], '--status', 'abandoned', '--summary', 'batch next leftover cleanup']);
+
+  const dispatched = hccJson(['task', 'dispatch', '--from', 'human', '--to', 'dispatch-a', '--title', 'dispatch new task', '--body', 'dispatch body', '--no-inject']);
+  if (!dispatched.task || dispatched.task.assignee !== 'dispatch-a' || dispatched.task.owner ||
+      dispatched.injected !== false || dispatched.injection_reason !== 'no_inject' || !dispatched.message_id) {
+    fail(`task dispatch did not create message-only assigned task:\n${JSON.stringify(dispatched, null, 2)}`);
+  }
+  const dispatchInbox = hcc(['msg', 'inbox', '--peer', 'dispatch-a', '--all']);
+  if (!dispatchInbox.includes(`task #${dispatched.task.id}`) || !dispatchInbox.includes('dispatch new task')) {
+    fail(`task dispatch durable message missing:\n${dispatchInbox}`);
+  }
+  const dispatchAudit = eventPayloads('task.dispatched', 20)
+    .find((event) => Number(event.payload?.message_id) === Number(dispatched.message_id));
+  if (!dispatchAudit ||
+      dispatchAudit.actor !== 'human' ||
+      dispatchAudit.payload.actor_peer !== 'human' ||
+      dispatchAudit.payload.target_peer !== 'dispatch-a' ||
+      dispatchAudit.payload.source !== 'cli' ||
+      dispatchAudit.payload.injected !== false ||
+      dispatchAudit.payload.injection_reason !== 'no_inject') {
+    fail(`task dispatch audit payload wrong:\n${JSON.stringify(dispatchAudit, null, 2)}`);
+  }
+  const dispatchExistingCreated = hcc(['task', 'create', '--from', 'human', '--title', 'dispatch existing task']);
+  const dispatchExistingMatch = dispatchExistingCreated.match(/created task #(\d+):/);
+  if (!dispatchExistingMatch) fail(`cannot parse dispatch existing task id: ${dispatchExistingCreated}`);
+  const dispatchExisting = hccJson(['task', 'dispatch', '--from', 'human', '--to', 'dispatch-b', '--id', dispatchExistingMatch[1], '--message', 'custom dispatch existing', '--no-inject']);
+  if (String(dispatchExisting.task?.id) !== dispatchExistingMatch[1] ||
+      dispatchExisting.task.assignee !== 'dispatch-b' ||
+      dispatchExisting.message !== 'custom dispatch existing' ||
+      dispatchExisting.injected !== false) {
+    fail(`task dispatch --id did not assign existing task:\n${JSON.stringify(dispatchExisting, null, 2)}`);
+  }
+
   const takeoverOpen = hcc(['task', 'create', '--from', 'human', '--to', 'takeover-owner', '--title', 'takeover open']);
   const takeoverOpenMatch = takeoverOpen.match(/created task #(\d+):/);
   if (!takeoverOpenMatch) fail(`cannot parse takeover open id: ${takeoverOpen}`);
@@ -2305,11 +2368,18 @@ async function tmuxBackedStartWorkflow() {
   await expectWebSocketInputVisible('shell-a', 'WS_INPUT_VISIBLE_OK');
   await expectBoundedTmuxStream('tmux-backed FIFO stream');
 
-  await stopRuntime();
+  const heldWs = await openTerminalWebSocket('shell-a');
+  try {
+    await stopRuntime();
+    await waitFor(() => heldWs.readyState === WebSocket.CLOSED || heldWs.readyState === WebSocket.CLOSING, 'runtime websocket close', 2000);
+  } finally {
+    try { heldWs.close(); } catch {}
+  }
   run('tmux', ['display-message', '-p', '-t', pane, '#{pane_id}']);
   startRuntime();
   await waitRuntime();
-  await waitFor(() => hcc(['peer', 'list']).includes('shell-a'), 'tmux-backed peer restore');
+  await waitFor(() => hcc(['peer', 'list']).includes('shell-a'), 'tmux-backed peer restore after websocket shutdown');
+
   const restoredFile = path.join(outDir, 'pty-restored-ok');
   hcc(['inject', 'shell-a', `echo PTY_RESTORED_OK > ${restoredFile}`]);
   await waitForFile(restoredFile, 'PTY_RESTORED_OK', 'tmux restore injection');
@@ -2546,6 +2616,16 @@ async function askBroadcastWorkflow() {
   hcc(['ask', 'shell-b', `echo ASK_OK > ${askFile}`, '--from', 'human', '--inject']);
   await waitForFile(askFile, 'ASK_OK', 'ask injection');
   if (!hcc(['msg', 'inbox', '--peer', 'shell-b', '--all']).includes('ASK_OK')) fail('ask durable message missing');
+  const shellDefaultDispatch = hccJson(['task', 'dispatch', '--from', 'human', '--to', 'shell-b', '--title', 'shell default dispatch']);
+  if (shellDefaultDispatch.injected !== false || shellDefaultDispatch.injection_reason !== 'unsupported_session_kind') {
+    fail(`task dispatch injected default natural-language prompt into shell session:\n${JSON.stringify(shellDefaultDispatch, null, 2)}`);
+  }
+  const dispatchFile = path.join(outDir, 'dispatch-ok');
+  const shellCommandDispatch = hccJson(['task', 'dispatch', '--from', 'human', '--to', 'shell-b', '--title', 'shell command dispatch', '--message', `echo DISPATCH_OK > ${dispatchFile}`, '--force']);
+  if (!shellCommandDispatch.injected || shellCommandDispatch.delivery !== 'message+inject') {
+    fail(`task dispatch did not inject explicit shell-safe message:\n${JSON.stringify(shellCommandDispatch, null, 2)}`);
+  }
+  await waitForFile(dispatchFile, 'DISPATCH_OK', 'task dispatch injection');
   const broadcastFile = path.join(outDir, 'broadcast-ok');
   hcc(['broadcast', `echo BROADCAST_OK > ${broadcastFile}`, '--from', 'human', '--inject']);
   await waitForFile(broadcastFile, 'BROADCAST_OK', 'broadcast injection');
@@ -3588,11 +3668,12 @@ async function syntaxAndHelp() {
     events: [
       { id: 7, type: 'message.sent', actor: 'peer-a', task_id: 2, payload: '{}', created_at: 7 },
       { id: 8, type: 'task.done', actor: 'peer-a', task_id: 2, payload: JSON.stringify({ owner: 'peer-b', summary: 'done summary' }), created_at: 8 },
-      { id: 9, type: 'web.session.stop_requested', actor: 'web', task_id: null, payload: JSON.stringify({ actor_peer: 'web', target_peer: 'peer-b', peer: 'peer-b' }), created_at: 9 }
+      { id: 9, type: 'web.session.stop_requested', actor: 'web', task_id: null, payload: JSON.stringify({ actor_peer: 'web', target_peer: 'peer-b', peer: 'peer-b' }), created_at: 9 },
+      { id: 10, type: 'task.dispatched', actor: 'peer-a', task_id: 2, payload: JSON.stringify({ actor_peer: 'peer-a', target_peer: 'peer-b', peer: 'peer-b', title: 'dispatch timeline' }), created_at: 10 }
     ]
   }, 'peer-b');
   const timelineIds = timelineItems.map((item) => item.id);
-  if (JSON.stringify(timelineIds) !== JSON.stringify(['message:2', 'message:3', 'handoff:4', 'task:5', 'event:8', 'event:9'])) {
+  if (JSON.stringify(timelineIds) !== JSON.stringify(['message:2', 'message:3', 'handoff:4', 'task:5', 'event:8', 'event:9', 'event:10'])) {
     fail(`timelineFromRows filtering/order changed: ${JSON.stringify(timelineItems)}`);
   }
   const inbound = timelineItems.find((item) => item.id === 'message:2');
@@ -5143,11 +5224,24 @@ async function syntaxAndHelp() {
   if (!taskHelp.includes('task next [--peer ID] [--force]') ||
       !taskHelp.includes('[--count N]') ||
       !taskHelp.includes('existing claimed/running/review/blocked task') ||
+      !taskHelp.includes('task dispatch --to ID --title TEXT') ||
+      !taskHelp.includes('task dispatch --to ID --id N') ||
+      !taskHelp.includes('message-only') ||
+      !taskHelp.includes('running managed Claude/Codex terminal') ||
       !taskHelp.includes('task takeover [--peer ID] --id N --reason TEXT') ||
       !taskHelp.includes('[--policy any|blocked|stale|blocked-or-stale]') ||
       !taskHelp.includes('task claim [--peer ID] --id N[,N]') ||
       !taskHelp.includes('task create --title TEXT --parent N')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
+  }
+  for (const expected of [
+    "if (sub === 'dispatch') return taskDispatch",
+    'async function taskDispatch(ctx, args)',
+    "addEvent(eventDb, 'task.dispatched'",
+    'function sessionLooksProviderInteractive(session)',
+    '!customMessage && !sessionLooksProviderInteractive(session)'
+  ]) {
+    if (!hccSource.includes(expected)) fail(`task dispatch source guard missing: ${expected}`);
   }
   const teamHelp = run(process.execPath, [hccBin, 'team', '--help']);
   if (!teamHelp.includes('hcc team') || !teamHelp.includes('team plan') || !teamHelp.includes('team start') || !teamHelp.includes('team status')) {

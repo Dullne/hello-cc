@@ -93,6 +93,8 @@ sender by default. Use `msg thread` to inspect the full thread for one message.
 
 ```text
 hcc task create --title TEXT [--body TEXT] [--from ID] [--to ID] [--priority N]
+hcc task dispatch --to ID --title TEXT [--body TEXT] [--from ID] [--message TEXT] [--no-inject] [--force]
+hcc task dispatch --to ID --id N [--from ID] [--message TEXT] [--no-inject] [--force]
 hcc task list [--status S] [--peer ID] [--all]
 hcc task claim [--peer ID] --id N[,N] [--id N] [--ids N,N] [--force]
 hcc task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|blocked-or-stale] [--stale-after SECONDS]
@@ -107,11 +109,16 @@ Tasks are shared project facts. They remain visible until marked `done` or
 task before claiming a new pending task; use `--force` only when intentionally
 taking additional pending tasks, and combine it with `--count N` for explicit
 batch claims. `task claim` also accepts repeated `--id` values and comma-separated
-`--id` or `--ids` lists. Use `task takeover` when explicitly taking a
-non-complete task from another owner; it records the previous owner, requires a
-reason, and notifies them. Add `--policy blocked`, `stale`, or `blocked-or-stale`
-when takeover should only proceed under that auditable precondition. The default
-policy is `any` for compatibility.
+`--id` or `--ids` lists. `task dispatch` is the explicit one-step form for
+assigning a new or existing task to one peer, sending the durable task message,
+and injecting the startup prompt only when that peer has a running managed
+Claude/Codex terminal. Use `--no-inject` for message-only dispatch, and use
+`--force` only when intentionally injecting while the target already owns another
+active task. Use `task takeover` when explicitly taking a non-complete task from
+another owner; it records the previous owner, requires a reason, and notifies
+them. Add `--policy blocked`, `stale`, or `blocked-or-stale` when takeover
+should only proceed under that auditable precondition. The default policy is
+`any` for compatibility.
 
 ## Teams
 
