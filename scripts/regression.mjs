@@ -52,6 +52,13 @@ function log(message) {
 }
 
 function fail(message) {
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    const escaped = String(message)
+      .replace(/%/g, '%25')
+      .replace(/\r/g, '%0D')
+      .replace(/\n/g, '%0A');
+    process.stderr.write(`::error::${escaped}\n`);
+  }
   throw new Error(message);
 }
 
