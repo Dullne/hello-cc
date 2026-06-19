@@ -16,6 +16,55 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.8
+
+### Summary
+
+hello-cc 0.1.8 is a targeted patch release for Claude/Codex shim
+self-repair. It fixes generated shims that could stay pinned to a removed
+provider binary after Claude or Codex was reinstalled.
+
+### Highlights
+
+- Fixed `hcc shim ensure` so it only reuses an existing `# Real binary:` path
+  when that binary still exists.
+- Preserved the existing fast path for valid generated shims while falling back
+  to the requested binary or rediscovering the provider from `PATH` when the
+  recorded path is stale.
+- Added regression coverage for the reinstall case where a generated shim
+  points at a deleted provider binary but a working provider is available on
+  `PATH`.
+
+### Compatibility Notes
+
+- No CLI command or package surface changes are intended in this release.
+- Existing generated shims will self-heal on the next `hcc shim ensure` or shim
+  launch when their recorded provider binary has disappeared.
+
+### Validation
+
+The 0.1.8 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+find lib -name '*.mjs' -print0 | xargs -0 -n1 node --check
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.8
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.7
 
 ### Summary
