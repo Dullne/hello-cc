@@ -1400,6 +1400,25 @@ async function setupRegression() {
   if (!refreshedShim.includes('shim ensure "claude"') || refreshedShim.includes('stale --web-managed')) {
     fail(`shim ensure did not refresh stale shim:\n${refreshedShim}`);
   }
+  const deadRealBin = path.join(outDir, 'removed-claude');
+  fs.rmSync(deadRealBin, { force: true });
+  fs.writeFileSync(staleShim, [
+    '#!/usr/bin/env bash',
+    '# hello-cc shim for claude (auto-generated; do not edit manually)',
+    `# Real binary: ${deadRealBin}`,
+    `REAL_BIN=${sh(deadRealBin)}`,
+    'exec "$REAL_BIN" "$@"',
+    ''
+  ].join('\n'), { mode: 0o755 });
+  const rediscovered = hccMaybe(['shim', 'ensure', 'claude', staleShim, deadRealBin]);
+  if (rediscovered.status !== 75) {
+    fail(`shim ensure did not request re-exec for stale real binary:\n${rediscovered.stdout}\n${rediscovered.stderr}`);
+  }
+  const rediscoveredShim = fs.readFileSync(staleShim, 'utf8');
+  const expectedRealBin = path.join(fakeBin, 'claude');
+  if (!rediscoveredShim.includes(`# Real binary: ${expectedRealBin}`) || rediscoveredShim.includes(deadRealBin)) {
+    fail(`shim ensure preserved stale real binary instead of rediscovering PATH binary:\n${rediscoveredShim}`);
+  }
   await stopRuntime();
   assertPeerBindingUniqueConstraints();
   assertLegacySchemaMigration();
