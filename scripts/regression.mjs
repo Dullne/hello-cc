@@ -2748,8 +2748,8 @@ async function downGcPackWorkflow() {
     "tags:\n      - 'v*'",
     'workflow_dispatch:',
     'contents: write',
-    'actions/checkout@v4',
-    'actions/setup-node@v4',
+    'actions/checkout@v5',
+    'actions/setup-node@v5',
     'node-version: 24',
     'npm run release:check',
     'npm run release:github:dry-run',
@@ -2772,16 +2772,23 @@ function oldNameScan() {
     'ACTIVE_' + 'AGENT_' + 'TTL',
     '--' + 'agent\\b'
   ].join('|');
-  const rg = runMaybe('rg', [
-    '-n',
-    '--glob', '!node_modules/**',
-    '--glob', '!*.tgz',
-    '--',
-    oldNamePattern,
-    '.'
-  ]);
-  if (rg.status === 0) fail(`old names found:\n${rg.stdout}`);
-  if (rg.status !== 1) fail(`rg failed:\n${rg.stderr || rg.stdout}`);
+  const oldNameRegex = new RegExp(oldNamePattern);
+  const files = run('git', ['ls-files'])
+    .split('\n')
+    .map((file) => file.trim())
+    .filter(Boolean)
+    .filter((file) => !file.includes('/node_modules/') && !file.endsWith('.tgz'));
+  const matches = [];
+  for (const file of files) {
+    const fullPath = path.join(repoRoot, file);
+    let content = '';
+    try { content = fs.readFileSync(fullPath, 'utf8'); } catch { continue; }
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i += 1) {
+      if (oldNameRegex.test(lines[i])) matches.push(`${file}:${i + 1}: ${lines[i]}`);
+    }
+  }
+  if (matches.length) fail(`old names found:\n${matches.join('\n')}`);
 }
 
 function identityEnforcementWorkflow() {
