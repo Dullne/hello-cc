@@ -1260,6 +1260,38 @@ function startRuntime(options = {}) {
   if (!output.includes('web started in background')) fail(`hcc web did not report background start:\n${output}`);
 }
 
+async function assertWebWrapperParentSurvives() {
+  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-wrapper-root-${testId}-`));
+  const wrapperPort = port + 101;
+  let wrapperPid = null;
+  try {
+    const script = [
+      'set -e',
+      `out=$(${sh(process.execPath)} ${sh(hccBin)} --root ${sh(wrapperRoot)} web --local --port ${wrapperPort} --no-discover --no-guidance)`,
+      `printf '%s\\n' "$out"`
+    ].join('\n');
+    const result = runMaybe('bash', ['-lc', script], { env });
+    if (result.status !== 0) {
+      fail(`hcc web killed or failed inside a wrapper shell:\nstdout=${result.stdout}\nstderr=${result.stderr}\nstatus=${result.status}\nsignal=${result.signal}`);
+    }
+    const match = String(result.stdout || '').match(/^pid:\s*(\d+)/m);
+    if (!match) fail(`wrapper hcc web did not print background pid:\n${result.stdout}`);
+    wrapperPid = Number.parseInt(match[1], 10);
+    ensureFile(path.join(wrapperRoot, '.hello-cc', 'runtime.json'));
+  } finally {
+    runMaybe(process.execPath, [hccBin, '--root', wrapperRoot, 'down'], { env });
+    if (wrapperPid) {
+      try {
+        await waitForProcessExit(wrapperPid, 'wrapper runtime process exit', 5000);
+      } catch {
+        try { process.kill(wrapperPid, 'SIGTERM'); } catch {}
+        try { await waitForProcessExit(wrapperPid, 'wrapper runtime process exit after SIGTERM', 2000); } catch {}
+      }
+    }
+    try { fs.rmSync(wrapperRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function stopRuntime() {
   if (!runtimePid) return;
   const pid = runtimePid;
@@ -1420,6 +1452,7 @@ async function setupRegression() {
     fail(`shim ensure preserved stale real binary instead of rediscovering PATH binary:\n${rediscoveredShim}`);
   }
   await stopRuntime();
+  await assertWebWrapperParentSurvives();
   assertPeerBindingUniqueConstraints();
   assertLegacySchemaMigration();
   assertRegisteredProjectDbMigration();
@@ -1442,6 +1475,18 @@ async function setupRegression() {
   if (unauthorizedResponse.status !== 401) fail(`default web API allowed missing token: ${unauthorizedResponse.status}`);
   const tokenResponse = await runtimeFetch('/api/runtime');
   if (!tokenResponse.ok) fail(`default web API rejected runtime token: ${tokenResponse.status}`);
+  const badJsonResponse = await runtimeFetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{bad json'
+  });
+  if (badJsonResponse.status !== 400) {
+    fail(`bad JSON request returned ${badJsonResponse.status}, expected 400:\n${await badJsonResponse.text()}`);
+  }
+  const badJsonBody = await badJsonResponse.json();
+  if (badJsonBody?.error?.code !== 'BAD_REQUEST') {
+    fail(`bad JSON request did not return BAD_REQUEST:\n${JSON.stringify(badJsonBody, null, 2)}`);
+  }
   const tokenFile = path.join(home, '.hello-cc', 'web-token');
   ensureFile(tokenFile, tokenRuntime.token);
   fs.rmSync(tokenFile, { force: true });

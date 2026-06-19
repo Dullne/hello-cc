@@ -2044,11 +2044,21 @@ function hccWebProcessMatches(line, ctx) {
     sameResolvedPath(global.db, ctx.dbPath);
 }
 
+function currentProcessAncestorPids(ppidByPid) {
+  const ancestors = new Set();
+  let pid = process.ppid;
+  while (Number.isFinite(pid) && pid > 0 && !ancestors.has(pid)) {
+    ancestors.add(pid);
+    pid = ppidByPid.get(pid);
+  }
+  return ancestors;
+}
+
 async function stopOrphanWebRuntimes(ctx, keepPid = null) {
   if (process.platform === 'win32') return;
   let output = '';
   try {
-    output = spawnSync('ps', ['-eo', 'pid=,args='], {
+    output = spawnSync('ps', ['-eo', 'pid=,ppid=,args='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore']
     }).stdout || '';
@@ -2056,15 +2066,25 @@ async function stopOrphanWebRuntimes(ctx, keepPid = null) {
     return;
   }
 
-  const pids = [];
+  const rows = [];
+  const ppidByPid = new Map();
   for (const line of output.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(\d+)\s+(.*)$/);
+    const match = trimmed.match(/^(\d+)\s+(\d+)\s+(.*)$/);
     if (!match) continue;
     const pid = Number.parseInt(match[1], 10);
-    if (!Number.isFinite(pid) || pid === process.pid || pid === keepPid) continue;
-    if (hccWebProcessMatches(match[2], ctx)) pids.push(pid);
+    const ppid = Number.parseInt(match[2], 10);
+    if (!Number.isFinite(pid)) continue;
+    if (Number.isFinite(ppid)) ppidByPid.set(pid, ppid);
+    rows.push({ pid, args: match[3] });
+  }
+
+  const ancestorPids = currentProcessAncestorPids(ppidByPid);
+  const pids = [];
+  for (const row of rows) {
+    if (row.pid === process.pid || row.pid === keepPid || ancestorPids.has(row.pid)) continue;
+    if (hccWebProcessMatches(row.args, ctx)) pids.push(row.pid);
   }
   if (!pids.length) return;
 
