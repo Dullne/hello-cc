@@ -20,7 +20,7 @@ hcc update
 `hcc update` 会执行 `npm install -g @logicseek/hello-cc@latest`。使用
 `hcc update --help` 可以查看更新选项。`hcc task update` 更新的是协作任务状态，不是安装包版本。
 
-移除本机 hooks 和 shims：
+移除本机 hooks、shims 和 shell PATH 配置：
 
 ```bash
 hcc uninstall
@@ -76,11 +76,11 @@ stop: hcc down
 
 `hcc web` 使用单个全局 Web runtime。你在另一个项目目录再次运行 `hcc web` 时，不会再开一个端口，而是把那个项目注册到同一个 Web 控制台。前端 Project 下拉框可以在不同项目 root 之间切换；每个项目仍然使用自己的 `.hello-cc/mesh.db`，任务、消息、锁和 peers 不会混在一起。
 
-第一次安装 shim 后，需要打开一个新终端，或执行：
+第一次安装 shim 后，打开新终端，或根据当前 shell 重新加载配置：
 
-```bash
-source ~/.bashrc
-```
+- bash: `source ~/.bashrc`
+- zsh: `source ~/.zshrc`
+- fish: `source ~/.config/fish/config.fish`
 
 之后在这个项目目录中直接输入：
 
@@ -97,6 +97,9 @@ codex resume <session-id>
 - Web 控制台看到并操作的是同一个 tmux pane，不是浏览器里临时创建的假终端。
 - `hcc down` 只停止 Web runtime，不会杀掉这些 tmux 会话。
 - 重新运行 `hcc web` 后，只要 tmux pane 还活着，Web 会重新接管。
+
+Linux 还可以通过 `/proc` 做更完整的进程自动发现。macOS 上如果需要可靠的终端
+控制和稳定 peer 身份，建议使用 shim 启动的会话或 `hcc peer start`。
 
 如果只想初始化本地通信、不启动 Web、不安装 shim，可使用：
 

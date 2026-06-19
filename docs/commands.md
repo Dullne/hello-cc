@@ -12,7 +12,7 @@ hcc uninstall [--purge --yes]
 ```
 
 `hcc update` updates the global npm install. `hcc uninstall` removes local
-hooks and shims; add `--purge --yes` only when you also want to remove the
+hooks, shims, and the shell PATH entry; add `--purge --yes` only when you also want to remove the
 current project's `.hello-cc` data and guidance blocks.
 
 ## Start And Stop

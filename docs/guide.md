@@ -21,7 +21,7 @@ hcc update
 `hcc update --help` to see the available update options. `hcc task update`
 updates a coordination task, not the installed package.
 
-Remove hooks and shims from this machine:
+Remove hooks, shims, and the shell PATH entry from this machine:
 
 ```bash
 hcc uninstall
@@ -83,11 +83,12 @@ with the same web console. The frontend Project selector switches between
 registered roots. Each project still keeps its own `.hello-cc/mesh.db`, so
 tasks, messages, locks, and peers stay isolated.
 
-After the first shim install, open a new terminal or run:
+After the first shim install, open a new terminal or reload the rc file for
+your shell:
 
-```bash
-source ~/.bashrc
-```
+- bash: `source ~/.bashrc`
+- zsh: `source ~/.zshrc`
+- fish: `source ~/.config/fish/config.fish`
 
 Then direct project-local commands are wrapped automatically:
 
@@ -105,6 +106,10 @@ The wrappers create or reuse local persistent tmux terminals:
   terminal.
 - `hcc down` stops only the web runtime. It does not kill tmux sessions.
 - Running `hcc web` again reattaches live recorded tmux panes.
+
+Linux also has richer process auto-discovery through `/proc`. On macOS, prefer
+shim-launched or `hcc peer start` sessions when you want reliable terminal
+control and stable peer identity.
 
 For local coordination without Web or shims, use:
 

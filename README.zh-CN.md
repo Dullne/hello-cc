@@ -38,7 +38,11 @@
 
 ## 安装和维护
 
-需要 Node.js 24 或更新版本。
+hello-cc 支持 Linux 和 macOS。需要 Node.js 24 或更新版本；可被浏览器控制的
+终端需要 `tmux`。当前不支持原生 Windows shell；Windows 用户建议使用 WSL。
+
+Linux 可以通过 `/proc` 做更完整的进程自动发现。macOS 上建议通过 hello-cc
+shim 或 `hcc peer start` 启动会话，以获得可靠的 tmux 托管终端。
 
 ```bash
 npm install -g @logicseek/hello-cc
@@ -56,7 +60,7 @@ hcc update
 npx @logicseek/hello-cc web
 ```
 
-移除本机 hooks 和 shims：
+移除本机 hooks、shims 和 shell PATH 配置：
 
 ```bash
 hcc uninstall
@@ -91,11 +95,11 @@ local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
 `hcc web` 会初始化项目总线，安装 Claude/Codex hooks 和 shims，启动或复用 Web
 控制台，然后把终端还给你。
 
-第一次安装 shim 后，打开新终端或重新加载 shell：
+第一次安装 shim 后，打开新终端，或根据当前 shell 重新加载配置：
 
-```bash
-source ~/.bashrc
-```
+- bash: `source ~/.bashrc`
+- zsh: `source ~/.zshrc`
+- fish: `source ~/.config/fish/config.fish`
 
 在项目目录中正常启动 agent：
 

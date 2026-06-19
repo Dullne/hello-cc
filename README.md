@@ -49,7 +49,12 @@ doing.
 
 ## Install And Manage
 
-Node.js 24 or newer is required.
+hello-cc supports Linux and macOS. Node.js 24 or newer is required, and
+browser-controllable terminals require `tmux`. Native Windows shells are not
+currently supported; use WSL for a Linux-like environment.
+
+Linux has richer process auto-discovery through `/proc`. On macOS, use
+hello-cc shims or `hcc peer start` for reliable tmux-managed terminal sessions.
 
 ```bash
 npm install -g @logicseek/hello-cc
@@ -67,7 +72,7 @@ Or run it without a global install:
 npx @logicseek/hello-cc web
 ```
 
-Remove hooks and shims from this machine:
+Remove hooks, shims, and the shell PATH entry from this machine:
 
 ```bash
 hcc uninstall
@@ -103,11 +108,12 @@ Use `--local` to bind only to `127.0.0.1`, or `--port N` to request a specific
 port. `hcc web` initializes the project bus, installs Claude/Codex hooks and
 shims, starts or reuses the Web console, and returns the terminal to you.
 
-After the first shim install, open a new terminal or reload your shell:
+After the first shim install, open a new terminal or reload the rc file for
+your shell:
 
-```bash
-source ~/.bashrc
-```
+- bash: `source ~/.bashrc`
+- zsh: `source ~/.zshrc`
+- fish: `source ~/.config/fish/config.fish`
 
 Start normal agent sessions from the project:
 

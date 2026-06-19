@@ -10,7 +10,7 @@ hcc update [--tag TAG] [--registry URL] [--dry-run]
 hcc uninstall [--purge --yes]
 ```
 
-`hcc update` 更新全局 npm 安装。`hcc uninstall` 移除本机 hooks 和 shims；
+`hcc update` 更新全局 npm 安装。`hcc uninstall` 移除本机 hooks、shims 和 shell PATH 配置；
 只有在确定也要删除当前项目的 `.hello-cc` 数据和指导块时，才加
 `--purge --yes`。
 

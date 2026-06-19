@@ -227,6 +227,8 @@ const {
   helpDown,
   helpUpdate,
   helpUninstall,
+  helpInstallHooks,
+  helpShim,
   helpWeb
 } = createHelpFunctions({
   productName: PRODUCT_NAME,
@@ -279,7 +281,11 @@ function splitProcessArgs(line) {
 
 function sameResolvedPath(a, b) {
   if (!a || !b) return false;
-  return path.resolve(a) === path.resolve(b);
+  function key(value) {
+    try { return fs.realpathSync(value); }
+    catch { return path.resolve(value); }
+  }
+  return key(a) === key(b);
 }
 
 const {
@@ -1927,6 +1933,7 @@ async function cmdUp(ctx, args) {
     if (r.hooks.claudeInstalled) lines.push('Claude Code hooks installed');
     if (r.hooks.codexInstalled) lines.push('Codex hooks installed');
     if (r.detected.length) lines.push(`detected: ${r.detected.map((s) => s.peerId).join(', ')}`);
+    if (r.warnings?.length) lines.push(...r.warnings.map((warning) => `warning: ${warning}`));
     lines.push('web: run hcc web when you need browser terminal control');
     return lines.join('\n');
   });
@@ -1943,31 +1950,42 @@ async function prepareLocalBus(ctx, opts = {}) {
 
   const hooks = { claudeInstalled: false, codexInstalled: false };
   const shims = { installed: [], skipped: [], pathUpdated: false, rcFile: null };
+  const warnings = [];
   try {
-    const { verifyClaudeHooks, installClaudeHooks,
-            verifyCodexHooks, installCodexHooks,
-            installShims, installPathEntry } = await loadSetup();
-    if (!verifyClaudeHooks()) {
-      installClaudeHooks(commandPath());
-      hooks.claudeInstalled = true;
+    const setup = await loadSetup();
+    try {
+      if (!setup.verifyClaudeHooks()) {
+        setup.installClaudeHooks(commandPath());
+        hooks.claudeInstalled = true;
+      }
+    } catch (err) {
+      warnings.push(`Claude Code hooks installation failed: ${err.message}`);
     }
-    if (!verifyCodexHooks()) {
-      try {
-        installCodexHooks(commandPath());
+    try {
+      if (!setup.verifyCodexHooks()) {
+        setup.installCodexHooks(commandPath());
         hooks.codexInstalled = true;
-      } catch {}
+      }
+    } catch (err) {
+      warnings.push(`Codex hooks installation failed: ${err.message}`);
     }
     if (opts.installShims) {
-      const result = installShims(commandPath());
-      shims.installed = result.installed;
-      shims.skipped = result.skipped;
-      if (result.installed.length) {
-        const pathResult = installPathEntry();
-        shims.pathUpdated = !pathResult.alreadyPresent;
-        shims.rcFile = pathResult.rcFile;
+      try {
+        const result = setup.installShims(commandPath());
+        shims.installed = result.installed;
+        shims.skipped = result.skipped;
+        if (result.installed.length) {
+          const pathResult = setup.installPathEntry();
+          shims.pathUpdated = !pathResult.alreadyPresent;
+          shims.rcFile = pathResult.rcFile;
+        }
+      } catch (err) {
+        warnings.push(`shim installation failed: ${err.message}`);
       }
     }
-  } catch {}
+  } catch (err) {
+    warnings.push(`local integration setup failed: ${err.message}`);
+  }
 
   const detected = [];
   if (!opts['no-discover']) {
@@ -1977,7 +1995,7 @@ async function prepareLocalBus(ctx, opts = {}) {
         ...scanClaudeSessions(),
         ...scanCodexSessions(),
         ...scanProcesses(),
-      ].filter((s) => s.hccRoot === ctx.root);
+      ].filter((s) => sameResolvedPath(s.hccRoot, ctx.root));
       const byId = new Map();
       for (const s of found) {
         if (!byId.has(s.peerId)) byId.set(s.peerId, s);
@@ -2010,7 +2028,8 @@ async function prepareLocalBus(ctx, opts = {}) {
     guidance,
     hooks,
     shims,
-    detected
+    detected,
+    warnings
   };
 }
 
@@ -2066,7 +2085,10 @@ async function startWebBackground(ctx, args) {
   validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
   validateWebTokenOpts(opts);
   ensureTmuxAvailable({ autoInstall: true });
-  const setup = await prepareLocalBus(ctx, { ...opts, installShims: true });
+  const setup = await prepareLocalBus(ctx, {
+    ...opts,
+    installShims: process.env.HCC_SKIP_SHIM_INSTALL === '1' ? false : true
+  });
   registerProject(ctx);
 
   const existing = await readHealthyGlobalRuntime();
@@ -2190,6 +2212,9 @@ function printWebRuntime(ctx, runtime, opts = {}) {
         lines.push(`PATH updated in ${opts.setup.shims.rcFile}; open a new terminal or source it`);
       }
     }
+    if (opts.setup?.warnings?.length) {
+      lines.push(...opts.setup.warnings.map((warning) => `warning: ${warning}`));
+    }
     lines.push(`stop: ${r.stop}`);
     return lines.join('\n');
   });
@@ -2237,7 +2262,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   function knownProjects() {
     const rows = readProjectRegistry();
-    if (!rows.some((p) => p.root === ctx.root)) rows.unshift(projectRecord(ctx));
+    if (!rows.some((p) => sameResolvedPath(p.root, ctx.root))) rows.unshift(projectRecord(ctx));
     for (const project of rows) {
       if (!projectContexts.has(project.root)) {
         projectContexts.set(project.root, contextForProject(project.root, project.db, { json: ctx.json }));
@@ -2262,7 +2287,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function sessionsForProject(projectCtx) {
-    return [...sessions.values()].filter((session) => session.root === projectCtx.root);
+    return [...sessions.values()].filter((session) => sameResolvedPath(session.root, projectCtx.root));
   }
 
   function getSession(projectCtx, id, db = null) {
@@ -4789,6 +4814,7 @@ async function cmdHook(ctx, args) {
 // ─── hcc install-hooks ───────────────────────────────────────────────────────
 
 async function cmdInstallHooks(ctx, args) {
+  if (wantsHelp(args)) return helpInstallHooks();
   const opts = parseOpts(args, { booleans: ['uninstall', 'status'] });
   const { installClaudeHooks, uninstallClaudeHooks, verifyClaudeHooks,
           installCodexHooks, uninstallCodexHooks, verifyCodexHooks } = await loadSetup();
@@ -4818,11 +4844,20 @@ async function cmdInstallHooks(ctx, args) {
     `hooks installed: claude → ${cp}${cxp ? `, codex → ${cxp}` : ''}`);
 }
 
+function pathEntryRemovalMessage(pathEntry) {
+  if (pathEntry.error) return `PATH entry not removed: ${pathEntry.error}`;
+  if (pathEntry.missing) return `PATH entry not present (${pathEntry.rcFile} not found)`;
+  if (pathEntry.removed === false) return `PATH entry not present in ${pathEntry.rcFile}`;
+  return `PATH entry removed from ${pathEntry.rcFile}`;
+}
+
 // ─── hcc shim ────────────────────────────────────────────────────────────────
 
 async function cmdShim(ctx, args) {
   const sub = args[0];
-  const { installShims, uninstallShims, verifyShims, installPathEntry, SHIM_DIR } = await loadSetup();
+  const { installShims, uninstallShims, shimStatus, installPathEntry, uninstallPathEntry, SHIM_DIR } = await loadSetup();
+
+  if (wantsHelp(args)) return helpShim();
 
   if (sub === 'ensure') {
     const name = args[1];
@@ -4830,9 +4865,10 @@ async function cmdShim(ctx, args) {
     if (!['claude', 'codex'].includes(name) || !target) {
       throw new CliError('BAD_ARGS', 'Usage: hcc shim ensure claude|codex PATH');
     }
-    const result = installShims(commandPath());
+    const realBin = args[3] || null;
+    const result = installShims(commandPath(), realBin ? { realBins: { [name]: realBin } } : {});
     const changed = (result.changed || []).map((p) => path.resolve(p));
-    if (changed.includes(target)) {
+    if (changed.some((p) => sameResolvedPath(p, target))) {
       process.exitCode = 75;
       return;
     }
@@ -4842,32 +4878,45 @@ async function cmdShim(ctx, args) {
   if (!sub || sub === 'install') {
     const hccBin = commandPath();
     const result = installShims(hccBin);
-    const { alreadyPresent, rcFile } = installPathEntry();
     const lines = [
       result.installed.length
         ? `shims installed:\n${result.installed.map((p) => `  ${p}`).join('\n')}`
         : 'no shims installed (claude/codex not found on PATH)',
     ];
     if (result.skipped.length) lines.push(`skipped: ${result.skipped.join(', ')}`);
-    if (!alreadyPresent) {
-      lines.push(`PATH updated in ${rcFile}`);
-      lines.push(`run: source ${rcFile}  (or open a new terminal)`);
-    } else {
-      lines.push(`PATH entry already present in ${rcFile}`);
+    if (result.installed.length) {
+      const { alreadyPresent, rcFile } = installPathEntry();
+      if (!alreadyPresent) {
+        lines.push(`PATH updated in ${rcFile}`);
+        lines.push(`run: source ${rcFile}  (or open a new terminal)`);
+      } else {
+        lines.push(`PATH entry already present in ${rcFile}`);
+      }
     }
     printResult(ctx, result, () => lines.join('\n'));
     return;
   }
   if (sub === 'uninstall') {
     const removed = uninstallShims();
-    printResult(ctx, { removed }, () => removed.length ? `removed: ${removed.join(', ')}` : 'no shims to remove');
+    const pathEntry = uninstallPathEntry();
+    printResult(ctx, { removed, path_entry: pathEntry }, () => [
+      removed.length ? `removed: ${removed.join(', ')}` : 'no shims to remove',
+      pathEntryRemovalMessage(pathEntry)
+    ].join('\n'));
     return;
   }
   if (sub === 'status') {
-    const installed = verifyShims();
-    printResult(ctx, { installed, shim_dir: SHIM_DIR }, () =>
-      installed ? `shims installed in ${SHIM_DIR} ✓` : `shims not installed (run: hcc web)`
-    );
+    const status = shimStatus();
+    printResult(ctx, status, (r) => [
+      `shim dir: ${r.shimDir}`,
+      `claude: ${r.tools.claude.installed ? 'installed' : 'missing'} (${r.tools.claude.path})`,
+      `codex: ${r.tools.codex.installed ? 'installed' : 'missing'} (${r.tools.codex.path})`,
+      r.complete
+        ? 'status: complete'
+        : r.installed
+          ? 'status: partial (run: hcc shim install)'
+          : 'status: not installed (run: hcc shim install)'
+    ].join('\n'));
     return;
   }
   throw new CliError('BAD_ARGS', `Unknown shim subcommand: ${sub}`);
@@ -4893,7 +4942,7 @@ async function cmdSetup(ctx, args) {
 
   // 2. Install Claude Code + Codex hooks
   const { installClaudeHooks, verifyClaudeHooks, installCodexHooks, verifyCodexHooks,
-          installShims, verifyShims, installPathEntry } = await loadSetup();
+          installShims, installPathEntry } = await loadSetup();
   const hccBin = commandPath();
 
   if (!verifyClaudeHooks()) {
@@ -4911,20 +4960,23 @@ async function cmdSetup(ctx, args) {
   }
 
   // 3. Install shims
-  if (!verifyShims()) {
-    const result = installShims(hccBin);
-    if (result.installed.length) {
-      log(`✓  shims installed → ${result.installed.join(', ')}`);
+  const result = installShims(hccBin);
+  if (result.installed.length) {
+    if (result.changed.length) {
+      log(`✓  shims installed → ${result.changed.join(', ')}`);
     } else {
-      log('⚠  shims: claude/codex not found on PATH — skipped');
+      log(`✓  shims already installed → ${result.installed.join(', ')}`);
     }
+    if (result.skipped.length) log(`⚠  shims skipped: ${result.skipped.join(', ')}`);
     const { alreadyPresent, rcFile } = installPathEntry();
     if (!alreadyPresent) {
       log(`✓  PATH updated in ${rcFile}`);
       log(`   run: source ${rcFile}  (or open a new terminal)`);
+    } else {
+      log(`✓  PATH entry already present in ${rcFile}`);
     }
   } else {
-    log('✓  shims already installed');
+    log('⚠  shims: claude/codex not found on PATH — skipped');
   }
 
   log('\nDone. Run `hcc web` for the default coordinated terminal experience.');
@@ -5004,13 +5056,15 @@ async function cmdUninstall(ctx, args) {
     lines.push('runtime not running');
   }
 
-  const { uninstallClaudeHooks, uninstallCodexHooks, uninstallShims } = await loadSetup();
+  const { uninstallClaudeHooks, uninstallCodexHooks, uninstallShims, uninstallPathEntry } = await loadSetup();
   const claude = uninstallClaudeHooks();
   const codex = uninstallCodexHooks();
   const shims = uninstallShims();
+  const pathEntry = uninstallPathEntry();
   lines.push(claude ? 'Claude Code hooks removed' : 'Claude Code hooks not found');
   lines.push(codex ? 'Codex hooks removed' : 'Codex hooks not found');
   lines.push(shims.length ? `shims removed: ${shims.join(', ')}` : 'shims not found');
+  lines.push(pathEntryRemovalMessage(pathEntry));
 
   let guidance = [];
   let purged = false;
@@ -5028,7 +5082,7 @@ async function cmdUninstall(ctx, args) {
     lines.push('project data kept; run hcc uninstall --purge --yes to remove .hello-cc and guidance blocks');
   }
 
-  printResult(ctx, { runtime: Boolean(runtime), claude, codex, shims, purge: purged, guidance }, () => lines.join('\n'));
+  printResult(ctx, { runtime: Boolean(runtime), claude, codex, shims, path_entry: pathEntry, purge: purged, guidance }, () => lines.join('\n'));
 }
 
 // ─── hcc scan ────────────────────────────────────────────────────────────────
@@ -5041,7 +5095,7 @@ async function cmdScan(ctx, args) {
     ...scanClaudeSessions(),
     ...scanCodexSessions(),
     ...scanProcesses(),
-  ].filter((s) => s.hccRoot === ctx.root);
+  ].filter((s) => sameResolvedPath(s.hccRoot, ctx.root));
 
   // Deduplicate by peerId
   const byId = new Map();

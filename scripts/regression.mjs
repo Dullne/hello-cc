@@ -38,7 +38,8 @@ const managedTmuxSessions = new Set();
 const env = {
   ...process.env,
   HOME: home,
-  PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`
+  PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+  SHELL: '/bin/bash'
 };
 for (const key of Object.keys(env)) {
   if (key.startsWith('HCC_')) delete env[key];
@@ -60,6 +61,20 @@ function commandText(command, args) {
 
 function sh(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function canonicalPath(value) {
+  try { return fs.realpathSync(value); }
+  catch { return path.resolve(value); }
+}
+
+function samePath(a, b) {
+  return canonicalPath(a) === canonicalPath(b);
+}
+
+function statusValue(output, key) {
+  const match = String(output || '').match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
+  return match ? match[1].trim() : '';
 }
 
 function shortHash(value) {
@@ -400,7 +415,8 @@ async function assertTmuxGcPolicy() {
     }), t);
   });
 
-  const client = spawnSync('tmux', ['new-session', '-d', '-s', `${tmuxSession}-gc-client`, '-e', `HCC_ROOT=${root}`, 'sh', '-lc', `unset TMUX; exec tmux attach-session -t ${sh(attachedSession)}`], {
+  const attachTmux = realTmuxBin ? `${sh(realTmuxBin)} -L ${sh(tmuxSocketName)}` : 'tmux';
+  const client = spawnSync('tmux', ['new-session', '-d', '-s', `${tmuxSession}-gc-client`, '-e', `HCC_ROOT=${root}`, 'sh', '-lc', `unset TMUX; exec ${attachTmux} attach-session -t ${sh(attachedSession)}`], {
     env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe']
@@ -1023,19 +1039,34 @@ async function waitForFile(file, expected, label = file) {
 }
 
 async function waitForFileContent(file, expected, label = file) {
-  await waitFor(() => {
-    if (!fs.existsSync(file)) return false;
-    return fs.readFileSync(file, 'utf8').trim() === expected;
-  }, label);
+  const deadline = Date.now() + 10000;
+  let actual = '(missing)';
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) {
+      actual = fs.readFileSync(file, 'utf8').trim();
+      if (actual === expected) break;
+    }
+    await sleep(100);
+  }
+  if (actual !== expected) {
+    fail(`timed out waiting for ${label}\nexpected: ${expected}\nactual: ${actual}`);
+  }
   ensureFile(file, expected);
 }
 
 async function waitForFileLineCount(file, expected, label = file) {
-  await waitFor(() => {
-    if (!fs.existsSync(file)) return false;
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    return lines.length === expected;
-  }, label);
+  const deadline = Date.now() + 10000;
+  let actual = '(missing)';
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) {
+      actual = fs.readFileSync(file, 'utf8').trim();
+      const lines = actual.split('\n').filter(Boolean);
+      if (lines.length === expected) return;
+    }
+    await sleep(100);
+  }
+  const count = actual === '(missing)' ? 0 : actual.split('\n').filter(Boolean).length;
+  fail(`timed out waiting for ${label}\nexpected lines: ${expected}\nactual lines: ${count}\nactual: ${actual}`);
 }
 
 async function waitRuntime() {
@@ -1346,7 +1377,12 @@ async function setupRegression() {
     fail(`interactive bash did not keep codex shim first: ${interactiveCodex}`);
   }
   if (!hcc(['install-hooks', '--status']).includes('claude=yes codex=yes')) fail('hooks not installed');
-  if (!hcc(['shim', 'status']).includes('shims installed')) fail('shims not installed');
+  const shimStatusOutput = hcc(['shim', 'status']);
+  if (!shimStatusOutput.includes('claude: installed') ||
+      !shimStatusOutput.includes('codex: installed') ||
+      !shimStatusOutput.includes('status: complete')) {
+    fail(`shims not fully installed:\n${shimStatusOutput}`);
+  }
   const staleShim = path.join(home, '.hcc-shims', 'claude');
   fs.writeFileSync(staleShim, '#!/usr/bin/env bash\necho stale --web-managed\n', { mode: 0o755 });
   const ensured = hccMaybe(['shim', 'ensure', 'claude', staleShim]);
@@ -1448,16 +1484,18 @@ async function setupRegression() {
   const childDir = path.join(root, 'packages', 'child');
   fs.mkdirSync(childDir, { recursive: true });
   const childFindRoot = hccFrom(['find-root'], childDir).trim();
-  if (childFindRoot !== childDir) fail(`child find-root mismatch: ${childFindRoot} !== ${childDir}`);
+  if (!samePath(childFindRoot, childDir)) fail(`child find-root mismatch: ${childFindRoot} !== ${childDir}`);
   const childStatus = hccFrom(['status'], childDir);
-  if (!childStatus.includes(`root: ${childDir}`) || !childStatus.includes(`db: ${path.join(childDir, '.hello-cc', 'mesh.db')}`)) {
+  if (!samePath(statusValue(childStatus, 'root'), childDir) ||
+      !samePath(statusValue(childStatus, 'db'), path.join(childDir, '.hello-cc', 'mesh.db'))) {
     fail(`child command did not stay on current path:\n${childStatus}`);
   }
   ensureFile(path.join(childDir, '.hello-cc', 'mesh.db'));
   const explicitChildRoot = hccFrom(['--root', root, 'find-root'], childDir).trim();
-  if (explicitChildRoot !== root) fail(`explicit child find-root mismatch: ${explicitChildRoot} !== ${root}`);
+  if (!samePath(explicitChildRoot, root)) fail(`explicit child find-root mismatch: ${explicitChildRoot} !== ${root}`);
   const explicitChildStatus = hccFrom(['--root', root, 'status'], childDir);
-  if (!explicitChildStatus.includes(`root: ${root}`) || !explicitChildStatus.includes(`db: ${path.join(root, '.hello-cc', 'mesh.db')}`)) {
+  if (!samePath(statusValue(explicitChildStatus, 'root'), root) ||
+      !samePath(statusValue(explicitChildStatus, 'db'), path.join(root, '.hello-cc', 'mesh.db'))) {
     fail(`explicit child command did not use requested root:\n${explicitChildStatus}`);
   }
   const childHookPayload = JSON.stringify({ session_id: 'child-hook-session', cwd: childDir, hook_event_name: 'UserPromptSubmit', prompt: 'status?' });
@@ -1909,8 +1947,9 @@ async function multiProjectWebWorkflow() {
   fs.mkdirSync(otherRoot, { recursive: true });
   const output = hccFrom(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance'], otherRoot);
   if (!output.includes('web already running in background')) fail(`second project did not reuse global web:\n${output}`);
-  if (!output.includes(`project: ${otherRoot}`)) fail(`second project output did not show its root:\n${output}`);
-  if (!output.includes(encodeURIComponent(otherRoot))) fail(`second project URL did not include project query:\n${output}`);
+  const outputRoot = statusValue(output, 'project');
+  if (!samePath(outputRoot, otherRoot)) fail(`second project output did not show its root:\n${output}`);
+  if (!output.includes(encodeURIComponent(outputRoot))) fail(`second project URL did not include project query:\n${output}`);
 
   const otherRuntimeFile = path.join(otherRoot, '.hello-cc', 'runtime.json');
   ensureFile(otherRuntimeFile);
@@ -1922,8 +1961,9 @@ async function multiProjectWebWorkflow() {
   const projectsResponse = await runtimeFetch('/api/projects', {}, { root: otherRoot });
   const projects = await projectsResponse.json();
   if (!projectsResponse.ok) fail(`projects API failed: ${JSON.stringify(projects)}`);
-  const roots = new Set((projects.projects || []).map((p) => p.root));
-  if (!roots.has(root) || !roots.has(otherRoot)) {
+  const roots = (projects.projects || []).map((p) => p.root);
+  if (!roots.some((projectRoot) => samePath(projectRoot, root)) ||
+      !roots.some((projectRoot) => samePath(projectRoot, otherRoot))) {
     fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
   }
 
@@ -2541,6 +2581,9 @@ async function shimTmuxWorkflow() {
   const firstEnvFile = path.join(outDir, 'shim-env-first');
   hcc(['inject', peer, `printf '%s\\n' "$HCC_REG_VALUE" > ${firstEnvFile}`]);
   await waitForFile(firstEnvFile, 'shim-first', 'shim first env');
+  const shimInternalEnvFile = path.join(outDir, 'shim-internal-env');
+  hcc(['inject', peer, `printf '%s|%s\\n' "\${HCC_SHIM_ENSURED-unset}" "\${HCC_SKIP_SHIM_INSTALL-unset}" > ${shimInternalEnvFile}`]);
+  await waitForFile(shimInternalEnvFile, 'unset|unset', 'shim internal env cleanup');
 
   const restarted = run(shim, ['--resume', 'shim-regression-session'], {
     cwd: root,
@@ -2562,12 +2605,34 @@ async function shimTmuxWorkflow() {
     HCC_FAKE_STAY_ALIVE: '0',
     HCC_FAKE_LOG: exitedLog
   };
-  const exitedFirst = run(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  const exitedFirstResult = runMaybe(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  if (exitedFirstResult.status !== 0) {
+    const allShimLines = fs.readFileSync(shim, 'utf8').split('\n');
+    const shimLines = allShimLines
+      .slice(0, 35)
+      .concat(['...'])
+      .concat(allShimLines.slice(139))
+      .map((line, index) => {
+        if (index < 35) return `${index + 1}: ${line}`;
+        if (index === 35) return line;
+        return `${index + 104}: ${line}`;
+      })
+      .join('\n');
+    fail(`${sh([shim, '--resume', exitedResume].join(' '))} failed\n${exitedFirstResult.stdout || ''}${exitedFirstResult.stderr || ''}\nshim excerpt:\n${shimLines}`);
+  }
+  const exitedFirst = exitedFirstResult.stdout || '';
   const exitedPeerMatch = exitedFirst.match(/started\s+(\S+)\s+\(/);
   if (!exitedPeerMatch) fail(`exited shim did not start a peer:\n${exitedFirst}`);
   const exitedPeer = exitedPeerMatch[1];
-  parsePane(exitedFirst);
-  await waitForFileLineCount(exitedLog, 1, 'shim exited first provider launch');
+  const exitedPane = parsePane(exitedFirst);
+  try {
+    await waitForFileLineCount(exitedLog, 1, 'shim exited first provider launch');
+  } catch (err) {
+    const paneCapture = runMaybe('tmux', ['capture-pane', '-p', '-S', '-80', '-t', exitedPane]);
+    const peerList = hccMaybe(['peer', 'list']);
+    const shimHead = fs.readFileSync(shim, 'utf8').split('\n').slice(0, 18).join('\n');
+    fail(`${err.message}\nshim output:\n${exitedFirst}\nshim stderr:\n${exitedFirstResult.stderr || ''}\npeer list:\n${peerList.stdout || ''}${peerList.stderr || ''}\npane ${exitedPane}:\n${paneCapture.stdout || ''}${paneCapture.stderr || ''}\nshim head:\n${shimHead}`);
+  }
   const fallbackFile = path.join(outDir, 'shim-exited-fallback');
   hcc(['inject', exitedPeer, `printf '%s\\n' fallback > ${sh(fallbackFile)}`]);
   await waitForFile(fallbackFile, 'fallback', 'shim exited fallback shell');
@@ -3212,6 +3277,7 @@ async function syntaxAndHelp() {
     'function installShims',
     'function uninstallShims',
     'function verifyShims',
+    'function shimStatus',
     'function findRealBinary',
     'function fsExists'
   ]) {
@@ -3239,7 +3305,8 @@ async function syntaxAndHelp() {
   }
   if (!integrationShimScriptSource.includes('function generateShim') ||
       !integrationShimScriptSource.includes('hello-cc shim for ${tool.name}') ||
-      !integrationShimScriptSource.includes('HCC_SHIM_ENSURED')) {
+      !integrationShimScriptSource.includes('HCC_SHIM_ENSURED') ||
+      !integrationShimScriptSource.includes('HCC_SKIP_SHIM_INSTALL')) {
     fail('integrations shim script module is missing expected generateShim wiring');
   }
   if (!shellPathSource.includes('function installPathEntry') ||
@@ -3264,7 +3331,7 @@ async function syntaxAndHelp() {
     if (typeof integrationHooks[name] !== 'function') fail(`integrations hook module missing export: ${name}`);
     if (setupModule[name] !== integrationHooks[name]) fail(`setup hook export mismatch: ${name}`);
   }
-  for (const name of ['installShims', 'uninstallShims', 'verifyShims', 'findRealBinary']) {
+  for (const name of ['installShims', 'uninstallShims', 'verifyShims', 'shimStatus', 'findRealBinary']) {
     if (typeof integrationShims[name] !== 'function') fail(`integrations shim module missing export: ${name}`);
     if (setupModule[name] !== integrationShims[name]) fail(`setup shim export mismatch: ${name}`);
   }
@@ -3277,6 +3344,147 @@ async function syntaxAndHelp() {
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
     if (setupModule[name] !== shellPath[name]) fail(`setup shell path export mismatch: ${name}`);
+  }
+  const bashRc = '# regression rc\n[ -z "$PS1" ] && return\nexport PATH="/late:$PATH"\n';
+  const bashPath = shellPath.insertPathEntry(bashRc, 'bash');
+  if ((bashPath.match(/# hello-cc shims/g) || []).length !== 2 ||
+      bashPath.indexOf('# hello-cc shims (early)') > bashPath.indexOf('[ -z "$PS1" ] && return') ||
+      bashPath.lastIndexOf('# hello-cc shims (final)') < bashPath.indexOf('export PATH="/late:$PATH"')) {
+    fail(`bash shell PATH insertion lost early/final placement:\n${bashPath}`);
+  }
+  const zshPath = shellPath.insertPathEntry('export PATH="$HOME/bin:$PATH"\n', 'zsh');
+  if ((zshPath.match(/# hello-cc shims/g) || []).length !== 1 ||
+      zshPath.includes('# hello-cc shims (early)') ||
+      !zshPath.includes('# hello-cc shims (final)')) {
+    fail(`zsh shell PATH insertion should install one final entry:\n${zshPath}`);
+  }
+  const fishPath = shellPath.insertPathEntry('set -gx PATH $HOME/bin $PATH\n', 'fish');
+  if ((fishPath.match(/# hello-cc shims/g) || []).length !== 1 ||
+      fishPath.includes('# hello-cc shims (early)') ||
+      !fishPath.includes('# hello-cc shims (final)')) {
+    fail(`fish shell PATH insertion should install one final entry:\n${fishPath}`);
+  }
+  const customRc = [
+    'export PATH="$HOME/.hcc-shims:$PATH" # user custom shim dir',
+    shellPath.pathEntryLine('bash', 'final')
+  ].join('\n');
+  const cleanedRc = shellPath.removePathEntryLines(customRc);
+  if (!cleanedRc.includes('user custom shim dir') || cleanedRc.includes('# hello-cc shims')) {
+    fail(`shell PATH cleanup removed a non-hello-cc custom line or kept hello-cc line:\n${cleanedRc}`);
+  }
+  const noProviderHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-no-provider-home-'));
+  try {
+    const noProviderEnv = {
+      ...env,
+      HOME: noProviderHome,
+      PATH: '/usr/bin:/bin',
+      SHELL: '/bin/bash'
+    };
+    const noProviderInstall = run(process.execPath, [hccBin, '--root', root, 'shim', 'install'], { env: noProviderEnv });
+    if (!noProviderInstall.includes('no shims installed')) {
+      fail(`shim install without providers did not report no shims:\n${noProviderInstall}`);
+    }
+    const noProviderBashrc = path.join(noProviderHome, '.bashrc');
+    if (fs.existsSync(noProviderBashrc) && fs.readFileSync(noProviderBashrc, 'utf8').includes('.hcc-shims')) {
+      fail(`shim install without providers modified shell PATH:\n${fs.readFileSync(noProviderBashrc, 'utf8')}`);
+    }
+  } finally {
+    try { fs.rmSync(noProviderHome, { recursive: true, force: true }); } catch {}
+  }
+  const fishHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-fish-home-'));
+  try {
+    const fishEnv = {
+      ...env,
+      HOME: fishHome,
+      SHELL: '/usr/bin/fish'
+    };
+    const fishInstall = run(process.execPath, [hccBin, '--root', root, 'shim', 'install'], { env: fishEnv });
+    const fishRc = path.join(fishHome, '.config', 'fish', 'config.fish');
+    if (!fishInstall.includes('PATH updated') ||
+        !fs.existsSync(fishRc) ||
+        !fs.readFileSync(fishRc, 'utf8').includes('# hello-cc shims (final)')) {
+      fail(`fish shim install did not create config.fish PATH entry:\n${fishInstall}\n${fs.existsSync(fishRc) ? fs.readFileSync(fishRc, 'utf8') : '(missing)'}`);
+    }
+  } finally {
+    try { fs.rmSync(fishHome, { recursive: true, force: true }); } catch {}
+  }
+  const missingRcHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-missing-rc-home-'));
+  try {
+    const missingRcEnv = {
+      ...env,
+      HOME: missingRcHome,
+      SHELL: '/bin/bash'
+    };
+    const uninstallOutput = run(process.execPath, [hccBin, '--root', root, 'shim', 'uninstall'], { env: missingRcEnv });
+    if (uninstallOutput.includes('PATH entry not removed') || !uninstallOutput.includes('PATH entry not present')) {
+      fail(`shim uninstall reported missing shell rc as a failure:\n${uninstallOutput}`);
+    }
+  } finally {
+    try { fs.rmSync(missingRcHome, { recursive: true, force: true }); } catch {}
+  }
+  const partialStatusHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-partial-status-home-'));
+  try {
+    const partialStatusDir = path.join(partialStatusHome, '.hcc-shims');
+    fs.mkdirSync(partialStatusDir, { recursive: true });
+    fs.writeFileSync(path.join(partialStatusDir, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const partialStatusEnv = {
+      ...env,
+      HOME: partialStatusHome,
+      SHELL: '/bin/bash'
+    };
+    const statusOutput = run(process.execPath, [hccBin, '--root', root, 'shim', 'status'], { env: partialStatusEnv });
+    if (!statusOutput.includes('claude: installed') ||
+        !statusOutput.includes('codex: missing') ||
+        !statusOutput.includes('status: partial')) {
+      fail(`shim status did not report partial install per tool:\n${statusOutput}`);
+    }
+  } finally {
+    try { fs.rmSync(partialStatusHome, { recursive: true, force: true }); } catch {}
+  }
+  const partialShimHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-partial-shim-home-'));
+  const partialShimRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-partial-shim-root-'));
+  try {
+    const partialShimDir = path.join(partialShimHome, '.hcc-shims');
+    fs.mkdirSync(partialShimDir, { recursive: true });
+    fs.writeFileSync(path.join(partialShimDir, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const partialShimEnv = {
+      ...env,
+      HOME: partialShimHome,
+      SHELL: '/bin/bash'
+    };
+    run(process.execPath, [hccBin, '--root', partialShimRoot, 'setup', '--quiet'], { env: partialShimEnv });
+    for (const name of ['claude', 'codex']) {
+      if (!fs.existsSync(path.join(partialShimDir, name))) {
+        fail(`setup did not repair partial shim install; missing ${name}`);
+      }
+    }
+  } finally {
+    try { fs.rmSync(partialShimHome, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(partialShimRoot, { recursive: true, force: true }); } catch {}
+  }
+  const scanHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-scan-home-'));
+  const scanRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-scan-root-'));
+  try {
+    const scanRealRoot = fs.realpathSync(scanRoot);
+    const claudeSessionsDir = path.join(scanHome, '.claude', 'sessions');
+    fs.mkdirSync(claudeSessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(claudeSessionsDir, 'scan-realpath.json'), JSON.stringify({
+      pid: process.pid,
+      sessionId: 'scan-realpath-session',
+      cwd: scanRoot,
+      status: 'running'
+    }));
+    const scanEnv = {
+      ...env,
+      HOME: scanHome
+    };
+    const scanOutput = run(process.execPath, [hccBin, '--root', scanRealRoot, 'scan'], { env: scanEnv });
+    if (!scanOutput.includes('claude') || !scanOutput.includes('scan-realpath')) {
+      fail(`scan did not match discovered hccRoot through realpath comparison:\n${scanOutput}`);
+    }
+  } finally {
+    try { fs.rmSync(scanHome, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(scanRoot, { recursive: true, force: true }); } catch {}
   }
   const cliRuntime = await import(path.join(repoRoot, 'lib', 'cli-runtime.mjs'));
   for (const name of ['commandPath', 'createContext', 'packageRoot', 'shellCommand', 'tailFile']) {
@@ -5271,6 +5479,19 @@ async function syntaxAndHelp() {
       !tmuxHelp.includes('deletion requires --yes')) {
     fail(`tmux help missing DB-backed gc semantics:\n${tmuxHelp}`);
   }
+  const shimHelp = run(process.execPath, [hccBin, 'shim', '--help']);
+  if (!shimHelp.includes('hcc shim') ||
+      !shimHelp.includes('shim install') ||
+      !shimHelp.includes('shim status') ||
+      !shimHelp.includes('shell PATH entry')) {
+    fail(`shim help missing maintenance command content:\n${shimHelp}`);
+  }
+  const installHooksHelp = run(process.execPath, [hccBin, 'install-hooks', '--help']);
+  if (!installHooksHelp.includes('hcc install-hooks') ||
+      !installHooksHelp.includes('install-hooks --status') ||
+      !installHooksHelp.includes('install-hooks --uninstall')) {
+    fail(`install-hooks help missing maintenance command content:\n${installHooksHelp}`);
+  }
   const gcHelp = run(process.execPath, [hccBin, 'gc', '--help']);
   if (!gcHelp.includes('hcc gc') ||
       !gcHelp.includes('gc [--older-than DAYS] [--yes]') ||
@@ -5340,11 +5561,16 @@ function uninstallWorkflow() {
   ensureFile(path.join(uninstallHome, '.claude', 'settings.json'));
   ensureFile(path.join(uninstallHome, '.codex', 'hooks.json'));
   ensureFile(path.join(uninstallHome, '.hcc-shims', 'claude'));
+  const uninstallBashrc = path.join(uninstallHome, '.bashrc');
+  if (!fs.readFileSync(uninstallBashrc, 'utf8').includes('.hcc-shims')) {
+    fail('setup did not install shim PATH entry before uninstall workflow');
+  }
 
   const kept = run(process.execPath, [hccBin, '--root', uninstallRoot, 'uninstall'], { env: uninstallEnv });
   if (!kept.includes('project data kept')) fail(`uninstall did not keep project data by default:\n${kept}`);
   if (!fs.existsSync(path.join(uninstallRoot, '.hello-cc', 'mesh.db'))) fail('default uninstall removed project db');
   if (fs.existsSync(path.join(uninstallHome, '.hcc-shims', 'claude'))) fail('default uninstall did not remove shim');
+  if (fs.readFileSync(uninstallBashrc, 'utf8').includes('.hcc-shims')) fail('default uninstall did not remove shim PATH entry');
   if (!run(process.execPath, [hccBin, '--root', uninstallRoot, 'install-hooks', '--status'], { env: uninstallEnv }).includes('claude=no codex=no')) {
     fail('default uninstall did not remove hooks');
   }
