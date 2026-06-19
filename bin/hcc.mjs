@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
+import { randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
@@ -2270,7 +2271,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const prepared = await prepareLocalBus(ctx, opts);
 
   function newSessionActionToken() {
-    return makeWebToken({ token: null });
+    return randomBytes(32).toString('base64url');
   }
 
   function rememberProject(projectCtx) {

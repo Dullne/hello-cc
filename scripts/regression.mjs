@@ -2296,6 +2296,10 @@ async function multiProjectWebWorkflow() {
   if (!managedActionSession.action_token) {
     fail(`managed web session did not include action token:\n${JSON.stringify(managedActionSession, null, 2)}`);
   }
+  const runtimeActionToken = currentRuntime().token || '';
+  if (managedActionSession.action_token === runtimeActionToken || managedActionSession.action_token.length < 32) {
+    fail(`managed web session action token is not an independent session token:\n${JSON.stringify({ runtimeActionToken, managedActionSession }, null, 2)}`);
+  }
   const actionNext = await (await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/task-next`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
