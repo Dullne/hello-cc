@@ -26,7 +26,9 @@ hcc up [--no-discover] [--no-guidance]
 Web 控制台，然后把终端还给你。裸 `hcc web` 会监听 `0.0.0.0` 并使用固定
 URL token；首次使用时自动生成并保存。用 `--local` 可只绑定 `127.0.0.1`，
 用 `--token` 或 `HCC_WEB_TOKEN` 可替换保存的 token，只有在可信本地/测试环境才使用 `--no-token`。
-只想使用本地协作、不需要 Web 或 shims 时，再使用 `hcc up`。
+只想使用本地协作、不需要 Web 或 shims 时，再使用 `hcc up`。provider shim 只会加入
+已经由 `hcc web` 生成本地 `.hello-cc/runtime.json` 的项目，不会使用全局 runtime
+去管理任意目录。
 
 ## Peers 和状态
 

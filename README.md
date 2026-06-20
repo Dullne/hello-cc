@@ -107,6 +107,9 @@ local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
 Use `--local` to bind only to `127.0.0.1`, or `--port N` to request a specific
 port. `hcc web` initializes the project bus, installs Claude/Codex hooks and
 shims, starts or reuses the Web console, and returns the terminal to you.
+`hcc web --local` is still Web mode; it only limits the listener to loopback.
+Use `hcc up` when you want local coordination commands without the Web console
+or shims.
 
 After the first shim install, open a new terminal or reload the rc file for
 your shell:
@@ -125,7 +128,11 @@ codex resume <session-id>
 ```
 
 Those sessions become tmux-backed peers that can be seen and controlled from
-Web while remaining usable from the local terminal.
+Web while remaining usable from the local terminal. The shims only use the
+current project's runtime file. If you start `claude` or `codex` in a directory
+where `hcc web` has not created `.hello-cc/runtime.json`, the shim falls back to
+the real provider CLI instead of using the global Web runtime or creating a new
+project database.
 
 ## Basic Workflow
 

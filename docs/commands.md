@@ -29,7 +29,9 @@ shims, starts or reuses the Web console, and returns the terminal to you. Bare
 first use. Use `--local` to bind only `127.0.0.1`, `--token` or `HCC_WEB_TOKEN`
 to replace the saved token, and
 `--no-token` only in trusted local/test environments. Use `hcc up` only when you
-want coordination without the Web console or shims.
+want coordination without the Web console or shims. Provider shims only join
+projects with a local `.hello-cc/runtime.json` from `hcc web`; they do not use a
+global runtime to manage arbitrary directories.
 
 ## Peers And Status
 

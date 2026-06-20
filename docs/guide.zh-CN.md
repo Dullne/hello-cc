@@ -95,6 +95,9 @@ codex resume <session-id>
 
 - 本地终端会 attach 到同一个 tmux 会话，仍然可以像普通 Claude/Codex 一样交互。
 - Web 控制台看到并操作的是同一个 tmux pane，不是浏览器里临时创建的假终端。
+- shim 只使用当前项目的 `.hello-cc/runtime.json`。全局 Web runtime 不会让任意
+  目录自动进入管理；如果当前项目没有运行过 `hcc web`，`claude` 和 `codex`
+  会回退到真实 provider CLI，不会创建 `.hello-cc/mesh.db`。
 - `hcc down` 只停止 Web runtime，不会杀掉这些 tmux 会话。
 - 重新运行 `hcc web` 后，只要 tmux pane 还活着，Web 会重新接管。
 
@@ -108,10 +111,14 @@ hcc up
 ```
 
 普通用户优先使用 `hcc web`。
+`hcc web --local` 仍然是 Web 模式，只是把 Web runtime 限制为监听
+`127.0.0.1`。
 
 ## 项目边界
 
-默认项目边界就是当前工作目录。如果当前目录没有 `.hello-cc/mesh.db`，hello-cc 会在首次使用时创建：
+默认项目边界就是当前工作目录。显式运行 `hcc web`、`hcc up`、`hcc task` 或
+`hcc peer start` 这类 `hcc` 命令时，如果当前目录没有 `.hello-cc/mesh.db`，
+hello-cc 会在首次使用时创建：
 
 ```text
 /repo-a/.hello-cc/mesh.db
@@ -119,6 +126,10 @@ hcc up
 ```
 
 这两个目录默认是两个不同项目，不会互相看到任务和消息。想让多个终端自然通信，就在同一个项目目录启动它们。
+
+provider shim 更严格：直接运行 `claude` 和 `codex` 时，只有当前项目已经通过
+`hcc web` 生成本地 `.hello-cc/runtime.json` 才会加入 hello-cc。它们不会使用
+`~/.hello-cc/runtime.json` 去自动注册无关目录，也不会为这些目录创建数据库。
 
 如果确实要让多个路径或 worktree 共用一个总线，需要显式指定：
 

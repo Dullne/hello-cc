@@ -94,6 +94,8 @@ local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
 使用 `--local` 可以只绑定 `127.0.0.1`，使用 `--port N` 可以指定请求端口。
 `hcc web` 会初始化项目总线，安装 Claude/Codex hooks 和 shims，启动或复用 Web
 控制台，然后把终端还给你。
+`hcc web --local` 仍然是 Web 模式，只是限制监听在本机 loopback。只想使用本地
+协作命令、不启动 Web 控制台、不安装 shims 时，使用 `hcc up`。
 
 第一次安装 shim 后，打开新终端，或根据当前 shell 重新加载配置：
 
@@ -111,6 +113,9 @@ codex resume <session-id>
 ```
 
 这些会话会成为 tmux-backed peer，可以继续在本地终端里使用，也可以被 Web 控制台观察和操作。
+shim 只使用当前项目自己的 runtime 文件。如果你在没有通过 `hcc web` 创建
+`.hello-cc/runtime.json` 的目录里启动 `claude` 或 `codex`，shim 会回退到真实
+provider CLI，不会使用全局 Web runtime，也不会为这个目录新建项目数据库。
 
 ## 基本流程
 

@@ -1302,6 +1302,111 @@ fi
   }
 }
 
+async function assertShimIgnoresGlobalRuntime(generateShim) {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-shim-global-runtime-${testId}-`));
+  const fakeHome = path.join(testDir, 'home');
+  const projectRoot = path.join(testDir, 'project-without-runtime');
+  const requests = [];
+  let server = null;
+  try {
+    fs.mkdirSync(path.join(fakeHome, '.hello-cc'), { recursive: true });
+    fs.mkdirSync(projectRoot, { recursive: true });
+
+    server = http.createServer((req, res) => {
+      requests.push({ method: req.method, url: req.url });
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET' && req.url.startsWith('/api/runtime')) {
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === 'POST' && req.url.startsWith('/api/sessions')) {
+        res.end(JSON.stringify({ session: {
+          id: 'global-runtime-session',
+          kind: 'claude',
+          role: 'peer',
+          status: 'running',
+          pane: '%900'
+        } }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'not found' } }));
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    const globalRuntime = {
+      product: 'hello-cc',
+      version: 'regression',
+      pid: process.pid,
+      root: testDir,
+      db: path.join(testDir, '.hello-cc', 'mesh.db'),
+      host: '127.0.0.1',
+      port: address.port,
+      base_url: `http://127.0.0.1:${address.port}`,
+      token: '',
+      started_at: Math.floor(Date.now() / 1000),
+      global_runtime: true
+    };
+    fs.writeFileSync(path.join(fakeHome, '.hello-cc', 'runtime.json'), JSON.stringify(globalRuntime, null, 2));
+
+    const hccWrapper = path.join(testDir, 'hcc-wrapper');
+    fs.writeFileSync(hccWrapper, `#!/usr/bin/env bash\nexec ${sh(process.execPath)} ${sh(hccBin)} "$@"\n`, { mode: 0o755 });
+
+    const cases = [
+      {
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        args: ['--resume', 'global-runtime-session'],
+        expected: 'real-claude --resume global-runtime-session'
+      },
+      {
+        tool: { name: 'codex', kind: 'codex' },
+        args: ['resume', 'global-runtime-session'],
+        expected: 'real-codex resume global-runtime-session'
+      }
+    ];
+
+    for (const entry of cases) {
+      requests.length = 0;
+      fs.rmSync(path.join(projectRoot, '.hello-cc'), { recursive: true, force: true });
+      const realBin = path.join(testDir, `real-${entry.tool.name}`);
+      const shimBin = path.join(testDir, entry.tool.name);
+      fs.writeFileSync(realBin, `#!/usr/bin/env bash
+printf 'real-${entry.tool.name}'
+for arg in "$@"; do printf ' %s' "$arg"; done
+printf '\\n'
+`, { mode: 0o755 });
+      fs.writeFileSync(shimBin, generateShim(hccWrapper, realBin, entry.tool), { mode: 0o755 });
+      const result = runMaybe(shimBin, entry.args, {
+        cwd: projectRoot,
+        env: {
+          ...env,
+          HOME: fakeHome,
+          HCC_SHIM_ENSURED: '1',
+          HCC_SHIM_NO_ATTACH: '1'
+        }
+      });
+      if (result.status !== 0) {
+        fail(`${entry.tool.name} shim failed while ignoring global runtime:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+      if (!String(result.stdout || '').includes(entry.expected)) {
+        fail(`${entry.tool.name} shim used global runtime instead of falling back:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+      if (requests.length) {
+        fail(`${entry.tool.name} shim contacted global runtime despite project-local restriction:\n${JSON.stringify(requests, null, 2)}`);
+      }
+      if (fs.existsSync(path.join(projectRoot, '.hello-cc', 'mesh.db'))) {
+        fail(`${entry.tool.name} shim created a project database while only a global runtime existed`);
+      }
+    }
+  } finally {
+    if (server?.listening) await new Promise((resolve) => server.close(resolve));
+    try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function expectBoundedTmuxStream(label) {
   let nodes = [];
   await waitFor(() => {
@@ -2747,8 +2852,8 @@ async function shimTmuxWorkflow() {
   hcc(['inject', peer, `printf '%s\\n' "$HCC_REG_VALUE" > ${firstEnvFile}`]);
   await waitForFile(firstEnvFile, 'shim-first', 'shim first env');
   const shimInternalEnvFile = path.join(outDir, 'shim-internal-env');
-  hcc(['inject', peer, `printf '%s|%s\\n' "\${HCC_SHIM_ENSURED-unset}" "\${HCC_SKIP_SHIM_INSTALL-unset}" > ${shimInternalEnvFile}`]);
-  await waitForFile(shimInternalEnvFile, 'unset|unset', 'shim internal env cleanup');
+  hcc(['inject', peer, `printf '%s|%s|%s\\n' "\${HCC_SHIM_ENSURED-unset}" "\${HCC_SKIP_SHIM_INSTALL-unset}" "\${HCC_RUNTIME_LOCAL_ONLY-unset}" > ${shimInternalEnvFile}`]);
+  await waitForFile(shimInternalEnvFile, 'unset|unset|unset', 'shim internal env cleanup');
 
   const restarted = run(shim, ['--resume', 'shim-regression-session'], {
     cwd: root,
@@ -3478,6 +3583,7 @@ async function syntaxAndHelp() {
   if (!integrationShimScriptSource.includes('function generateShim') ||
       !integrationShimScriptSource.includes('hello-cc shim for ${tool.name}') ||
       !integrationShimScriptSource.includes('HCC_SHIM_ENSURED') ||
+      !integrationShimScriptSource.includes('HCC_RUNTIME_LOCAL_ONLY') ||
       !integrationShimScriptSource.includes('hcc_runtime_unavailable_start_failure')) {
     fail('integrations shim script module is missing expected generateShim wiring');
   }
@@ -3517,6 +3623,7 @@ async function syntaxAndHelp() {
   if (typeof integrationShimScript.generateShim !== 'function') fail('integrations shim script module missing generateShim export');
   if (shimScriptCompat.generateShim !== integrationShimScript.generateShim) fail('shim script compatibility export mismatch');
   assertShimRuntimeUnavailableFallback(integrationShimScript.generateShim);
+  await assertShimIgnoresGlobalRuntime(integrationShimScript.generateShim);
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
     if (setupModule[name] !== shellPath[name]) fail(`setup shell path export mismatch: ${name}`);

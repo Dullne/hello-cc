@@ -104,6 +104,10 @@ The wrappers create or reuse local persistent tmux terminals:
 - The local terminal attaches to the same tmux session and remains usable.
 - The web console controls the same tmux pane, not a temporary browser-only
   terminal.
+- Shims only use the current project's `.hello-cc/runtime.json`. A global Web
+  runtime does not make arbitrary directories managed; if the current project
+  has not run `hcc web`, `claude` and `codex` fall back to the real provider CLI
+  without creating `.hello-cc/mesh.db`.
 - `hcc down` stops only the web runtime. It does not kill tmux sessions.
 - Running `hcc web` again reattaches live recorded tmux panes.
 
@@ -118,11 +122,14 @@ hcc up
 ```
 
 Most users should start with `hcc web`.
+`hcc web --local` is still Web mode; it binds the Web runtime only to
+`127.0.0.1`.
 
 ## Project Boundary
 
-By default, the project boundary is the current working directory. If the
-current directory has no `.hello-cc/mesh.db`, hello-cc creates one on first use:
+By default, the project boundary is the current working directory. Explicit
+`hcc` commands such as `hcc web`, `hcc up`, `hcc task`, or `hcc peer start`
+create the project database on first use:
 
 ```text
 /repo-a/.hello-cc/mesh.db
@@ -131,6 +138,11 @@ current directory has no `.hello-cc/mesh.db`, hello-cc creates one on first use:
 
 Those are two different projects by default. Sessions communicate naturally
 when they start from the same project path.
+
+Provider shims are stricter: direct `claude` and `codex` commands only join
+hello-cc when the current project already has a local `.hello-cc/runtime.json`
+from `hcc web`. They do not use `~/.hello-cc/runtime.json` to auto-register or
+create databases for unrelated directories.
 
 To share one bus across paths or worktrees, opt in explicitly:
 
