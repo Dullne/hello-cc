@@ -1418,15 +1418,28 @@ async function cmdBroadcast(ctx, args) {
   touchCurrentPeer(db, ctx, identity, null, 'shell');
   const id = sendMessage(db, sender, 'all', taskId, kind, body);
   let injected = 0;
+  let skipped = 0;
   if (opts.inject) {
     const sessions = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
     const running = (sessions.sessions || []).filter((session) => session.status === 'running');
     for (const session of running) {
-      await injectPeer(ctx, session.id, body, !opts['no-enter'], runtime, sender);
-      injected += 1;
+      try {
+        await injectPeer(ctx, session.id, body, !opts['no-enter'], runtime, sender);
+        injected += 1;
+      } catch (err) {
+        if (err instanceof CliError && ['NOT_FOUND', 'SESSION_NOT_RUNNING', 'TMUX_ERROR'].includes(err.code)) {
+          skipped += 1;
+          continue;
+        }
+        throw err;
+      }
     }
   }
-  printResult(ctx, { id, sender, recipient: 'all', task_id: taskId, kind, body, injected }, (data) => `broadcast message #${data.id}${data.injected ? ` and injected ${data.injected} terminal(s)` : ''}`);
+  printResult(ctx, { id, sender, recipient: 'all', task_id: taskId, kind, body, injected, skipped }, (data) => {
+    const injectedText = data.injected ? ` and injected ${data.injected} terminal(s)` : '';
+    const skippedText = data.skipped ? `, skipped ${data.skipped} stale terminal(s)` : '';
+    return `broadcast message #${data.id}${injectedText}${skippedText}`;
+  });
 }
 
 async function injectPeer(ctx, peer, text, enter = true, runtime = null, auditActor = null) {

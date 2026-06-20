@@ -1216,6 +1216,92 @@ function libModuleFiles() {
     .map((name) => path.join('lib', name));
 }
 
+function assertShimRuntimeUnavailableFallback(generateShim) {
+  const fallbackDir = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-shim-fallback-${testId}-`));
+  try {
+    const fakeHcc = path.join(fallbackDir, 'hcc');
+    fs.writeFileSync(fakeHcc, `#!/usr/bin/env bash
+case "\${1:-}" in
+  shim)
+    exit 64
+    ;;
+  find-root)
+    if [ -n "\${HCC_FAKE_ROOT:-}" ]; then
+      printf '%s\\n' "$HCC_FAKE_ROOT"
+      exit 0
+    fi
+    exit 1
+    ;;
+  web)
+    exit 1
+    ;;
+  peer)
+    if [ "\${2:-}" = "start" ]; then
+      printf '%s\\n' "hcc: No running web runtime found. Start hcc web first, then hcc peer start \${3:-peer}" >&2
+      exit 1
+    fi
+    exit 1
+    ;;
+esac
+exit 1
+`, { mode: 0o755 });
+
+    const cases = [
+      {
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        args: ['--resume', 'missing-web-session'],
+        expected: 'real-claude --resume missing-web-session'
+      },
+      {
+        tool: { name: 'codex', kind: 'codex' },
+        args: ['resume', 'missing-web-session'],
+        expected: 'real-codex resume missing-web-session'
+      }
+    ];
+
+    for (const entry of cases) {
+      const realBin = path.join(fallbackDir, `real-${entry.tool.name}`);
+      const shimBin = path.join(fallbackDir, entry.tool.name);
+      const logFile = path.join(fallbackDir, `${entry.tool.name}.log`);
+      fs.writeFileSync(realBin, `#!/usr/bin/env bash
+printf 'real-${entry.tool.name}'
+for arg in "$@"; do printf ' %s' "$arg"; done
+printf '\\n'
+if [ -n "\${HCC_FAKE_LOG:-}" ]; then
+  printf 'real-${entry.tool.name}' >> "$HCC_FAKE_LOG"
+  for arg in "$@"; do printf ' %s' "$arg" >> "$HCC_FAKE_LOG"; done
+  printf '\\n' >> "$HCC_FAKE_LOG"
+fi
+`, { mode: 0o755 });
+      fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
+
+      const result = runMaybe(shimBin, entry.args, {
+        cwd: fallbackDir,
+        env: {
+          ...env,
+          HCC_FAKE_ROOT: fallbackDir,
+          HCC_FAKE_LOG: logFile
+        }
+      });
+      if (result.status !== 0) {
+        fail(`${entry.tool.name} shim did not fall back when runtime was unavailable:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+      if (!String(result.stdout || '').includes(entry.expected)) {
+        fail(`${entry.tool.name} shim fallback did not launch the real provider:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+      const logOutput = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+      if (!logOutput.includes(entry.expected)) {
+        fail(`${entry.tool.name} shim fallback did not preserve provider argv:\n${logOutput}`);
+      }
+      if (String(result.stderr || '').includes('No running web runtime found')) {
+        fail(`${entry.tool.name} shim leaked hcc runtime failure instead of transparent fallback:\n${result.stderr}`);
+      }
+    }
+  } finally {
+    try { fs.rmSync(fallbackDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function expectBoundedTmuxStream(label) {
   let nodes = [];
   await waitFor(() => {
@@ -2586,6 +2672,10 @@ async function shimTmuxWorkflow() {
   }
 
   log('[6/13] shim tmux-backed launch');
+  if (!fs.existsSync(path.join(root, '.hello-cc', 'runtime.json'))) {
+    startRuntime();
+  }
+  await waitRuntime();
   const shim = path.join(home, '.hcc-shims', 'claude');
   const codexShim = path.join(home, '.hcc-shims', 'codex');
   const claudeVersion = run(shim, ['--version'], { cwd: root, env });
@@ -3388,8 +3478,11 @@ async function syntaxAndHelp() {
   if (!integrationShimScriptSource.includes('function generateShim') ||
       !integrationShimScriptSource.includes('hello-cc shim for ${tool.name}') ||
       !integrationShimScriptSource.includes('HCC_SHIM_ENSURED') ||
-      !integrationShimScriptSource.includes('HCC_SKIP_SHIM_INSTALL')) {
+      !integrationShimScriptSource.includes('hcc_runtime_unavailable_start_failure')) {
     fail('integrations shim script module is missing expected generateShim wiring');
+  }
+  if (integrationShimScriptSource.includes('HCC_SKIP_SHIM_INSTALL=1 "$HCC_BIN" web')) {
+    fail('integration shim script still auto-starts hcc web instead of falling back to the real provider');
   }
   if (!shellPathSource.includes('function installPathEntry') ||
       !shellPathSource.includes('function uninstallPathEntry') ||
@@ -3423,6 +3516,7 @@ async function syntaxAndHelp() {
   if (setupModule.SHIM_DIR !== integrationShims.SHIM_DIR) fail('setup shim dir export mismatch');
   if (typeof integrationShimScript.generateShim !== 'function') fail('integrations shim script module missing generateShim export');
   if (shimScriptCompat.generateShim !== integrationShimScript.generateShim) fail('shim script compatibility export mismatch');
+  assertShimRuntimeUnavailableFallback(integrationShimScript.generateShim);
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
     if (setupModule[name] !== shellPath[name]) fail(`setup shell path export mismatch: ${name}`);
