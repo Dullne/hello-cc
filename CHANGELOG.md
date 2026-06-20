@@ -16,6 +16,64 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 0.1.9
+
+### Summary
+
+hello-cc 0.1.9 publishes the post-0.1.8 Web runtime and provider shim
+hardening work. It tightens Web peer action identity, makes runtime cleanup
+safer, and keeps Claude/Codex shims from attaching unrelated projects to a
+global Web runtime.
+
+### Highlights
+
+- Hardened Web runtime cleanup so starting `hcc web` from a wrapper shell does
+  not terminate the current parent process chain while still removing stale
+  orphan runtimes for the same project.
+- Returned structured `BAD_REQUEST` JSON for malformed Web API request bodies
+  instead of surfacing raw JSON parse failures.
+- Replaced Web-runtime-token reuse for mutating peer actions with independent
+  per-session action tokens.
+- Changed provider shims to fall back to the real Claude/Codex CLI when no
+  current-project Web runtime is available.
+- Made provider shims use only the current project's `.hello-cc/runtime.json`
+  during managed launches, avoiding accidental attachment through a global Web
+  runtime from another project.
+- Kept shim-only environment variables out of restarted provider sessions.
+
+### Compatibility Notes
+
+- No breaking CLI command changes are intended in this release.
+- `hcc web --local` is still Web mode; use `hcc up` when you only want local
+  coordination commands without the Web console or shims.
+- Starting `claude` or `codex` in a directory without a local
+  `.hello-cc/runtime.json` now runs the real provider CLI instead of implicitly
+  using a global hello-cc Web runtime.
+
+### Validation
+
+The 0.1.9 release should be validated with:
+
+```bash
+git diff --check
+node --check bin/hcc.mjs
+find lib -name '*.mjs' -print0 | xargs -0 -n1 node --check
+node --check scripts/github-release.mjs
+node --check scripts/regression.mjs
+node --check scripts/release-notes.mjs
+npm run release:check
+npm run release:github:dry-run -- --version 0.1.9
+npm pack --dry-run --json
+npm publish --dry-run --registry=https://registry.npmjs.org/ --access public
+npm test
+```
+
+The expected full regression marker is:
+
+```text
+FULL_REGRESSION_OK
+```
+
 ## 0.1.8
 
 ### Summary
