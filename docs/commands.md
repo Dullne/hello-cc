@@ -103,6 +103,7 @@ hcc task takeover [--peer ID] --id N --reason TEXT [--policy any|blocked|stale|b
 hcc task next [--peer ID] [--force] [--count N]
 hcc task create --title TEXT --parent N [--team-role ROLE]
 hcc task update [--peer ID] --id N --status running|review|blocked|done|abandoned [--summary TEXT] [--body TEXT] [--to ID]
+hcc task running|review|blocked|abandoned [--peer ID] --id N [--summary TEXT] [--body TEXT] [--to ID]
 hcc task done [--peer ID] --id N --summary TEXT
 ```
 
@@ -121,6 +122,8 @@ another owner; it records the previous owner, requires a reason, and notifies
 them. Add `--policy blocked`, `stale`, or `blocked-or-stale` when takeover
 should only proceed under that auditable precondition. The default policy is
 `any` for compatibility.
+Use `task running`, `task review`, `task blocked`, or `task abandoned` as
+shortcuts for `task update --status STATUS`.
 
 ## Teams
 

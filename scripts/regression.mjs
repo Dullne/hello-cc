@@ -1789,7 +1789,7 @@ async function dbWorkflow() {
   if (!taskMatch) fail(`cannot parse task id: ${created}`);
   const taskId = taskMatch[1];
   hcc(['task', 'claim', '--peer', 'codex-a', '--id', taskId]);
-  hcc(['task', 'update', '--peer', 'codex-a', '--id', taskId, '--status', 'running', '--summary', 'started']);
+  hcc(['task', 'running', '--peer', 'codex-a', '--id', taskId, '--summary', 'started']);
   const runningTasksForOtherPeer = hccJson(['task', 'list'], { env: { ...env, HCC_PEER: 'claude-a' } });
   if (!hasTask(runningTasksForOtherPeer, taskId)) {
     fail(`running task hidden from default list for another peer: #${taskId}`);
@@ -1896,6 +1896,23 @@ async function dbWorkflow() {
     hcc(['task', 'done', '--peer', 'batch-b', '--id', String(task.id), '--summary', 'batch next cleanup']);
   }
   hcc(['task', 'update', '--peer', 'human', '--id', batchNextIds[2], '--status', 'abandoned', '--summary', 'batch next leftover cleanup']);
+
+  for (const status of ['running', 'review', 'blocked', 'abandoned']) {
+    const peer = `shortcut-${status}`;
+    const out = hcc(['task', 'create', '--from', 'human', '--to', peer, '--title', `shortcut ${status}`]);
+    const match = out.match(/created task #(\d+):/);
+    if (!match) fail(`cannot parse shortcut task id: ${out}`);
+    const shortcutTaskId = match[1];
+    hcc(['task', 'claim', '--peer', peer, '--id', shortcutTaskId]);
+    hcc(['task', status, '--peer', peer, '--id', shortcutTaskId, '--summary', `${status} shortcut`]);
+    const row = hccJson(['task', 'list', '--all']).find((task) => String(task.id) === String(shortcutTaskId));
+    if (!row || row.status !== status) {
+      fail(`task ${status} shortcut did not set status ${status}:\n${JSON.stringify(row, null, 2)}`);
+    }
+    if (!['done', 'abandoned'].includes(status)) {
+      hcc(['task', 'done', '--peer', peer, '--id', shortcutTaskId, '--summary', `${status} shortcut cleanup`]);
+    }
+  }
 
   const dispatched = hccJson(['task', 'dispatch', '--from', 'human', '--to', 'dispatch-a', '--title', 'dispatch new task', '--body', 'dispatch body', '--no-inject']);
   if (!dispatched.task || dispatched.task.assignee !== 'dispatch-a' || dispatched.task.owner ||
@@ -5722,7 +5739,10 @@ async function syntaxAndHelp() {
       !taskHelp.includes('task takeover [--peer ID] --id N --reason TEXT') ||
       !taskHelp.includes('[--policy any|blocked|stale|blocked-or-stale]') ||
       !taskHelp.includes('task claim [--peer ID] --id N[,N]') ||
-      !taskHelp.includes('task create --title TEXT --parent N')) {
+      !taskHelp.includes('task create --title TEXT --parent N') ||
+      !taskHelp.includes('task running|review|blocked|abandoned [--peer ID] --id N') ||
+      !taskHelp.includes('shortcuts for') ||
+      !taskHelp.includes('task update --status STATUS')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
   for (const expected of [
@@ -5801,6 +5821,7 @@ async function syntaxAndHelp() {
   if (runHelp.includes('--web-managed')) fail(`run help exposes removed --web-managed:\n${runHelp}`);
   const subcommandHelpCases = [
     ['task', 'done', 'hcc task done'],
+    ['task', 'running', 'hcc task running'],
     ['msg', 'reply', 'hcc msg reply'],
     ['peer', 'attach', 'peer attach'],
     ['tmux', 'gc', 'hcc tmux'],

@@ -734,6 +734,8 @@ async function cmdPeers(ctx, args) {
   ]));
 }
 
+const TASK_STATUS_SHORTCUTS = new Set(['running', 'review', 'blocked', 'abandoned']);
+
 async function cmdTask(ctx, args) {
   const sub = args[0];
   if (!sub || wantsHelp(args)) return helpTask();
@@ -745,6 +747,7 @@ async function cmdTask(ctx, args) {
   if (sub === 'next') return taskNext(ctx, args.slice(1));
   if (sub === 'update') return taskUpdate(ctx, args.slice(1));
   if (sub === 'done') return taskDone(ctx, args.slice(1));
+  if (TASK_STATUS_SHORTCUTS.has(sub)) return taskStatusShortcut(ctx, sub, args.slice(1));
   throw new CliError('BAD_ARGS', `Unknown task command: ${sub}`);
 }
 
@@ -1132,6 +1135,10 @@ async function taskUpdate(ctx, args) {
     throw err;
   }
   printResult(ctx, task, (data) => `task #${data.id} -> ${data.status}`);
+}
+
+async function taskStatusShortcut(ctx, status, args) {
+  return taskUpdate(ctx, args.concat(['--status', status]));
 }
 
 async function taskDone(ctx, args) {

@@ -139,6 +139,7 @@ project database.
 ```bash
 hcc task create --title "Review router changes" --priority 20
 hcc task next
+hcc task running --id 1 --summary "Started"
 hcc lock acquire --resource src/router --ttl 900 --reason "edit router"
 hcc status
 hcc handoff create --summary "Router change ready for review" --tests "npm test"
