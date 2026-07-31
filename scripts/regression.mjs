@@ -150,7 +150,9 @@ function hccFromMaybe(args, cwd, options = {}) {
 }
 
 function withMeshDb(fn) {
-  const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'));
+  // Match production connect(): a busy timeout so read-during-write (the runtime
+  // holds the WAL) does not fail fast with SQLITE_BUSY on Linux.
+  const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { timeout: 5000 });
   try {
     return fn(db);
   } finally {
@@ -179,7 +181,7 @@ function parsePayloadJson(value) {
 }
 
 function eventPayloads(type, limit = 20, dbPath = path.join(root, '.hello-cc', 'mesh.db')) {
-  const db = new DatabaseSync(dbPath);
+  const db = new DatabaseSync(dbPath, { timeout: 5000 });
   try {
     return db.prepare(`
       SELECT actor, payload
@@ -1724,7 +1726,9 @@ async function setupRegression() {
   }
   await stopRuntime();
 
-  const noTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-token', '--no-discover', '--no-guidance']);
+  // --no-token is only permitted on a loopback bind (a tokenless writable
+  // terminal on a non-loopback address is remotely exploitable).
+  const noTokenOutput = hcc(['web', '--local', '--port', String(port), '--no-token', '--no-discover', '--no-guidance']);
   const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
   if (!noTokenMatch) fail(`explicit no-token web did not print background pid:\n${noTokenOutput}`);
   runtimePid = Number.parseInt(noTokenMatch[1], 10);
@@ -1737,6 +1741,12 @@ async function setupRegression() {
   const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`);
   if (!noTokenResponse.ok) fail(`explicit no-token web API required token: ${noTokenResponse.status}`);
   await stopRuntime();
+
+  // A tokenless bind to a non-loopback address must be refused outright.
+  const exposedNoToken = hccMaybe(['web', '--host', '0.0.0.0', '--port', String(port), '--no-token', '--no-discover', '--no-guidance']);
+  if (exposedNoToken.status === 0 || !String(exposedNoToken.stderr || exposedNoToken.stdout).includes('without a token')) {
+    fail(`web allowed a tokenless non-loopback bind:\n${exposedNoToken.stdout}\n${exposedNoToken.stderr}`);
+  }
 
   const conflictingToken = hccMaybe(['web', '--local', '--port', String(port), '--token', 'abc', '--no-token', '--no-discover', '--no-guidance']);
   if (conflictingToken.status === 0 || !String(conflictingToken.stderr || conflictingToken.stdout).includes('--no-token cannot be combined')) {
@@ -2115,7 +2125,15 @@ async function dbWorkflow() {
   if (!takeoverTaskMatch) fail(`cannot parse takeover task id: ${takeoverTask}`);
   const takeoverTaskId = takeoverTaskMatch[1];
   hcc(['task', 'claim', '--peer', 'codex-owner', '--id', takeoverTaskId]);
-  const takeoverOutput = hcc(['task', 'takeover', '--peer', 'codex-taker', '--id', takeoverTaskId, '--reason', 'owner inactive']);
+  // Default takeover policy is now blocked-or-stale: an active owner's task
+  // must not be taken over silently (hb-07/conc-04). codex-owner just claimed,
+  // so it is active and the default takeover must be rejected.
+  const rejectedTakeover = hccMaybe(['task', 'takeover', '--peer', 'codex-taker', '--id', takeoverTaskId, '--reason', 'owner active']);
+  if (rejectedTakeover.status === 0 || !String(rejectedTakeover.stderr || rejectedTakeover.stdout).includes('does not match takeover policy')) {
+    fail(`default takeover was not rejected against an active owner:\n${rejectedTakeover.stdout}\n${rejectedTakeover.stderr}`);
+  }
+  // --force restores unconditional takeover of an active owner's task.
+  const takeoverOutput = hcc(['task', 'takeover', '--peer', 'codex-taker', '--id', takeoverTaskId, '--reason', 'forced', '--force']);
   if (!takeoverOutput.includes(`took over task #${takeoverTaskId}`)) fail(`takeover output wrong:\n${takeoverOutput}`);
   const takeoverRow = hccJson(['task', 'list', '--all']).find((row) => String(row.id) === String(takeoverTaskId));
   if (!takeoverRow || takeoverRow.owner !== 'codex-taker' || takeoverRow.status !== 'claimed') {
@@ -3894,7 +3912,7 @@ async function syntaxAndHelp() {
     const projectRuntimeFile = runtimeState.writeRuntime(runtimeCtx, {
       base_url: 'http://127.0.0.1:11',
       token: 'project-token',
-      pid: 101
+      pid: process.pid
     });
     if (!fs.existsSync(projectRuntimeFile) || (fs.statSync(projectRuntimeFile).mode & 0o777) !== 0o600) {
       fail('runtime state writeRuntime did not create a 0600 runtime file');
@@ -3910,13 +3928,13 @@ async function syntaxAndHelp() {
     }
     runtimeState.clearRuntime(runtimeCtx, 202);
     if (!fs.existsSync(projectRuntimeFile)) fail('runtime state clearRuntime removed a different pid');
-    runtimeState.clearRuntime(runtimeCtx, 101);
+    runtimeState.clearRuntime(runtimeCtx, process.pid);
     if (fs.existsSync(projectRuntimeFile)) fail('runtime state clearRuntime did not remove matching project pid');
 
     const globalRuntimeFile = runtimeState.writeGlobalRuntime({
       base_url: 'http://127.0.0.1:12',
       token: 'global-token',
-      pid: 303
+      pid: process.pid
     });
     const globalRuntime = runtimeState.readRuntime(runtimeCtx);
     if (globalRuntime.base_url !== 'http://127.0.0.1:12' ||
@@ -3927,13 +3945,31 @@ async function syntaxAndHelp() {
     }
     runtimeState.clearRuntime(runtimeCtx, 404);
     if (!fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime removed a different global pid');
-    runtimeState.clearRuntime(runtimeCtx, 303);
+    runtimeState.clearRuntime(runtimeCtx, process.pid);
     if (fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime did not remove matching global pid');
 
-    fs.writeFileSync(globalRuntimeFile, '{bad');
-    if (runtimeState.readGlobalRuntimeFile() !== null || fs.existsSync(globalRuntimeFile)) {
-      fail('runtime state readGlobalRuntimeFile did not remove invalid JSON');
+    // bg-01: a runtime pointer whose pid is dead must be skipped (not returned
+    // as reachable), so commands don't fail against a stale pointer.
+    runtimeState.writeGlobalRuntime({ base_url: 'http://127.0.0.1:13', token: 'dead-token', pid: 999999 });
+    try {
+      runtimeState.readRuntime(runtimeCtx);
+      fail('runtime state readRuntime returned a dead-pid runtime pointer');
+    } catch (err) {
+      if (err?.code !== 'RUNTIME_NOT_RUNNING') throw err;
     }
+    runtimeState.clearRuntime(runtimeCtx, 999999);
+    if (fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime did not remove the dead-pid global pointer');
+
+    fs.writeFileSync(globalRuntimeFile, '{bad');
+    if (runtimeState.readGlobalRuntimeFile() !== null) {
+      fail('runtime state readGlobalRuntimeFile did not reject invalid JSON');
+    }
+    // A torn/partial write must NOT be deleted on read (rob-02): deleting it can
+    // orphan a healthy runtime. It is preserved for health probing / restart.
+    if (!fs.existsSync(globalRuntimeFile)) {
+      fail('runtime state readGlobalRuntimeFile must not delete a torn/partial file');
+    }
+    fs.rmSync(globalRuntimeFile, { force: true });
 
     process.env.HCC_RUNTIME_URL = 'http://env-runtime.test';
     process.env.HCC_RUNTIME_TOKEN = 'env-token';
@@ -4622,6 +4658,7 @@ async function syntaxAndHelp() {
       );
       CREATE TABLE peers (
         id TEXT PRIMARY KEY,
+        status TEXT,
         last_seen_at INTEGER NOT NULL
       );
       CREATE TABLE handoffs (
@@ -5897,6 +5934,141 @@ function uninstallWorkflow() {
   try { fs.rmSync(uninstallHome, { recursive: true, force: true }); } catch {}
 }
 
+// Name-authoritative re-adoption + dead-peer reaper (session leak hardening).
+async function sessionRecoveryWorkflow() {
+  if (!tmuxAvailable()) {
+    log('session recovery skipped (tmux not installed)');
+    return;
+  }
+  log('session recovery: re-adopt orphan tmux + reap dead peer');
+  if (!fs.existsSync(path.join(root, '.hello-cc', 'runtime.json'))) startRuntime();
+  await waitRuntime();
+
+  // ── Default Stop (no kill) must not strand a live managed session ──
+  const readoptPeer = 'readopt-shell';
+  const pane = parsePane(hcc(['peer', 'start', readoptPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
+  const sessionName = tmuxManagedSession(root, readoptPeer);
+  let binding = peerBindingRow(readoptPeer);
+  if (!binding || binding.runtime_target !== pane) {
+    fail(`readopt peer binding not live after start:\n${JSON.stringify(binding, null, 2)}`);
+  }
+  hcc(['peer', 'stop', readoptPeer]); // default = detach, leaves tmux alive
+  // Immediately after a default stop: tmux session still alive, binding detached.
+  if (runMaybe('tmux', ['has-session', '-t', sessionName]).status !== 0) {
+    fail('default peer stop killed the tmux session instead of detaching');
+  }
+  binding = peerBindingRow(readoptPeer);
+  if (!binding || binding.runtime_target !== null) {
+    fail(`default stop did not detach binding:\n${JSON.stringify(binding, null, 2)}`);
+  }
+  // Within a few poll cycles the name-sweep must re-adopt the still-live session.
+  await waitFor(() => {
+    const row = peerBindingRow(readoptPeer);
+    return Boolean(row && row.runtime_target === pane);
+  }, 'orphan managed tmux session re-adoption', 20000);
+  const restoredStatus = withMeshDb((db) => db.prepare('SELECT status FROM peers WHERE id = ?').get(readoptPeer)?.status);
+  if (restoredStatus !== 'running') fail(`re-adopted peer not marked running (status=${restoredStatus})`);
+  // Re-enterability: the runtime now exposes the session again.
+  const sessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+  if (!(sessions.sessions || []).some((s) => s.id === readoptPeer && s.status === 'running')) {
+    fail(`re-adopted session not exposed by /api/sessions:\n${JSON.stringify(sessions, null, 2)}`);
+  }
+  // Destroying the live session is the real teardown path (CLI peer stop has
+  // no kill flag; the web API's kill_tmux is the equivalent). Kill it directly
+  // so it does not leak into the final tmux-session leak assertion.
+  runMaybe('tmux', ['kill-session', '-t', sessionName]);
+  if (runMaybe('tmux', ['has-session', '-t', sessionName]).status === 0) {
+    fail('failed to tear down re-adopted managed tmux session');
+  }
+  withMeshDb((db) => {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(readoptPeer);
+    db.prepare('DELETE FROM peers WHERE id = ?').run(readoptPeer);
+  });
+
+  // ── A peer whose process is gone must be reaped, not stuck at 'running' ──
+  const reaped = spawnSync('sleep', ['10'], { stdio: 'ignore' });
+  // spawnSync of sleep returns after exit; its pid is guaranteed dead now.
+  const deadPid = reaped.pid;
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000);
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES (?, 'shell', 'peer', ?, '', ?, 'running', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, status = 'running', last_seen_at = excluded.last_seen_at
+    `).run('reap-dead', root, deadPid, t, t);
+    db.prepare(`
+      INSERT INTO peer_bindings(peer, provider, resume_mode, transport, runtime_session_id, runtime_target, created_at, updated_at)
+      VALUES (?, 'shell', 'attached', 'tmux', ?, 'DEADPANE', ?, ?)
+      ON CONFLICT(peer) DO UPDATE SET runtime_target = 'DEADPANE', updated_at = excluded.updated_at
+    `).run('reap-dead', 'reap-dead', t, t);
+  });
+  await waitFor(() => {
+    const row = withMeshDb((db) => db.prepare('SELECT status FROM peers WHERE id = ?').get('reap-dead') || {});
+    return row.status === 'exited';
+  }, 'dead peer reaped to exited', 20000);
+  const reapedBinding = peerBindingRow('reap-dead');
+  if (!reapedBinding || reapedBinding.runtime_target !== null) {
+    fail(`reaper did not clear dead peer runtime_target:\n${JSON.stringify(reapedBinding, null, 2)}`);
+  }
+  if (!eventPayloads('peer.reaped').some((e) => e.payload?.peer === 'reap-dead')) {
+    fail('reaper did not emit peer.reaped event');
+  }
+  // Cleanup the synthetic peer row so later assertions are unaffected.
+  withMeshDb((db) => {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run('reap-dead');
+    db.prepare('DELETE FROM peers WHERE id = ?').run('reap-dead');
+  });
+}
+
+// `hcc gc` must cover messages/handoffs/expired locks (not just events/tasks).
+function gcCoverageWorkflow() {
+  log('gc coverage: messages + handoffs + expired locks');
+  const t = Math.floor(Date.now() / 1000);
+  const liveLockResource = 'gc-live-lock';
+  withMeshDb((db) => {
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
+      VALUES ('gc-peer', 'shell', 'peer', ?, '', NULL, 'idle', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+    `).run(root, t, t);
+    db.prepare(`
+      INSERT INTO messages(sender, recipient, kind, body, thread_id, created_at)
+      VALUES ('gc-peer', 'gc-peer', 'note', 'stale', NULL, ?)
+    `).run(t - 100000);
+    const messageId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    db.prepare('INSERT INTO message_reads(message_id, peer, read_at) VALUES (?, ?, ?)').run(messageId, 'gc-peer', t);
+    db.prepare(`
+      INSERT INTO handoffs(task_id, from_peer, to_peer, summary, created_at)
+      VALUES (NULL, 'gc-peer', NULL, 'stale handoff', ?)
+    `).run(t - 100000);
+    db.prepare(`
+      INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at)
+      VALUES (?, ?, '*', 'gc-peer', 'expired', ?, ?)
+    `).run('gc-expired-lock', 'gc-expired-lock', t - 60, t - 100000);
+    db.prepare(`
+      INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at)
+      VALUES (?, ?, '*', 'gc-peer', 'live', ?, ?)
+    `).run(liveLockResource, liveLockResource, t + 3600, t);
+  });
+
+  const out = hcc(['gc', '--older-than', '0', '--yes']);
+  if (!/old messages:\s+[1-9]/.test(out)) fail(`gc did not report deleted messages:\n${out}`);
+  if (!/old handoffs:\s+[1-9]/.test(out)) fail(`gc did not report deleted handoffs:\n${out}`);
+  if (!/expired locks:\s+[1-9]/.test(out)) fail(`gc did not report expired locks:\n${out}`);
+
+  withMeshDb((db) => {
+    if (db.prepare('SELECT COUNT(*) AS n FROM messages').get().n !== 0) fail('gc left messages behind');
+    if (db.prepare('SELECT COUNT(*) AS n FROM message_reads').get().n !== 0) fail('message_reads did not cascade-delete with messages');
+    if (db.prepare('SELECT COUNT(*) AS n FROM handoffs').get().n !== 0) fail('gc left handoffs behind');
+    if (db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(t).n !== 0) fail('gc left expired locks behind');
+    const live = db.prepare('SELECT resource FROM locks WHERE resource = ?').get(liveLockResource);
+    if (!live) fail('gc deleted a not-yet-expired lock');
+    // Cleanup
+    db.prepare('DELETE FROM locks WHERE resource = ?').run(liveLockResource);
+    db.prepare('DELETE FROM peers WHERE id = ?').run('gc-peer');
+  });
+}
+
 async function main() {
   process.once('SIGINT', () => { cleanup(); process.exit(130); });
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
@@ -5911,8 +6083,10 @@ async function main() {
   await tmuxBackedStartWorkflow();
   await shimTmuxWorkflow();
   await tmuxWorkflow();
+  await sessionRecoveryWorkflow();
   await askBroadcastWorkflow();
   await downGcPackWorkflow();
+  gcCoverageWorkflow();
   oldNameScan();
   identityEnforcementWorkflow();
   await syntaxAndHelp();

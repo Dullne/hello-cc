@@ -147,6 +147,7 @@ import {
   tmuxHasSession,
   tmuxKillSession,
   tmuxLaunchFingerprint,
+  tmuxListSessionNames,
   tmuxManagedSessionName,
   tmuxPaneInfo,
   tmuxProviderState,
@@ -154,6 +155,7 @@ import {
   tmuxSessionEnvironmentValue,
   tmuxSessionHasClients
 } from '../lib/tmux.mjs';
+import { isAlive } from '../lib/discover.mjs';
 import {
   lockArgv,
   lockBaseResource,
@@ -363,7 +365,7 @@ function iso(ts) {
 function webErrorStatus(err) {
   if (!(err instanceof CliError)) return 500;
   if (['BAD_ARGS', 'BAD_REQUEST', 'PEER_IDENTITY_REQUIRED', 'REQUEST_TOO_LARGE'].includes(err.code)) return 400;
-  if (['PEER_IDENTITY_MISMATCH', 'TASK_OWNED', 'LOCK_OWNED'].includes(err.code)) return 403;
+  if (['PEER_IDENTITY_MISMATCH', 'TASK_OWNED', 'LOCK_OWNED', 'PROJECT_NOT_REGISTERED', 'PROJECT_PATH_FORBIDDEN'].includes(err.code)) return 403;
   if (['NOT_FOUND'].includes(err.code)) return 404;
   if (['LOCK_HELD', 'SESSION_NOT_RUNNING'].includes(err.code)) return 409;
   return 500;
@@ -400,6 +402,7 @@ function connect(ctx) {
   const db = new DatabaseSync(ctx.dbPath, { timeout: 5000 });
   db.exec('PRAGMA busy_timeout = 5000;');
   execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
+  db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   initSchema(db, { beforePostMigrationIndexes: dedupePeerBindings });
   migrateRegisteredProjectDbs(ctx);
@@ -425,14 +428,15 @@ function migrateRegisteredProjectDbs(ctx) {
         db = new DatabaseSync(dbPath, { timeout: 5000 });
         db.exec('PRAGMA busy_timeout = 5000;');
         execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
+        db.exec('PRAGMA synchronous = NORMAL;');
         db.exec('PRAGMA foreign_keys = ON;');
         initSchema(db, { beforePostMigrationIndexes: dedupePeerBindings });
         migratedRegisteredProjectDbs.add(cacheKey);
       } catch (err) {
-        throw new CliError('REGISTERED_DB_MIGRATION_FAILED', `Failed to migrate registered project database ${dbPath}: ${err?.message || err}`, {
-          db: dbPath,
-          code: err instanceof CliError ? err.code : undefined
-        });
+        // A corrupt or busy sibling project DB must not fail commands or crash
+        // the shared runtime for unrelated projects. Skip it and keep going.
+        console.error(`[${new Date().toISOString()}] skipping registered project DB migration for ${dbPath}: ${err?.message || err}`);
+        continue;
       } finally {
         try { db?.close(); } catch {}
       }
@@ -1009,7 +1013,7 @@ async function taskList(ctx, args) {
   }
   const t = now();
   const peers = db.prepare(`
-    SELECT id, last_seen_at, (? - last_seen_at) AS age_sec
+    SELECT id, status, last_seen_at, (? - last_seen_at) AS age_sec
     FROM peers
   `).all(t);
   const locks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
@@ -1068,13 +1072,16 @@ function notifyTaskOwnerConflict(ctx, err) {
 }
 
 async function taskTakeover(ctx, args) {
-  const opts = parseOpts(args);
+  const opts = parseOpts(args, { booleans: ['force'] });
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
   if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
   const reason = required(opts, 'reason');
-  const policy = opts.policy || 'any';
+  // Default to blocked-or-stale so an active owner's task is not silently
+  // taken over (hb-07/conc-04). --force restores the old unconditional 'any'
+  // behavior; --policy still wins when given explicitly.
+  const policy = opts.force ? 'any' : (opts.policy || 'blocked-or-stale');
   const staleAfter = positiveIntOpt(opts, 'stale-after', ACTIVE_PEER_TTL, { max: 86400 * 30 });
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
@@ -2121,10 +2128,42 @@ async function stopOrphanWebRuntimes(ctx, keepPid = null) {
   }
 }
 
+function assertWebTokenForHost(host, hasToken) {
+  if (!isLoopbackHost(host) && !hasToken) {
+    throw new CliError('WEB_EXPOSED_WITHOUT_TOKEN',
+      `Refusing to expose the web console on ${host} without a token. A tokenless ` +
+      `terminal on a non-loopback address lets anyone on the network run commands as you. ` +
+      `Use --local to bind loopback only, or drop --no-token so a token is required.`);
+  }
+}
+
+function webExposureWarning(host, port) {
+  return `WARNING: hello-cc web is bound to ${host}:${port}, exposing a writable terminal ` +
+    `(remote code execution surface) to your network. Anyone who reaches this port with the ` +
+    `token can run commands as you. Prefer '--local' + 'ssh -L ${port}:127.0.0.1:${port}', ` +
+    `or put it behind a TLS reverse proxy.`;
+}
+
+// Same-origin check for the WebSocket terminal upgrade. Browsers always send an
+// Origin header on WebSocket handshakes, so a cross-site page attempting a
+// cross-site WebSocket hijack (CSWSH) is rejected. Non-browser clients (the CLI,
+// the `ws` library, regression tests) send no Origin and are allowed through to
+// the token gate.
+function webSocketOriginAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  let originHost;
+  try { originHost = new URL(origin).host; } catch { return false; }
+  return originHost === (req.headers.host || '');
+}
+
 async function startWebBackground(ctx, args) {
   const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
   validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
   validateWebTokenOpts(opts);
+  const requestedHost = expectedWebHost(opts);
+  assertWebTokenForHost(requestedHost, !opts['no-token']);
+  if (!isLoopbackHost(requestedHost)) console.error(webExposureWarning(requestedHost, intOpt(opts, 'port', 8787)));
   ensureTmuxAvailable({ autoInstall: true });
   const setup = await prepareLocalBus(ctx, {
     ...opts,
@@ -2153,7 +2192,10 @@ async function startWebBackground(ctx, args) {
 
   const logFile = webLogPath(ctx);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  fs.appendFileSync(logFile, `\n[${new Date().toISOString()}] ${CLI_NAME} web ${args.join(' ')}\n`);
+  fs.appendFileSync(logFile, `\n[${new Date().toISOString()}] ${CLI_NAME} web ${args.join(' ')}\n`, { mode: 0o600 });
+  // The runtime echoes token-bearing URLs into web.log; keep it owner-only so a
+  // co-tenant on the machine cannot read the token (net-02).
+  try { fs.chmodSync(logFile, 0o600); } catch {}
   const logFd = fs.openSync(logFile, 'a');
 
   const childArgs = [
@@ -2282,6 +2324,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const host = expectedWebHost(opts);
   const port = intOpt(opts, 'port', 8787);
   const token = makeWebToken(opts);
+  assertWebTokenForHost(host, Boolean(token));
+  if (!isLoopbackHost(host)) console.error(webExposureWarning(host, port));
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');
@@ -2312,15 +2356,34 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return rows;
   }
 
+  function assertDbUnderRoot(root, db) {
+    const stateDir = path.join(path.resolve(root), '.hello-cc');
+    const resolvedDb = path.resolve(db);
+    if (resolvedDb !== path.join(stateDir, 'mesh.db') && !resolvedDb.startsWith(stateDir + path.sep)) {
+      throw new CliError('PROJECT_PATH_FORBIDDEN', `Database path must live under ${stateDir}`);
+    }
+  }
+
   function projectFromRequest(req, url) {
     const root = url.searchParams.get('root') ||
       url.searchParams.get('project') ||
       req.headers['x-hcc-root'] ||
       ctx.root;
+    const resolvedRoot = path.resolve(root);
+    // A bearer token must not open or create a SQLite DB at an arbitrary path
+    // (net-07) or read pseudo-files (?db=/proc/...). Require a real directory and
+    // keep the DB under its own .hello-cc/. This preserves multi-project switching
+    // (point the console at any real project dir) without granting an
+    // arbitrary-filesystem-write primitive.
+    if (resolvedRoot !== path.resolve(ctx.root) &&
+        (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory())) {
+      throw new CliError('PROJECT_NOT_REGISTERED', `Project root does not exist: ${resolvedRoot}`);
+    }
     const db = url.searchParams.get('db') ||
       req.headers['x-hcc-db'] ||
-      path.join(path.resolve(root), '.hello-cc', 'mesh.db');
-    return rememberProject(contextForProject(root, db, { cwd: path.resolve(root), json: ctx.json }));
+      path.join(resolvedRoot, '.hello-cc', 'mesh.db');
+    assertDbUnderRoot(resolvedRoot, db);
+    return rememberProject(contextForProject(resolvedRoot, db, { cwd: resolvedRoot, json: ctx.json }));
   }
 
   function sessionKey(projectCtx, id) {
@@ -2402,6 +2465,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
   fs.mkdirSync(bufsDir, { recursive: true });
 
+  // An external (hcc run) session signals exit by removing its .out file. If the
+  // wrapper is SIGKILLed it never does, so also treat the session as dead when
+  // every recorded pid is gone. Returns false when no pid is known (can't tell —
+  // fall back to the .out lifecycle) so normal running sessions are unaffected.
+  function externalSessionDead(meta) {
+    const wrapperPid = meta?.wrapper_pid || meta?.wrapperPid || null;
+    const pid = meta?.pid || null;
+    if (!wrapperPid && !pid) return false;
+    if (wrapperPid && isAlive(wrapperPid)) return false;
+    if (pid && isAlive(pid)) return false;
+    return true;
+  }
+
+  function cleanupExternalBufferFiles(id) {
+    for (const suffix of ['out', 'in', 'resize', 'meta']) {
+      try { fs.rmSync(path.join(bufsDir, `${id}.${suffix}`), { force: true }); } catch {}
+    }
+  }
+
   function adoptExternalSession(id) {
     const pctx = ctx;
     const key = sessionKey(pctx, id);
@@ -2414,6 +2496,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     let meta = { kind: 'external', role: 'peer', command: '(shim)', cwd: ctx.root, pid: null, wrapper_pid: null, cols: 120, rows: 40 };
     try { meta = { ...meta, ...JSON.parse(fs.readFileSync(metaFile, 'utf8')) }; } catch {}
+
+    // The .out file exists but the process is gone → a wrapper that was killed
+    // before it could clean up. Remove the stale buffers instead of adopting a
+    // ghost session that would show as 'running' forever.
+    if (externalSessionDead(meta)) {
+      cleanupExternalBufferFiles(id);
+      return;
+    }
 
     const session = {
       id,
@@ -2467,17 +2557,35 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }, 100);
 
-    // Detect when .out file is removed (session ended)
+    // Session ended when the .out file is removed (clean exit) or every recorded
+    // process is gone (wrapper SIGKILLed without cleaning up).
     session.exitPoller = setInterval(() => {
-      if (!fs.existsSync(outFile)) {
-        session.status = 'exited';
-        session.exitedAt = now();
-        broadcast(session, { type: 'exit', event: {} });
-        if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
-        if (session.outputPoller) clearInterval(session.outputPoller);
-        if (session.exitPoller) clearInterval(session.exitPoller);
-        sessions.delete(key);
-      }
+      try {
+        const outGone = !fs.existsSync(outFile);
+        const procDead = externalSessionDead({ wrapper_pid: session.wrapperPid, pid: session.pid });
+        if (outGone || procDead) {
+          session.status = 'exited';
+          session.exitedAt = now();
+          broadcast(session, { type: 'exit', event: {} });
+          // hb-03: persist the exit in the peers table so hcc peers/status no
+          // longer shows this session as active once its .out vanished.
+          try {
+            const exitDb = connect(session.ctx || ctx);
+            try {
+              const exitPeerId = session.peerId || session.id;
+              exitDb.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', exitPeerId);
+              exitDb.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), exitPeerId);
+            } finally { exitDb.close(); }
+          } catch {}
+          if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
+          if (session.outputPoller) clearInterval(session.outputPoller);
+          if (session.exitPoller) clearInterval(session.exitPoller);
+          sessions.delete(key);
+          // Crashed without removing its own buffers → clean them so the next
+          // scan does not re-adopt a ghost.
+          if (procDead && !outGone) cleanupExternalBufferFiles(id);
+        }
+      } catch {}
     }, 2000);
   }
 
@@ -2495,11 +2603,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const externalScanPoller = setInterval(scanExternalSessions, 1000);
 
   // Watch for new external sessions appearing
+  let bufsWatcher = null;
   try {
-    fs.watch(bufsDir, { persistent: false }, (event, filename) => {
+    bufsWatcher = fs.watch(bufsDir, { persistent: false }, (event, filename) => {
       if (filename?.endsWith('.out')) {
         setTimeout(() => adoptExternalSession(path.basename(filename, '.out')), 300);
       }
+    });
+    // An FSWatcher with no 'error' listener re-throws async errors as an
+    // uncaught exception (e.g. inotify limits, bufsDir removed) — keep it
+    // contained so the shared runtime survives.
+    bufsWatcher.on('error', (err) => {
+      console.error(`[${new Date().toISOString()}] bufs watcher error: ${err?.message || err}`);
     });
   } catch {}
 
@@ -2563,8 +2678,17 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function scanAndAttachDetectedPeers() {
     if (autoAttachScanInFlight) return;
     autoAttachScanInFlight = true;
-    const db = connect(ctx);
+    let db = null;
     try {
+      db = connect(ctx);
+
+      // Always-on, TTL-independent hygiene: recover managed tmux sessions left
+      // alive (default Stop = detach-without-kill, or across a restart) and reap
+      // peers whose process is gone. Sweep first so its live set protects
+      // still-alive sessions from being reaped.
+      const liveManaged = reAdoptOrphanManagedTmuxSessions(ctx);
+      reapDeadPeers(ctx, liveManaged, db);
+
       const rows = db.prepare(`
         SELECT p.id, p.kind, p.role, p.worktree, p.pid,
                b.peer AS binding_peer, b.provider, b.provider_session_id,
@@ -2638,14 +2762,60 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           attached.panes.add(pane.pane);
         } catch {}
       }
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] auto-attach scan failed: ${err?.message || err}`);
     } finally {
-      db.close();
+      try { db?.close(); } catch {}
       autoAttachScanInFlight = false;
     }
   }
 
   scanAndAttachDetectedPeers();
   const autoAttachPoller = setInterval(scanAndAttachDetectedPeers, 5000);
+
+  // ── Liveness reaper ───────────────────────────────────────────────────────
+  // Backstop for peers that died without an exit signal (kill -9, crash, a
+  // provider Stop hook that never fired). A peer is reaped only when it has
+  // been silent beyond REAPER_GRACE AND its pid is gone, so a live-but-quiet
+  // peer is never mistaken for dead (hb-02). Peers backed by an in-memory
+  // managed session are skipped: their own exit poller owns their transition.
+  const REAPER_GRACE_SEC = 120;
+  let reaperInFlight = false;
+  function reapDeadPeers() {
+    if (reaperInFlight) return;
+    reaperInFlight = true;
+    let db = null;
+    try {
+      db = connect(ctx);
+      const t = now();
+      const managedPeerIds = new Set();
+      for (const s of sessions.values()) {
+        if (s.status === 'running') {
+          const managedId = s.peerId || s.id;
+          if (managedId) managedPeerIds.add(managedId);
+        }
+      }
+      const rows = db.prepare(`
+        SELECT id, pid FROM peers
+        WHERE status IN ('running', 'working', 'busy')
+          AND pid IS NOT NULL
+          AND last_seen_at < ?
+      `).all(t - REAPER_GRACE_SEC);
+      for (const row of rows) {
+        if (managedPeerIds.has(row.id)) continue;
+        if (isAlive(Number(row.pid))) continue;
+        db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
+        db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(t, row.id);
+        try { addEvent(db, 'peer.reaped', 'web-runtime', null, { peer: row.id, pid: row.pid }); } catch {}
+      }
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] liveness reaper failed: ${err?.message || err}`);
+    } finally {
+      try { db?.close(); } catch {}
+      reaperInFlight = false;
+    }
+  }
+  const reaperPoller = setInterval(reapDeadPeers, 30000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
   function resolveSessionPeerId(db, session) {
@@ -2825,7 +2995,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     try {
       const t = now();
       const peerId = resolveSessionPeerId(db, session) || session.id;
-      db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id IN (?, ?)').run(status, t, session.id, peerId);
+      // Do not bump last_seen_at on death: preserve the true last-seen time so a
+      // just-detached owner is not misread as freshly active (hb-01).
+      db.prepare('UPDATE peers SET status = ? WHERE id IN (?, ?)').run(status, session.id, peerId);
       db.prepare(`
         UPDATE peer_bindings
         SET runtime_target = NULL, updated_at = ?
@@ -3743,6 +3915,27 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       db.close();
     }
     for (const row of rows) {
+      // Do not re-adopt a pane by its stored id without confirming it still
+      // belongs to THIS peer's managed tmux session. tmux pane ids (%N) are
+      // recycled across a tmux server restart, so a stale runtime_target can
+      // point at an unrelated local pane (e.g. the user's editor) and stream its
+      // content + inject keystrokes (sess-01). Apply the same ownership checks
+      // the GC/kill paths already use.
+      const actualSession = tmuxSessionNameForPane(row.runtime_target);
+      const expectedSession = tmuxManagedSessionName(projectCtx, row.id);
+      const hccRoot = actualSession ? tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT') : null;
+      const ownershipOk = Boolean(actualSession) && actualSession === expectedSession &&
+        (!hccRoot || path.resolve(hccRoot) === path.resolve(projectCtx.root));
+      if (!ownershipOk) {
+        // Clear the stale/foreign binding so it is not retried or mis-adopted.
+        try {
+          const db2 = connect(projectCtx);
+          try {
+            db2.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), row.id);
+          } finally { db2.close(); }
+        } catch {}
+        continue;
+      }
       try {
         attachTmuxSession({
           id: row.id,
@@ -3766,6 +3959,140 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             runtime_session_id: row.id,
             runtime_target: row.runtime_target
           }
+        });
+      } catch {}
+    }
+    // The fast path above only re-adopts bindings whose runtime_target is still
+    // set. Also sweep by session name so sessions left alive with a cleared
+    // runtime_target (default Stop = detach-without-kill) are recovered.
+    reAdoptOrphanManagedTmuxSessions(projectCtx);
+  }
+
+  // tmux is the source of truth for managed sessions. Re-adopt any live
+  // `hcc-<hash(root)>-*` session this runtime is not already tracking, so a
+  // session left alive by a detach-without-kill or across a runtime restart
+  // stays visible + re-enterable. Returns the set of peerIds that currently own
+  // a live managed tmux session (used by the dead-peer reaper).
+  function reAdoptOrphanManagedTmuxSessions(projectCtx = ctx) {
+    const live = new Set();
+    let names;
+    try {
+      names = tmuxListSessionNames().filter((name) => isProjectManagedTmuxSession(projectCtx, name));
+    } catch {
+      return live;
+    }
+    if (!names.length) return live;
+
+    // Map each known peer's expected managed session name back to its id, and
+    // capture its binding so the re-adopted session stays resumable.
+    const nameToPeer = new Map();
+    const bindingByPeer = new Map();
+    try {
+      const db = connect(projectCtx);
+      try {
+        for (const row of db.prepare(`
+          SELECT p.id,
+                 b.provider, b.provider_session_id, b.provider_session_name,
+                 b.resume_mode, b.resume_arg, b.command
+          FROM peers p
+          LEFT JOIN peer_bindings b ON b.peer = p.id
+        `).all()) {
+          nameToPeer.set(tmuxManagedSessionName(projectCtx, row.id), row.id);
+          if (row.provider || row.command) bindingByPeer.set(row.id, row);
+        }
+      } finally {
+        db.close();
+      }
+    } catch {
+      return live;
+    }
+
+    const tracked = new Set(
+      sessionsForProject(projectCtx)
+        .filter((session) => session.status === 'running' && session.type === 'tmux')
+        .map((session) => session.id)
+    );
+
+    for (const name of names) {
+      const peerId = nameToPeer.get(name);
+      if (!peerId) continue;
+      // Ownership: the session's HCC_ROOT env must match this project root.
+      const hccRoot = tmuxSessionEnvironmentValue(name, 'HCC_ROOT');
+      if (hccRoot && path.resolve(hccRoot) !== path.resolve(projectCtx.root)) continue;
+      live.add(peerId);
+      if (tracked.has(peerId)) continue;
+
+      let info;
+      try { info = tmuxPaneInfo(`${name}:0.0`); } catch { continue; }
+      if (!info || info.dead) continue;
+
+      const b = bindingByPeer.get(peerId) || null;
+      const binding = b ? {
+        provider: b.provider,
+        provider_session_id: b.provider_session_id,
+        provider_session_name: b.provider_session_name,
+        resume_mode: b.resume_mode,
+        resume_arg: b.resume_arg,
+        command: b.command,
+        transport: 'tmux',
+        runtime_session_id: peerId,
+        runtime_target: info.pane
+      } : null;
+
+      try {
+        attachTmuxSession({
+          id: peerId,
+          pane: info.pane,
+          cwd: info.cwd || projectCtx.root,
+          command: b?.command || null,
+          projectCtx,
+          force: false,
+          autoAttach: true,
+          auditActorPeer: 'web-runtime',
+          auditSource: 'runtime',
+          binding
+        });
+      } catch {}
+    }
+    return live;
+  }
+
+  // Mark peers whose OS process is gone as exited so crashed/killed sessions
+  // stop lingering as 'running'. Conservative: never reap a peer that still owns
+  // a live managed tmux session, is tracked in memory, or whose pid is alive.
+  function reapDeadPeers(projectCtx, liveManagedPeerIds, db) {
+    let rows;
+    try {
+      rows = db.prepare(`
+        SELECT id, pid FROM peers
+        WHERE status IN ('running', 'working', 'busy') AND pid IS NOT NULL
+      `).all();
+    } catch {
+      return;
+    }
+    if (!rows.length) return;
+    const trackedIds = new Set(
+      sessionsForProject(projectCtx)
+        .filter((session) => session.status === 'running')
+        .map((session) => session.id)
+    );
+    for (const row of rows) {
+      if (liveManagedPeerIds.has(row.id)) continue;
+      if (trackedIds.has(row.id)) continue;
+      if (isAlive(row.pid)) continue;
+      try {
+        tx(db, () => {
+          // Preserve last_seen_at (see detachTmuxSession) — only flip status.
+          db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
+          db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), row.id);
+          addEvent(db, 'peer.reaped', 'web-runtime', null, auditPayload({
+            actor: 'web-runtime',
+            target: row.id,
+            source: 'runtime',
+            peer: row.id,
+            pid: row.pid,
+            reason: 'process_dead'
+          }));
         });
       } catch {}
     }
@@ -3974,7 +4301,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/projects') {
         const input = await readJsonRequest(req);
-        const projectCtx = rememberProject(contextForProject(input.root || reqCtx.root, input.db || reqCtx.dbPath, { json: ctx.json }));
+        const requestedRoot = path.resolve(input.root || reqCtx.root);
+        if (!fs.existsSync(requestedRoot) || !fs.statSync(requestedRoot).isDirectory()) {
+          throw new CliError('BAD_REQUEST', `Project root does not exist: ${requestedRoot}`);
+        }
+        const requestedDb = input.db ? path.resolve(input.db) : path.join(requestedRoot, '.hello-cc', 'mesh.db');
+        assertDbUnderRoot(requestedRoot, requestedDb);
+        const projectCtx = rememberProject(contextForProject(requestedRoot, requestedDb, { json: ctx.json }));
         const db = connect(projectCtx);
         db.close();
         writeRuntime(projectCtx, {
@@ -4267,7 +4600,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           if (input.kill_tmux) {
             killPlan = killDbProvenTmuxSession(reqCtx, db, peerId);
           }
-          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now_, peerId);
+          // Preserve last_seen_at on death so the just-stopped owner is not
+          // misread as freshly active (hb-01); status='exited' drives liveness.
+          db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', peerId);
           db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now_, peerId);
           addEvent(db, 'peer.stopped', 'web', null, auditPayload({
             actor: 'web',
@@ -4314,9 +4649,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
+    try {
     const url = requestUrl(req);
     if (!authOk(url, req, token)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (!webSocketOriginAllowed(req)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -4361,6 +4702,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       });
       ws.on('close', () => session.clients.delete(ws));
     });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] ws upgrade failed: ${err?.message || err}`);
+      try { socket.destroy(); } catch {}
+    }
   });
 
   let shuttingDown = false;
@@ -4368,8 +4713,45 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (shuttingDown) return;
     shuttingDown = true;
     clearRuntime(ctx);
+    // rob-07: clear this runtime's per-project pointers for every registered
+    // project, not just the primary ctx, so sibling projects don't keep
+    // pointing at a now-dead runtime.
+    try {
+      for (const project of readProjectRegistry()) {
+        clearRuntime({ root: project.root }, process.pid);
+      }
+    } catch {}
+    // sess-02: mark managed (tmux/pty) sessions detached in their own project
+    // DB and clear their runtime_target, so a restart does not consume stale
+    // bindings. Best-effort; never block shutdown.
+    try {
+      const byRoot = new Map();
+      for (const s of sessions.values()) {
+        if (s.status !== 'running' || (s.type !== 'tmux' && s.type !== 'pty')) continue;
+        const peerId = s.peerId || s.id;
+        if (!peerId) continue;
+        const root = path.resolve(s.ctx?.root || s.root || ctx.root);
+        if (!byRoot.has(root)) byRoot.set(root, new Set());
+        byRoot.get(root).add(peerId);
+      }
+      const detachedAt = now();
+      for (const [root, idSet] of byRoot) {
+        const peerIds = [...idSet];
+        if (!peerIds.length) continue;
+        const placeholders = peerIds.map(() => '?').join(',');
+        const cleanupDb = connect(contextForProject(root, null, { json: ctx.json }));
+        try {
+          cleanupDb.prepare(`UPDATE peers SET status = 'detached' WHERE id IN (${placeholders}) AND status IN ('running','working','busy')`).run(...peerIds);
+          cleanupDb.prepare(`UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer IN (${placeholders})`).run(detachedAt, ...peerIds);
+        } finally {
+          cleanupDb.close();
+        }
+      }
+    } catch {}
     clearInterval(externalScanPoller);
     clearInterval(autoAttachPoller);
+    clearInterval(reaperPoller);
+    try { bufsWatcher?.close(); } catch {}
     for (const session of sessions.values()) {
       closeSessionClients(session);
       if (session.status !== 'running') continue;
@@ -4409,6 +4791,30 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
+  // Best-effort backstop for exit paths that bypass shutdown() (process.exit,
+  // uncaught exceptions): synchronously kill pty-backed children so they are not
+  // orphaned. Cannot run on SIGKILL — the dead-peer reaper repairs DB state on
+  // the next start. tmux sessions are intentionally left alive.
+  process.on('exit', () => {
+    for (const session of sessions.values()) {
+      if (session.type !== 'tmux' && session.type !== 'external' && session.pty) {
+        try { session.pty.kill(); } catch {}
+      }
+    }
+  });
+
+  // Keep the shared runtime alive across unexpected errors thrown from pollers,
+  // the WS upgrade path, connect(), fs watchers, or request handlers. A single
+  // bad request or a corrupt sibling project DB must not take down the runtime
+  // that serves every project. Fatal signals still route through shutdown().
+  process.on('uncaughtException', (err) => {
+    if (shuttingDown) return;
+    console.error(`[${new Date().toISOString()}] uncaughtException in web runtime (kept alive): ${err?.stack || err}`);
+  });
+  process.on('unhandledRejection', (reason) => {
+    if (shuttingDown) return;
+    console.error(`[${new Date().toISOString()}] unhandledRejection in web runtime (kept alive): ${reason?.stack || reason}`);
+  });
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
   const runtime = {
@@ -5516,7 +5922,7 @@ async function cmdGc(ctx, args) {
   const dryRun = !opts.yes && !opts.force;
   const cutoff = now() - olderThanDays * 86400;
   const db = connect(ctx);
-  const results = { buf_files: 0, stale_peers: 0, old_events: 0, old_tasks: 0 };
+  const results = { buf_files: 0, stale_peers: 0, old_events: 0, old_tasks: 0, old_messages: 0, old_handoffs: 0, expired_locks: 0 };
 
   try {
     // 1. Clean stale buffer files
@@ -5558,17 +5964,36 @@ async function cmdGc(ctx, args) {
     ).run(cutoff);
     results.old_tasks = oldTasks.n;
 
+    // 5. Remove old messages (message_reads cascade via foreign_keys = ON)
+    const oldMessages = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE created_at < ?').get(cutoff);
+    if (!dryRun) db.prepare('DELETE FROM messages WHERE created_at < ?').run(cutoff);
+    results.old_messages = oldMessages.n;
+
+    // 6. Remove old handoffs
+    const oldHandoffs = db.prepare('SELECT COUNT(*) AS n FROM handoffs WHERE created_at < ?').get(cutoff);
+    if (!dryRun) db.prepare('DELETE FROM handoffs WHERE created_at < ?').run(cutoff);
+    results.old_handoffs = oldHandoffs.n;
+
+    // 7. Remove already-expired advisory lock rows (queries already ignore them)
+    const expiredLocks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(now());
+    if (!dryRun) db.prepare('DELETE FROM locks WHERE expires_at < ?').run(now());
+    results.expired_locks = expiredLocks.n;
+
   } finally {
     db.close();
   }
 
   printResult(ctx, results, (r) => {
     const lines = [`gc completed${dryRun ? ' (dry-run, add --yes to apply)' : ''}:`];
-    if (r.buf_files)    lines.push(`  buffer files:   ${r.buf_files}`);
-    if (r.stale_peers)  lines.push(`  stale peers:    ${r.stale_peers}`);
-    if (r.old_events)   lines.push(`  old events:     ${r.old_events}`);
-    if (r.old_tasks)    lines.push(`  old tasks:      ${r.old_tasks}`);
-    if (!r.buf_files && !r.stale_peers && !r.old_events && !r.old_tasks) {
+    if (r.buf_files)     lines.push(`  buffer files:   ${r.buf_files}`);
+    if (r.stale_peers)   lines.push(`  stale peers:    ${r.stale_peers}`);
+    if (r.old_events)    lines.push(`  old events:     ${r.old_events}`);
+    if (r.old_tasks)     lines.push(`  old tasks:      ${r.old_tasks}`);
+    if (r.old_messages)  lines.push(`  old messages:   ${r.old_messages}`);
+    if (r.old_handoffs)  lines.push(`  old handoffs:   ${r.old_handoffs}`);
+    if (r.expired_locks) lines.push(`  expired locks:  ${r.expired_locks}`);
+    if (!r.buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
+        !r.old_messages && !r.old_handoffs && !r.expired_locks) {
       lines.push('  nothing to clean');
     }
     return lines.join('\n');
