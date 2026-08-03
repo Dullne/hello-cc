@@ -1798,13 +1798,15 @@ fi
   }
 }
 
-function assertGeneratedShimPeerHash(generateShim) {
+function assertGeneratedShimPeerHash(generateShim, providerSessionPeerId) {
   const testDir = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-shim-peer-hash-${testId}-`));
   try {
     const hashBin = path.join(testDir, 'bin');
     const fakeHcc = path.join(testDir, 'hcc');
     const realBin = path.join(testDir, 'real-provider');
     const opensslLog = path.join(testDir, 'openssl.log');
+    const injectionMarker = path.join(testDir, 'argv-command-substitution-ran');
+    const specialProviderId = `provider with spaces "double" 'single' $(touch ${injectionMarker})`;
     fs.mkdirSync(hashBin, { recursive: true });
     fs.writeFileSync(fakeHcc, `#!/usr/bin/env bash
 case "\${1:-}" in
@@ -1821,8 +1823,11 @@ case "\${1:-}" in
 esac
 exit 1
 `, { mode: 0o755 });
-    fs.writeFileSync(realBin, `#!/usr/bin/env bash
-printf '%s\\n' "$HCC_PEER"
+    fs.writeFileSync(realBin, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  peer: process.env.HCC_PEER || null,
+  argv: process.argv.slice(2)
+}) + '\\n');
 `, { mode: 0o755 });
     fs.writeFileSync(path.join(hashBin, 'sha1sum'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
     fs.writeFileSync(path.join(hashBin, 'shasum'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
@@ -1839,23 +1844,49 @@ process.stdin.on('end', () => {
 });
 `, { mode: 0o755 });
 
-    const cases = [
+    const identityCases = [
       {
+        label: 'claude --resume',
         tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
-        providerId: `linux-openssl-claude-${testId}`,
-        args(providerId) { return ['--resume', providerId]; }
+        providerId: '123e4567-e89b-12d3-a456-426614174000',
+        args(providerId) { return ['--resume', providerId, 'prompt with spaces', '"quoted"']; },
+        extraEnv: {}
       },
       {
+        label: 'claude --session-id',
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        providerId: specialProviderId,
+        args(providerId) { return ['--session-id', providerId, "'single quoted argument'"]; },
+        extraEnv: {}
+      },
+      {
+        label: 'claude CLAUDE_CODE_SESSION_ID',
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        providerId: 'feature-login',
+        args() { return ['prompt with spaces', 'literal $(printf not-executed)', '']; },
+        extraEnv: { CLAUDE_CODE_SESSION_ID: 'feature-login' }
+      },
+      {
+        label: 'claude --name',
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        providerId: 'feature-logout',
+        args(providerId) { return ['--name', providerId, 'semi;colon', 'back\\slash']; },
+        extraEnv: {}
+      },
+      {
+        label: 'codex resume',
         tool: { name: 'codex', kind: 'codex' },
-        providerId: `linux-openssl-codex-${testId}`,
-        args(providerId) { return ['resume', providerId]; }
+        providerId: specialProviderId,
+        args(providerId) { return ['resume', providerId, '--model', 'model with spaces', 'literal $(printf not-executed)']; },
+        extraEnv: {}
       }
     ];
 
-    for (const entry of cases) {
-      const shimBin = path.join(testDir, entry.tool.name);
+    for (const [index, entry] of identityCases.entries()) {
+      const shimBin = path.join(testDir, `${entry.tool.name}-${index}`);
       fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
-      const result = runMaybe(shimBin, entry.args(entry.providerId), {
+      const args = entry.args(entry.providerId);
+      const result = runMaybe(shimBin, args, {
         cwd: testDir,
         env: {
           ...env,
@@ -1863,33 +1894,39 @@ process.stdin.on('end', () => {
           HCC_FAKE_ROOT: testDir,
           HCC_OPENSSL_LOG: opensslLog,
           HCC_SHIM_ENSURED: '1',
-          HCC_SHIM_NO_ATTACH: '1'
+          HCC_SHIM_NO_ATTACH: '1',
+          CLAUDE_CODE_SESSION_ID: '',
+          ...entry.extraEnv
         }
       });
-      const expected = `${entry.tool.kind}-${shortHash(entry.providerId)}`;
-      if (result.status !== 0 || String(result.stdout || '').trim() !== expected) {
-        fail(`${entry.tool.name} generated shim peer hash did not match JS shortHash:\nexpected=${expected}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      const expected = providerSessionPeerId(entry.tool.kind, entry.providerId);
+      let providerOutput = null;
+      try { providerOutput = JSON.parse(String(result.stdout || '').trim()); } catch {}
+      if (result.status !== 0 ||
+          providerOutput?.peer !== expected ||
+          JSON.stringify(providerOutput?.argv) !== JSON.stringify(args)) {
+        fail(`${entry.label} generated shim did not preserve the JS identity and argv bytes:\nexpected=${JSON.stringify({ peer: expected, argv: args })}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
       }
     }
     const opensslCalls = fs.existsSync(opensslLog)
       ? fs.readFileSync(opensslLog, 'utf8').trim().split('\n').map((line) => line.split('\t'))
       : [];
-    if (opensslCalls.length !== cases.length || opensslCalls.some((call, index) =>
-      call[0] !== 'dgst -sha1' || call[1] !== Buffer.from(cases[index].providerId).toString('hex'))) {
+    if (opensslCalls.length !== identityCases.length || opensslCalls.some((call, index) =>
+      call[0] !== 'dgst -sha1' || call[1] !== Buffer.from(identityCases[index].providerId).toString('hex'))) {
       fail(`generated shims did not hash the full provider id through OpenSSL:\n${JSON.stringify(opensslCalls, null, 2)}`);
     }
+    if (fs.existsSync(injectionMarker)) {
+      fail('generated shim executed command substitution from a provider id instead of treating it as literal data');
+    }
 
-    // If no hashing tool can produce a valid digest, identity derivation is
-    // unavailable. The shim must preserve provider usability by transparently
-    // executing the real binary with the original argv.
-    fs.writeFileSync(path.join(hashBin, 'openssl'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
-    fs.writeFileSync(realBin, `#!/usr/bin/env bash
-printf 'real-provider'
-for arg in "$@"; do printf ' %s' "$arg"; done
-printf '\\n'
-`, { mode: 0o755 });
-    for (const entry of cases) {
-      const shimBin = path.join(testDir, `${entry.tool.name}-no-hash`);
+    // A hashing command that exits successfully can still be unusable. Every
+    // candidate emits a malformed digest here, so strict validation must reject
+    // all of them and preserve provider usability with the original argv.
+    for (const command of ['openssl', 'sha1sum', 'shasum']) {
+      fs.writeFileSync(path.join(hashBin, command), '#!/usr/bin/env bash\nprintf \'not-a-sha1\\n\'\n', { mode: 0o755 });
+    }
+    for (const [index, entry] of identityCases.entries()) {
+      const shimBin = path.join(testDir, `${entry.tool.name}-${index}-no-hash`);
       fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
       const args = entry.args(entry.providerId);
       const result = runMaybe(shimBin, args, {
@@ -1899,13 +1936,21 @@ printf '\\n'
           PATH: `${hashBin}${path.delimiter}${env.PATH || ''}`,
           HCC_FAKE_ROOT: testDir,
           HCC_SHIM_ENSURED: '1',
-          HCC_SHIM_NO_ATTACH: '1'
+          HCC_SHIM_NO_ATTACH: '1',
+          CLAUDE_CODE_SESSION_ID: '',
+          ...entry.extraEnv
         }
       });
-      const expected = `real-provider ${args.join(' ')}`;
-      if (result.status !== 0 || String(result.stdout || '').trim() !== expected) {
-        fail(`${entry.tool.name} shim did not fall back to the real provider when hashing failed:\nexpected=${expected}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      let providerOutput = null;
+      try { providerOutput = JSON.parse(String(result.stdout || '').trim()); } catch {}
+      if (result.status !== 0 ||
+          providerOutput?.peer !== null ||
+          JSON.stringify(providerOutput?.argv) !== JSON.stringify(args)) {
+        fail(`${entry.label} shim did not preserve argv boundaries during invalid-hash passthrough:\nexpected=${JSON.stringify({ peer: null, argv: args })}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
       }
+    }
+    if (fs.existsSync(injectionMarker)) {
+      fail('invalid-hash passthrough executed command substitution from provider argv');
     }
   } finally {
     try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
@@ -5013,6 +5058,7 @@ async function syntaxAndHelp() {
   const integrationHooks = await import(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'));
   const integrationShims = await import(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'));
   const integrationShimScript = await import(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'));
+  const peerSession = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'));
   const shimScriptCompat = await import(path.join(repoRoot, 'lib', 'shim-script.mjs'));
   const shellPath = await import(path.join(repoRoot, 'lib', 'shell-path.mjs'));
   for (const name of [
@@ -5037,7 +5083,7 @@ async function syntaxAndHelp() {
   if (typeof integrationShimScript.generateShim !== 'function') fail('integrations shim script module missing generateShim export');
   if (shimScriptCompat.generateShim !== integrationShimScript.generateShim) fail('shim script compatibility export mismatch');
   assertShimRuntimeUnavailableFallback(integrationShimScript.generateShim);
-  assertGeneratedShimPeerHash(integrationShimScript.generateShim);
+  assertGeneratedShimPeerHash(integrationShimScript.generateShim, peerSession.providerSessionPeerId);
   await assertShimIgnoresGlobalRuntime(integrationShimScript.generateShim);
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
@@ -6445,7 +6491,6 @@ async function syntaxAndHelp() {
   }
   const providerCommands = await import(path.join(repoRoot, 'lib', 'integrations', 'providers.mjs'));
   const compatProviderCommands = await import(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
-  const peerSession = await import(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'));
   for (const name of [
     'providerSessionPeerId',
     'providerSessionParts',
@@ -6466,6 +6511,27 @@ async function syntaxAndHelp() {
     if (typeof peerSession[name] !== 'function') fail(`peer session module missing export: ${name}`);
     if (providerCommands[name] !== peerSession[name]) fail(`provider command module no longer re-exports peer session helper: ${name}`);
     if (compatProviderCommands[name] !== providerCommands[name]) fail(`provider command compat module no longer re-exports helper: ${name}`);
+  }
+  const providerIdentityFixtures = [
+    ['claude', '123e4567-e89b-12d3-a456-426614174000', 'claude-7f7df0f5'],
+    ['codex', 'feature-login', 'codex-2a4f907b'],
+    ['codex', 'feature-logout', 'codex-b6c66f1f']
+  ];
+  const legacyProviderSessionPeerId = (kind, providerId) =>
+    `${kind}-${sanitizePeerPart(String(providerId || '').slice(0, 8), shortHash(providerId))}`;
+  for (const [kind, providerId, expected] of providerIdentityFixtures) {
+    const actual = peerSession.providerSessionPeerId(kind, providerId);
+    if (actual !== expected) {
+      fail(`v1 provider identity contract changed for ${kind}/${providerId}: expected=${expected} actual=${actual}`);
+    }
+    const legacy = legacyProviderSessionPeerId(kind, providerId);
+    if (actual === legacy) {
+      fail(`v1 provider identity still matches remote v0.1.9 prefix algorithm for ${kind}/${providerId}: ${actual}`);
+    }
+  }
+  if (peerSession.providerSessionPeerId('codex', 'feature-login') ===
+      peerSession.providerSessionPeerId('codex', 'feature-logout')) {
+    fail('v1 provider identity still collides for same-prefix session names');
   }
   const providerNameSession = peerSession.providerSessionParts('named-session');
   if (providerNameSession.provider_session_name !== 'named-session' || providerNameSession.provider_session_id !== null) {
