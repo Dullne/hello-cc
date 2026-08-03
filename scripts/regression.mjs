@@ -6,13 +6,14 @@ import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
+import { inspectProcessIdentity } from '../lib/process/identity.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -387,45 +388,141 @@ async function assertTmuxGcPolicy() {
   const stalePeer = 'tmux-gc-stale';
   const peerFilterPeer = 'tmux-gc-peer-filter';
   const attachedPeer = 'tmux-gc-attached';
+  const deadBindingPeer = 'tmux-gc-binding-dead';
+  const reusedBindingPeer = 'tmux-gc-binding-reused';
+  const clientUnknownBindingPeer = 'tmux-gc-binding-client-unknown';
   const eventPeer = 'tmux-gc-event';
+  const deadEventPeer = 'tmux-gc-event-dead';
   const reusedEventPeer = 'tmux-gc-event-reused';
+  const reusedProcessEventPeer = 'tmux-gc-event-reused-process';
+  const clientUnknownEventPeer = 'tmux-gc-event-client-unknown';
+  const rootEventPeer = 'tmux-gc-event-root';
+  const legacyEventPeer = 'tmux-gc-event-legacy';
   const manualSession = `hcc-${shortHash(root)}-manual-lookalike`;
   const staleSession = tmuxManagedSession(root, stalePeer);
   const peerFilterSession = tmuxManagedSession(root, peerFilterPeer);
   const attachedSession = tmuxManagedSession(root, attachedPeer);
+  const deadBindingSession = tmuxManagedSession(root, deadBindingPeer);
+  const reusedBindingSession = tmuxManagedSession(root, reusedBindingPeer);
+  const clientUnknownBindingSession = tmuxManagedSession(root, clientUnknownBindingPeer);
   const eventSession = `${tmuxManagedSession(root, eventPeer)}-old-regression`;
+  const deadEventSession = `${tmuxManagedSession(root, deadEventPeer)}-old-regression`;
   const reusedEventSession = tmuxManagedSession(root, reusedEventPeer);
-  for (const session of [staleSession, peerFilterSession, attachedSession, eventSession, reusedEventSession, manualSession]) {
+  const reusedProcessEventSession = tmuxManagedSession(root, reusedProcessEventPeer);
+  const clientUnknownEventSession = tmuxManagedSession(root, clientUnknownEventPeer);
+  const rootEventSession = tmuxManagedSession(root, rootEventPeer);
+  for (const session of [staleSession, peerFilterSession, attachedSession, deadBindingSession, reusedBindingSession, clientUnknownBindingSession, eventSession, deadEventSession, reusedEventSession, reusedProcessEventSession, clientUnknownEventSession, rootEventSession, manualSession]) {
     runMaybe('tmux', ['kill-session', '-t', session]);
   }
   cleanupBindingPeers('tmux-gc-');
   managedTmuxSessions.add(peerFilterSession);
   managedTmuxSessions.add(attachedSession);
+  managedTmuxSessions.add(deadBindingSession);
+  managedTmuxSessions.add(reusedBindingSession);
+  managedTmuxSessions.add(clientUnknownBindingSession);
   managedTmuxSessions.add(eventSession);
+  managedTmuxSessions.add(deadEventSession);
   managedTmuxSessions.add(reusedEventSession);
+  managedTmuxSessions.add(reusedProcessEventSession);
+  managedTmuxSessions.add(clientUnknownEventSession);
+  managedTmuxSessions.add(rootEventSession);
   managedTmuxSessions.add(manualSession);
 
   run('tmux', ['new-session', '-d', '-s', staleSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', peerFilterSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', attachedSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', deadBindingSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'sleep', '300']);
+  run('tmux', ['set-option', '-t', deadBindingSession, 'remain-on-exit', 'on']);
+  run('tmux', ['new-session', '-d', '-s', reusedBindingSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', clientUnknownBindingSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', eventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', deadEventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'sleep', '300']);
+  run('tmux', ['set-option', '-t', deadEventSession, 'remain-on-exit', 'on']);
   run('tmux', ['new-session', '-d', '-s', reusedEventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', reusedProcessEventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
+  run('tmux', ['new-session', '-d', '-s', clientUnknownEventSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'sleep', '300']);
+  run('tmux', ['set-option', '-t', clientUnknownEventSession, 'remain-on-exit', 'on']);
+  run('tmux', ['new-session', '-d', '-s', rootEventSession, '-e', `HCC_ROOT=${root}-other`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', manualSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   const stalePane = run('tmux', ['display-message', '-p', '-t', `${staleSession}:0.0`, '#{pane_id}']).trim();
   const peerFilterPane = run('tmux', ['display-message', '-p', '-t', `${peerFilterSession}:0.0`, '#{pane_id}']).trim();
   const attachedPane = run('tmux', ['display-message', '-p', '-t', `${attachedSession}:0.0`, '#{pane_id}']).trim();
+  const deadBindingPane = run('tmux', ['display-message', '-p', '-t', `${deadBindingSession}:0.0`, '#{pane_id}']).trim();
+  const reusedBindingPane = run('tmux', ['display-message', '-p', '-t', `${reusedBindingSession}:0.0`, '#{pane_id}']).trim();
+  const clientUnknownBindingPane = run('tmux', ['display-message', '-p', '-t', `${clientUnknownBindingSession}:0.0`, '#{pane_id}']).trim();
   const eventPane = run('tmux', ['display-message', '-p', '-t', `${eventSession}:0.0`, '#{pane_id}']).trim();
+  const deadEventPane = run('tmux', ['display-message', '-p', '-t', `${deadEventSession}:0.0`, '#{pane_id}']).trim();
   const reusedEventPane = run('tmux', ['display-message', '-p', '-t', `${reusedEventSession}:0.0`, '#{pane_id}']).trim();
+  const reusedProcessEventPane = run('tmux', ['display-message', '-p', '-t', `${reusedProcessEventSession}:0.0`, '#{pane_id}']).trim();
+  const clientUnknownEventPane = run('tmux', ['display-message', '-p', '-t', `${clientUnknownEventSession}:0.0`, '#{pane_id}']).trim();
+  const rootEventPane = run('tmux', ['display-message', '-p', '-t', `${rootEventSession}:0.0`, '#{pane_id}']).trim();
   const manualPane = run('tmux', ['display-message', '-p', '-t', `${manualSession}:0.0`, '#{pane_id}']).trim();
+  const tmuxEventEvidence = (session, pane) => {
+    const pid = Number(run('tmux', ['display-message', '-p', '-t', pane, '#{pane_pid}']).trim());
+    return {
+      old_process_identity: inspectProcessIdentity(pid).identity,
+      old_hcc_root: canonicalPath(root),
+      old_tmux_session_created: run('tmux', ['display-message', '-p', '-t', session, '#{session_created}']).trim(),
+      old_tmux_session_id: run('tmux', ['display-message', '-p', '-t', session, '#{session_id}']).trim(),
+      old_pane: pane
+    };
+  };
+  const eventEvidence = tmuxEventEvidence(eventSession, eventPane);
+  const deadEventEvidence = tmuxEventEvidence(deadEventSession, deadEventPane);
+  const reusedEventEvidence = tmuxEventEvidence(reusedEventSession, reusedEventPane);
+  const reusedProcessEventEvidence = tmuxEventEvidence(reusedProcessEventSession, reusedProcessEventPane);
+  const clientUnknownEventEvidence = tmuxEventEvidence(clientUnknownEventSession, clientUnknownEventPane);
+  const rootEventEvidence = tmuxEventEvidence(rootEventSession, rootEventPane);
+  const staleEvidence = tmuxEventEvidence(staleSession, stalePane);
+  const peerFilterEvidence = tmuxEventEvidence(peerFilterSession, peerFilterPane);
+  const attachedEvidence = tmuxEventEvidence(attachedSession, attachedPane);
+  const deadBindingEvidence = tmuxEventEvidence(deadBindingSession, deadBindingPane);
+  const reusedBindingEvidence = tmuxEventEvidence(reusedBindingSession, reusedBindingPane);
+  const clientUnknownBindingEvidence = tmuxEventEvidence(clientUnknownBindingSession, clientUnknownBindingPane);
   insertRuntimeTargetBinding(stalePeer, 'shell', 'tmux-gc-stale-session', stalePane);
   insertRuntimeTargetBinding(peerFilterPeer, 'shell', 'tmux-gc-peer-filter-session', peerFilterPane);
   insertRuntimeTargetBinding(attachedPeer, 'shell', 'tmux-gc-attached-session', attachedPane);
+  insertRuntimeTargetBinding(deadBindingPeer, 'shell', 'tmux-gc-binding-dead-session', deadBindingPane);
+  insertRuntimeTargetBinding(reusedBindingPeer, 'shell', 'tmux-gc-binding-reused-session', reusedBindingPane);
+  insertRuntimeTargetBinding(clientUnknownBindingPeer, 'shell', 'tmux-gc-binding-client-unknown-session', clientUnknownBindingPane);
   const eventActivePane = parsePane(hcc(['peer', 'start', eventPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
   const eventActiveSession = run('tmux', ['display-message', '-p', '-t', eventActivePane, '#{session_name}']).trim();
   withMeshDb((db) => {
     const t = Math.floor(Date.now() / 1000) - 30 * 86400;
     db.prepare('UPDATE peers SET last_seen_at = ? WHERE id IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
+    db.prepare("UPDATE peers SET status = 'exited' WHERE id IN (?, ?)").run(stalePeer, peerFilterPeer);
     db.prepare('UPDATE peer_bindings SET updated_at = ? WHERE peer IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
+    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id IN (?, ?, ?)').run(t, deadBindingPeer, reusedBindingPeer, clientUnknownBindingPeer);
+    db.prepare("UPDATE peers SET status = 'exited' WHERE id IN (?, ?)").run(reusedBindingPeer, clientUnknownBindingPeer);
+    db.prepare('UPDATE peer_bindings SET updated_at = ? WHERE peer IN (?, ?, ?)').run(t, deadBindingPeer, reusedBindingPeer, clientUnknownBindingPeer);
+    for (const [peer, session, pane, evidence] of [
+      [stalePeer, staleSession, stalePane, staleEvidence],
+      [peerFilterPeer, peerFilterSession, peerFilterPane, peerFilterEvidence],
+      [attachedPeer, attachedSession, attachedPane, attachedEvidence],
+      [deadBindingPeer, deadBindingSession, deadBindingPane, deadBindingEvidence],
+      [reusedBindingPeer, reusedBindingSession, reusedBindingPane, {
+        ...reusedBindingEvidence,
+        old_process_identity: {
+          ...reusedBindingEvidence.old_process_identity,
+          startToken: `${reusedBindingEvidence.old_process_identity.startToken}:reused`
+        }
+      }],
+      [clientUnknownBindingPeer, clientUnknownBindingSession, clientUnknownBindingPane, clientUnknownBindingEvidence]
+    ]) {
+      db.prepare(`
+        INSERT INTO events(type, actor, task_id, payload, created_at)
+        VALUES ('tmux.session.attached', ?, NULL, ?, ?)
+      `).run(peer, JSON.stringify({
+        actor_peer: peer,
+        target_peer: peer,
+        pane,
+        tmux_session: session,
+        tmux_session_created: evidence.old_tmux_session_created,
+        tmux_session_id: evidence.old_tmux_session_id,
+        hcc_root: evidence.old_hcc_root,
+        process_identity: evidence.old_process_identity
+      }), t);
+    }
     db.prepare(`
       INSERT INTO events(type, actor, task_id, payload, created_at)
       VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
@@ -434,7 +531,19 @@ async function assertTmuxGcPolicy() {
       old_peer: eventPeer,
       old_runtime_target: eventPane,
       new_runtime_target: eventActivePane,
-      old_tmux_session: eventSession
+      old_tmux_session: eventSession,
+      ...eventEvidence
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(deadEventPeer, JSON.stringify({
+      reason: 'cleanup_failed',
+      old_peer: deadEventPeer,
+      old_runtime_target: deadEventPane,
+      new_runtime_target: `%new-dead-${process.pid}`,
+      old_tmux_session: deadEventSession,
+      ...deadEventEvidence
     }), t);
     db.prepare(`
       INSERT INTO events(type, actor, task_id, payload, created_at)
@@ -442,11 +551,66 @@ async function assertTmuxGcPolicy() {
     `).run(reusedEventPeer, JSON.stringify({
       reason: 'has_clients',
       old_peer: reusedEventPeer,
-      old_runtime_target: `%dead-old-${process.pid}`,
+      old_runtime_target: reusedEventPane,
       new_runtime_target: `%new-${process.pid}`,
-      old_tmux_session: reusedEventSession
+      old_tmux_session: reusedEventSession,
+      ...reusedEventEvidence,
+      old_tmux_session_created: '1'
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(reusedProcessEventPeer, JSON.stringify({
+      reason: 'cleanup_failed',
+      old_peer: reusedProcessEventPeer,
+      old_runtime_target: reusedProcessEventPane,
+      new_runtime_target: `%new-reused-process-${process.pid}`,
+      old_tmux_session: reusedProcessEventSession,
+      ...reusedProcessEventEvidence,
+      old_process_identity: {
+        ...reusedProcessEventEvidence.old_process_identity,
+        startToken: `${reusedProcessEventEvidence.old_process_identity.startToken}:reused`
+      }
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(clientUnknownEventPeer, JSON.stringify({
+      reason: 'cleanup_failed',
+      old_peer: clientUnknownEventPeer,
+      old_runtime_target: clientUnknownEventPane,
+      new_runtime_target: `%new-client-unknown-${process.pid}`,
+      old_tmux_session: clientUnknownEventSession,
+      ...clientUnknownEventEvidence
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(rootEventPeer, JSON.stringify({
+      reason: 'hcc_root_mismatch',
+      old_peer: rootEventPeer,
+      old_runtime_target: rootEventPane,
+      new_runtime_target: `%new-root-${process.pid}`,
+      old_tmux_session: rootEventSession,
+      ...rootEventEvidence
+    }), t);
+    db.prepare(`
+      INSERT INTO events(type, actor, task_id, payload, created_at)
+      VALUES ('tmux.session.rebind_cleanup_failed', ?, NULL, ?, ?)
+    `).run(legacyEventPeer, JSON.stringify({
+      reason: 'legacy',
+      old_peer: legacyEventPeer,
+      old_runtime_target: manualPane,
+      new_runtime_target: `%new-legacy-${process.pid}`,
+      old_tmux_session: manualSession
     }), t);
   });
+  process.kill(deadEventEvidence.old_process_identity.pid, 'SIGKILL');
+  process.kill(clientUnknownEventEvidence.old_process_identity.pid, 'SIGKILL');
+  process.kill(deadBindingEvidence.old_process_identity.pid, 'SIGKILL');
+  await waitFor(() => run('tmux', ['display-message', '-p', '-t', deadEventPane, '#{pane_dead}']).trim() === '1', 'dead event pane');
+  await waitFor(() => run('tmux', ['display-message', '-p', '-t', clientUnknownEventPane, '#{pane_dead}']).trim() === '1', 'client-unknown dead event pane');
+  await waitFor(() => run('tmux', ['display-message', '-p', '-t', deadBindingPane, '#{pane_dead}']).trim() === '1', 'dead binding pane');
 
   const attachTmux = realTmuxBin ? `${sh(realTmuxBin)} -L ${sh(tmuxSocketName)}` : 'tmux';
   const client = spawnSync('tmux', ['new-session', '-d', '-s', `${tmuxSession}-gc-client`, '-e', `HCC_ROOT=${root}`, 'sh', '-lc', `unset TMUX; exec ${attachTmux} attach-session -t ${sh(attachedSession)}`], {
@@ -457,23 +621,38 @@ async function assertTmuxGcPolicy() {
   if (client.status !== 0) fail(`could not attach client for tmux gc policy test:\n${client.stderr || client.stdout}`);
   try {
     await waitFor(() => Boolean(run('tmux', ['list-clients', '-t', attachedSession, '-F', '#{client_tty}']).trim()), 'tmux gc attached-client setup');
-    const dryRun = hcc(['tmux', 'gc', '--older-than', '14']);
-    if (!dryRun.includes(stalePeer) || !dryRun.includes('stale_hcc_managed_session') ||
-        !dryRun.includes(peerFilterPeer) ||
-        !dryRun.includes(eventPeer) || !dryRun.includes('stale_rebind_cleanup_failed_session')) {
+    const gcOutputHasPeer = (output, peer) => String(output).split('\n')
+      .some((line) => line.trim().split(/\s+/)[0] === peer);
+    const gcEnv = {
+      ...env,
+      HCC_REGRESSION_TMUX_FAIL_CLIENT_SESSIONS: [clientUnknownEventSession, clientUnknownBindingSession].join(' ')
+    };
+    const dryRun = hcc(['tmux', 'gc', '--older-than', '14'], { env: gcEnv });
+    if (!gcOutputHasPeer(dryRun, stalePeer) || !dryRun.includes('stale_hcc_managed_session') ||
+        !gcOutputHasPeer(dryRun, peerFilterPeer) ||
+        !gcOutputHasPeer(dryRun, deadBindingPeer) ||
+        !gcOutputHasPeer(dryRun, deadEventPeer) || !dryRun.includes('stale_rebind_cleanup_failed_session')) {
       fail(`tmux gc dry-run did not list stale DB-proven managed session:\n${dryRun}`);
     }
-    if (dryRun.includes(reusedEventPeer)) {
-      fail(`tmux gc dry-run treated stale event session-name reuse as removable:\n${dryRun}`);
+    for (const protectedPeer of [reusedBindingPeer, clientUnknownBindingPeer, eventPeer, reusedEventPeer, reusedProcessEventPeer, clientUnknownEventPeer, rootEventPeer, legacyEventPeer]) {
+      if (gcOutputHasPeer(dryRun, protectedPeer)) {
+        fail(`tmux gc dry-run treated live/unknown event evidence as removable (${protectedPeer}):\n${dryRun}`);
+      }
+    }
+    const dryRunJson = hccJson(['tmux', 'gc', '--older-than', '14'], { env: gcEnv });
+    const candidateModes = new Map(dryRunJson.candidates.map((candidate) => [candidate.peer, candidate.gc_validation_mode]));
+    if (candidateModes.get(stalePeer) !== 'explicit_exit_live' ||
+        candidateModes.get(deadBindingPeer) !== 'dead_process') {
+      fail(`tmux gc did not record strict binding validation modes:\n${JSON.stringify(dryRunJson.candidates, null, 2)}`);
     }
     if (runMaybe('tmux', ['has-session', '-t', staleSession]).status !== 0) {
       fail('tmux gc dry-run deleted stale managed session');
     }
-    const filteredDryRun = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer]);
+    const filteredDryRun = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer], { env: gcEnv });
     if (!filteredDryRun.includes(peerFilterPeer) || filteredDryRun.includes(stalePeer) || filteredDryRun.includes(eventPeer)) {
       fail(`tmux gc --peer dry-run did not filter to requested peer:\n${filteredDryRun}`);
     }
-    const filteredRemoved = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer, '--yes']);
+    const filteredRemoved = hcc(['tmux', 'gc', '--older-than', '14', '--peer', peerFilterPeer, '--yes'], { env: gcEnv });
     if (!filteredRemoved.includes(peerFilterPeer) || filteredRemoved.includes(stalePeer) || filteredRemoved.includes(eventPeer)) {
       fail(`tmux gc --peer --yes did not remove only requested peer:\n${filteredRemoved}`);
     }
@@ -485,15 +664,28 @@ async function assertTmuxGcPolicy() {
       fail('tmux gc --peer --yes deleted an unrequested stale managed session');
     }
 
-    const removed = hcc(['tmux', 'gc', '--older-than', '14', '--yes']);
-    if (!removed.includes(stalePeer) || !removed.includes(eventPeer) || removed.includes(peerFilterPeer) || removed.includes(attachedPeer) || removed.includes(manualPane)) {
+    const removed = hcc(['tmux', 'gc', '--older-than', '14', '--yes'], { env: gcEnv });
+    if (!gcOutputHasPeer(removed, stalePeer) || !gcOutputHasPeer(removed, deadBindingPeer) || !gcOutputHasPeer(removed, deadEventPeer) ||
+        gcOutputHasPeer(removed, reusedBindingPeer) || gcOutputHasPeer(removed, clientUnknownBindingPeer) ||
+        gcOutputHasPeer(removed, eventPeer) || gcOutputHasPeer(removed, reusedEventPeer) ||
+        gcOutputHasPeer(removed, reusedProcessEventPeer) || gcOutputHasPeer(removed, clientUnknownEventPeer) ||
+        gcOutputHasPeer(removed, rootEventPeer) || gcOutputHasPeer(removed, legacyEventPeer) ||
+        gcOutputHasPeer(removed, peerFilterPeer) || gcOutputHasPeer(removed, attachedPeer) || removed.includes(manualPane)) {
       fail(`tmux gc --yes output wrong:\n${removed}`);
     }
     if (runMaybe('tmux', ['has-session', '-t', staleSession]).status === 0) {
       fail('tmux gc --yes did not delete stale DB-proven managed session');
     }
-    if (runMaybe('tmux', ['has-session', '-t', eventSession]).status === 0) {
-      fail('tmux gc --yes did not delete stale rebind cleanup-failed session');
+    if (runMaybe('tmux', ['has-session', '-t', deadBindingSession]).status === 0) {
+      fail('tmux gc --yes did not delete a truly dead exact binding session');
+    }
+    if (runMaybe('tmux', ['has-session', '-t', deadEventSession]).status === 0) {
+      fail('tmux gc --yes did not delete a confirmed-dead rebind cleanup session listed by dry-run');
+    }
+    for (const protectedSession of [reusedBindingSession, clientUnknownBindingSession, eventSession, reusedEventSession, reusedProcessEventSession, clientUnknownEventSession, rootEventSession, manualSession]) {
+      if (runMaybe('tmux', ['has-session', '-t', protectedSession]).status !== 0) {
+        fail(`tmux gc deleted live/unknown event session: ${protectedSession}`);
+      }
     }
     if (runMaybe('tmux', ['has-session', '-t', eventActiveSession]).status !== 0) {
       fail('tmux gc deleted the active replacement session for the same peer');
@@ -522,6 +714,19 @@ async function assertTmuxGcPolicy() {
     if (!attachedBinding || attachedBinding.runtime_target !== attachedPane) {
       fail(`tmux gc changed attached-client binding:\n${JSON.stringify(attachedBinding, null, 2)}`);
     }
+    const deadBinding = peerBindingRow(deadBindingPeer);
+    if (!deadBinding || deadBinding.transport !== 'detached' || deadBinding.runtime_target !== null) {
+      fail(`tmux gc did not detach truly dead binding:\n${JSON.stringify(deadBinding, null, 2)}`);
+    }
+    for (const [peer, pane] of [
+      [reusedBindingPeer, reusedBindingPane],
+      [clientUnknownBindingPeer, clientUnknownBindingPane]
+    ]) {
+      const protectedBinding = peerBindingRow(peer);
+      if (!protectedBinding || protectedBinding.runtime_target !== pane) {
+        fail(`tmux gc changed protected binding ${peer}:\n${JSON.stringify(protectedBinding, null, 2)}`);
+      }
+    }
     const eventBinding = peerBindingRow(eventPeer);
     if (!eventBinding || eventBinding.runtime_target !== eventActivePane) {
       fail(`tmux gc changed active replacement binding for event-backed stale session:\n${JSON.stringify(eventBinding, null, 2)}`);
@@ -531,8 +736,15 @@ async function assertTmuxGcPolicy() {
     runMaybe('tmux', ['kill-session', '-t', `${tmuxSession}-gc-client`]);
     runMaybe('tmux', ['kill-session', '-t', peerFilterSession]);
     runMaybe('tmux', ['kill-session', '-t', attachedSession]);
+    runMaybe('tmux', ['kill-session', '-t', deadBindingSession]);
+    runMaybe('tmux', ['kill-session', '-t', reusedBindingSession]);
+    runMaybe('tmux', ['kill-session', '-t', clientUnknownBindingSession]);
     runMaybe('tmux', ['kill-session', '-t', eventSession]);
+    runMaybe('tmux', ['kill-session', '-t', deadEventSession]);
     runMaybe('tmux', ['kill-session', '-t', reusedEventSession]);
+    runMaybe('tmux', ['kill-session', '-t', reusedProcessEventSession]);
+    runMaybe('tmux', ['kill-session', '-t', clientUnknownEventSession]);
+    runMaybe('tmux', ['kill-session', '-t', rootEventSession]);
     runMaybe('tmux', ['kill-session', '-t', eventActiveSession]);
     runMaybe('tmux', ['kill-session', '-t', manualSession]);
     runMaybe('tmux', ['kill-session', '-t', staleSession]);
@@ -1828,7 +2040,7 @@ function writeFakeTools() {
   fs.mkdirSync(fakeBin, { recursive: true });
   if (realTmuxBin) {
     const tmuxWrapper = path.join(fakeBin, 'tmux');
-    fs.writeFileSync(tmuxWrapper, `#!/usr/bin/env bash\nexec ${sh(realTmuxBin)} -L ${sh(tmuxSocketName)} "$@"\n`, { mode: 0o755 });
+    fs.writeFileSync(tmuxWrapper, `#!/usr/bin/env bash\nif [ "\${1:-}" = "list-clients" ] && [ -n "\${HCC_REGRESSION_TMUX_FAIL_CLIENT_SESSIONS:-}" ]; then\n  for failed_session in $HCC_REGRESSION_TMUX_FAIL_CLIENT_SESSIONS; do\n    for arg in "$@"; do\n      if [ "$arg" = "$failed_session" ]; then exit 1; fi\n    done\n  done\nfi\nexec ${sh(realTmuxBin)} -L ${sh(tmuxSocketName)} "$@"\n`, { mode: 0o755 });
   }
   for (const name of ['claude', 'codex']) {
     const file = path.join(fakeBin, name);
@@ -1982,6 +2194,8 @@ async function setupRegression() {
     cwd: root,
     pid: process.pid,
     wrapper_pid: process.pid,
+    child_identity: inspectProcessIdentity(process.pid).identity,
+    wrapper_identity: inspectProcessIdentity(process.pid).identity,
     cols: 120,
     rows: 40
   }));
@@ -2564,7 +2778,11 @@ async function dbWorkflow() {
   hcc(['task', 'claim', '--peer', 'stale-owner', '--id', staleTaskId]);
   withMeshDb((db) => {
     const staleAt = Math.floor(Date.now() / 1000) - 7200;
-    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(staleAt, 'stale-owner');
+    db.prepare(`
+      UPDATE peers
+      SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL, last_seen_at = ?
+      WHERE id = ?
+    `).run(staleAt, 'stale-owner');
   });
   const staleTakeover = hccJson(['task', 'takeover', '--peer', 'takeover-b', '--id', staleTaskId, '--reason', 'stale takeover smoke', '--policy', 'stale', '--stale-after', '60']);
   if (String(staleTakeover.owner) !== 'takeover-b') {
@@ -2582,7 +2800,11 @@ async function dbWorkflow() {
   hcc(['task', 'claim', '--peer', 'stale-liveness-owner', '--id', staleLivenessTaskId]);
   withMeshDb((db) => {
     const staleAt = Math.floor(Date.now() / 1000) - 7200;
-    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(staleAt, 'stale-liveness-owner');
+    db.prepare(`
+      UPDATE peers
+      SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL, last_seen_at = ?
+      WHERE id = ?
+    `).run(staleAt, 'stale-liveness-owner');
   });
   const staleLivenessList = hcc(['task', 'list', '--status', 'claimed']);
   if (!staleLivenessList.includes(`#${staleLivenessTaskId}`) || !staleLivenessList.includes('stale/no-lock')) {
@@ -2745,7 +2967,11 @@ async function dbWorkflow() {
   // Make the owner old by age (would normally be stale) for a baseline.
   const graceDb = new DatabaseSync(graceDbPath, { timeout: 5000 });
   graceDb.exec('PRAGMA foreign_keys = ON;');
-  graceDb.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(graceNow - 1000, 'grace-owner');
+  graceDb.prepare(`
+    UPDATE peers
+    SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL, last_seen_at = ?
+    WHERE id = ?
+  `).run(graceNow - 1000, 'grace-owner');
   graceDb.close();
   const graceBaseline = hccMaybe(['task', 'takeover', '--peer', 'grace-taker', '--id', graceTaskId, '--reason', 'baseline', '--policy', 'stale']);
   if (graceBaseline.status !== 0 || !graceBaseline.stdout.includes('took over task')) {
@@ -2756,7 +2982,11 @@ async function dbWorkflow() {
   hcc(['task', 'takeover', '--peer', 'grace-owner', '--id', graceTaskId, '--reason', 'give back', '--force']);
   const graceDb2 = new DatabaseSync(graceDbPath, { timeout: 5000 });
   graceDb2.exec('PRAGMA foreign_keys = ON;');
-  graceDb2.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(graceNow - 1000, 'grace-owner');
+  graceDb2.prepare(`
+    UPDATE peers
+    SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL, last_seen_at = ?
+    WHERE id = ?
+  `).run(graceNow - 1000, 'grace-owner');
   graceDb2.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(graceNow + 60));
   graceDb2.close();
   const graceRejected = hccMaybe(['task', 'takeover', '--peer', 'grace-taker', '--id', graceTaskId, '--reason', 'during grace', '--policy', 'stale']);
@@ -2808,19 +3038,21 @@ async function dbWorkflow() {
   if (lockDuringGrace.status === 0 || !String(lockDuringGrace.stderr || lockDuringGrace.stdout).includes('conflicts with lock')) {
     fail(`lock acquire during grace window should see the expired lock as held:\n${lockDuringGrace.stdout}\n${lockDuringGrace.stderr}`);
   }
-  // After grace, both automation and the mutation path agree that the expired
-  // lock is acquirable again.
+  // After grace, process evidence still protects the expired lock: age alone
+  // cannot release ownership held by a verified-live peer.
   const lockDb2 = new DatabaseSync(graceDbPath, { timeout: 5000 });
   lockDb2.exec('PRAGMA foreign_keys = ON;');
   lockDb2.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
   lockDb2.close();
   const graceEndedState = hccJson(['state', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
-  if (graceEndedState.clock_grace_active !== false ||
-      graceEndedState.locks.some((row) => row.resource === 'src/grace-lock') ||
-      graceEndedState.automation.phase !== 'acquire_lock' ||
-      graceEndedState.automation.next_action.kind !== 'lock.acquire') {
-    fail(`state automation did not release the expired conflict after grace:\n${JSON.stringify(graceEndedState, null, 2)}`);
+  if (graceEndedState.clock_grace_active !== false) {
+    fail(`clock grace did not end:\n${JSON.stringify(graceEndedState, null, 2)}`);
   }
+  const lockAfterGrace = hccMaybe(['lock', 'acquire', '--peer', 'grace-lock-taker', '--task', graceLockTaskId, '--resource', 'src/grace-lock', '--ttl', '900']);
+  if (lockAfterGrace.status === 0 || !String(lockAfterGrace.stderr || lockAfterGrace.stdout).includes('conflicts with lock')) {
+    fail(`verified-live lock owner was released after clock grace:\n${lockAfterGrace.stdout}\n${lockAfterGrace.stderr}`);
+  }
+  withMeshDb((db) => db.prepare("UPDATE peers SET status = 'exited' WHERE id = ?").run('grace-lock-owner'));
   hcc(['lock', 'acquire', '--peer', 'grace-lock-taker', '--task', graceLockTaskId, '--resource', 'src/grace-lock', '--ttl', '900']);
   hcc(['lock', 'release', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
   hcc(['task', 'done', '--peer', 'grace-lock-taker', '--id', graceLockTaskId, '--summary', 'grace lock automation done']);
@@ -3336,7 +3568,202 @@ async function multiProjectWebWorkflow() {
   await runWebHeartbeatWithStableTtl(60, 'second web heartbeat');
   await runWebHeartbeatWithStableTtl(75, 'web heartbeat TTL override', 75);
   await runWebHeartbeatWithStableTtl(75, 'web heartbeat persisted TTL after override');
+  // A verified-live Web peer can recover its retained lock after the stored
+  // expiry, matching the CLI heartbeat evidence policy outside clock grace.
+  withMeshDb((db) => {
+    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?')
+      .run(Math.floor(Date.now() / 1000) - 60, webTtlResource);
+  });
+  await runWebHeartbeatWithStableTtl(75, 'verified-live Web expired-lock recovery');
+
+  const managedHeartbeatIdentity = withMeshDb((db) => db.prepare(`
+    SELECT pid, pid_start_token, pid_command_hash
+    FROM peers WHERE id = ?
+  `).get(managedActionPeer));
+  withMeshDb((db) => {
+    db.prepare(`
+      UPDATE peers SET pid_start_token = NULL, pid_command_hash = NULL WHERE id = ?
+    `).run(managedActionPeer);
+    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?')
+      .run(Math.floor(Date.now() / 1000) - 60, webTtlResource);
+  });
+  const unknownHeartbeatResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: managedActionToken, renew_locks: true })
+  }, { root });
+  const unknownHeartbeat = await unknownHeartbeatResponse.json();
+  if (!unknownHeartbeatResponse.ok || unknownHeartbeat.data?.renewed !== 0) {
+    fail(`unknown Web peer renewed an expired lock outside grace:\n${JSON.stringify(unknownHeartbeat, null, 2)}`);
+  }
+  withMeshDb((db) => {
+    db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(String(Math.floor(Date.now() / 1000) + 60));
+  });
+  const graceHeartbeatResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: managedActionToken, renew_locks: true })
+  }, { root });
+  const graceHeartbeat = await graceHeartbeatResponse.json();
+  if (!graceHeartbeatResponse.ok || graceHeartbeat.data?.renewed !== 1) {
+    fail(`clock grace did not preserve unknown Web peer lock renewal:\n${JSON.stringify(graceHeartbeat, null, 2)}`);
+  }
+  withMeshDb((db) => {
+    db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+    db.prepare(`
+      UPDATE peers SET pid = ?, pid_start_token = ?, pid_command_hash = ? WHERE id = ?
+    `).run(
+      managedHeartbeatIdentity.pid,
+      managedHeartbeatIdentity.pid_start_token,
+      managedHeartbeatIdentity.pid_command_hash,
+      managedActionPeer
+    );
+  });
   hcc(['lock', 'release', '--peer', managedActionPeer, '--resource', webTtlResource]);
+
+  const evidenceOwnerSession = await startProvider({ kind: 'shell', command: 'bash --noprofile --norc' });
+  const evidenceOwner = evidenceOwnerSession.peer_id || evidenceOwnerSession.id;
+  const evidenceOwnerPane = evidenceOwnerSession.pane;
+  const evidenceOwnerPid = Number(run('tmux', ['display-message', '-p', '-t', evidenceOwnerPane, '#{pane_pid}']).trim());
+  const evidenceOwnerIdentity = inspectProcessIdentity(evidenceOwnerPid).identity;
+  if (!evidenceOwnerIdentity) fail('cannot inspect live web evidence owner identity');
+  const evidenceTaskOutput = hcc(['task', 'create', '--from', 'human', '--to', evidenceOwner, '--title', 'web full-evidence owner']);
+  const evidenceTaskMatch = evidenceTaskOutput.match(/created task #(\d+):/);
+  if (!evidenceTaskMatch) fail(`cannot parse web evidence task id:\n${evidenceTaskOutput}`);
+  const evidenceTaskId = Number(evidenceTaskMatch[1]);
+  hcc(['task', 'claim', '--peer', evidenceOwner, '--id', String(evidenceTaskId)]);
+  const staleEvidenceAt = Math.floor(Date.now() / 1000) - 7200;
+  const recentEvidenceAt = Math.floor(Date.now() / 1000);
+  withMeshDb((db) => db.prepare(`
+    UPDATE peers
+    SET pid = ?, pid_start_token = 'reused:web-owner', pid_command_hash = ?,
+        status = 'working', last_seen_at = ?
+    WHERE id = ?
+  `).run(evidenceOwnerPid, 'a'.repeat(64), recentEvidenceAt, evidenceOwner));
+  const evidenceOwnerBeforeReads = withMeshDb((db) => db.prepare(`
+    SELECT pid, pid_start_token, pid_command_hash, status, last_seen_at
+    FROM peers WHERE id = ?
+  `).get(evidenceOwner));
+  hccJson(['status', '--peer', evidenceOwner]);
+  hccJson(['state', '--peer', evidenceOwner]);
+  hccJson(['lock', 'list', '--all']);
+  const evidenceOwnerAfterReads = withMeshDb((db) => db.prepare(`
+    SELECT pid, pid_start_token, pid_command_hash, status, last_seen_at
+    FROM peers WHERE id = ?
+  `).get(evidenceOwner));
+  if (JSON.stringify(evidenceOwnerAfterReads) !== JSON.stringify(evidenceOwnerBeforeReads)) {
+    fail(`status/state/lock-list mutated peer evidence:\n${JSON.stringify({ evidenceOwnerBeforeReads, evidenceOwnerAfterReads }, null, 2)}`);
+  }
+
+  const unknownEvidenceState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
+  const unknownEvidenceTask = (unknownEvidenceState.data?.tasks || []).find((task) => Number(task.id) === evidenceTaskId);
+  if (!unknownEvidenceState.ok || unknownEvidenceTask?.owner_evidence_state !== 'unknown' ||
+      unknownEvidenceTask?.owner_stale || unknownEvidenceTask?.takeover_ready) {
+    fail(`state API aged an exact live tmux owner with uncertain process evidence into stale:\n${JSON.stringify(unknownEvidenceTask, null, 2)}`);
+  }
+  const unknownTakeoverResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/task-takeover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action_token: managedActionToken,
+      id: evidenceTaskId,
+      reason: 'must reject uncertain live tmux owner',
+      policy: 'stale',
+      stale_after: 60
+    })
+  }, { root });
+  const unknownTakeover = await unknownTakeoverResponse.json();
+  if (unknownTakeoverResponse.ok || unknownTakeover.error?.code !== 'TAKEOVER_POLICY') {
+    fail(`web takeover treated uncertain live tmux evidence as process-dead/stale:\n${JSON.stringify(unknownTakeover, null, 2)}`);
+  }
+
+  withMeshDb((db) => db.prepare(`
+    UPDATE peers
+    SET pid = ?, pid_start_token = ?, pid_command_hash = ?, last_seen_at = ?
+    WHERE id = ?
+  `).run(
+    evidenceOwnerPid,
+    evidenceOwnerIdentity.startToken,
+    evidenceOwnerIdentity.commandHash,
+    staleEvidenceAt,
+    evidenceOwner
+  ));
+  const liveExpiredResource = 'web/live-expired-lock';
+  withMeshDb((db) => db.prepare(`
+    INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at, ttl_sec)
+    VALUES (?, ?, '*', ?, ?, 'live expired evidence', ?, ?, 60)
+    ON CONFLICT(resource) DO UPDATE SET owner = excluded.owner, task_id = excluded.task_id,
+      reason = excluded.reason, expires_at = excluded.expires_at, created_at = excluded.created_at, ttl_sec = excluded.ttl_sec
+  `).run(liveExpiredResource, liveExpiredResource, evidenceOwner, evidenceTaskId,
+    Math.floor(Date.now() / 1000) - 60, staleEvidenceAt));
+  const liveEvidenceState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
+  const liveEvidenceTask = (liveEvidenceState.data?.tasks || []).find((task) => Number(task.id) === evidenceTaskId);
+  const liveEvidenceLock = (liveEvidenceState.data?.locks || []).find((lock) => lock.resource === liveExpiredResource);
+  if (!liveEvidenceState.ok || liveEvidenceTask?.owner_evidence_state !== 'live' ||
+      liveEvidenceTask?.owner_stale || liveEvidenceTask?.takeover_ready || !liveEvidenceLock) {
+    fail(`state API omitted verified-live task/expired-lock evidence:\n${JSON.stringify({ liveEvidenceTask, liveEvidenceLock }, null, 2)}`);
+  }
+  const liveEvidenceStatus = await (await runtimeFetch('/api/peers/web-action-peer/actions/status', {}, { root })).json();
+  if (!liveEvidenceStatus.ok || Number(liveEvidenceStatus.data?.active_locks || 0) < 1) {
+    fail(`status API omitted expired lock owned by a verified-live peer:\n${JSON.stringify(liveEvidenceStatus, null, 2)}`);
+  }
+  const evidenceHookPayload = JSON.stringify({
+    session_id: 'web-evidence-hook-viewer-session',
+    cwd: root,
+    hook_event_name: 'UserPromptSubmit',
+    prompt: 'inspect live evidence owner'
+  });
+  const evidenceHook = hookContext(hcc(['hook', 'userpromptsubmit'], {
+    env: { ...env, HCC_PEER: 'web-evidence-hook-viewer' },
+    input: evidenceHookPayload
+  }), 'UserPromptSubmit');
+  if (!evidenceHook.includes(`#${evidenceTaskId} claimed owner=${evidenceOwner} assignee=${evidenceOwner} owner_state=active`) ||
+      !evidenceHook.includes(liveExpiredResource)) {
+    fail(`hook snapshot omitted verified-live task/expired lock:\n${evidenceHook}`);
+  }
+  const liveLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: managedActionToken, resource: liveExpiredResource, ttl: 60 })
+  }, { root });
+  const liveLockResult = await liveLockResponse.json();
+  if (liveLockResponse.ok || liveLockResult.error?.code !== 'LOCK_HELD') {
+    fail(`web lock acquisition overwrote an expired lock owned by a verified-live peer:\n${JSON.stringify(liveLockResult, null, 2)}`);
+  }
+
+  const deadLockOwner = 'web-dead-expired-owner';
+  const deadLockResource = 'web/dead-expired-lock';
+  const deadLockPid = spawnSync('true', [], { stdio: 'ignore' }).pid;
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000) - 7200;
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, pid, pid_start_token, pid_command_hash, status, created_at, last_seen_at)
+      VALUES (?, 'shell', 'peer', ?, 'dead:web-lock', ?, 'working', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, pid_start_token = excluded.pid_start_token,
+        pid_command_hash = excluded.pid_command_hash, status = excluded.status, last_seen_at = excluded.last_seen_at
+    `).run(deadLockOwner, deadLockPid, 'd'.repeat(64), t, t);
+    db.prepare(`
+      INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at, ttl_sec)
+      VALUES (?, ?, '*', ?, NULL, 'dead expired evidence', ?, ?, 60)
+      ON CONFLICT(resource) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at,
+        created_at = excluded.created_at, ttl_sec = excluded.ttl_sec
+    `).run(deadLockResource, deadLockResource, deadLockOwner, t, t);
+  });
+  const deadLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: managedActionToken, resource: deadLockResource, ttl: 60 })
+  }, { root });
+  const deadLockResult = await deadLockResponse.json();
+  if (!deadLockResponse.ok || !deadLockResult.ok || deadLockResult.data?.lock?.owner !== managedActionPeer) {
+    fail(`web lock acquisition did not replace an expired lock owned by a confirmed-dead peer:\n${JSON.stringify(deadLockResult, null, 2)}`);
+  }
+  hcc(['lock', 'release', '--peer', managedActionPeer, '--resource', deadLockResource]);
+  hcc(['lock', 'release', '--peer', 'human', '--resource', liveExpiredResource, '--force']);
+  hcc(['task', 'takeover', '--peer', 'human', '--id', String(evidenceTaskId), '--reason', 'web evidence cleanup', '--force']);
+  hcc(['task', 'update', '--peer', 'human', '--id', String(evidenceTaskId), '--status', 'abandoned', '--summary', 'web evidence cleanup']);
+  await stopSession(evidenceOwnerSession.id);
 
   const actionHeartbeat = await (await runtimeFetch('/api/peers/web-action-peer/actions/heartbeat', {
     method: 'POST',
@@ -3577,6 +4004,89 @@ async function tmuxBackedStartWorkflow() {
   if (runMaybe('tmux', ['has-session', '-t', tmuxManagedSession(root, 'claude-force-b')]).status === 0) {
     fail('failed duplicate provider start left a new claude-force-b tmux session behind');
   }
+  let forceFirstAttachEvent = withMeshDb((db) => {
+    const row = db.prepare(`
+      SELECT id, payload FROM events
+      WHERE type = 'tmux.session.attached'
+        AND json_extract(payload, '$.target_peer') = 'claude-force-a'
+      ORDER BY id DESC LIMIT 1
+    `).get();
+    return row ? { id: row.id, payload: JSON.parse(row.payload) } : null;
+  });
+  if (!forceFirstAttachEvent?.payload?.tmux_session_created) {
+    fail(`tmux attach event omitted immutable identity: ${JSON.stringify(forceFirstAttachEvent)}`);
+  }
+  const oldAuthorityAt = Math.floor(Date.now() / 1000) - 20 * 86400;
+  withMeshDb((db) => db.prepare('UPDATE events SET created_at = ? WHERE id = ?')
+    .run(oldAuthorityAt, forceFirstAttachEvent.id));
+  await stopRuntime();
+  const authorityBindingAfterStop = withMeshDb((db) => db.prepare(`
+    SELECT peer, transport, runtime_target, runtime_session_id
+    FROM peer_bindings WHERE peer = 'claude-force-a'
+  `).get());
+  if (!withMeshDb((db) => db.prepare('SELECT id FROM events WHERE id = ?').get(forceFirstAttachEvent.id))) {
+    fail(`runtime shutdown deleted the latest immutable tmux authority event: ${JSON.stringify(authorityBindingAfterStop)}`);
+  }
+  startRuntime();
+  await waitRuntime();
+  const restoredAuthority = withMeshDb((db) => {
+    const row = db.prepare(`
+      SELECT id, payload FROM events
+      WHERE type = 'tmux.session.attached'
+        AND json_extract(payload, '$.target_peer') = 'claude-force-a'
+      ORDER BY id DESC LIMIT 1
+    `).get();
+    return row ? { id: row.id, payload: JSON.parse(row.payload) } : null;
+  });
+  if (!restoredAuthority?.payload?.tmux_session_created || !restoredAuthority?.payload?.tmux_session_id) {
+    fail(`startup auto GC left no complete immutable tmux authority: ${JSON.stringify({ authorityBindingAfterStop, restoredAuthority })}`);
+  }
+  withMeshDb((db) => db.prepare('UPDATE events SET created_at = ? WHERE id = ?')
+    .run(oldAuthorityAt, restoredAuthority.id));
+  hcc(['gc', '--older-than', '14', '--yes']);
+  const authorityRowsAfterFullGc = withMeshDb((db) => db.prepare(`
+    SELECT id FROM events
+    WHERE type = 'tmux.session.attached'
+      AND json_extract(payload, '$.target_peer') = 'claude-force-a'
+    ORDER BY id
+  `).all().map((row) => row.id));
+  if ((restoredAuthority.id !== forceFirstAttachEvent.id && authorityRowsAfterFullGc.includes(forceFirstAttachEvent.id)) ||
+      !authorityRowsAfterFullGc.includes(restoredAuthority.id)) {
+    fail(`full GC did not delete only superseded tmux authority events: ${JSON.stringify(authorityRowsAfterFullGc)}`);
+  }
+  forceFirstAttachEvent = restoredAuthority;
+  run('tmux', ['set-environment', '-u', '-t', forceFirstSession, 'HCC_ROOT']);
+  const missingRootStopResponse = await runtimeFetch('/api/sessions/claude-force-a/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kill_tmux: true })
+  }, { root });
+  const missingRootStop = await missingRootStopResponse.json();
+  if (missingRootStopResponse.ok ||
+      runMaybe('tmux', ['has-session', '-t', forceFirstSession]).status !== 0 ||
+      !String(missingRootStop.error?.message || '').includes('tmux_root_unknown')) {
+    fail(`tmux stop did not fail closed on missing HCC_ROOT:\n${JSON.stringify(missingRootStop, null, 2)}`);
+  }
+  run('tmux', ['set-environment', '-t', forceFirstSession, 'HCC_ROOT', root]);
+
+  withMeshDb((db) => {
+    const changed = {
+      ...forceFirstAttachEvent.payload,
+      tmux_session_created: `${forceFirstAttachEvent.payload.tmux_session_created}-reused`
+    };
+    db.prepare('UPDATE events SET payload = ? WHERE id = ?').run(JSON.stringify(changed), forceFirstAttachEvent.id);
+  });
+  const reusedRebind = hccMaybe(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession, '--force'], {
+    env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
+  });
+  if (reusedRebind.status === 0 ||
+      !`${reusedRebind.stdout}\n${reusedRebind.stderr}`.includes('tmux_session_reused') ||
+      runMaybe('tmux', ['has-session', '-t', forceFirstSession]).status !== 0 ||
+      runMaybe('tmux', ['has-session', '-t', tmuxManagedSession(root, 'claude-force-b')]).status === 0) {
+    fail(`tmux rebind did not reject a reused immutable session identity:\n${reusedRebind.stdout}\n${reusedRebind.stderr}`);
+  }
+  withMeshDb((db) => db.prepare('UPDATE events SET payload = ? WHERE id = ?')
+    .run(JSON.stringify(forceFirstAttachEvent.payload), forceFirstAttachEvent.id));
   const forceSecond = hcc(['peer', 'start', 'claude-force-b', '--kind', 'claude', '--resume', forceSession, '--force'], {
     env: { ...env, HCC_FAKE_STAY_ALIVE: '1' }
   });
@@ -3591,6 +4101,26 @@ async function tmuxBackedStartWorkflow() {
   }
   if (runMaybe('tmux', ['has-session', '-t', forceFirstSession]).status === 0) {
     fail('--force provider rebind did not remove old hcc-managed tmux session');
+  }
+  const rebindEvidence = withMeshDb((db) => {
+    const row = db.prepare(`
+      SELECT payload
+      FROM events
+      WHERE type = 'tmux.session.rebind_cleanup_pending'
+        AND json_extract(payload, '$.old_peer') = 'claude-force-a'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get();
+    return row ? JSON.parse(row.payload) : null;
+  });
+  if (rebindEvidence?.old_pane !== forceFirstPane ||
+      rebindEvidence?.old_process_identity?.pid <= 0 ||
+      !rebindEvidence?.old_process_identity?.startToken ||
+      !rebindEvidence?.old_process_identity?.commandHash ||
+      !samePath(rebindEvidence?.old_hcc_root, root) ||
+      !rebindEvidence?.old_tmux_session_created ||
+      !rebindEvidence?.old_tmux_session_id) {
+    fail(`forced rebind did not persist complete old tmux evidence:\n${JSON.stringify(rebindEvidence, null, 2)}`);
   }
   hccMaybe(['peer', 'stop', 'claude-force-a']);
   hcc(['peer', 'stop', 'claude-force-b']);
@@ -4028,6 +4558,7 @@ async function syntaxAndHelp() {
   const shellPathSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shell-path.mjs'), 'utf8');
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
+  const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
     "runTmux(['pipe-pane', '-t', session.pane]);",
@@ -4065,7 +4596,8 @@ async function syntaxAndHelp() {
     'function safeOldTmuxRebindPlan(',
     'function assertOldTmuxCanRebind(',
     'TMUX_REBIND_NOT_HCC_MANAGED',
-    'TMUX_REBIND_ROOT_MISMATCH',
+    'assertTmuxDestructiveEvidence(stored, observed',
+    'tmuxAttachmentEvidence(db, oldPeer, oldTarget)',
     "addEvent(db, 'tmux.session.rebind_cleanup_pending'",
     'TMUX_REBIND_OLD_SESSION_IN_USE',
     "addEvent(db, 'tmux.session.rebind_cleanup_failed'",
@@ -4085,8 +4617,10 @@ async function syntaxAndHelp() {
     "binding.transport !== 'tmux'",
     'const expectedSession = tmuxManagedSessionName(projectCtx, peerId);',
     "throw new CliError('TMUX_KILL_NOT_HCC_MANAGED'",
-    "throw new CliError('TMUX_KILL_ROOT_MISMATCH'",
-    "throw new CliError('TMUX_KILL_HAS_CLIENTS'",
+    'const stored = tmuxAttachmentEvidence(db, peerId, binding.runtime_target);',
+    'executeTmuxKillPlan(projectCtx, plan);',
+    'validateTmuxDestructiveEvidence(stored, observed, options)',
+    'conditionalTmuxKill(runTmux, plan.stored);',
     'killDbProvenTmuxSession(reqCtx, db, peerId)',
     'safeTmuxKillPlan(reqCtx, stopDb, peerId, session.pane || null)'
   ]) {
@@ -4109,7 +4643,18 @@ async function syntaxAndHelp() {
     "const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');",
     "skip('hcc_root_mismatch'",
     "skip('runtime_managed')",
-    "skip('has_tmux_clients'",
+    'validateTmuxGcBindingEvidence(validationSubject, observed)',
+    'expected_root: canonicalRoot(subject.expected_root)',
+    'root: canonicalRoot(subject.authority.root)',
+    'gc_validation_subject: bindingSubject',
+    'sameTmuxGcBindingSubject(candidate.gc_validation_subject, currentSubject)',
+    "'tmux_binding_validation_mode_changed'",
+    'TMUX_GC_CONDITIONAL_TIMEOUT_MS = 5000',
+    'finalizeTmuxGcBindingMutation({',
+    'readSubject: () => tmuxGcBindingSubjectFromDb(db, ctx, candidate.peer)',
+    'conditionalKill: () => conditionalTmuxKill(runBoundedTmuxGcCommand',
+    'casBinding: (subject) => casDetachTmuxGcBinding(db, subject, t)',
+    'updatePeer: (subject) => casDetachTmuxGcPeer(db, subject, t)',
     "reason: 'stale_hcc_managed_session'",
     "type IN ('tmux.session.rebind_cleanup_failed', 'tmux.session.rebind_cleanup_pending')",
     "'stale_rebind_cleanup_failed_session'",
@@ -4120,6 +4665,34 @@ async function syntaxAndHelp() {
     "addEvent(db, 'tmux.session.gc'"
   ]) {
     if (!hccSource.includes(expected)) fail(`tmux gc guard missing: ${expected}`);
+  }
+  const bindingFinalizerSource = tmuxSafetySource.slice(
+    tmuxSafetySource.indexOf('export function finalizeTmuxGcBindingMutation('),
+    tmuxSafetySource.indexOf('const KILL_OK')
+  );
+  for (const expected of [
+    'return tx(db, () => {',
+    'const currentSubject = readSubject();',
+    'conditionalKill();',
+    'const bindingResult = casBinding(currentSubject);',
+    'Number(bindingResult?.changes) !== 1',
+    'updatePeer(currentSubject);'
+  ]) {
+    if (!bindingFinalizerSource.includes(expected)) fail(`tmux GC finalizer guard missing: ${expected}`);
+  }
+  for (const forbidden of [
+    'inspectProcessIdentity',
+    'observeTmuxConditionalTarget',
+    'tmuxSessionEnvironmentValue',
+    'validateTmuxGcBindingEvidence'
+  ]) {
+    if (bindingFinalizerSource.includes(forbidden)) {
+      fail(`tmux GC finalizer performs an evidence probe inside its write transaction: ${forbidden}`);
+    }
+  }
+  if (bindingFinalizerSource.indexOf('casBinding(currentSubject)') >
+      bindingFinalizerSource.indexOf('updatePeer(currentSubject)')) {
+    fail('tmux GC finalizer updates peer state before binding CAS');
   }
   const autoAttachSource = hccSource.slice(
     hccSource.indexOf('function scanAndAttachDetectedPeers()'),
@@ -4235,7 +4808,9 @@ async function syntaxAndHelp() {
     "throw new CliError('PEER_IDENTITY_MISMATCH'",
     "throw new CliError('PEER_IDENTITY_REQUIRED'",
     'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
-    'takeOverTaskForPeer(db, peer, id, { reason, policy, staleAfter, source: ',
+    'ownerEvidenceFor: (owner, _row, ownerRow, binding) => observePeerEvidence',
+    'runOptimisticEvidenceMutation(db, {',
+    'capture: (subjectDb) => captureLockAcquireSubject(subjectDb, {',
     "assertTaskOwnerForMutation(db, peer, task, 'lock-acquire')",
     'const status = statusSummary(projectCtx, peer)',
     "normalized === 'task-next'",
@@ -4319,7 +4894,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
       !hccSource.includes("} from '../lib/web/runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web/http.mjs'") ||
-      !hccSource.includes("webIndexHtml, webLoginPage } from '../lib/web/ui-template.mjs'") ||
+      !hccSource.includes("import * as webUiTemplate from '../lib/web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
     fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
@@ -4646,6 +5221,7 @@ async function syntaxAndHelp() {
   }
   const stateHelpers = coordinationState.createCoordinationState({
     connect: () => ({ close() {} }),
+    observePeerEvidence: () => ({ state: 'unknown', reason: 'test' }),
     queryInbox: () => [],
     queryOpenTasks: () => [],
     queryTimelineMessages: () => []
@@ -5207,8 +5783,9 @@ async function syntaxAndHelp() {
       graceConflictAutomation.next_action.kind !== 'msg.send' ||
       graceConflictAutomation.next_action.lock_owner !== 'other-peer' ||
       graceConflictAutomation.next_action.argv.includes('--force') ||
-      afterGraceAutomation.phase !== 'acquire_lock' ||
-      afterGraceAutomation.next_action.kind !== 'lock.acquire') {
+      afterGraceAutomation.phase !== 'coordinate_lock' ||
+      afterGraceAutomation.next_action.kind !== 'msg.send' ||
+      afterGraceAutomation.next_action.lock_owner !== 'other-peer') {
     fail(`automation clock-grace lock conflict semantics changed:\n${JSON.stringify({ graceConflictAutomation, afterGraceAutomation }, null, 2)}`);
   }
   const automationContext = automationModule.renderAutomationContext(acquireAutomation);
@@ -5490,7 +6067,20 @@ async function syntaxAndHelp() {
       CREATE TABLE peers (
         id TEXT PRIMARY KEY,
         status TEXT,
+        pid INTEGER,
+        pid_start_token TEXT,
+        pid_command_hash TEXT,
         last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE peer_bindings (
+        peer TEXT PRIMARY KEY,
+        transport TEXT,
+        runtime_target TEXT,
+        updated_at INTEGER
+      );
+      CREATE TABLE meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
       );
       CREATE TABLE handoffs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5505,9 +6095,11 @@ async function syntaxAndHelp() {
         ('stale owned', 'running', NULL, 'old-owner', NULL, NULL, 20, 'alice', 1000, 1000),
         ('parent', 'pending', NULL, NULL, NULL, NULL, 30, 'alice', 1000, 1000),
         ('child done', 'done', NULL, NULL, 3, 'worker', 31, 'alice', 1000, 1000),
-        ('next pending', 'pending', NULL, NULL, NULL, NULL, 40, 'alice', 1000, 1000)
+        ('next pending', 'pending', NULL, NULL, NULL, NULL, 40, 'alice', 1000, 1000),
+        ('callback protected', 'running', NULL, 'callback-owner', NULL, NULL, 50, 'alice', 1000, 1000)
     `).run();
     taskDb.prepare('INSERT INTO peers(id, last_seen_at) VALUES (?, ?)').run('old-owner', 1000);
+    taskDb.prepare('INSERT INTO peers(id, last_seen_at) VALUES (?, ?)').run('callback-owner', 1000);
     taskDb.prepare('INSERT INTO handoffs(task_id, summary) VALUES (?, ?)').run(4, 'child handoff');
     const claimed = taskStore.claimTaskRowsForPeer(taskDb, 'bob', [1]);
     const blockedReject = (() => {
@@ -5519,6 +6111,24 @@ async function syntaxAndHelp() {
       }
     })();
     const taken = taskStore.takeOverTaskForPeer(taskDb, 'taker', 2, { reason: 'stale policy', policy: 'stale', staleAfter: 60 });
+    let callbackOwner = null;
+    const callbackProtected = (() => {
+      try {
+        taskStore.takeOverTaskForPeer(taskDb, 'taker', 6, {
+          reason: 'must use current transactional owner',
+          policy: 'stale',
+          staleAfter: 60,
+          ownerEvidenceFor: (owner, row) => {
+            callbackOwner = owner;
+            if (row.owner !== owner) fail('owner evidence callback received a mismatched task row');
+            return { state: 'live', reason: 'verified_callback_owner' };
+          }
+        });
+        return false;
+      } catch (err) {
+        return err?.code === 'TAKEOVER_POLICY';
+      }
+    })();
     const next = taskStore.claimNextTasksForPeer(taskDb, 'next-peer', { count: 1 });
     const openForBob = taskStore.queryOpenTasks(taskDb, 10, 'bob');
     const summary = taskStore.teamSummary(taskDb, 3);
@@ -5526,6 +6136,9 @@ async function syntaxAndHelp() {
         claimed[0].owner !== 'bob' ||
         !blockedReject ||
         taken.owner !== 'taker' ||
+        !callbackProtected ||
+        callbackOwner !== 'callback-owner' ||
+        taskStore.taskById(taskDb, 6)?.owner !== 'callback-owner' ||
         taskMessages.length !== 1 ||
         !taskMessages[0].body.includes('Task #2 taken over by taker') ||
         next.tasks.length !== 1 ||
@@ -6949,6 +7562,183 @@ function uninstallWorkflow() {
   try { fs.rmSync(uninstallHome, { recursive: true, force: true }); } catch {}
 }
 
+async function processEvidenceWorkflow() {
+  log('process evidence: live, reused, legacy, dead, root mismatch');
+
+  const createOwnedTask = (peer, title) => {
+    const output = hcc(['task', 'create', '--from', 'human', '--to', peer, '--title', title]);
+    const match = output.match(/created task #(\d+):/);
+    if (!match) fail(`cannot parse evidence task id: ${output}`);
+    hcc(['task', 'claim', '--peer', peer, '--id', match[1]]);
+    return match[1];
+  };
+  const agePeer = (peer, mutate = '') => withMeshDb((db) => db.prepare(`
+    UPDATE peers SET last_seen_at = ? ${mutate} WHERE id = ?
+  `).run(Math.floor(Date.now() / 1000) - 7200, peer));
+  const taskRow = (taskId) => hccJson(['task', 'list', '--all'])
+    .find((row) => String(row.id) === String(taskId));
+  const cleanupTask = (taskId) => {
+    hcc(['task', 'takeover', '--peer', 'human', '--id', taskId, '--reason', 'evidence fixture cleanup', '--force']);
+    hcc(['task', 'update', '--peer', 'human', '--id', taskId, '--status', 'abandoned', '--summary', 'evidence fixture cleanup']);
+  };
+
+  const livePeer = 'evidence-live-process';
+  hcc(['register', '--peer', livePeer, '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+  const persisted = withMeshDb((db) => db.prepare(`
+    SELECT pid_start_token, pid_command_hash FROM peers WHERE id = ?
+  `).get(livePeer));
+  if (!persisted?.pid_start_token || !/^[a-f0-9]{64}$/.test(persisted.pid_command_hash || '')) {
+    fail(`register did not persist complete live process identity: ${JSON.stringify(persisted)}`);
+  }
+  const liveTask = createOwnedTask(livePeer, 'live evidence blocks takeover');
+  agePeer(livePeer);
+  const liveTakeover = hccMaybe(['task', 'takeover', '--peer', 'evidence-taker', '--id', liveTask, '--reason', 'must reject live', '--policy', 'stale', '--stale-after', '60']);
+  if (liveTakeover.status === 0 || taskRow(liveTask)?.owner_evidence_state !== 'live') {
+    fail(`verified live non-tmux peer did not block takeover:\n${liveTakeover.stdout}\n${liveTakeover.stderr}`);
+  }
+  cleanupTask(liveTask);
+
+  const reusedPeer = 'evidence-reused-pid';
+  hcc(['register', '--peer', reusedPeer, '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+  const reusedTask = createOwnedTask(reusedPeer, 'reused PID permits takeover');
+  agePeer(reusedPeer, `, pid_start_token = 'reused:start', pid_command_hash = '${'f'.repeat(64)}'`);
+  if (taskRow(reusedTask)?.owner_evidence_state !== 'dead') fail('reused PID fingerprint was not reported dead');
+  const reusedTakeover = hccMaybe(['task', 'takeover', '--peer', 'evidence-taker', '--id', reusedTask, '--reason', 'reused PID', '--policy', 'stale', '--stale-after', '60']);
+  if (reusedTakeover.status !== 0) fail(`reused PID did not permit takeover:\n${reusedTakeover.stdout}\n${reusedTakeover.stderr}`);
+  hcc(['task', 'update', '--peer', 'evidence-taker', '--id', reusedTask, '--status', 'abandoned', '--summary', 'evidence fixture cleanup']);
+
+  const legacyPeer = 'evidence-legacy';
+  hcc(['register', '--peer', legacyPeer, '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+  const legacyTask = createOwnedTask(legacyPeer, 'legacy evidence remains unknown');
+  agePeer(legacyPeer, ', pid_start_token = NULL, pid_command_hash = NULL');
+  const legacyRow = taskRow(legacyTask);
+  if (legacyRow?.owner_evidence_state !== 'unknown' || legacyRow?.owner_evidence_reason !== 'process_identity_incomplete' ||
+      !legacyRow?.owner_stale || !legacyRow?.takeover_ready) {
+    fail(`legacy process evidence was not preserved as unknown: ${JSON.stringify(legacyRow)}`);
+  }
+  cleanupTask(legacyTask);
+
+  const deadPeer = 'evidence-dead-process';
+  const deadPid = spawnSync('true', [], { stdio: 'ignore' }).pid;
+  const deadTask = createOwnedTask(deadPeer, 'dead process permits takeover');
+  withMeshDb((db) => {
+    const t = Math.floor(Date.now() / 1000);
+    db.prepare(`
+      UPDATE peers SET pid = ?, pid_start_token = 'dead:start', pid_command_hash = ?,
+                       status = 'working', last_seen_at = ?
+      WHERE id = ?
+    `).run(deadPid, 'e'.repeat(64), t, deadPeer);
+  });
+  const deadRow = taskRow(deadTask);
+  if (deadRow?.owner_evidence_state !== 'dead' || !deadRow?.owner_stale || !deadRow?.takeover_ready) {
+    fail(`recent confirmed-dead process was not reported stale: ${JSON.stringify(deadRow)}`);
+  }
+  const deadTakeover = hccMaybe(['task', 'takeover', '--peer', 'evidence-taker', '--id', deadTask, '--reason', 'confirmed dead', '--policy', 'stale', '--stale-after', '60']);
+  if (deadTakeover.status !== 0) fail(`confirmed dead process did not permit takeover:\n${deadTakeover.stdout}\n${deadTakeover.stderr}`);
+  hcc(['task', 'update', '--peer', 'evidence-taker', '--id', deadTask, '--status', 'abandoned', '--summary', 'evidence fixture cleanup']);
+
+  if (tmuxAvailable()) {
+    const rootPeer = 'evidence-root-mismatch';
+    const session = tmuxManagedSession(root, rootPeer);
+    managedTmuxSessions.add(session);
+    runMaybe('tmux', ['kill-session', '-t', session]);
+    run('tmux', ['new-session', '-d', '-s', session, '-e', `HCC_ROOT=${root}-other`, '-c', root, 'bash', '--noprofile', '--norc']);
+    const pane = run('tmux', ['display-message', '-p', '-t', `${session}:0.0`, '#{pane_id}']).trim();
+    const panePid = Number(run('tmux', ['display-message', '-p', '-t', pane, '#{pane_pid}']).trim());
+    const paneIdentity = inspectProcessIdentity(panePid).identity;
+    const rootTask = createOwnedTask(rootPeer, 'root mismatch remains unknown');
+    withMeshDb((db) => {
+      const t = Math.floor(Date.now() / 1000) - 7200;
+      db.prepare(`
+        UPDATE peers SET pid = ?, pid_start_token = ?, pid_command_hash = ?, status = 'working', last_seen_at = ?
+        WHERE id = ?
+      `).run(panePid, paneIdentity?.startToken || null, paneIdentity?.commandHash || null, t, rootPeer);
+      db.prepare(`
+        INSERT INTO peer_bindings(peer, provider, resume_mode, transport, runtime_session_id, runtime_target, created_at, updated_at)
+        VALUES (?, 'shell', 'attached', 'tmux', ?, ?, ?, ?)
+        ON CONFLICT(peer) DO UPDATE SET transport = 'tmux', runtime_target = excluded.runtime_target, updated_at = excluded.updated_at
+      `).run(rootPeer, rootPeer, pane, t, t);
+    });
+    const rootRow = taskRow(rootTask);
+    if (rootRow?.owner_evidence_state !== 'unknown' || rootRow?.owner_evidence_reason !== 'tmux_root_mismatch') {
+      fail(`tmux root mismatch was not preserved as unknown: ${JSON.stringify(rootRow)}`);
+    }
+    cleanupTask(rootTask);
+    runMaybe('tmux', ['kill-session', '-t', session]);
+    cleanupBindingPeers(rootPeer);
+  }
+
+  const externalId = `evidence-external-${testId}`;
+  const externalDir = path.join(root, '.hello-cc', 'bufs');
+  const externalMetaFile = path.join(externalDir, `${externalId}.meta`);
+  const producer = spawn(process.execPath, [
+    hccBin,
+    '--root', root,
+    'run', '--peer', externalId, '--kind', 'shell', '--',
+    '/bin/bash', '--noprofile', '--norc', '-c', 'trap "" HUP; exec sleep 30'
+  ], {
+    cwd: root,
+    env: { ...env, HCC_INTERNAL_WEB_MANAGED_RUN: '1' },
+    stdio: 'ignore'
+  });
+  await waitFor(() => fs.existsSync(externalMetaFile), 'external producer metadata', 10000);
+  const externalMeta = JSON.parse(fs.readFileSync(externalMetaFile, 'utf8'));
+  if (externalMeta.wrapper_pid !== producer.pid ||
+      !externalMeta.pid || externalMeta.pid === externalMeta.wrapper_pid ||
+      externalMeta.wrapper_identity?.pid !== externalMeta.wrapper_pid ||
+      !externalMeta.wrapper_identity?.startToken ||
+      !externalMeta.wrapper_identity?.commandHash ||
+      externalMeta.child_identity?.pid !== externalMeta.pid ||
+      !externalMeta.child_identity?.startToken ||
+      !externalMeta.child_identity?.commandHash) {
+    fail(`external producer did not persist distinct complete identities: ${JSON.stringify(externalMeta)}`);
+  }
+  await waitFor(async () => {
+    const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+    return (data.sessions || []).some((session) => session.id === externalId);
+  }, 'external session adoption', 10000);
+  producer.kill('SIGKILL');
+  await waitForProcessExit(producer.pid, 'external wrapper SIGKILL');
+  await sleep(2500);
+  if (inspectProcessIdentity(externalMeta.pid).state !== 'live' || !fs.existsSync(externalMetaFile)) {
+    fail('live external child did not preserve session after wrapper death');
+  }
+  process.kill(externalMeta.pid, 'SIGKILL');
+  await waitFor(() => !fs.existsSync(externalMetaFile), 'external aggregate cleanup', 10000);
+
+  const legacyExternalId = `evidence-external-legacy-${testId}`;
+  const legacyProcess = spawn('sleep', ['30'], { stdio: 'ignore' });
+  const legacyFiles = ['out', 'in', 'resize', 'meta']
+    .map((suffix) => path.join(externalDir, `${legacyExternalId}.${suffix}`));
+  fs.writeFileSync(legacyFiles[0], 'legacy external\n');
+  fs.writeFileSync(legacyFiles[1], '');
+  fs.writeFileSync(legacyFiles[2], '');
+  fs.writeFileSync(legacyFiles[3], JSON.stringify({
+    id: legacyExternalId,
+    kind: 'shell',
+    role: 'peer',
+    command: 'sleep 30',
+    cwd: root,
+    pid: legacyProcess.pid,
+    wrapper_pid: legacyProcess.pid,
+    cols: 120,
+    rows: 40
+  }));
+  await waitFor(async () => {
+    const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+    return (data.sessions || []).some((session) => session.id === legacyExternalId);
+  }, 'legacy external adoption', 10000);
+  legacyProcess.kill('SIGKILL');
+  await waitForProcessExit(legacyProcess.pid, 'legacy external process exit');
+  await sleep(2500);
+  const legacySessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+  if (!fs.existsSync(legacyFiles[3]) ||
+      !(legacySessions.sessions || []).some((session) => session.id === legacyExternalId)) {
+    fail('legacy external metadata was converted from unknown to dead/cleaned');
+  }
+  for (const file of legacyFiles) fs.rmSync(file, { force: true });
+}
+
 // Name-authoritative re-adoption + dead-peer reaper (session leak hardening).
 async function sessionRecoveryWorkflow() {
   if (!tmuxAvailable()) {
@@ -6967,6 +7757,11 @@ async function sessionRecoveryWorkflow() {
   if (!binding || binding.runtime_target !== pane) {
     fail(`readopt peer binding not live after start:\n${JSON.stringify(binding, null, 2)}`);
   }
+  const detachedTaskOutput = hcc(['task', 'create', '--from', 'human', '--to', readoptPeer, '--title', 'detached tmux evidence']);
+  const detachedTaskMatch = detachedTaskOutput.match(/created task #(\d+):/);
+  if (!detachedTaskMatch) fail(`cannot parse detached tmux task id: ${detachedTaskOutput}`);
+  const detachedTaskId = detachedTaskMatch[1];
+  hcc(['task', 'claim', '--peer', readoptPeer, '--id', detachedTaskId]);
   hcc(['peer', 'stop', readoptPeer]); // default = detach, leaves tmux alive
   // Immediately after a default stop: tmux session still alive, binding detached.
   if (runMaybe('tmux', ['has-session', '-t', sessionName]).status !== 0) {
@@ -6975,6 +7770,16 @@ async function sessionRecoveryWorkflow() {
   binding = peerBindingRow(readoptPeer);
   if (!binding || binding.runtime_target !== null) {
     fail(`default stop did not detach binding:\n${JSON.stringify(binding, null, 2)}`);
+  }
+  withMeshDb((db) => db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?')
+    .run(Math.floor(Date.now() / 1000) - 7200, readoptPeer));
+  const detachedRow = hccJson(['task', 'list', '--all'])
+    .find((row) => String(row.id) === String(detachedTaskId));
+  const detachedTakeover = hccMaybe(['task', 'takeover', '--peer', 'detached-taker', '--id', detachedTaskId, '--reason', 'must reject live tmux', '--policy', 'stale', '--stale-after', '60']);
+  if (detachedRow?.owner_evidence_state !== 'live' ||
+      detachedRow?.owner_evidence_reason !== 'tmux_identity_match' ||
+      detachedTakeover.status === 0) {
+    fail(`live detached tmux pane did not block takeover: ${JSON.stringify(detachedRow)}\n${detachedTakeover.stdout}\n${detachedTakeover.stderr}`);
   }
   // Within a few poll cycles the name-sweep must re-adopt the still-live session.
   await waitFor(() => {
@@ -6988,6 +7793,8 @@ async function sessionRecoveryWorkflow() {
   if (!(sessions.sessions || []).some((s) => s.id === readoptPeer && s.status === 'running')) {
     fail(`re-adopted session not exposed by /api/sessions:\n${JSON.stringify(sessions, null, 2)}`);
   }
+  hcc(['task', 'takeover', '--peer', 'human', '--id', detachedTaskId, '--reason', 'detached evidence cleanup', '--force']);
+  hcc(['task', 'update', '--peer', 'human', '--id', detachedTaskId, '--status', 'abandoned', '--summary', 'detached evidence cleanup']);
   // Destroying the live session is the real teardown path (CLI peer stop has
   // no kill flag; the web API's kill_tmux is the equivalent). Kill it directly
   // so it does not leak into the final tmux-session leak assertion.
@@ -7007,10 +7814,18 @@ async function sessionRecoveryWorkflow() {
   withMeshDb((db) => {
     const t = Math.floor(Date.now() / 1000);
     db.prepare(`
-      INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
-      VALUES (?, 'shell', 'peer', ?, '', ?, 'running', '', ?, ?)
-      ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, status = 'running', last_seen_at = excluded.last_seen_at
-    `).run('reap-dead', root, deadPid, t, t);
+      INSERT INTO peers(
+        id, kind, role, worktree, branch, pid, pid_start_token,
+        pid_command_hash, status, capabilities, created_at, last_seen_at
+      )
+      VALUES (?, 'shell', 'peer', ?, '', ?, 'dead:identity', ?, 'running', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        pid = excluded.pid,
+        pid_start_token = excluded.pid_start_token,
+        pid_command_hash = excluded.pid_command_hash,
+        status = 'running',
+        last_seen_at = excluded.last_seen_at
+    `).run('reap-dead', root, deadPid, 'd'.repeat(64), t, t);
     db.prepare(`
       INSERT INTO peer_bindings(peer, provider, resume_mode, transport, runtime_session_id, runtime_target, created_at, updated_at)
       VALUES (?, 'shell', 'attached', 'tmux', ?, 'DEADPANE', ?, ?)
@@ -7136,9 +7951,11 @@ function doctorReadOnlyWorkflow() {
 
 // `hcc gc` must cover messages/handoffs/expired locks (not just events/tasks).
 function gcCoverageWorkflow() {
-  log('gc coverage: messages + handoffs + expired locks');
+  log('gc coverage: messages + handoffs + expired locks + dead-only peers');
   const t = Math.floor(Date.now() / 1000);
   const liveLockResource = 'gc-live-lock';
+  const unknownPeer = 'gc-legacy-unknown';
+  const deadPeer = 'gc-confirmed-dead';
   // Track the exact message row we insert. Assert per-row afterwards: a late
   // async message write from an earlier workflow (e.g. broadcast) can land with
   // a created_at that gc's second-resolution cutoff excludes, so whole-table
@@ -7147,9 +7964,20 @@ function gcCoverageWorkflow() {
   withMeshDb((db) => {
     db.prepare(`
       INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
-      VALUES ('gc-peer', 'shell', 'peer', ?, '', NULL, 'idle', '', ?, ?)
-      ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+      VALUES ('gc-peer', 'shell', 'peer', ?, '', NULL, 'exited', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = 'exited', last_seen_at = excluded.last_seen_at
     `).run(root, t, t);
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, pid_start_token, pid_command_hash, status, capabilities, created_at, last_seen_at)
+      VALUES (?, 'shell', 'peer', ?, '', NULL, NULL, NULL, 'working', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL,
+        status = 'working', last_seen_at = excluded.last_seen_at
+    `).run(unknownPeer, root, t - 100000, t - 100000);
+    db.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, pid, pid_start_token, pid_command_hash, status, capabilities, created_at, last_seen_at)
+      VALUES (?, 'shell', 'peer', ?, '', NULL, NULL, NULL, 'exited', '', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = 'exited', last_seen_at = excluded.last_seen_at
+    `).run(deadPeer, root, t - 100000, t - 100000);
     db.prepare(`
       INSERT INTO messages(sender, recipient, kind, body, thread_id, created_at)
       VALUES ('gc-peer', 'gc-peer', 'note', 'stale', NULL, ?)
@@ -7174,6 +8002,7 @@ function gcCoverageWorkflow() {
   if (!/old messages:\s+[1-9]/.test(out)) fail(`gc did not report deleted messages:\n${out}`);
   if (!/old handoffs:\s+[1-9]/.test(out)) fail(`gc did not report deleted handoffs:\n${out}`);
   if (!/expired locks:\s+[1-9]/.test(out)) fail(`gc did not report expired locks:\n${out}`);
+  if (!/unknown peers deferred:\s+[1-9]/.test(out)) fail(`gc did not report deferred unknown peers:\n${out}`);
 
   withMeshDb((db) => {
     if (db.prepare('SELECT COUNT(*) AS n FROM messages WHERE id = ?').get(gcMessageId).n !== 0) fail('gc left our message behind');
@@ -7182,9 +8011,12 @@ function gcCoverageWorkflow() {
     if (db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(t).n !== 0) fail('gc left expired locks behind');
     const live = db.prepare('SELECT resource FROM locks WHERE resource = ?').get(liveLockResource);
     if (!live) fail('gc deleted a not-yet-expired lock');
+    if (!db.prepare('SELECT id FROM peers WHERE id = ?').get(unknownPeer)) fail('gc deleted a legacy peer with unknown evidence');
+    if (db.prepare('SELECT id FROM peers WHERE id = ?').get(deadPeer)) fail('gc retained a confirmed-dead peer');
     // Cleanup
     db.prepare('DELETE FROM locks WHERE resource = ?').run(liveLockResource);
     db.prepare('DELETE FROM peers WHERE id = ?').run('gc-peer');
+    db.prepare('DELETE FROM peers WHERE id = ?').run(unknownPeer);
   });
 }
 
@@ -7198,6 +8030,7 @@ async function main() {
   await waitRuntime();
   hcc(['peer', 'list']);
   await dbWorkflow();
+  await processEvidenceWorkflow();
   await multiProjectWebWorkflow();
   await tmuxBackedStartWorkflow();
   await shimTmuxWorkflow();
