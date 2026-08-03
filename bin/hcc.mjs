@@ -77,7 +77,8 @@ import {
   writeGlobalRuntime,
   writeRuntime
 } from '../lib/runtime/state.mjs';
-import { runtimeRequest } from '../lib/runtime/client.mjs';
+import { runtimeBufferGcUnavailable, runtimeRequest } from '../lib/runtime/client.mjs';
+import { pruneBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import {
   detectBranch,
   detectRoot
@@ -3038,6 +3039,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const resizeFile = path.join(bufsDir, `${id}.resize`);
     const metaFile = path.join(bufsDir, `${id}.meta`);
     if (!fs.existsSync(outFile)) return;
+    // An output file without producer metadata is an orphan, not a running
+    // session. The external wrapper writes metadata during startup and the
+    // watcher retries, so waiting here also avoids inventing PID-less sessions.
+    if (!fs.existsSync(metaFile)) return;
 
     let meta = { kind: 'external', role: 'peer', command: '(shim)', cwd: ctx.root, pid: null, wrapper_pid: null, cols: 120, rows: 40 };
     try { meta = { ...meta, ...JSON.parse(fs.readFileSync(metaFile, 'utf8')) }; } catch {}
@@ -3065,7 +3070,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       childIdentity: meta.child_identity || null,
       wrapperIdentity: meta.wrapper_identity || null,
       type: 'external',
-      outFile, inFile, resizeFile,
+      outFile, inFile, resizeFile, metaFile,
       status: 'running',
       createdAt: now(),
       exitedAt: null,
@@ -3446,30 +3451,39 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // prunes high-volume/ephemeral items (events >14d, expired locks, stale bufs),
   // never peers/tasks/messages/handoffs. Runs once at startup then every 6h.
   let autoGcInFlight = false;
-  function protectedBufferFileNames(projectCtx) {
-    const names = new Set();
-    const projectBufsDir = path.resolve(path.join(projectCtx.root, '.hello-cc', BUFS_DIR_NAME));
-    // Buffer adoption/watchers are still primary-project scoped. Until they
-    // are split per project, preserve every sibling buffer rather than deleting
-    // a live file the primary runtime cannot see.
-    if (!sameResolvedPath(projectCtx.root, ctx.root)) {
-      try {
-        for (const file of fs.readdirSync(projectBufsDir)) names.add(file);
-      } catch {}
-      return names;
-    }
-    // tmux FIFO storage currently uses the primary bufsDir even for sibling
-    // sessions, so protect by actual file location rather than session owner.
+  function runningBufferPathSnapshot() {
+    const protectedPaths = new Set();
     for (const session of sessions.values()) {
       if (session.status !== 'running') continue;
-      for (const file of [session.outFile, session.inFile, session.resizeFile, session.pipeFile]) {
-        if (file && path.resolve(path.dirname(file)) === projectBufsDir) names.add(path.basename(file));
-      }
-      if (session.type === 'external' && session.id && sameResolvedPath(session.root, projectCtx.root)) {
-        names.add(path.basename(`${session.id}.meta`));
+      for (const file of [session.outFile, session.inFile, session.resizeFile, session.pipeFile, session.metaFile]) {
+        if (file) protectedPaths.add(path.resolve(file));
       }
     }
-    return names;
+    return protectedPaths;
+  }
+
+  function runtimeBufferGc(projectCtx, { cutoffMs, dryRun }) {
+    const protectedPaths = runningBufferPathSnapshot();
+    const directories = new Set([bufferDirectory(projectCtx)]);
+    for (const file of protectedPaths) directories.add(path.dirname(file));
+    return pruneBufferFiles({
+      directories,
+      cutoffMs,
+      protectedPaths,
+      dryRun
+    });
+  }
+
+  function autoGcProtectedBufferPaths(projectCtx) {
+    const protectedPaths = runningBufferPathSnapshot();
+    // External adoption remains primary-project scoped. Until sibling watchers
+    // exist, every sibling file is unknown to this runtime and must be retained.
+    if (!sameResolvedPath(projectCtx.root, ctx.root)) {
+      for (const file of bufferDirectoryPaths(bufferDirectory(projectCtx))) {
+        protectedPaths.add(file);
+      }
+    }
+    return protectedPaths;
   }
   function runAutoGc() {
     if (autoGcInFlight) return;
@@ -3483,7 +3497,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             olderThanDays: 14,
             dryRun: false,
             scope: 'auto',
-            protectedBufFiles: protectedBufferFileNames(projectCtx)
+            protectedBufFiles: autoGcProtectedBufferPaths(projectCtx)
           });
           try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); } catch {}
         } catch (err) {
@@ -5421,6 +5435,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           projects: knownProjects(),
           sessions: sessionsForProject(reqCtx).length
         });
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/runtime/gc-buffers') {
+        const input = await readJsonRequest(req);
+        const cutoffMs = Number(input.cutoffMs);
+        if (!Number.isFinite(cutoffMs)) {
+          throw new CliError('BAD_REQUEST', 'cutoffMs must be a finite number');
+        }
+        sendJson(res, 200, runtimeBufferGc(reqCtx, {
+          cutoffMs,
+          dryRun: Boolean(input.dryRun)
+        }));
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/runtime/stop') {
@@ -7503,7 +7529,9 @@ function runGc(ctx, db, {
   olderThanDays = 7,
   dryRun = false,
   scope = 'full',
-  protectedBufFiles = null
+  protectedBufFiles = null,
+  bufferCutoffMs = null,
+  skipBufferFiles = false
 } = {}) {
   const auto = scope === 'auto';
   const historyCategories = auto ? ['events'] : ['events', 'tasks', 'messages', 'handoffs'];
@@ -7521,6 +7549,8 @@ function runGc(ctx, db, {
       dryRun,
       auto,
       protectedBufFiles,
+      bufferCutoffMs,
+      skipBufferFiles,
       historyCategories,
       gcNow,
       historySnapshot
@@ -7534,6 +7564,8 @@ function runGcWithHistorySnapshot(ctx, db, {
   dryRun,
   auto,
   protectedBufFiles,
+  bufferCutoffMs,
+  skipBufferFiles,
   historyCategories,
   gcNow,
   historySnapshot
@@ -7552,6 +7584,7 @@ function runGcWithHistorySnapshot(ctx, db, {
   const results = {
     buf_files: 0,
     protected_buf_files: 0,
+    deferred_buf_files: 0,
     stale_peers: 0,
     old_events: 0,
     old_tasks: 0,
@@ -7565,24 +7598,21 @@ function runGcWithHistorySnapshot(ctx, db, {
   };
 
   // Buffer files (high-volume ephemeral). Auto keeps a shorter 7-day window.
-  const bufCutoffMs = Date.now() - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
+  const bufCutoffMs = Number.isFinite(bufferCutoffMs)
+    ? bufferCutoffMs
+    : gcNow * 1000 - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
-  if (!graceActive) try {
-    for (const f of fs.readdirSync(bufsDir)) {
-      const fp = path.join(bufsDir, f);
-      try {
-        const st = fs.statSync(fp);
-        if (st.mtimeMs < bufCutoffMs) {
-          if (auto && protectedBuffers.has(f)) {
-            results.protected_buf_files++;
-            continue;
-          }
-          if (!dryRun) fs.unlinkSync(fp);
-          results.buf_files++;
-        }
-      } catch {}
-    }
-  } catch {}
+  if (!graceActive && !skipBufferFiles) {
+    const bufferResult = pruneBufferFiles({
+      directories: [bufsDir],
+      cutoffMs: bufCutoffMs,
+      protectedPaths: protectedBuffers,
+      dryRun
+    });
+    results.buf_files = bufferResult.deleted;
+    results.protected_buf_files = bufferResult.protected;
+    results.deferred_buf_files = bufferResult.deferred;
+  }
 
   // A clock jump can make every lock look expired at once. Preserve those rows
   // for the grace window so acquisition and heartbeat logic can recover them.
@@ -7639,15 +7669,174 @@ function runGcWithHistorySnapshot(ctx, db, {
   return results;
 }
 
+function bufferDirectory(ctx) {
+  return path.resolve(path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME));
+}
+
+function bufferDirectoryPaths(directory) {
+  try {
+    return fs.readdirSync(directory).map((name) => path.resolve(directory, name));
+  } catch {
+    return [];
+  }
+}
+
+function deferEligibleBufferFiles(directory, cutoffMs) {
+  return pruneBufferFiles({
+    directories: [directory],
+    cutoffMs,
+    unknownPaths: bufferDirectoryPaths(directory),
+    dryRun: true
+  });
+}
+
+function externalBufferEvidence(meta) {
+  const processes = [];
+  const wrapperPid = meta?.wrapper_pid || meta?.wrapperPid || null;
+  const childPid = meta?.pid || null;
+  if (wrapperPid) processes.push({
+    name: 'wrapper',
+    storedIdentity: meta?.wrapper_identity || meta?.wrapperIdentity || null,
+    current: inspectProcessIdentity(wrapperPid)
+  });
+  if (childPid) processes.push({
+    name: 'child',
+    storedIdentity: meta?.child_identity || meta?.childIdentity || null,
+    current: inspectProcessIdentity(childPid)
+  });
+  return resolvePeerEvidence({ peer: { status: 'running' }, processes });
+}
+
+function addExternalBufferGroup(target, directory, id) {
+  for (const suffix of ['out', 'in', 'resize', 'meta']) {
+    target.add(path.resolve(directory, `${id}.${suffix}`));
+  }
+}
+
+function localBufferEvidence(ctx, db, directory) {
+  const protectedPaths = new Set();
+  const unknownPaths = new Set();
+
+  for (const file of bufferDirectoryPaths(directory)) {
+    if (!file.endsWith('.meta')) continue;
+    const id = path.basename(file, '.meta');
+    let meta;
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('metadata is not a regular file');
+      meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      addExternalBufferGroup(unknownPaths, directory, id);
+      continue;
+    }
+    const evidence = externalBufferEvidence(meta);
+    if (evidence.state === 'live') addExternalBufferGroup(protectedPaths, directory, id);
+    else if (evidence.state === 'unknown') addExternalBufferGroup(unknownPaths, directory, id);
+  }
+
+  const tmuxPaths = new Set();
+  const rows = db.prepare(`
+    SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
+           b.transport, b.runtime_session_id, b.runtime_target
+    FROM peer_bindings b
+    JOIN peers p ON p.id = b.peer
+    WHERE b.transport = 'tmux' AND b.runtime_target IS NOT NULL
+  `).all();
+  for (const row of rows) {
+    const evidence = observePeerEvidence(ctx, row, row);
+    const safePane = String(row.runtime_target || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const runtimeIds = new Set([row.runtime_session_id, row.id].filter(Boolean));
+    for (const runtimeId of runtimeIds) {
+      const safeId = String(runtimeId).replace(/[^a-zA-Z0-9_-]/g, '');
+      if (!safePane || !safeId) continue;
+      const file = path.resolve(directory, `tmux-${safePane}-${safeId}.pipe`);
+      tmuxPaths.add(file);
+      if (evidence.state === 'live') protectedPaths.add(file);
+      else if (evidence.state === 'unknown') unknownPaths.add(file);
+    }
+  }
+
+  // A FIFO without a DB identity cannot be proven orphaned. Preserve it as
+  // unknown; exact dead DB/tmux evidence above is the only path to deletion.
+  for (const file of bufferDirectoryPaths(directory)) {
+    if (file.endsWith('.pipe') && !tmuxPaths.has(file)) unknownPaths.add(file);
+  }
+  return { protectedPaths, unknownPaths };
+}
+
+function runtimePointerPresent(ctx) {
+  return Boolean(process.env.HCC_RUNTIME_URL ||
+    fs.existsSync(runtimePath(ctx)) ||
+    fs.existsSync(globalRuntimePath()));
+}
+
+async function arbitrateManualBufferGc(ctx, db, { cutoffMs, dryRun }) {
+  const directory = bufferDirectory(ctx);
+  const pointerPresent = runtimePointerPresent(ctx);
+  let runtime = null;
+  try { runtime = readRuntime(ctx); } catch (error) {
+    if (pointerPresent) return deferEligibleBufferFiles(directory, cutoffMs);
+    if (error?.code !== 'RUNTIME_NOT_RUNNING') throw error;
+  }
+
+  if (runtime) {
+    try {
+      return await runtimeRequest(ctx, 'POST', '/api/runtime/gc-buffers', {
+        cutoffMs,
+        dryRun
+      }, runtime, { timeoutMs: 5000 });
+    } catch (error) {
+      if (runtimeBufferGcUnavailable(error)) {
+        return deferEligibleBufferFiles(directory, cutoffMs);
+      }
+      throw error;
+    }
+  }
+
+  const { protectedPaths, unknownPaths } = localBufferEvidence(ctx, db, directory);
+  return pruneBufferFiles({
+    directories: [directory],
+    cutoffMs,
+    protectedPaths,
+    unknownPaths,
+    dryRun
+  });
+}
+
+function requireBufferGcResult(value) {
+  const result = {};
+  for (const key of ['deleted', 'protected', 'deferred']) {
+    const count = Number(value?.[key]);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new CliError('RUNTIME_BAD_RESPONSE', `Runtime buffer GC returned an invalid ${key} count`);
+    }
+    result[key] = count;
+  }
+  return result;
+}
+
 async function cmdGc(ctx, args) {
   if (wantsHelp(args)) return helpGc();
   const opts = parseOpts(args, { booleans: ['yes', 'force'] });
   const olderThanDays = intOpt(opts, 'older-than', 7);
   const dryRun = !opts.yes && !opts.force;
+  const bufferCutoffMs = Date.now() - olderThanDays * 86400000;
   const db = connect(ctx);
   let results;
   try {
-    results = runGc(ctx, db, { olderThanDays, dryRun, scope: 'full' });
+    results = runGc(ctx, db, {
+      olderThanDays,
+      dryRun,
+      scope: 'full',
+      bufferCutoffMs,
+      skipBufferFiles: true
+    });
+    const bufferResult = requireBufferGcResult(results.deferred_age_based
+      ? deferEligibleBufferFiles(bufferDirectory(ctx), bufferCutoffMs)
+      : await arbitrateManualBufferGc(ctx, db, { cutoffMs: bufferCutoffMs, dryRun }));
+    results.buf_files = bufferResult.deleted;
+    results.protected_buf_files = bufferResult.protected;
+    results.deferred_buf_files = bufferResult.deferred;
     if (!dryRun) {
       // Reclaim WAL after deleting many rows (conc-05). Best-effort: may be busy
       // with other connections; the result is reported but never blocks.
@@ -7663,6 +7852,8 @@ async function cmdGc(ctx, args) {
   printResult(ctx, results, (r) => {
     const lines = [`gc completed${dryRun ? ' (dry-run, add --yes to apply)' : ''}:`];
     if (r.buf_files)     lines.push(`  buffer files:   ${r.buf_files}`);
+    if (r.protected_buf_files) lines.push(`  protected buffer files: ${r.protected_buf_files}`);
+    if (r.deferred_buf_files) lines.push(`  buffer files deferred: ${r.deferred_buf_files}`);
     if (r.stale_peers)   lines.push(`  stale peers:    ${r.stale_peers}`);
     if (r.deferred_unknown_peers) lines.push(`  unknown peers deferred: ${r.deferred_unknown_peers}`);
     if (r.deferred_history) lines.push(`  history rows deferred after subject change: ${r.deferred_history}`);
@@ -7674,7 +7865,7 @@ async function cmdGc(ctx, args) {
     if (r.expired_locks) lines.push(`  expired locks:  ${r.expired_locks}`);
     if (r.deferred_expired_locks) lines.push(`  expired locks deferred by clock grace: ${r.deferred_expired_locks}`);
     if (r.wal_checkpoint) lines.push(`  wal checkpoint: ${r.wal_checkpoint.busy ? 'busy' : 'ok'} (log ${r.wal_checkpoint.log}, checkpointed ${r.wal_checkpoint.checkpointed})`);
-    if (!r.buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
+    if (!r.buf_files && !r.protected_buf_files && !r.deferred_buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
         !r.old_messages && !r.old_handoffs && !r.expired_locks && !r.deferred_expired_locks &&
         !r.deferred_unknown_peers && !r.deferred_history && !r.deferred_age_based) {
       lines.push('  nothing to clean');

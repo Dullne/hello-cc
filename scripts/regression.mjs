@@ -14,6 +14,7 @@ import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -3980,6 +3981,319 @@ async function multiProjectWebWorkflow() {
   hccFromMaybe(['peer', 'stop', 'other-shell'], otherRoot);
 }
 
+async function statusServer(status) {
+  const child = spawn(process.execPath, ['-e', `
+    const http = require('node:http');
+    const server = http.createServer((req, res) => {
+      res.writeHead(${status}, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'RUNTIME_VERSION_UNSUPPORTED', message: 'unsupported runtime' } }));
+    });
+    server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port) + '\\n'));
+    process.on('SIGTERM', () => server.close(() => process.exit(0)));
+  `], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const port = await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => reject(new Error(`timed out starting ${status} status server`)), 5000);
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+      const match = output.match(/^(\d+)\n/);
+      if (!match) return;
+      clearTimeout(timer);
+      resolve(Number(match[1]));
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`${status} status server exited early with ${code}`));
+    });
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    close: async () => {
+      child.kill('SIGTERM');
+      try { await waitForProcessExit(child.pid, `${status} status server exit`, 3000); } catch {}
+    }
+  };
+}
+
+async function stalledRuntimeServer(phase) {
+  const child = spawn(process.execPath, ['-e', `
+    const http = require('node:http');
+    const sockets = new Set();
+    const server = http.createServer((req, res) => {
+      if (${JSON.stringify(phase)} === 'body') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write('{"deleted":0');
+      }
+    });
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+    server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port) + '\\n'));
+    process.on('SIGTERM', () => {
+      for (const socket of sockets) socket.destroy();
+      server.close(() => process.exit(0));
+    });
+  `], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const port = await new Promise((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => reject(new Error(`timed out starting ${phase} stalled runtime`)), 5000);
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+      const match = output.match(/^(\d+)\n/);
+      if (!match) return;
+      clearTimeout(timer);
+      resolve(Number(match[1]));
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`${phase} stalled runtime exited early with ${code}`));
+    });
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    close: async () => {
+      child.kill('SIGTERM');
+      try { await waitForProcessExit(child.pid, `${phase} stalled runtime exit`, 3000); } catch {}
+    }
+  };
+}
+
+function bufferGcCanonicalizationRaceWorkflow() {
+  for (const phase of ['before', 'after']) {
+    const raceRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-realpath-${phase}-${testId}-`));
+    const directory = path.join(raceRoot, 'bufs');
+    const movedDirectory = path.join(raceRoot, 'moved-bufs');
+    const outsideDirectory = path.join(raceRoot, 'outside');
+    fs.mkdirSync(directory);
+    fs.mkdirSync(outsideDirectory);
+    const cutoffMs = Date.now() - 60_000;
+    let outsideFile = path.join(outsideDirectory, 'outside.out');
+    fs.writeFileSync(outsideFile, 'outside');
+    fs.utimesSync(outsideFile, new Date(cutoffMs - 60_000), new Date(cutoffMs - 60_000));
+    const originalRealpathSync = fs.realpathSync;
+    let replaced = false;
+    try {
+      fs.realpathSync = function interceptedRealpath(value, ...args) {
+        const matches = !replaced && path.resolve(String(value)) === path.resolve(directory);
+        if (matches && phase === 'before') {
+          replaced = true;
+          fs.renameSync(directory, movedDirectory);
+          fs.symlinkSync(outsideDirectory, directory);
+        }
+        const resolved = originalRealpathSync.call(this, value, ...args);
+        if (matches && phase === 'after') {
+          replaced = true;
+          fs.renameSync(directory, movedDirectory);
+          fs.mkdirSync(directory);
+          outsideFile = path.join(directory, 'outside.out');
+          fs.writeFileSync(outsideFile, 'replacement');
+          fs.utimesSync(outsideFile, new Date(cutoffMs - 60_000), new Date(cutoffMs - 60_000));
+        }
+        return resolved;
+      };
+      const plan = planBufferFiles({ directories: [directory], cutoffMs });
+      const result = applyBufferPlan(plan);
+      if (plan.deletePaths.length !== 0 || result.deleted !== 0 || !fs.existsSync(outsideFile)) {
+        fail(`buffer GC scanned a ${phase}-realpath replacement: ${JSON.stringify({ plan, result })}`);
+      }
+    } finally {
+      fs.realpathSync = originalRealpathSync;
+      fs.rmSync(raceRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+async function bufferGcArbitrationWorkflow() {
+  log('buffer GC: runtime arbitration, exact active paths, and safe fallback');
+  bufferGcCanonicalizationRaceWorkflow();
+  const runtime = currentRuntime();
+  const unauthorized = await fetch(new URL('/api/runtime/gc-buffers', runtime.base_url), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cutoffMs: Date.now(), dryRun: true })
+  });
+  if (unauthorized.status !== 401) fail(`buffer GC endpoint allowed missing auth: ${unauthorized.status}`);
+
+  const cutoffMs = Date.now() - 60_000;
+  const oldTime = new Date(cutoffMs - 60_000);
+  const rootBufs = path.join(root, '.hello-cc', 'bufs');
+  const siblingBufs = path.join(secondProjectRoot, '.hello-cc', 'bufs');
+  fs.mkdirSync(rootBufs, { recursive: true });
+  fs.mkdirSync(siblingBufs, { recursive: true });
+  const rootOrphan = path.join(rootBufs, `gc-orphan-${testId}.out`);
+  const siblingOrphan = path.join(siblingBufs, `gc-sibling-orphan-${testId}.out`);
+  fs.writeFileSync(rootOrphan, 'orphan');
+  fs.writeFileSync(siblingOrphan, 'sibling orphan');
+  fs.utimesSync(rootOrphan, oldTime, oldTime);
+  fs.utimesSync(siblingOrphan, oldTime, oldTime);
+
+  const liveId = `gc-live-external-${testId}`;
+  const liveFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${liveId}.${suffix}`));
+  for (const file of liveFiles.slice(0, 3)) fs.writeFileSync(file, file.endsWith('.out') ? 'live\n' : '');
+  const identity = inspectProcessIdentity(process.pid).identity;
+  fs.writeFileSync(liveFiles[3], JSON.stringify({
+    id: liveId,
+    kind: 'shell',
+    role: 'peer',
+    command: 'regression live external',
+    cwd: root,
+    pid: process.pid,
+    wrapper_pid: process.pid,
+    child_identity: identity,
+    wrapper_identity: identity,
+    cols: 120,
+    rows: 40
+  }));
+  await waitFor(async () => {
+    const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+    return (data.sessions || []).some((session) => session.id === liveId);
+  }, 'buffer GC live external adoption');
+  for (const file of liveFiles) fs.utimesSync(file, oldTime, oldTime);
+
+  const legacyId = `gc-legacy-${testId}`;
+  const legacyFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${legacyId}.${suffix}`));
+  for (const file of legacyFiles.slice(0, 3)) fs.writeFileSync(file, '');
+  fs.writeFileSync(legacyFiles[3], JSON.stringify({ id: legacyId, pid: process.pid, wrapper_pid: process.pid }));
+  for (const file of legacyFiles) fs.utimesSync(file, oldTime, oldTime);
+  await waitFor(async () => {
+    const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+    return (data.sessions || []).some((session) => session.id === legacyId);
+  }, 'buffer GC legacy external adoption');
+
+  let siblingPeer = null;
+  let siblingPipe = null;
+  if (tmuxAvailable()) {
+    siblingPeer = `gc-sibling-live-${testId}`;
+    const started = hccFrom(['peer', 'start', siblingPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc'], secondProjectRoot);
+    const pane = parsePane(started);
+    const safePane = pane.replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeId = siblingPeer.replace(/[^a-zA-Z0-9_-]/g, '');
+    siblingPipe = path.join(rootBufs, `tmux-${safePane}-${safeId}.pipe`);
+    await waitFor(() => fs.existsSync(siblingPipe), 'sibling-project tmux FIFO');
+    fs.utimesSync(siblingPipe, oldTime, oldTime);
+  }
+
+  const siblingDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    siblingDb.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+    siblingDb.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(Math.floor(Date.now() / 1000)));
+  } finally {
+    siblingDb.close();
+  }
+  const aliasContainer = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-alias-${testId}-`));
+  const parentAlias = path.join(aliasContainer, 'parent');
+  fs.symlinkSync(path.dirname(secondProjectRoot), parentAlias);
+  const siblingAliasRoot = path.join(parentAlias, path.basename(secondProjectRoot));
+  const gcOutput = hccFrom(['--json', 'gc', '--older-than', '0', '--yes'], siblingAliasRoot);
+  fs.rmSync(aliasContainer, { recursive: true, force: true });
+  const gcPayload = JSON.parse(gcOutput);
+  const result = gcPayload.data || {};
+  const expectedProtected = liveFiles.length + legacyFiles.length + (siblingPipe ? 1 : 0);
+  if (result.buf_files !== 2 || result.protected_buf_files < expectedProtected || result.deferred_buf_files !== 0) {
+    fail(`buffer GC endpoint returned incomplete counts: ${JSON.stringify(result)}`);
+  }
+  for (const file of [rootOrphan, siblingOrphan]) {
+    if (fs.existsSync(file)) fail(`sibling-root buffer GC did not remove old orphan: ${file}`);
+  }
+  for (const file of [...liveFiles, ...legacyFiles, ...(siblingPipe ? [siblingPipe] : [])]) {
+    if (!fs.existsSync(file)) fail(`buffer GC removed active/unknown file: ${file}`);
+  }
+  if (siblingPeer) hccFromMaybe(['peer', 'stop', siblingPeer], secondProjectRoot);
+  for (const file of [...liveFiles, ...legacyFiles]) fs.rmSync(file, { force: true });
+
+  for (const status of ['unreachable', 404, 426]) {
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-${status}-${testId}-`));
+    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-home-${status}-${testId}-`));
+    let server = null;
+    try {
+      const isolatedEnv = { ...env, HOME: isolatedHome };
+      run(process.execPath, [hccBin, '--root', isolatedRoot, 'init', '--no-guidance'], { env: isolatedEnv });
+      const directory = path.join(isolatedRoot, '.hello-cc', 'bufs');
+      fs.mkdirSync(directory, { recursive: true });
+      const orphan = path.join(directory, 'old-orphan.out');
+      fs.writeFileSync(orphan, 'orphan');
+      fs.utimesSync(orphan, oldTime, oldTime);
+      if (status !== 'unreachable') server = await statusServer(status);
+      const pointer = {
+        pid: process.pid,
+        base_url: server?.baseUrl || 'http://127.0.0.1:1',
+        token: 'regression-token'
+      };
+      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify(pointer));
+      const gc = run(process.execPath, [hccBin, '--root', isolatedRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: isolatedEnv });
+      const payload = JSON.parse(gc);
+      if (!fs.existsSync(orphan) || Number(payload.data?.deferred_buf_files || 0) < 1) {
+        fail(`runtime ${status} did not defer eligible buffer cleanup: ${gc}`);
+      }
+    } finally {
+      await server?.close();
+      fs.rmSync(isolatedRoot, { recursive: true, force: true });
+      fs.rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  }
+
+  for (const phase of ['headers', 'body']) {
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-stall-${phase}-${testId}-`));
+    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-stall-home-${phase}-${testId}-`));
+    let server = null;
+    try {
+      const isolatedEnv = { ...env, HOME: isolatedHome };
+      run(process.execPath, [hccBin, '--root', isolatedRoot, 'init', '--no-guidance'], { env: isolatedEnv });
+      const directory = path.join(isolatedRoot, '.hello-cc', 'bufs');
+      fs.mkdirSync(directory, { recursive: true });
+      const orphan = path.join(directory, 'old-orphan.out');
+      fs.writeFileSync(orphan, 'orphan');
+      fs.utimesSync(orphan, oldTime, oldTime);
+      server = await stalledRuntimeServer(phase);
+      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify({
+        pid: process.pid,
+        base_url: server.baseUrl,
+        token: 'regression-token'
+      }));
+
+      const startedAt = Date.now();
+      const gc = run(process.execPath, [hccBin, '--root', isolatedRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: isolatedEnv });
+      const elapsedMs = Date.now() - startedAt;
+      const payload = JSON.parse(gc);
+      if (elapsedMs >= 9000 ||
+          Number(payload.data?.buf_files || 0) !== 0 ||
+          Number(payload.data?.deferred_buf_files || 0) < 1 ||
+          !fs.existsSync(orphan)) {
+        fail(`runtime ${phase} stall did not fail closed within deadline (${elapsedMs}ms): ${gc}`);
+      }
+    } finally {
+      await server?.close();
+      fs.rmSync(isolatedRoot, { recursive: true, force: true });
+      fs.rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  }
+
+  const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-local-${testId}-`));
+  const localHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-local-home-${testId}-`));
+  try {
+    const localEnv = { ...env, HOME: localHome };
+    run(process.execPath, [hccBin, '--root', localRoot, 'init', '--no-guidance'], { env: localEnv });
+    const directory = path.join(localRoot, '.hello-cc', 'bufs');
+    fs.mkdirSync(directory, { recursive: true });
+    const files = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(directory, `legacy-local.${suffix}`));
+    for (const file of files.slice(0, 3)) fs.writeFileSync(file, '');
+    fs.writeFileSync(files[3], JSON.stringify({ id: 'legacy-local', pid: process.pid, wrapper_pid: process.pid }));
+    for (const file of files) fs.utimesSync(file, oldTime, oldTime);
+    const gc = run(process.execPath, [hccBin, '--root', localRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: localEnv });
+    const payload = JSON.parse(gc);
+    if (Number(payload.data?.deferred_buf_files || 0) < files.length || files.some((file) => !fs.existsSync(file))) {
+      fail(`CLI-only legacy metadata was not deferred: ${gc}`);
+    }
+  } finally {
+    fs.rmSync(localRoot, { recursive: true, force: true });
+    fs.rmSync(localHome, { recursive: true, force: true });
+  }
+}
+
 async function tmuxBackedStartWorkflow() {
   if (!tmuxAvailable()) {
     log('[5/13] tmux-backed start skipped (tmux not installed)');
@@ -4940,7 +5254,8 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/core/peers/liveness.mjs'") ||
       !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
-      !hccSource.includes("import { runtimeRequest } from '../lib/runtime/client.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime/client.mjs'") ||
+      !hccSource.includes("import { pruneBufferFiles } from '../lib/runtime/buffer-gc.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
       !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
@@ -8408,6 +8723,7 @@ async function main() {
   gcOutputConsistencyWorkflow();
   await processEvidenceWorkflow();
   await multiProjectWebWorkflow();
+  await bufferGcArbitrationWorkflow();
   await tmuxBackedStartWorkflow();
   await shimTmuxWorkflow();
   await tmuxWorkflow();
