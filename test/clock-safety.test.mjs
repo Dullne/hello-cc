@@ -4,7 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import {
   decideClockSafety,
-  observeClockSafety
+  observeClockSafety,
+  previewClockSafety
 } from '../lib/core/coordination/clock-safety.mjs';
 import {
   classifyClockDrift,
@@ -465,6 +466,27 @@ function sequenceDb({ withLock = false } = {}) {
   `);
   return db;
 }
+
+test('clock preview predicts pending-gap grace without changing persisted metadata', () => {
+  const db = sequenceDb();
+  db.prepare(`
+    INSERT INTO meta(key, value) VALUES ('clock_pending_gap', ?)
+  `).run(JSON.stringify({ from: 100, to: 1000, backward: false, first: false }));
+  const before = db.prepare('SELECT key, value FROM meta ORDER BY key').all();
+
+  const preview = previewClockSafety(db, {
+    operation: 'gc',
+    nowSec: 1001,
+    gcCutoffs: [500]
+  });
+
+  assert.deepEqual(preview, {
+    decision: { enterGrace: true, renewOwners: false, reason: 'gc-cutoff' },
+    graceUntil: 1121
+  });
+  assert.deepEqual(db.prepare('SELECT key, value FROM meta ORDER BY key').all(), before);
+  db.close();
+});
 
 test('empty observation preserves a gap for a later unknown boundary', () => {
   const db = sequenceDb();

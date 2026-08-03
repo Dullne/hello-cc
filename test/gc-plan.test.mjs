@@ -24,7 +24,8 @@ import {
   finalizeHistoryGcBatches,
   finalizeHistoryGcPlan,
   historyGcCutoffs,
-  runWithHistoryGcSnapshotCleanup
+  runWithHistoryGcSnapshotCleanup,
+  runWithHistoryGcSnapshotCleanupAsync
 } from '../lib/core/coordination/gc-plan.mjs';
 
 function withDropFailure(db, cleanupError, onDrop = () => {}) {
@@ -183,6 +184,31 @@ test('GC lock finalization binds task authority and deletes only an unchanged de
   db.close();
 });
 
+test('GC lock finalization defers the frozen set when its in-transaction mutation barrier closes', () => {
+  const db = fixtureDb();
+  db.exec(`
+    INSERT INTO peers VALUES ('owner', 'exited', 10, 'start', 'command', 100);
+    INSERT INTO peer_bindings VALUES ('owner', 'shell', NULL, 'process', NULL, 100);
+    INSERT INTO locks VALUES ('src/a', 'src/a', '*', 'owner', NULL, 'old', 500, 100, 90);
+  `);
+  const planned = captureGcLockSubjects(db, 1000);
+  const result = finalizeGcLockSubjects(
+    db,
+    planned,
+    new Map([['owner', { state: 'dead' }]]),
+    {
+      beforeMutate: () => {
+        assert.equal(db.isTransaction, true);
+        return false;
+      }
+    }
+  );
+
+  assert.deepEqual(result, { deleted: 0, deferred: 1, live: 0, blocked: true });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM locks WHERE resource = 'src/a'").get().n, 1);
+  db.close();
+});
+
 function seedHistory(db) {
   db.exec(`
     INSERT INTO tasks VALUES (1, 'done', 'done', 'owner', 100);
@@ -217,6 +243,28 @@ test('history GC plans exact rows and preserves handoffs linked to open tasks', 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM message_reads').get().n, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoffs WHERE id = 21').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE id = 2').get().n, 1);
+  db.close();
+});
+
+test('history GC snapshot separately counts old handoffs protected by open tasks', () => {
+  const db = fixtureDb();
+  seedHistory(db);
+  const snapshot = createHistoryGcSnapshot(db, 500);
+
+  assert.deepEqual(snapshot.eligibleCounts, {
+    events: 1,
+    tasks: 1,
+    messages: 1,
+    handoffs: 1
+  });
+  assert.deepEqual(snapshot.protectedCounts, {
+    events: 0,
+    tasks: 0,
+    messages: 0,
+    handoffs: 1
+  });
+
+  dropHistoryGcSnapshot(db, snapshot);
   db.close();
 });
 
@@ -466,6 +514,31 @@ test('history GC subtracts a committed batch before deferring a later drift', ()
   db.close();
 });
 
+test('history GC stops at an in-transaction mutation barrier and defers the exact snapshot remainder', () => {
+  const db = fixtureDb();
+  seedEvents(db, HISTORY_GC_BATCH_SIZE + 44);
+  const plan = captureHistoryGcPlan(db, 500, { categories: ['events'] });
+  let barrierCalls = 0;
+  const result = finalizeHistoryGcBatches(db, plan, {
+    beforeMutate: () => {
+      assert.equal(db.isTransaction, true);
+      barrierCalls += 1;
+      return barrierCalls === 1;
+    }
+  });
+
+  assert.deepEqual(result, {
+    old_events: HISTORY_GC_BATCH_SIZE,
+    old_tasks: 0,
+    old_messages: 0,
+    old_handoffs: 0,
+    deferred: 44
+  });
+  assert.equal(barrierCalls, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 44);
+  db.close();
+});
+
 test('history GC shares a bounded batch across categories and completes with zero deferred', () => {
   const db = fixtureDb();
   const event = db.prepare(`
@@ -643,6 +716,23 @@ test('history GC drops its snapshot when batch deletion throws', () => {
   assert.throws(() => finalizeHistoryGcBatches(db, plan), /forced history GC failure/);
   assert.deepEqual(historySnapshotNames(db), []);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 1);
+  db.close();
+});
+
+test('async history GC owner drops its snapshot after an awaited failure', async () => {
+  const db = fixtureDb();
+  seedEvents(db, 1);
+  const snapshot = createHistoryGcSnapshot(db, 500, { categories: ['events'] });
+  const primary = new Error('runtime apply failed');
+
+  await assert.rejects(
+    runWithHistoryGcSnapshotCleanupAsync(db, snapshot, async () => {
+      await Promise.resolve();
+      throw primary;
+    }),
+    (error) => error === primary
+  );
+  assert.deepEqual(historySnapshotNames(db), []);
   db.close();
 });
 

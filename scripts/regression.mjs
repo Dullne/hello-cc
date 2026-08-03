@@ -4115,6 +4115,73 @@ async function bufferGcArbitrationWorkflow() {
   });
   if (unauthorized.status !== 401) fail(`buffer GC endpoint allowed missing auth: ${unauthorized.status}`);
 
+  const legacyResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cutoffMs: Date.now(), observedAt: 1, retentionSec: 0, dryRun: true })
+  }, { root: secondProjectRoot });
+  if (legacyResponse.status !== 400) {
+    fail(`buffer GC endpoint accepted legacy client timing: ${legacyResponse.status}`);
+  }
+  const forgedResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: true, observedAt: 1 })
+  }, { root: secondProjectRoot });
+  if (forgedResponse.status !== 400) {
+    fail(`buffer GC endpoint accepted a forged timing tuple: ${forgedResponse.status}`);
+  }
+  const previewResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: true })
+  }, { root: secondProjectRoot });
+  const preview = await previewResponse.json();
+  if (!previewResponse.ok || Object.hasOwn(preview, 'token') ||
+      !Number.isSafeInteger(preview.observedAt) ||
+      preview.cutoffMs !== preview.observedAt * 1000 ||
+      !Array.isArray(preview.gcCutoffs)) {
+    fail(`buffer GC dry-run prepare returned an invalid preview: ${JSON.stringify(preview)}`);
+  }
+  const boundPrepareResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: false })
+  }, { root: secondProjectRoot });
+  const boundPrepare = await boundPrepareResponse.json();
+  if (!boundPrepareResponse.ok || !/^[A-Za-z0-9_-]{43}$/.test(boundPrepare.token || '')) {
+    fail(`buffer GC apply prepare omitted its one-shot token: ${JSON.stringify(boundPrepare)}`);
+  }
+  const mismatchResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'apply', token: boundPrepare.token })
+  }, { root });
+  if (mismatchResponse.ok) fail('buffer GC token was not bound to its prepared project');
+  const mismatchReplay = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'apply', token: boundPrepare.token })
+  }, { root: secondProjectRoot });
+  if (mismatchReplay.ok) fail('buffer GC binding mismatch did not consume the token');
+  const replayPrepareResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: false })
+  }, { root: secondProjectRoot });
+  const replayPrepare = await replayPrepareResponse.json();
+  const firstApply = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'apply', token: replayPrepare.token })
+  }, { root: secondProjectRoot });
+  const replayApply = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'apply', token: replayPrepare.token })
+  }, { root: secondProjectRoot });
+  if (!firstApply.ok || replayApply.ok) fail('buffer GC token was not exactly once');
+
   const cutoffMs = Date.now() - 60_000;
   const oldTime = new Date(cutoffMs - 60_000);
   const rootBufs = path.join(root, '.hello-cc', 'bufs');
@@ -4161,6 +4228,16 @@ async function bufferGcArbitrationWorkflow() {
     return (data.sessions || []).some((session) => session.id === legacyId);
   }, 'buffer GC legacy external adoption');
 
+  const isolatedProjectPreviewResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: true })
+  }, { root: secondProjectRoot });
+  const isolatedProjectPreview = await isolatedProjectPreviewResponse.json();
+  if (!isolatedProjectPreviewResponse.ok || isolatedProjectPreview.deleted !== 1) {
+    fail(`buffer GC scanned another project's unrelated actual directory: ${JSON.stringify(isolatedProjectPreview)}`);
+  }
+
   let siblingPeer = null;
   let siblingPipe = null;
   if (tmuxAvailable()) {
@@ -4176,13 +4253,49 @@ async function bufferGcArbitrationWorkflow() {
 
   const siblingDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
   try {
-    siblingDb.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+    siblingDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
     siblingDb.prepare(`
       INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(String(Math.floor(Date.now() / 1000)));
   } finally {
     siblingDb.close();
+  }
+  const graceRacePrepareResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'prepare', retentionSec: 0, dryRun: false })
+  }, { root: secondProjectRoot });
+  const graceRacePrepare = await graceRacePrepareResponse.json();
+  const graceRaceDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    graceRaceDb.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(Math.floor(Date.now() / 1000) + 120));
+  } finally {
+    graceRaceDb.close();
+  }
+  const graceRaceApplyResponse = await runtimeFetch('/api/runtime/gc-buffers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phase: 'apply', token: graceRacePrepare.token })
+  }, { root: secondProjectRoot });
+  const graceRaceApply = await graceRaceApplyResponse.json();
+  if (!graceRaceApplyResponse.ok || Number(graceRaceApply.deleted || 0) !== 0 ||
+      Number(graceRaceApply.deferred || 0) < 2 || graceRaceApply.complete !== false ||
+      !fs.existsSync(rootOrphan) || !fs.existsSync(siblingOrphan)) {
+    fail(`runtime buffer apply ignored grace extended after prepare: ${JSON.stringify(graceRaceApply)}`);
+  }
+  const clearGraceRaceDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    clearGraceRaceDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+    clearGraceRaceDb.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(Math.floor(Date.now() / 1000)));
+  } finally {
+    clearGraceRaceDb.close();
   }
   const aliasContainer = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-alias-${testId}-`));
   const parentAlias = path.join(aliasContainer, 'parent');
@@ -4203,6 +4316,159 @@ async function bufferGcArbitrationWorkflow() {
     if (!fs.existsSync(file)) fail(`buffer GC removed active/unknown file: ${file}`);
   }
   if (siblingPeer) hccFromMaybe(['peer', 'stop', siblingPeer], secondProjectRoot);
+
+  const setSiblingClockGap = (boundary) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const clockDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+    try {
+      clockDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+      clockDb.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(nowSec));
+      clockDb.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_pending_gap', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(JSON.stringify({
+        from: Math.max(0, boundary - 1),
+        to: nowSec,
+        backward: false,
+        first: false
+      }));
+    } finally {
+      clockDb.close();
+    }
+  };
+  const clearSiblingClockSafety = () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const clockDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+    try {
+      clockDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+      clockDb.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(nowSec));
+    } finally {
+      clockDb.close();
+    }
+  };
+
+  const gapOrphan = path.join(rootBufs, `gc-actual-dir-gap-${testId}.out`);
+  fs.writeFileSync(gapOrphan, 'actual directory pending gap');
+  fs.utimesSync(gapOrphan, oldTime, oldTime);
+  const unifiedIds = {};
+  const unifiedDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    const oldSec = Math.floor(oldTime.getTime() / 1000);
+    unifiedDb.prepare(`
+      INSERT INTO peers(id, kind, role, worktree, branch, status, capabilities, created_at, last_seen_at)
+      VALUES ('gc-unified-dead', 'shell', 'peer', ?, '', 'exited', '', ?, ?)
+    `).run(secondProjectRoot, oldSec, oldSec);
+    unifiedDb.prepare(`
+      INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at, ttl_sec)
+      VALUES ('gc-unified-lock', 'gc-unified-lock', '*', 'gc-unified-dead', 'expired', ?, ?, 90)
+    `).run(oldSec, oldSec);
+    unifiedIds.event = Number(unifiedDb.prepare(`
+      INSERT INTO events(type, actor, payload, created_at)
+      VALUES ('gc.unified.clock', 'seed', '{}', ?) RETURNING id
+    `).get(oldSec).id);
+  } finally {
+    unifiedDb.close();
+  }
+  setSiblingClockGap(Math.floor(fs.statSync(gapOrphan).mtimeMs / 1000));
+  const beforeGapPreviewDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  let beforeGapMeta;
+  try {
+    beforeGapMeta = beforeGapPreviewDb.prepare('SELECT key, value FROM meta ORDER BY key').all();
+  } finally {
+    beforeGapPreviewDb.close();
+  }
+  const gapPreview = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--history'], secondProjectRoot)).data;
+  const afterGapPreviewDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    const afterGapMeta = afterGapPreviewDb.prepare('SELECT key, value FROM meta ORDER BY key').all();
+    if (JSON.stringify(afterGapMeta) !== JSON.stringify(beforeGapMeta) ||
+        !afterGapPreviewDb.prepare('SELECT 1 FROM events WHERE id = ?').get(unifiedIds.event) ||
+        !afterGapPreviewDb.prepare("SELECT 1 FROM locks WHERE resource = 'gc-unified-lock'").get() ||
+        !afterGapPreviewDb.prepare("SELECT 1 FROM peers WHERE id = 'gc-unified-dead'").get()) {
+      fail(`manual GC dry-run changed unified clock state: ${JSON.stringify({ beforeGapMeta, afterGapMeta })}`);
+    }
+  } finally {
+    afterGapPreviewDb.close();
+  }
+  if (Number(gapPreview.deferred_buf_files || 0) < 1 ||
+      Number(gapPreview.deferred_old_events || 0) < 1 ||
+      Number(gapPreview.deferred_expired_locks || 0) < 1 ||
+      Number(gapPreview.deferred_stale_peers || 0) < 1) {
+    fail(`manual GC dry-run did not predict unified grace deferral: ${JSON.stringify(gapPreview)}`);
+  }
+
+  const gapGc = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--history', '--yes'], secondProjectRoot)).data;
+  if (!fs.existsSync(gapOrphan) || Number(gapGc.buf_files || 0) !== 0 ||
+      Number(gapGc.deferred_buf_files || 0) < 1 ||
+      Number(gapGc.protected_buf_files || 0) < liveFiles.length + legacyFiles.length ||
+      Number(gapGc.deferred_old_events || 0) < 1 ||
+      Number(gapGc.deferred_expired_locks || 0) < 1 ||
+      Number(gapGc.deferred_stale_peers || 0) < 1) {
+    fail(`actual runtime buffer directory ignored clock pending gap: ${JSON.stringify(gapGc)}`);
+  }
+  const afterGapApplyDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    if (!afterGapApplyDb.prepare('SELECT 1 FROM events WHERE id = ?').get(unifiedIds.event) ||
+        !afterGapApplyDb.prepare("SELECT 1 FROM locks WHERE resource = 'gc-unified-lock'").get() ||
+        !afterGapApplyDb.prepare("SELECT 1 FROM peers WHERE id = 'gc-unified-dead'").get()) {
+      fail('manual GC applied a database plan after runtime grace deferral');
+    }
+  } finally {
+    afterGapApplyDb.close();
+  }
+
+  clearSiblingClockSafety();
+  const normalOrphan = path.join(rootBufs, `gc-actual-dir-normal-${testId}.out`);
+  fs.writeFileSync(normalOrphan, 'actual directory normal baseline');
+  fs.utimesSync(normalOrphan, oldTime, oldTime);
+  const normalGc = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--yes'], secondProjectRoot)).data;
+  if (fs.existsSync(gapOrphan) || fs.existsSync(normalOrphan) || Number(normalGc.buf_files || 0) < 2) {
+    fail(`actual runtime buffer directory did not delete against a live baseline: ${JSON.stringify(normalGc)}`);
+  }
+
+  const failureRetentionDays = 100;
+  const failureRetentionSec = failureRetentionDays * 86400;
+  const failureOrphan = path.join(rootBufs, `gc-actual-dir-clock-failure-${testId}.out`);
+  const failureMtime = new Date((Math.floor(Date.now() / 1000) - 101 * 86400) * 1000);
+  fs.writeFileSync(failureOrphan, 'actual directory clock persistence failure');
+  fs.utimesSync(failureOrphan, failureMtime, failureMtime);
+  setSiblingClockGap(Math.floor(fs.statSync(failureOrphan).mtimeMs / 1000) + failureRetentionSec);
+  const failureDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    failureDb.exec(`
+      CREATE TRIGGER fail_runtime_buffer_gc_clock_grace
+      BEFORE INSERT ON meta
+      WHEN NEW.key = 'clock_grace_until'
+      BEGIN
+        SELECT RAISE(ABORT, 'runtime buffer clock persistence failure');
+      END
+    `);
+  } finally {
+    failureDb.close();
+  }
+  const failedGc = hccFromMaybe(
+    ['--json', 'gc', '--older-than', String(failureRetentionDays), '--yes'],
+    secondProjectRoot
+  );
+  const failedGcOutput = `${failedGc.stdout || ''}\n${failedGc.stderr || ''}`;
+  if (failedGc.status === 0 || !/"code"\s*:\s*"CLOCK_SAFETY_UNAVAILABLE"/.test(failedGcOutput) ||
+      !fs.existsSync(failureOrphan)) {
+    fail(`runtime buffer clock persistence failure did not fail closed:\n${failedGcOutput}`);
+  }
+  const cleanupFailureDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    cleanupFailureDb.exec('DROP TRIGGER fail_runtime_buffer_gc_clock_grace');
+    cleanupFailureDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+  } finally {
+    cleanupFailureDb.close();
+  }
+  fs.rmSync(failureOrphan, { force: true });
   for (const file of [...liveFiles, ...legacyFiles]) fs.rmSync(file, { force: true });
 
   for (const status of ['unreachable', 404, 426]) {
@@ -5255,7 +5521,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
       !hccSource.includes("} from '../lib/runtime/client.mjs'") ||
-      !hccSource.includes("import { pruneBufferFiles } from '../lib/runtime/buffer-gc.mjs'") ||
+      !hccSource.includes("} from '../lib/runtime/buffer-gc.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
       !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
@@ -7864,8 +8130,11 @@ async function syntaxAndHelp() {
   }
   const gcHelp = run(process.execPath, [hccBin, 'gc', '--help']);
   if (!gcHelp.includes('hcc gc') ||
-      !gcHelp.includes('gc [--older-than DAYS] [--yes]') ||
-      !gcHelp.includes('deletion requires --yes')) {
+      !gcHelp.includes('gc [--older-than DAYS] [--history] [--yes]') ||
+      !gcHelp.includes('history deletion requires both --history and --yes') ||
+      !gcHelp.includes('Handoffs linked to open tasks are always preserved') ||
+      !gcHelp.includes('--older-than must be zero or greater') ||
+      !gcHelp.includes('every age-based category is deferred')) {
     fail(`gc help missing cleanup semantics:\n${gcHelp}`);
   }
   const uninstallHelp = run(process.execPath, [hccBin, 'uninstall', '--help']);
@@ -8395,14 +8664,14 @@ function gcOutputConsistencyWorkflow() {
       db.close();
     }
 
-    const text = gcHcc(['gc', '--older-than', '1']);
-    const json = JSON.parse(gcHcc(['--json', 'gc', '--older-than', '1'])).data;
+    const text = gcHcc(['gc', '--older-than', '1', '--history']);
+    const json = JSON.parse(gcHcc(['--json', 'gc', '--older-than', '1', '--history'])).data;
     for (const [key, label] of [
       ['old_events', 'old events'],
       ['old_tasks', 'old tasks'],
       ['old_messages', 'old messages'],
       ['old_handoffs', 'old handoffs'],
-      ['deferred_history', 'history rows deferred after subject change']
+      ['deferred_history', 'history rows deferred']
     ]) {
       const match = text.match(new RegExp(`^\\s*${label}:\\s*(\\d+)`, 'm'));
       const textCount = match ? Number(match[1]) : 0;
@@ -8414,6 +8683,372 @@ function gcOutputConsistencyWorkflow() {
       if (json[key] !== 17) fail(`gc output fixture count wrong for ${key}: ${json[key]}`);
     }
     if (json.deferred_history !== 0) fail(`gc output fixture unexpectedly deferred ${json.deferred_history} rows`);
+  } finally {
+    fs.rmSync(gcRoot, { recursive: true, force: true });
+    fs.rmSync(gcHome, { recursive: true, force: true });
+  }
+}
+
+function manualGcRetentionContractWorkflow() {
+  log('manual GC: explicit history retention and clock-safe age cleanup');
+  const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-contract-root-${testId}-`));
+  const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-contract-home-${testId}-`));
+  const gcEnv = { ...env, HOME: gcHome };
+  for (const key of Object.keys(gcEnv)) {
+    if (key.startsWith('HCC_')) delete gcEnv[key];
+  }
+  const gcDbPath = path.join(gcRoot, '.hello-cc', 'mesh.db');
+  const gcHcc = (args) => run(process.execPath, [hccBin, '--root', gcRoot, ...args], { env: gcEnv });
+  const gcHccMaybe = (args) => runMaybe(process.execPath, [hccBin, '--root', gcRoot, ...args], { env: gcEnv });
+  const readJson = (args) => JSON.parse(gcHcc(['--json', ...args])).data;
+  const treeSnapshot = (directory) => {
+    const entries = [];
+    const visit = (current, relative = '') => {
+      for (const item of fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        const absolute = path.join(current, item.name);
+        const name = relative ? path.join(relative, item.name) : item.name;
+        if (item.isDirectory()) {
+          entries.push([name, 'directory']);
+          visit(absolute, name);
+        } else if (item.isSymbolicLink()) {
+          entries.push([name, 'symlink', fs.readlinkSync(absolute)]);
+        } else {
+          entries.push([name, 'file', crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')]);
+        }
+      }
+    };
+    visit(directory);
+    return entries;
+  };
+  const rowExists = (db, table, id) => Boolean(db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id));
+
+  try {
+    gcHcc(['init', '--no-guidance']);
+    const t = Math.floor(Date.now() / 1000);
+    const old = t - 10 * 86400;
+    const bufsDir = path.join(gcRoot, '.hello-cc', 'bufs');
+    const ordinaryBuffer = path.join(bufsDir, 'ordinary-orphan.out');
+    fs.mkdirSync(bufsDir, { recursive: true });
+    fs.writeFileSync(ordinaryBuffer, 'ordinary orphan');
+    fs.utimesSync(ordinaryBuffer, new Date((old - 60) * 1000), new Date((old - 60) * 1000));
+
+    const seeded = {};
+    const db = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      db.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(t));
+      db.prepare(`
+        INSERT INTO peers(id, kind, role, worktree, branch, status, capabilities, created_at, last_seen_at)
+        VALUES ('gc-contract-dead', 'shell', 'peer', ?, '', 'exited', '', ?, ?)
+      `).run(gcRoot, old, old);
+      db.prepare(`
+        INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at, ttl_sec)
+        VALUES ('gc-contract-expired', 'gc-contract-expired', '*', 'gc-contract-dead', 'expired', ?, ?, 90)
+      `).run(old, old);
+      seeded.event = Number(db.prepare(
+        "INSERT INTO events(type, actor, payload, created_at) VALUES ('gc.contract', 'seed', '{}', ?) RETURNING id"
+      ).get(old).id);
+      seeded.doneTask = Number(db.prepare(`
+        INSERT INTO tasks(title, status, created_at, updated_at)
+        VALUES ('gc contract done', 'done', ?, ?) RETURNING id
+      `).get(old, old).id);
+      seeded.openTask = Number(db.prepare(`
+        INSERT INTO tasks(title, status, created_at, updated_at)
+        VALUES ('gc contract open', 'running', ?, ?) RETURNING id
+      `).get(old, old).id);
+      seeded.message = Number(db.prepare(`
+        INSERT INTO messages(sender, recipient, kind, body, created_at)
+        VALUES ('seed', 'reader', 'note', 'gc contract old', ?) RETURNING id
+      `).get(old).id);
+      db.prepare('INSERT INTO message_reads(message_id, peer, read_at) VALUES (?, ?, ?)')
+        .run(seeded.message, 'reader', old);
+      seeded.handoff = Number(db.prepare(`
+        INSERT INTO handoffs(task_id, from_peer, summary, created_at)
+        VALUES (NULL, 'seed', 'gc contract eligible', ?) RETURNING id
+      `).get(old).id);
+      seeded.openHandoff = Number(db.prepare(`
+        INSERT INTO handoffs(task_id, from_peer, summary, created_at)
+        VALUES (?, 'seed', 'gc contract open task', ?) RETURNING id
+      `).get(seeded.openTask, old).id);
+      db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    } finally {
+      db.close();
+    }
+
+    const beforeInvalid = {
+      project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+      home: treeSnapshot(gcHome)
+    };
+    for (const forceArgs of [
+      ['gc', '--older-than', '0', '--force'],
+      ['gc', '--older-than', '0', '--history', '--force'],
+      ['gc', '--older-than', '0', '--yes', '--force']
+    ]) {
+      const beforeForce = {
+        project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+        home: treeSnapshot(gcHome)
+      };
+      const forced = gcHccMaybe(['--json', ...forceArgs]);
+      const forcedOutput = `${forced.stdout || ''}\n${forced.stderr || ''}`;
+      if (forced.status === 0 || !/"code"\s*:\s*"BAD_ARGS"/.test(forcedOutput)) {
+        fail(`GC force alias did not fail with BAD_ARGS for ${forceArgs.join(' ')}:\n${forced.stdout}\n${forced.stderr}`);
+      }
+      const afterForce = {
+        project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+        home: treeSnapshot(gcHome)
+      };
+      if (JSON.stringify(afterForce) !== JSON.stringify(beforeForce)) {
+        fail(`GC force alias changed project state for ${forceArgs.join(' ')}:\n${JSON.stringify({ beforeForce, afterForce }, null, 2)}`);
+      }
+    }
+
+    const invalidGcArgs = [
+      ['gc', '--older-than', '0', '--yes=false'],
+      ['gc', '--older-than', '0', '--yes=true'],
+      ['gc', '--older-than', '0', '--yes=0'],
+      ['gc', '--older-than', '0', '--yes='],
+      ['gc', '--older-than', '0', '--yes=false', '--yes'],
+      ['gc', '--older-than', '0', '--history=false'],
+      ['gc', '--older-than', '0', '--history=true'],
+      ['gc', '--older-than', '0', '--history=0'],
+      ['gc', '--older-than', '0', '--history='],
+      ['gc', '--older-than', '0', '--history=false', '--history'],
+      ...['-1', '-0', '-0.5', '0.9', '1day', 'NaN', 'Infinity', '9007199254740992', '01']
+        .map((value) => ['gc', '--older-than', value, '--yes'])
+    ];
+    for (const invalidArgs of invalidGcArgs) {
+      const beforeCase = {
+        project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+        home: treeSnapshot(gcHome)
+      };
+      const invalid = gcHccMaybe(['--json', ...invalidArgs]);
+      const invalidOutput = `${invalid.stdout || ''}\n${invalid.stderr || ''}`;
+      if (invalid.status === 0 || !/"code"\s*:\s*"BAD_ARGS"/.test(invalidOutput)) {
+        fail(`invalid GC arguments did not fail with BAD_ARGS for ${invalidArgs.join(' ')}:\n${invalid.stdout}\n${invalid.stderr}`);
+      }
+      const afterCase = {
+        project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+        home: treeSnapshot(gcHome)
+      };
+      if (JSON.stringify(afterCase) !== JSON.stringify(beforeCase)) {
+        fail(`invalid GC arguments changed state for ${invalidArgs.join(' ')}:\n${JSON.stringify({ beforeCase, afterCase }, null, 2)}`);
+      }
+    }
+    const afterInvalid = {
+      project: treeSnapshot(path.join(gcRoot, '.hello-cc')),
+      home: treeSnapshot(gcHome)
+    };
+    if (JSON.stringify(afterInvalid) !== JSON.stringify(beforeInvalid)) {
+      fail(`invalid GC arguments changed project state:\n${JSON.stringify({ beforeInvalid, afterInvalid }, null, 2)}`);
+    }
+
+    const ordinary = readJson(['gc', '--older-than', '0', '--yes']);
+    if (ordinary.old_events !== 0 || ordinary.old_tasks !== 0 ||
+        ordinary.old_messages !== 0 || ordinary.old_handoffs !== 0) {
+      fail(`ordinary GC applied business history without --history:\n${JSON.stringify(ordinary, null, 2)}`);
+    }
+    if (!ordinary.wal_checkpoint || ordinary.protected_old_events < 1 ||
+        ordinary.protected_old_tasks < 1 || ordinary.protected_old_messages < 1 ||
+        ordinary.protected_old_handoffs < 2) {
+      fail(`ordinary GC did not report applied technical cleanup and protected history:\n${JSON.stringify(ordinary, null, 2)}`);
+    }
+    const afterOrdinary = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      for (const [table, id] of [
+        ['events', seeded.event],
+        ['tasks', seeded.doneTask],
+        ['messages', seeded.message],
+        ['handoffs', seeded.handoff],
+        ['handoffs', seeded.openHandoff]
+      ]) {
+        if (!rowExists(afterOrdinary, table, id)) fail(`ordinary GC removed ${table} row ${id}`);
+      }
+      if (afterOrdinary.prepare("SELECT 1 FROM locks WHERE resource = 'gc-contract-expired'").get()) {
+        fail('ordinary GC did not remove eligible technical lock state');
+      }
+    } finally {
+      afterOrdinary.close();
+    }
+    if (fs.existsSync(ordinaryBuffer)) fail('ordinary GC did not remove eligible technical buffer state');
+
+    const historyDryRun = readJson(['gc', '--older-than', '0', '--history']);
+    for (const key of ['old_events', 'old_tasks', 'old_messages', 'old_handoffs']) {
+      if (Number(historyDryRun[key] || 0) < 1) {
+        fail(`history dry-run did not plan ${key}: ${JSON.stringify(historyDryRun, null, 2)}`);
+      }
+    }
+    if (Number(historyDryRun.protected_old_handoffs || 0) < 1) {
+      fail(`history dry-run did not report the open-task handoff as protected: ${JSON.stringify(historyDryRun, null, 2)}`);
+    }
+    const afterDryRun = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      if (!rowExists(afterDryRun, 'messages', seeded.message) ||
+          !rowExists(afterDryRun, 'handoffs', seeded.handoff)) {
+        fail('history dry-run changed persisted history');
+      }
+    } finally {
+      afterDryRun.close();
+    }
+
+    const historyApplied = readJson(['gc', '--older-than', '0', '--history', '--yes']);
+    for (const key of ['old_events', 'old_tasks', 'old_messages', 'old_handoffs']) {
+      if (Number(historyApplied[key] || 0) < 1) {
+        fail(`history apply did not remove ${key}: ${JSON.stringify(historyApplied, null, 2)}`);
+      }
+    }
+    if (!historyApplied.wal_checkpoint) {
+      fail(`history apply omitted its post-cleanup WAL checkpoint: ${JSON.stringify(historyApplied, null, 2)}`);
+    }
+    const afterHistory = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      for (const [table, id] of [
+        ['events', seeded.event],
+        ['tasks', seeded.doneTask],
+        ['messages', seeded.message],
+        ['handoffs', seeded.handoff]
+      ]) {
+        if (rowExists(afterHistory, table, id)) fail(`history GC retained eligible ${table} row ${id}`);
+      }
+      if (!rowExists(afterHistory, 'tasks', seeded.openTask) ||
+          !rowExists(afterHistory, 'handoffs', seeded.openHandoff)) {
+        fail('history GC removed an open task or its handoff');
+      }
+      if (afterHistory.prepare('SELECT 1 FROM message_reads WHERE message_id = ?').get(seeded.message)) {
+        fail('history GC left message_reads for a deleted message');
+      }
+    } finally {
+      afterHistory.close();
+    }
+
+    const protectedOnlyText = gcHcc(['gc', '--older-than', '0', '--history']);
+    if (!/^\s*protected old handoffs:\s*[1-9]/m.test(protectedOnlyText) ||
+        /^\s*nothing to clean\s*$/m.test(protectedOnlyText)) {
+      fail(`history GC text did not report the open-task handoff as protected:\n${protectedOnlyText}`);
+    }
+
+    const completedDb = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      completedDb.prepare("UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?")
+        .run(old, seeded.openTask);
+    } finally {
+      completedDb.close();
+    }
+    const completedHistory = readJson(['gc', '--older-than', '0', '--history', '--yes']);
+    if (Number(completedHistory.old_handoffs || 0) < 1 ||
+        Number(completedHistory.protected_old_handoffs || 0) !== 0) {
+      fail(`completed-task handoff did not transition from protected to deleted: ${JSON.stringify(completedHistory, null, 2)}`);
+    }
+    const afterCompletedHistory = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      if (rowExists(afterCompletedHistory, 'tasks', seeded.openTask) ||
+          rowExists(afterCompletedHistory, 'handoffs', seeded.openHandoff)) {
+        fail('history GC retained a handoff after its task became complete');
+      }
+    } finally {
+      afterCompletedHistory.close();
+    }
+
+    const noOpApply = readJson(['gc', '--older-than', '0', '--yes']);
+    if (Object.hasOwn(noOpApply, 'wal_checkpoint')) {
+      fail(`GC checkpointed without applied database cleanup: ${JSON.stringify(noOpApply, null, 2)}`);
+    }
+
+    const graceBuffer = path.join(bufsDir, 'grace-orphan.out');
+    fs.writeFileSync(graceBuffer, 'grace orphan');
+    fs.utimesSync(graceBuffer, new Date((old - 60) * 1000), new Date((old - 60) * 1000));
+    const graceIds = {};
+    const graceDb = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      graceDb.prepare(`
+        INSERT INTO peers(id, kind, role, worktree, branch, status, capabilities, created_at, last_seen_at)
+        VALUES ('gc-contract-grace-dead', 'shell', 'peer', ?, '', 'exited', '', ?, ?)
+      `).run(gcRoot, old, old);
+      graceDb.prepare(`
+        INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at, ttl_sec)
+        VALUES ('gc-contract-grace-lock', 'gc-contract-grace-lock', '*', 'gc-contract-grace-dead', 'expired', ?, ?, 90)
+      `).run(old, old);
+      graceIds.event = Number(graceDb.prepare(
+        "INSERT INTO events(type, actor, payload, created_at) VALUES ('gc.contract.grace', 'seed', '{}', ?) RETURNING id"
+      ).get(old).id);
+      graceIds.task = Number(graceDb.prepare(`
+        INSERT INTO tasks(title, status, created_at, updated_at)
+        VALUES ('gc contract grace', 'done', ?, ?) RETURNING id
+      `).get(old, old).id);
+      graceIds.message = Number(graceDb.prepare(`
+        INSERT INTO messages(sender, kind, body, created_at)
+        VALUES ('seed', 'note', 'gc contract grace', ?) RETURNING id
+      `).get(old).id);
+      graceIds.handoff = Number(graceDb.prepare(`
+        INSERT INTO handoffs(task_id, from_peer, summary, created_at)
+        VALUES (NULL, 'seed', 'gc contract grace', ?) RETURNING id
+      `).get(old).id);
+      graceDb.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(t + 120));
+      graceDb.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(t));
+    } finally {
+      graceDb.close();
+    }
+
+    const graceText = gcHcc(['gc', '--older-than', '0', '--history', '--yes']);
+    for (const label of [
+      'buffer files deferred',
+      'stale peers deferred',
+      'old events deferred',
+      'old tasks deferred',
+      'old messages deferred',
+      'old handoffs deferred',
+      'expired locks deferred by clock grace'
+    ]) {
+      if (!new RegExp(`^\\s*${label}:\\s*[1-9]`, 'm').test(graceText)) {
+        fail(`clock-grace text output omitted ${label}:\n${graceText}`);
+      }
+    }
+
+    for (const args of [
+      ['gc', '--older-than', '0'],
+      ['gc', '--older-than', '0', '--yes'],
+      ['gc', '--older-than', '0', '--history'],
+      ['gc', '--older-than', '0', '--history', '--yes']
+    ]) {
+      const result = readJson(args);
+      if (!result.deferred_age_based || result.buf_files !== 0 || result.stale_peers !== 0 ||
+          result.expired_locks !== 0 || Number(result.deferred_buf_files || 0) < 1 ||
+          Number(result.deferred_stale_peers || 0) < 1 ||
+          Number(result.deferred_expired_locks || 0) < 1 ||
+          Number(result.deferred_old_events || 0) < 1 ||
+          Number(result.deferred_old_tasks || 0) < 1 ||
+          Number(result.deferred_old_messages || 0) < 1 ||
+          Number(result.deferred_old_handoffs || 0) < 1 ||
+          Object.hasOwn(result, 'wal_checkpoint')) {
+        fail(`clock-grace GC did not defer every age category for ${args.join(' ')}:\n${JSON.stringify(result, null, 2)}`);
+      }
+    }
+    const afterGrace = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      for (const [table, id] of [
+        ['events', graceIds.event],
+        ['tasks', graceIds.task],
+        ['messages', graceIds.message],
+        ['handoffs', graceIds.handoff]
+      ]) {
+        if (!rowExists(afterGrace, table, id)) fail(`clock-grace GC removed ${table} row ${id}`);
+      }
+      if (!afterGrace.prepare("SELECT 1 FROM locks WHERE resource = 'gc-contract-grace-lock'").get() ||
+          !afterGrace.prepare("SELECT 1 FROM peers WHERE id = 'gc-contract-grace-dead'").get()) {
+        fail('clock-grace GC removed age-based technical database state');
+      }
+    } finally {
+      afterGrace.close();
+    }
+    if (!fs.existsSync(graceBuffer)) fail('clock-grace GC removed an age-based buffer file');
   } finally {
     fs.rmSync(gcRoot, { recursive: true, force: true });
     fs.rmSync(gcHome, { recursive: true, force: true });
@@ -8686,7 +9321,7 @@ function gcCoverageWorkflow() {
     `).run(String(t));
   });
 
-  const out = hcc(['gc', '--older-than', '0', '--yes']);
+  const out = hcc(['gc', '--older-than', '0', '--history', '--yes']);
   if (!/old messages:\s+[1-9]/.test(out)) fail(`gc did not report deleted messages:\n${out}`);
   if (!/old handoffs:\s+[1-9]/.test(out)) fail(`gc did not report deleted handoffs:\n${out}`);
   if (!/expired locks:\s+[1-9]/.test(out)) fail(`gc did not report expired locks:\n${out}`);
@@ -8720,6 +9355,7 @@ async function main() {
   await dbWorkflow();
   cliOnlyClockSafetyWorkflow();
   gcClockSubjectDriftWorkflow();
+  manualGcRetentionContractWorkflow();
   gcOutputConsistencyWorkflow();
   await processEvidenceWorkflow();
   await multiProjectWebWorkflow();

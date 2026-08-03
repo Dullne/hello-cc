@@ -22,7 +22,8 @@ import {
 import {
   clockSafetyUnavailable,
   observeClockSafety,
-  observeClockSafetyInTransaction
+  observeClockSafetyInTransaction,
+  previewClockSafety
 } from '../lib/core/coordination/clock-safety.mjs';
 import {
   DB_SCHEMA_VERSION,
@@ -78,7 +79,16 @@ import {
   writeRuntime
 } from '../lib/runtime/state.mjs';
 import { runtimeBufferGcUnavailable, runtimeRequest } from '../lib/runtime/client.mjs';
-import { pruneBufferFiles } from '../lib/runtime/buffer-gc.mjs';
+import {
+  applyBufferPlan,
+  bufferPlanGcCutoffs,
+  planBufferFiles,
+  pruneBufferFiles
+} from '../lib/runtime/buffer-gc.mjs';
+import {
+  applyClockSafeBufferPlan,
+  createBufferGcPlanStore
+} from '../lib/runtime/buffer-gc-protocol.mjs';
 import {
   detectBranch,
   detectRoot
@@ -204,7 +214,8 @@ import {
   createHistoryGcSnapshot,
   finalizeGcLockSubjects,
   finalizeHistoryGcBatches,
-  runWithHistoryGcSnapshotCleanup
+  runWithHistoryGcSnapshotCleanup,
+  runWithHistoryGcSnapshotCleanupAsync
 } from '../lib/core/coordination/gc-plan.mjs';
 import {
   assignTeamWorkers,
@@ -431,14 +442,19 @@ function peerMutationSubject(db, peerId) {
   return { peer, binding };
 }
 
-function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate) {
+function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate, options = {}) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const subject = peerMutationSubject(db, peerId);
     if (!subject.peer) return { changed: false, evidence: { state: 'unknown', reason: 'peer_missing' } };
     const evidence = observePeerEvidence(projectCtx, subject.peer, subject.binding);
     if (evidence.state !== 'dead') return { changed: false, evidence };
     let subjectChanged = false;
+    let blocked = false;
     const changed = tx(db, () => {
+      if (options.beforeMutate?.({ subject, evidence }) === false) {
+        blocked = true;
+        return false;
+      }
       const current = peerMutationSubject(db, peerId);
       if (JSON.stringify(current) !== JSON.stringify(subject)) {
         subjectChanged = true;
@@ -447,6 +463,7 @@ function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate) {
       mutate(current, evidence);
       return true;
     });
+    if (blocked) return { changed: false, evidence, blocked: true };
     if (!subjectChanged) return { changed, evidence };
   }
   return { changed: false, evidence: { state: 'unknown', reason: 'subject_changed' } };
@@ -2788,6 +2805,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const WEB_SESSION_TTL_SEC = 30 * 24 * 60 * 60;
   const MAX_WEB_SESSIONS = 256;
   const webSessions = new Map();
+  const bufferGcPlanStore = createBufferGcPlanStore();
+  const bufferDirectoriesByProject = new Map();
   function parseCookieSid(req) {
     const header = req.headers.cookie || '';
     for (const part of header.split(';')) {
@@ -3451,31 +3470,78 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // prunes high-volume/ephemeral items (events >14d, expired locks, stale bufs),
   // never peers/tasks/messages/handoffs. Runs once at startup then every 6h.
   let autoGcInFlight = false;
-  function runningBufferPathSnapshot() {
+  function runningBufferPathSnapshot(projectCtx) {
     const protectedPaths = new Set();
+    const projectKey = canonicalRoot(projectCtx.root) || path.resolve(projectCtx.root);
+    const projectDirectories = bufferDirectoriesByProject.get(projectKey) || new Set();
     for (const session of sessions.values()) {
-      if (session.status !== 'running') continue;
       for (const file of [session.outFile, session.inFile, session.resizeFile, session.pipeFile, session.metaFile]) {
-        if (file) protectedPaths.add(path.resolve(file));
+        if (!file) continue;
+        const resolved = path.resolve(file);
+        if (sameResolvedPath(session.root, projectCtx.root)) projectDirectories.add(path.dirname(resolved));
+        if (session.status === 'running') protectedPaths.add(resolved);
       }
     }
-    return protectedPaths;
+    bufferDirectoriesByProject.set(projectKey, projectDirectories);
+    return { protectedPaths, projectDirectories };
   }
 
-  function runtimeBufferGc(projectCtx, { cutoffMs, dryRun }) {
-    const protectedPaths = runningBufferPathSnapshot();
-    const directories = new Set([bufferDirectory(projectCtx)]);
-    for (const file of protectedPaths) directories.add(path.dirname(file));
-    return pruneBufferFiles({
+  function prepareRuntimeBufferGc(projectCtx, { dryRun, retentionSec }) {
+    const observedAt = now();
+    const cutoffMs = observedAt * 1000 - retentionSec * 1000;
+    const { protectedPaths, projectDirectories } = runningBufferPathSnapshot(projectCtx);
+    const directories = new Set([bufferDirectory(projectCtx), ...projectDirectories]);
+    const plan = planBufferFiles({
       directories,
       cutoffMs,
-      protectedPaths,
-      dryRun
+      protectedPaths
     });
+    const prepared = {
+      observedAt,
+      cutoffMs,
+      retentionSec,
+      deleted: plan.deleteEntries.length,
+      protected: plan.protectedEntries.length,
+      deferred: plan.unknownEntries.length,
+      gcCutoffs: bufferPlanGcCutoffs(plan, retentionSec)
+    };
+    if (!dryRun) {
+      prepared.token = bufferGcPlanStore.prepare({
+        root: projectCtx.root,
+        dbPath: projectCtx.dbPath,
+        observedAt,
+        retentionSec,
+        plan
+      });
+    }
+    return prepared;
+  }
+
+  function applyPreparedRuntimeBufferGc(projectCtx, token) {
+    const prepared = bufferGcPlanStore.take({
+      token,
+      root: projectCtx.root,
+      dbPath: projectCtx.dbPath
+    });
+    let db = null;
+    try {
+      db = connect(projectCtx);
+      return applyClockSafeBufferPlan({
+        db,
+        plan: prepared.plan,
+        retentionSec: prepared.retentionSec,
+        nowSec: now
+      });
+    } catch (error) {
+      if (error instanceof CliError) throw error;
+      throw clockSafetyUnavailable(error);
+    } finally {
+      try { db?.close(); } catch {}
+    }
   }
 
   function autoGcProtectedBufferPaths(projectCtx) {
-    const protectedPaths = runningBufferPathSnapshot();
+    const { protectedPaths } = runningBufferPathSnapshot(projectCtx);
     // External adoption remains primary-project scoped. Until sibling watchers
     // exist, every sibling file is unknown to this runtime and must be retained.
     if (!sameResolvedPath(projectCtx.root, ctx.root)) {
@@ -3493,13 +3559,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         let db = null;
         try {
           db = connect(projectCtx, { migrateRegistered: false, create: false });
-          runGc(projectCtx, db, {
+          const result = runGc(projectCtx, db, {
             olderThanDays: 14,
             dryRun: false,
             scope: 'auto',
             protectedBufFiles: autoGcProtectedBufferPaths(projectCtx)
           });
-          try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); } catch {}
+          const appliedDatabaseRows = result.expired_locks + result.old_events;
+          if (appliedDatabaseRows > 0) {
+            try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); } catch {}
+          }
         } catch (err) {
           console.error(`[${new Date().toISOString()}] auto-gc failed for ${projectCtx.root}: ${err?.message || err}`);
         } finally {
@@ -5439,15 +5508,35 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/runtime/gc-buffers') {
         const input = await readJsonRequest(req);
-        const cutoffMs = Number(input.cutoffMs);
-        if (!Number.isFinite(cutoffMs)) {
-          throw new CliError('BAD_REQUEST', 'cutoffMs must be a finite number');
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          throw new CliError('BAD_REQUEST', 'buffer GC request must be an object');
         }
-        sendJson(res, 200, runtimeBufferGc(reqCtx, {
-          cutoffMs,
-          dryRun: Boolean(input.dryRun)
-        }));
-        return;
+        if (input.phase === 'prepare') {
+          const allowed = new Set(['phase', 'retentionSec', 'dryRun']);
+          if (Object.keys(input).some((key) => !allowed.has(key))) {
+            throw new CliError('BAD_REQUEST', 'buffer GC prepare contains unsupported fields');
+          }
+          if (typeof input.dryRun !== 'boolean') {
+            throw new CliError('BAD_REQUEST', 'dryRun must be a boolean');
+          }
+          if (!Number.isSafeInteger(input.retentionSec) || input.retentionSec < 0 ||
+              Object.is(input.retentionSec, -0) ||
+              !Number.isSafeInteger(input.retentionSec * 1000)) {
+            throw new CliError('BAD_REQUEST', 'retentionSec must be a canonical non-negative safe integer');
+          }
+          sendJson(res, 200, prepareRuntimeBufferGc(reqCtx, input));
+          return;
+        }
+        if (input.phase === 'apply') {
+          const allowed = new Set(['phase', 'token']);
+          if (Object.keys(input).some((key) => !allowed.has(key)) ||
+              typeof input.token !== 'string' || input.token.length === 0) {
+            throw new CliError('BAD_REQUEST', 'buffer GC apply requires only its token');
+          }
+          sendJson(res, 200, applyPreparedRuntimeBufferGc(reqCtx, input.token));
+          return;
+        }
+        throw new CliError('BAD_REQUEST', 'buffer GC phase must be prepare or apply');
       }
       if (req.method === 'POST' && url.pathname === '/api/runtime/stop') {
         sendJson(res, 200, { ok: true, pid: process.pid });
@@ -7419,13 +7508,14 @@ async function cmdTmux(ctx, args) {
 
 // ─── hcc gc ───────────────────────────────────────────────────────────────────
 
-// Prune stale state. scope='full' cleans everything (peers/events/tasks/
-// messages/handoffs/locks/bufs) — used by the explicit `hcc gc` command.
+// Prune stale state. scope='full' always plans technical and history state, but
+// manual history is applied only with `hcc gc --history --yes`.
 // scope='auto' cleans only high-volume/ephemeral items (events, expired locks,
 // stale bufs) so automatic background gc bounds DB growth without deleting
-// user-meaningful history (peers/tasks/messages/handoffs stay for `hcc gc`).
+// user-meaningful history.
 // `db` is used open; the caller owns its lifecycle.
 function captureGcClockSubject(db, {
+  bufferGcCutoffs,
   olderThanDays,
   observedAt,
   historyCategories,
@@ -7459,11 +7549,13 @@ function captureGcClockSubject(db, {
   }));
 
   return {
-    lockSubjects,
-    stalePeers,
+    technicalPlan: {
+      lockSubjects,
+      stalePeers
+    },
     owners,
     historyPlan,
-    gcCutoffs: [...historySnapshot.gcCutoffs],
+    gcCutoffs: [...historySnapshot.gcCutoffs, ...bufferGcCutoffs],
     graceUntil: readClockGraceUntil(db),
     olderThanDays,
     observedAt
@@ -7471,6 +7563,7 @@ function captureGcClockSubject(db, {
 }
 
 function observeGcClockSafety(ctx, db, {
+  bufferGcCutoffs,
   olderThanDays,
   observedAt,
   historyCategories,
@@ -7480,48 +7573,80 @@ function observeGcClockSafety(ctx, db, {
   try {
     return runOptimisticEvidenceMutation(db, {
       capture: (subjectDb) => captureGcClockSubject(subjectDb, {
+        bufferGcCutoffs,
         olderThanDays,
         observedAt,
         historyCategories,
         includeStalePeers,
         historySnapshot
       }),
-      observe: (subject) => new Map(subject.owners.map(({ owner, peer, binding }) => [
-        owner,
-        peer
-          ? observePeerEvidence(ctx, peer, binding)
-          : { state: 'unknown', reason: 'peer_missing' }
-      ])),
+      observe: (subject) => observeGcEvidence(ctx, subject),
       same: (left, right) => JSON.stringify(left) === JSON.stringify(right),
-      beforeMutate: (subject, evidenceByOwner) => observeClockSafetyInTransactionOrThrow(db, {
-        operation: 'gc',
-        candidates: [
-          ...subject.lockSubjects.map(({ lock }) => ({
-            boundary: Number(lock.expires_at),
-            evidence: evidenceByOwner.get(lock.owner)?.state || 'unknown',
-            owner: lock.owner,
-            resource: lock.resource
-          })),
-          ...subject.stalePeers.map(({ peer }) => ({
-            boundary: Number(peer.last_seen_at) + olderThanDays * 86400,
-            evidence: evidenceByOwner.get(peer.id)?.state || 'unknown',
-            owner: peer.id
-          }))
-        ],
-        gcCutoffs: subject.gcCutoffs,
-        nowSec: subject.observedAt
-      }),
+      beforeMutate: (subject, evidenceByOwner) => observeClockSafetyInTransactionOrThrow(
+        db,
+        gcClockSafetyOptions(subject, evidenceByOwner, olderThanDays)
+      ),
       changedMessage: 'GC subjects changed while clock evidence was being observed; retry',
       mutate: (subject, evidenceByOwner, observation) => ({
         ...observation,
         subject,
         evidenceByOwner,
-        expiredLockCount: subject.lockSubjects.length
+        expiredLockCount: subject.technicalPlan.lockSubjects.length
       })
     });
   } catch (err) {
     if (err instanceof CliError) throw err;
     throw clockSafetyUnavailable(err);
+  }
+}
+
+function observeGcEvidence(ctx, subject) {
+  return new Map(subject.owners.map(({ owner, peer, binding }) => [
+    owner,
+    peer
+      ? observePeerEvidence(ctx, peer, binding)
+      : { state: 'unknown', reason: 'peer_missing' }
+  ]));
+}
+
+function gcClockSafetyOptions(subject, evidenceByOwner, olderThanDays) {
+  return {
+    operation: 'gc',
+    candidates: [
+      ...subject.technicalPlan.lockSubjects.map(({ lock }) => ({
+        boundary: Number(lock.expires_at),
+        evidence: evidenceByOwner.get(lock.owner)?.state || 'unknown',
+        owner: lock.owner,
+        resource: lock.resource
+      })),
+      ...subject.technicalPlan.stalePeers.map(({ peer }) => ({
+        boundary: Number(peer.last_seen_at) + olderThanDays * 86400,
+        evidence: evidenceByOwner.get(peer.id)?.state || 'unknown',
+        owner: peer.id
+      }))
+    ],
+    gcCutoffs: subject.gcCutoffs,
+    nowSec: subject.observedAt
+  };
+}
+
+function previewGcClockSafety(ctx, db, options) {
+  try {
+    const subject = captureGcClockSubject(db, options);
+    const evidenceByOwner = observeGcEvidence(ctx, subject);
+    const observation = previewClockSafety(
+      db,
+      gcClockSafetyOptions(subject, evidenceByOwner, options.olderThanDays)
+    );
+    return {
+      ...observation,
+      subject,
+      evidenceByOwner,
+      expiredLockCount: subject.technicalPlan.lockSubjects.length
+    };
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw clockSafetyUnavailable(error);
   }
 }
 
@@ -7531,12 +7656,27 @@ function runGc(ctx, db, {
   scope = 'full',
   protectedBufFiles = null,
   bufferCutoffMs = null,
-  skipBufferFiles = false
+  skipBufferFiles = false,
+  history = false,
+  observedAt = null
 } = {}) {
   const auto = scope === 'auto';
   const historyCategories = auto ? ['events'] : ['events', 'tasks', 'messages', 'handoffs'];
-  const gcNow = now();
+  const applyHistory = auto || history;
+  const gcNow = Number.isSafeInteger(observedAt) && observedAt >= 0 ? observedAt : now();
   const retentionSec = olderThanDays * 86400;
+  const fixedBufferCutoffMs = Number.isFinite(bufferCutoffMs)
+    ? bufferCutoffMs
+    : gcNow * 1000 - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
+  const bufferRetentionSec = (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400;
+  const bufferGcCutoffs = bufferDirectoryPaths(bufferDirectory(ctx)).flatMap((file) => {
+    try {
+      const stat = fs.lstatSync(file);
+      return [Math.max(0, Math.floor(stat.mtimeMs / 1000) + bufferRetentionSec)];
+    } catch {
+      return [];
+    }
+  });
   const historySnapshot = createHistoryGcSnapshot(db, gcNow - retentionSec, {
     categories: historyCategories,
     retentionSec
@@ -7548,9 +7688,11 @@ function runGc(ctx, db, {
       olderThanDays,
       dryRun,
       auto,
+      applyHistory,
       protectedBufFiles,
-      bufferCutoffMs,
+      bufferCutoffMs: fixedBufferCutoffMs,
       skipBufferFiles,
+      bufferGcCutoffs,
       historyCategories,
       gcNow,
       historySnapshot
@@ -7563,21 +7705,39 @@ function runGcWithHistorySnapshot(ctx, db, {
   olderThanDays,
   dryRun,
   auto,
+  applyHistory,
   protectedBufFiles,
   bufferCutoffMs,
   skipBufferFiles,
+  bufferGcCutoffs,
   historyCategories,
   gcNow,
-  historySnapshot
+  historySnapshot,
+  clockObservation: preparedClockObservation = null,
+  forceDefer = false
 }) {
-  const clockObservation = observeGcClockSafety(ctx, db, {
+  const clockObservation = preparedClockObservation || observeGcClockSafety(ctx, db, {
+    bufferGcCutoffs,
     olderThanDays,
     observedAt: gcNow,
     historyCategories,
     includeStalePeers: !auto,
     historySnapshot
   });
-  const graceActive = clockGraceSuppressed(gcNow, clockObservation.graceUntil);
+  const graceActive = forceDefer || clockGraceSuppressed(gcNow, clockObservation.graceUntil);
+  let databaseGraceActive = graceActive;
+  const beforeDatabaseMutate = () => {
+    if (databaseGraceActive) return false;
+    try {
+      const observedAt = now();
+      const allowed = !clockGraceSuppressed(observedAt, readClockGraceUntil(db));
+      if (!allowed) databaseGraceActive = true;
+      return allowed;
+    } catch (error) {
+      if (error instanceof CliError) throw error;
+      throw clockSafetyUnavailable(error);
+    }
+  };
   const protectedBuffers = protectedBufFiles instanceof Set
     ? protectedBufFiles
     : new Set(protectedBufFiles || []);
@@ -7586,11 +7746,22 @@ function runGcWithHistorySnapshot(ctx, db, {
     protected_buf_files: 0,
     deferred_buf_files: 0,
     stale_peers: 0,
+    protected_stale_peers: 0,
+    deferred_stale_peers: 0,
     old_events: 0,
     old_tasks: 0,
     old_messages: 0,
     old_handoffs: 0,
+    protected_old_events: 0,
+    protected_old_tasks: 0,
+    protected_old_messages: 0,
+    protected_old_handoffs: Number(historySnapshot.protectedCounts?.handoffs || 0),
+    deferred_old_events: 0,
+    deferred_old_tasks: 0,
+    deferred_old_messages: 0,
+    deferred_old_handoffs: 0,
     expired_locks: 0,
+    protected_expired_locks: 0,
     deferred_expired_locks: graceActive ? clockObservation.expiredLockCount : 0,
     deferred_unknown_peers: 0,
     deferred_history: 0,
@@ -7616,7 +7787,7 @@ function runGcWithHistorySnapshot(ctx, db, {
 
   // A clock jump can make every lock look expired at once. Preserve those rows
   // for the grace window so acquisition and heartbeat logic can recover them.
-  const expiredLockSubjects = clockObservation.subject.lockSubjects;
+  const expiredLockSubjects = clockObservation.subject.technicalPlan.lockSubjects;
   if (graceActive) {
     results.deferred_expired_locks = Math.max(results.deferred_expired_locks, expiredLockSubjects.length);
   } else {
@@ -7624,47 +7795,87 @@ function runGcWithHistorySnapshot(ctx, db, {
       db,
       expiredLockSubjects,
       clockObservation.evidenceByOwner,
-      { dryRun }
+      {
+        dryRun,
+        beforeMutate: dryRun ? undefined : beforeDatabaseMutate
+      }
     );
     results.expired_locks = lockResult.deleted;
-    results.deferred_expired_locks += lockResult.deferred + lockResult.live;
+    results.protected_expired_locks = lockResult.live;
+    results.deferred_expired_locks += lockResult.deferred;
   }
 
-  if (!auto && !graceActive) {
+  if (!auto && databaseGraceActive) {
+    results.deferred_stale_peers = clockObservation.subject.technicalPlan.stalePeers.length;
+  } else if (!auto) {
     // Stale peers (no heartbeat in N days)
-    const stalePeers = clockObservation.subject.stalePeers;
+    const stalePeers = clockObservation.subject.technicalPlan.stalePeers;
     for (const subject of stalePeers) {
       const p = subject.peer;
       const evidence = clockObservation.evidenceByOwner.get(p.id) || { state: 'unknown' };
       if (evidence.state === 'unknown') {
         results.deferred_unknown_peers++;
+        results.deferred_stale_peers++;
         continue;
       }
-      if (evidence.state !== 'dead') continue;
+      if (evidence.state !== 'dead') {
+        results.protected_stale_peers++;
+        continue;
+      }
       if (dryRun) {
         results.stale_peers++;
+        continue;
+      }
+      if (databaseGraceActive) {
+        results.deferred_stale_peers++;
         continue;
       }
       const removed = mutateConfirmedDeadPeer(db, ctx, p.id, () => {
         db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(p.id);
         db.prepare('DELETE FROM peers WHERE id = ?').run(p.id);
-      });
+      }, { beforeMutate: beforeDatabaseMutate });
       if (removed.changed) results.stale_peers++;
+      else if (removed.evidence?.state === 'live') results.protected_stale_peers++;
+      else {
+        if (removed.evidence?.state === 'unknown') results.deferred_unknown_peers++;
+        results.deferred_stale_peers++;
+      }
     }
 
   }
 
-  if (!graceActive) {
+  const eligibleHistory = historySnapshot.eligibleCounts;
+  if (databaseGraceActive) {
+    results.deferred_old_events = Number(eligibleHistory.events || 0);
+    results.deferred_old_tasks = Number(eligibleHistory.tasks || 0);
+    results.deferred_old_messages = Number(eligibleHistory.messages || 0);
+    results.deferred_old_handoffs = Number(eligibleHistory.handoffs || 0);
+    results.deferred_history = results.deferred_old_events + results.deferred_old_tasks +
+      results.deferred_old_messages + results.deferred_old_handoffs;
+  } else if (!applyHistory) {
+    results.protected_old_events = Number(eligibleHistory.events || 0);
+    results.protected_old_tasks = Number(eligibleHistory.tasks || 0);
+    results.protected_old_messages = Number(eligibleHistory.messages || 0);
+    results.protected_old_handoffs += Number(eligibleHistory.handoffs || 0);
+  } else {
     const historyResult = finalizeHistoryGcBatches(db, clockObservation.subject.historyPlan, {
       dryRun,
-      dropSnapshot: false
+      dropSnapshot: false,
+      beforeMutate: dryRun ? undefined : beforeDatabaseMutate
     });
     results.old_events = historyResult.old_events;
     results.old_tasks = historyResult.old_tasks;
     results.old_messages = historyResult.old_messages;
     results.old_handoffs = historyResult.old_handoffs;
-    results.deferred_history = historyResult.deferred;
+    results.deferred_old_events = Math.max(0, Number(eligibleHistory.events || 0) - results.old_events);
+    results.deferred_old_tasks = Math.max(0, Number(eligibleHistory.tasks || 0) - results.old_tasks);
+    results.deferred_old_messages = Math.max(0, Number(eligibleHistory.messages || 0) - results.old_messages);
+    results.deferred_old_handoffs = Math.max(0, Number(eligibleHistory.handoffs || 0) - results.old_handoffs);
+    results.deferred_history = results.deferred_old_events + results.deferred_old_tasks +
+      results.deferred_old_messages + results.deferred_old_handoffs;
   }
+
+  results.deferred_age_based = results.deferred_age_based || databaseGraceActive;
 
   return results;
 }
@@ -7770,39 +7981,6 @@ function runtimePointerPresent(ctx) {
     fs.existsSync(globalRuntimePath()));
 }
 
-async function arbitrateManualBufferGc(ctx, db, { cutoffMs, dryRun }) {
-  const directory = bufferDirectory(ctx);
-  const pointerPresent = runtimePointerPresent(ctx);
-  let runtime = null;
-  try { runtime = readRuntime(ctx); } catch (error) {
-    if (pointerPresent) return deferEligibleBufferFiles(directory, cutoffMs);
-    if (error?.code !== 'RUNTIME_NOT_RUNNING') throw error;
-  }
-
-  if (runtime) {
-    try {
-      return await runtimeRequest(ctx, 'POST', '/api/runtime/gc-buffers', {
-        cutoffMs,
-        dryRun
-      }, runtime, { timeoutMs: 5000 });
-    } catch (error) {
-      if (runtimeBufferGcUnavailable(error)) {
-        return deferEligibleBufferFiles(directory, cutoffMs);
-      }
-      throw error;
-    }
-  }
-
-  const { protectedPaths, unknownPaths } = localBufferEvidence(ctx, db, directory);
-  return pruneBufferFiles({
-    directories: [directory],
-    cutoffMs,
-    protectedPaths,
-    unknownPaths,
-    dryRun
-  });
-}
-
 function requireBufferGcResult(value) {
   const result = {};
   for (const key of ['deleted', 'protected', 'deferred']) {
@@ -7815,29 +7993,240 @@ function requireBufferGcResult(value) {
   return result;
 }
 
+function requirePreparedBufferGc(value, { retentionSec, dryRun }) {
+  const counts = requireBufferGcResult(value);
+  const observedAt = Number(value?.observedAt);
+  const cutoffMs = Number(value?.cutoffMs);
+  if (!Number.isSafeInteger(observedAt) || observedAt < 0 ||
+      !Number.isSafeInteger(cutoffMs) ||
+      cutoffMs !== observedAt * 1000 - retentionSec * 1000 ||
+      !Array.isArray(value?.gcCutoffs) || value.gcCutoffs.some((cutoff) =>
+        !Number.isSafeInteger(cutoff) || cutoff < 0)) {
+    throw new CliError('RUNTIME_BAD_RESPONSE', 'Runtime buffer GC returned invalid derived timing');
+  }
+  if ((!dryRun && (typeof value?.token !== 'string' || value.token.length === 0)) ||
+      (dryRun && Object.hasOwn(value || {}, 'token'))) {
+    throw new CliError('RUNTIME_BAD_RESPONSE', 'Runtime buffer GC returned an invalid plan token');
+  }
+  return { ...counts, observedAt, cutoffMs, gcCutoffs: [...value.gcCutoffs], token: value.token || null };
+}
+
+function deferredPreparedBufferGc(prepared, graceActive = false) {
+  return {
+    deleted: 0,
+    protected: prepared.protected,
+    deferred: prepared.deferred + prepared.deleted,
+    complete: false,
+    graceActive
+  };
+}
+
+async function prepareManualBufferGc(ctx, db, { retentionSec, dryRun }) {
+  const directory = bufferDirectory(ctx);
+  const pointerPresent = runtimePointerPresent(ctx);
+  let runtime = null;
+  try { runtime = readRuntime(ctx); } catch (error) {
+    if (pointerPresent) {
+      const observedAt = now();
+      const cutoffMs = observedAt * 1000 - retentionSec * 1000;
+      const deferred = requireBufferGcResult(deferEligibleBufferFiles(directory, cutoffMs));
+      return { mode: 'unavailable', observedAt, cutoffMs, retentionSec, gcCutoffs: [], token: null, ...deferred };
+    }
+    if (error?.code !== 'RUNTIME_NOT_RUNNING') throw error;
+  }
+
+  if (runtime) {
+    try {
+      const prepared = await runtimeRequest(ctx, 'POST', '/api/runtime/gc-buffers', {
+        phase: 'prepare',
+        retentionSec,
+        dryRun
+      }, runtime, { timeoutMs: 5000 });
+      return {
+        mode: 'runtime',
+        runtime,
+        retentionSec,
+        ...requirePreparedBufferGc(prepared, { retentionSec, dryRun })
+      };
+    } catch (error) {
+      if (runtimeBufferGcUnavailable(error)) {
+        const observedAt = now();
+        const cutoffMs = observedAt * 1000 - retentionSec * 1000;
+        const deferred = requireBufferGcResult(deferEligibleBufferFiles(directory, cutoffMs));
+        return { mode: 'unavailable', observedAt, cutoffMs, retentionSec, gcCutoffs: [], token: null, ...deferred };
+      }
+      throw error;
+    }
+  }
+
+  const observedAt = now();
+  const cutoffMs = observedAt * 1000 - retentionSec * 1000;
+  const { protectedPaths, unknownPaths } = localBufferEvidence(ctx, db, directory);
+  const plan = planBufferFiles({
+    directories: [directory],
+    cutoffMs,
+    protectedPaths,
+    unknownPaths
+  });
+  return {
+    mode: 'local',
+    observedAt,
+    cutoffMs,
+    retentionSec,
+    gcCutoffs: bufferPlanGcCutoffs(plan, retentionSec),
+    token: null,
+    plan,
+    deleted: plan.deleteEntries.length,
+    protected: plan.protectedEntries.length,
+    deferred: plan.unknownEntries.length
+  };
+}
+
+async function applyManualBufferGc(ctx, db, prepared, { dryRun, graceActive }) {
+  if (dryRun) {
+    return graceActive || prepared.mode === 'unavailable'
+      ? deferredPreparedBufferGc(prepared, graceActive)
+      : { ...requireBufferGcResult(prepared), complete: true, graceActive: false };
+  }
+  if (prepared.mode === 'unavailable') return deferredPreparedBufferGc(prepared);
+  if (prepared.mode === 'local') {
+    if (graceActive) return deferredPreparedBufferGc(prepared, true);
+    try {
+      return applyClockSafeBufferPlan({
+        db,
+        plan: prepared.plan,
+        retentionSec: prepared.retentionSec
+      });
+    } catch (error) {
+      if (error instanceof CliError) throw error;
+      throw clockSafetyUnavailable(error);
+    }
+  }
+  try {
+    const applied = await runtimeRequest(ctx, 'POST', '/api/runtime/gc-buffers', {
+      phase: 'apply',
+      token: prepared.token
+    }, prepared.runtime, { timeoutMs: 5000 });
+    const counts = requireBufferGcResult(applied);
+    if (typeof applied?.complete !== 'boolean' || typeof applied?.graceActive !== 'boolean') {
+      throw new CliError('RUNTIME_BAD_RESPONSE', 'Runtime buffer GC returned invalid completion state');
+    }
+    return { ...counts, complete: applied.complete, graceActive: applied.graceActive };
+  } catch (error) {
+    if (runtimeBufferGcUnavailable(error)) return deferredPreparedBufferGc(prepared);
+    throw error;
+  }
+}
+
+async function runManualGc(ctx, db, {
+  olderThanDays,
+  dryRun,
+  history
+}) {
+  const retentionSec = olderThanDays * 86400;
+  const preparedBuffer = await prepareManualBufferGc(ctx, db, { retentionSec, dryRun });
+  const gcNow = preparedBuffer.observedAt;
+  const historyCategories = ['events', 'tasks', 'messages', 'handoffs'];
+  const historySnapshot = createHistoryGcSnapshot(db, gcNow - retentionSec, {
+    categories: historyCategories,
+    retentionSec
+  });
+  return runWithHistoryGcSnapshotCleanupAsync(
+    db,
+    historySnapshot,
+    async () => {
+      const observationOptions = {
+        bufferGcCutoffs: preparedBuffer.gcCutoffs,
+        olderThanDays,
+        observedAt: gcNow,
+        historyCategories,
+        includeStalePeers: true,
+        historySnapshot
+      };
+      const clockObservation = dryRun
+        ? previewGcClockSafety(ctx, db, observationOptions)
+        : observeGcClockSafety(ctx, db, observationOptions);
+      const graceActive = clockGraceSuppressed(gcNow, clockObservation.graceUntil);
+      const bufferResult = await applyManualBufferGc(ctx, db, preparedBuffer, { dryRun, graceActive });
+      let graceBeforeDatabaseApply = false;
+      if (!dryRun) {
+        try {
+          const finalObservedAt = now();
+          graceBeforeDatabaseApply = clockGraceSuppressed(
+            finalObservedAt,
+            readClockGraceUntil(db)
+          );
+        } catch (error) {
+          throw clockSafetyUnavailable(error);
+        }
+      }
+      const forceDefer = graceActive || (!dryRun && !bufferResult.complete) ||
+        preparedBuffer.mode === 'unavailable' || graceBeforeDatabaseApply;
+      const results = runGcWithHistorySnapshot(ctx, db, {
+        olderThanDays,
+        dryRun,
+        auto: false,
+        applyHistory: history,
+        protectedBufFiles: null,
+        bufferCutoffMs: preparedBuffer.cutoffMs,
+        skipBufferFiles: true,
+        bufferGcCutoffs: preparedBuffer.gcCutoffs,
+        historyCategories,
+        gcNow,
+        historySnapshot,
+        clockObservation,
+        forceDefer
+      });
+      results.buf_files = bufferResult.deleted;
+      results.protected_buf_files = bufferResult.protected;
+      results.deferred_buf_files = bufferResult.deferred;
+      return results;
+    },
+    'Manual GC run'
+  );
+}
+
+function gcRetentionDays(opts) {
+  const raw = opts['older-than'];
+  if (raw === undefined) return 7;
+  if (typeof raw !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(raw)) {
+    throw new CliError('BAD_ARGS', '--older-than must be a canonical non-negative integer');
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || !Number.isSafeInteger(value * 86400000)) {
+    throw new CliError('BAD_ARGS', '--older-than exceeds the safe integer range');
+  }
+  return value;
+}
+
 async function cmdGc(ctx, args) {
   if (wantsHelp(args)) return helpGc();
-  const opts = parseOpts(args, { booleans: ['yes', 'force'] });
-  const olderThanDays = intOpt(opts, 'older-than', 7);
-  const dryRun = !opts.yes && !opts.force;
-  const bufferCutoffMs = Date.now() - olderThanDays * 86400000;
+  const valuedDestructiveFlag = args.find((arg) =>
+    typeof arg === 'string' && (/^--yes=/.test(arg) || /^--history=/.test(arg)));
+  if (valuedDestructiveFlag) {
+    throw new CliError('BAD_ARGS', `${valuedDestructiveFlag.split('=', 1)[0]} does not accept a value`);
+  }
+  const opts = parseOpts(args, { booleans: ['yes', 'force', 'history'] });
+  validateOpts('gc', opts, ['older-than', 'yes', 'history']);
+  if (opts.yes !== undefined && opts.yes !== true) {
+    throw new CliError('BAD_ARGS', '--yes does not accept a value');
+  }
+  if (opts.history !== undefined && opts.history !== true) {
+    throw new CliError('BAD_ARGS', '--history does not accept a value');
+  }
+  const olderThanDays = gcRetentionDays(opts);
+  const dryRun = opts.yes !== true;
   const db = connect(ctx);
   let results;
   try {
-    results = runGc(ctx, db, {
+    results = await runManualGc(ctx, db, {
       olderThanDays,
       dryRun,
-      scope: 'full',
-      bufferCutoffMs,
-      skipBufferFiles: true
+      history: opts.history === true
     });
-    const bufferResult = requireBufferGcResult(results.deferred_age_based
-      ? deferEligibleBufferFiles(bufferDirectory(ctx), bufferCutoffMs)
-      : await arbitrateManualBufferGc(ctx, db, { cutoffMs: bufferCutoffMs, dryRun }));
-    results.buf_files = bufferResult.deleted;
-    results.protected_buf_files = bufferResult.protected;
-    results.deferred_buf_files = bufferResult.deferred;
-    if (!dryRun) {
+    const appliedDatabaseRows = results.stale_peers + results.expired_locks +
+      results.old_events + results.old_tasks + results.old_messages + results.old_handoffs;
+    if (!dryRun && appliedDatabaseRows > 0) {
       // Reclaim WAL after deleting many rows (conc-05). Best-effort: may be busy
       // with other connections; the result is reported but never blocks.
       try {
@@ -7855,19 +8244,33 @@ async function cmdGc(ctx, args) {
     if (r.protected_buf_files) lines.push(`  protected buffer files: ${r.protected_buf_files}`);
     if (r.deferred_buf_files) lines.push(`  buffer files deferred: ${r.deferred_buf_files}`);
     if (r.stale_peers)   lines.push(`  stale peers:    ${r.stale_peers}`);
+    if (r.protected_stale_peers) lines.push(`  protected stale peers: ${r.protected_stale_peers}`);
+    if (r.deferred_stale_peers) lines.push(`  stale peers deferred: ${r.deferred_stale_peers}`);
     if (r.deferred_unknown_peers) lines.push(`  unknown peers deferred: ${r.deferred_unknown_peers}`);
-    if (r.deferred_history) lines.push(`  history rows deferred after subject change: ${r.deferred_history}`);
+    if (r.deferred_history) lines.push(`  history rows deferred: ${r.deferred_history}`);
     if (r.deferred_age_based) lines.push('  age-based cleanup deferred by clock grace');
     if (r.old_events)    lines.push(`  old events:     ${r.old_events}`);
     if (r.old_tasks)     lines.push(`  old tasks:      ${r.old_tasks}`);
     if (r.old_messages)  lines.push(`  old messages:   ${r.old_messages}`);
     if (r.old_handoffs)  lines.push(`  old handoffs:   ${r.old_handoffs}`);
+    if (r.protected_old_events) lines.push(`  protected old events: ${r.protected_old_events}`);
+    if (r.protected_old_tasks) lines.push(`  protected old tasks: ${r.protected_old_tasks}`);
+    if (r.protected_old_messages) lines.push(`  protected old messages: ${r.protected_old_messages}`);
+    if (r.protected_old_handoffs) lines.push(`  protected old handoffs: ${r.protected_old_handoffs}`);
+    if (r.deferred_old_events) lines.push(`  old events deferred: ${r.deferred_old_events}`);
+    if (r.deferred_old_tasks) lines.push(`  old tasks deferred: ${r.deferred_old_tasks}`);
+    if (r.deferred_old_messages) lines.push(`  old messages deferred: ${r.deferred_old_messages}`);
+    if (r.deferred_old_handoffs) lines.push(`  old handoffs deferred: ${r.deferred_old_handoffs}`);
     if (r.expired_locks) lines.push(`  expired locks:  ${r.expired_locks}`);
+    if (r.protected_expired_locks) lines.push(`  protected expired locks: ${r.protected_expired_locks}`);
     if (r.deferred_expired_locks) lines.push(`  expired locks deferred by clock grace: ${r.deferred_expired_locks}`);
     if (r.wal_checkpoint) lines.push(`  wal checkpoint: ${r.wal_checkpoint.busy ? 'busy' : 'ok'} (log ${r.wal_checkpoint.log}, checkpointed ${r.wal_checkpoint.checkpointed})`);
-    if (!r.buf_files && !r.protected_buf_files && !r.deferred_buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
+    if (!r.buf_files && !r.protected_buf_files && !r.deferred_buf_files && !r.stale_peers &&
+        !r.protected_stale_peers && !r.deferred_stale_peers && !r.old_events && !r.old_tasks &&
         !r.old_messages && !r.old_handoffs && !r.expired_locks && !r.deferred_expired_locks &&
-        !r.deferred_unknown_peers && !r.deferred_history && !r.deferred_age_based) {
+        !r.protected_expired_locks && !r.deferred_unknown_peers && !r.deferred_history &&
+        !r.protected_old_events && !r.protected_old_tasks && !r.protected_old_messages &&
+        !r.protected_old_handoffs && !r.deferred_age_based) {
       lines.push('  nothing to clean');
     }
     return lines.join('\n');

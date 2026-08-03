@@ -6,6 +6,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   applyBufferPlan,
+  bufferPlanGcCutoffs,
+  deferBufferPlan,
   planBufferFiles,
   pruneBufferFiles
 } from '../lib/runtime/buffer-gc.mjs';
@@ -82,6 +84,31 @@ test('dry-run and apply produce the same plan without dry-run deletion', (t) => 
   assert.deepEqual(dryResult, applyResult);
   assert.equal(fs.existsSync(path.join(dryDirectory, 'dead.out')), true);
   assert.equal(fs.existsSync(path.join(applyDirectory, 'dead.out')), false);
+});
+
+test('clock cutoffs cover would-delete entries while grace preserves evidence classes', (t) => {
+  const directory = tempDirectory(t);
+  const retentionSec = 60;
+  const cutoffMs = Date.now() - 60_000;
+  const oldMs = Math.floor((cutoffMs - 60_000) / 1000) * 1000;
+  const protectedFile = path.join(directory, 'protected.out');
+  const unknownFile = path.join(directory, 'unknown.out');
+  const deleteFile = path.join(directory, 'delete.out');
+  for (const file of [protectedFile, unknownFile, deleteFile]) writeFile(file, file, oldMs);
+
+  const plan = planBufferFiles({
+    directories: [directory],
+    cutoffMs,
+    protectedPaths: [protectedFile],
+    unknownPaths: [unknownFile]
+  });
+
+  assert.deepEqual(
+    bufferPlanGcCutoffs(plan, retentionSec),
+    [Math.floor(oldMs / 1000) + retentionSec]
+  );
+  assert.deepEqual(deferBufferPlan(plan), { deleted: 0, protected: 1, deferred: 2 });
+  assert.equal(fs.existsSync(deleteFile), true);
 });
 
 test('normalizes relative directories and protection paths to absolute paths', (t) => {
