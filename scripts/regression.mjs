@@ -2828,6 +2828,13 @@ async function dbWorkflow() {
       SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL, last_seen_at = ?
       WHERE id = ?
     `).run(staleAt, 'stale-owner');
+    // This fixture tests ordinary stale policy, not an unconsumed wall-clock
+    // interval. Establish that the backdated state has already been observed.
+    db.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+    db.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(Math.floor(Date.now() / 1000)));
   });
   const staleTakeover = hccJson(['task', 'takeover', '--peer', 'takeover-b', '--id', staleTaskId, '--reason', 'stale takeover smoke', '--policy', 'stale', '--stale-after', '60']);
   if (String(staleTakeover.owner) !== 'takeover-b') {
@@ -3645,14 +3652,22 @@ async function multiProjectWebWorkflow() {
     db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .run(String(Math.floor(Date.now() / 1000) + 60));
   });
+  const graceHeartbeatExpiry = withMeshDb((db) => db.prepare(
+    'SELECT expires_at FROM locks WHERE resource = ?'
+  ).get(webTtlResource)?.expires_at);
   const graceHeartbeatResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action_token: managedActionToken, renew_locks: true })
   }, { root });
   const graceHeartbeat = await graceHeartbeatResponse.json();
-  if (!graceHeartbeatResponse.ok || graceHeartbeat.data?.renewed !== 1) {
-    fail(`clock grace did not preserve unknown Web peer lock renewal:\n${JSON.stringify(graceHeartbeat, null, 2)}`);
+  const graceHeartbeatState = withMeshDb((db) => ({
+    expiresAt: db.prepare('SELECT expires_at FROM locks WHERE resource = ?').get(webTtlResource)?.expires_at,
+    watermark: db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get()?.value
+  }));
+  if (!graceHeartbeatResponse.ok || graceHeartbeat.data?.renewed !== 0 ||
+      graceHeartbeatState.expiresAt !== graceHeartbeatExpiry || !graceHeartbeatState.watermark) {
+    fail(`clock grace renewed an unknown Web peer lock instead of retaining it unchanged:\n${JSON.stringify({ graceHeartbeat, graceHeartbeatExpiry, graceHeartbeatState }, null, 2)}`);
   }
   withMeshDb((db) => {
     db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
@@ -4855,7 +4870,9 @@ async function syntaxAndHelp() {
     'claimNextTasksForPeer(db, peer, { force: Boolean(input.force), count })',
     'ownerEvidenceFor: (owner, _row, ownerRow, binding) => observePeerEvidence',
     'runOptimisticEvidenceMutation(db, {',
-    'capture: (subjectDb) => captureLockAcquireSubject(subjectDb, {',
+    'captureLockAcquireSubject(subjectDb, {',
+    'beforeMutate: (subject, evidenceByOwner) =>',
+    'prepareClockObservation(db, subject, evidenceByOwner)',
     "assertTaskOwnerForMutation(db, peer, task, 'lock-acquire')",
     'const status = statusSummary(projectCtx, peer)',
     "normalized === 'task-next'",
@@ -6210,8 +6227,12 @@ async function syntaxAndHelp() {
     const fwd = clockGrace.classifyClockJump(120000);
     const bwd = clockGrace.classifyClockJump(-12000);
     const norm = clockGrace.classifyClockJump(30000);
-    if (fwd?.kind !== 'forward' || bwd?.kind !== 'backward' || norm !== null) {
-      fail(`clock jump classification changed: ${JSON.stringify({ fwd, bwd, norm })}`);
+    const stalled = clockGrace.classifyClockDrift({ wallDeltaMs: 120000, monotonicDeltaMs: 120000 });
+    const driftFwd = clockGrace.classifyClockDrift({ wallDeltaMs: 120000, monotonicDeltaMs: 30000 });
+    const driftBwd = clockGrace.classifyClockDrift({ wallDeltaMs: 18000, monotonicDeltaMs: 30000 });
+    if (fwd?.kind !== 'forward' || bwd?.kind !== 'backward' || norm !== null || stalled !== null ||
+        driftFwd?.kind !== 'forward' || driftBwd?.kind !== 'backward') {
+      fail(`clock jump classification changed: ${JSON.stringify({ fwd, bwd, norm, stalled, driftFwd, driftBwd })}`);
     }
   }
   for (const helper of [
@@ -7805,6 +7826,285 @@ async function processEvidenceWorkflow() {
   for (const file of legacyFiles) fs.rmSync(file, { force: true });
 }
 
+function cliOnlyClockSafetyWorkflow() {
+  log('CLI-only clock safety: live renew, unknown grace, dead cleanup, read-only observers');
+  const clockRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-clock-root-${testId}-`));
+  const clockHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-clock-home-${testId}-`));
+  const clockEnv = { ...env, HOME: clockHome };
+  for (const key of Object.keys(clockEnv)) {
+    if (key.startsWith('HCC_')) delete clockEnv[key];
+  }
+  const clockDbPath = path.join(clockRoot, '.hello-cc', 'mesh.db');
+  const clockHcc = (args) => run(process.execPath, [hccBin, '--root', clockRoot, ...args], { env: clockEnv });
+  const clockHccMaybe = (args) => runMaybe(process.execPath, [hccBin, '--root', clockRoot, ...args], { env: clockEnv });
+  const withClockDb = (fn) => {
+    const db = new DatabaseSync(clockDbPath, { timeout: 5000 });
+    try { return fn(db); } finally { db.close(); }
+  };
+  const rewind = (resource, ownerMode) => withClockDb((db) => {
+    const t = Math.floor(Date.now() / 1000);
+    db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+    db.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(t - 86400));
+    db.prepare('UPDATE locks SET created_at = ?, expires_at = ? WHERE resource = ?')
+      .run(t - 86400, t - 60, resource);
+    db.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(t - 86400, `${ownerMode}-owner`);
+    if (ownerMode === 'unknown') {
+      db.prepare(`
+        UPDATE peers SET pid_start_token = NULL, pid_command_hash = NULL
+        WHERE id = 'unknown-owner'
+      `).run();
+    } else if (ownerMode === 'dead') {
+      db.prepare("UPDATE peers SET status = 'exited' WHERE id = 'dead-owner'").run();
+    }
+    return t;
+  });
+
+  try {
+    fs.mkdirSync(clockRoot, { recursive: true });
+    clockHcc(['init', '--no-guidance']);
+    if (fs.existsSync(path.join(clockRoot, '.hello-cc', 'runtime.json')) ||
+        fs.existsSync(path.join(clockHome, '.hello-cc', 'runtime.json'))) {
+      fail('CLI-only clock fixture unexpectedly has a local or global runtime pointer');
+    }
+
+    clockHcc(['register', '--peer', 'live-owner', '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+    clockHcc(['lock', 'acquire', '--peer', 'live-owner', '--resource', 'src/clock-live', '--ttl', '90']);
+    const liveNow = rewind('src/clock-live', 'live');
+    const liveAttempt = clockHccMaybe(['--json', 'lock', 'acquire', '--peer', 'live-taker', '--resource', 'src/clock-live', '--ttl', '90']);
+    if (liveAttempt.status === 0 || !String(liveAttempt.stderr || liveAttempt.stdout).includes('LOCK_HELD')) {
+      fail(`live owner was not protected after a CLI-only clock gap:\n${liveAttempt.stderr}`);
+    }
+    const liveState = withClockDb((db) => ({
+      lock: db.prepare('SELECT owner, expires_at, ttl_sec FROM locks WHERE resource = ?').get('src/clock-live'),
+      grace: db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get() || null
+    }));
+    if (liveState.lock?.owner !== 'live-owner' || liveState.lock.ttl_sec !== 90 ||
+        liveState.lock.expires_at < liveNow + 90 || liveState.grace !== null) {
+      fail(`verified-live CLI-only owner was not renewed without blanket grace:\n${JSON.stringify(liveState, null, 2)}`);
+    }
+
+    clockHcc(['register', '--peer', 'unknown-owner', '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+    clockHcc(['lock', 'acquire', '--peer', 'unknown-owner', '--resource', 'src/clock-unknown', '--ttl', '90']);
+    const unknownNow = rewind('src/clock-unknown', 'unknown');
+    const unknownAttempt = clockHccMaybe(['--json', 'lock', 'acquire', '--peer', 'unknown-taker', '--resource', 'src/clock-unknown', '--ttl', '90']);
+    if (unknownAttempt.status === 0 || !String(unknownAttempt.stderr || unknownAttempt.stdout).includes('LOCK_HELD')) {
+      fail(`unknown owner was not protected by clock grace:\n${unknownAttempt.stdout}\n${unknownAttempt.stderr}`);
+    }
+    const unknownState = withClockDb((db) => ({
+      owner: db.prepare('SELECT owner FROM locks WHERE resource = ?').get('src/clock-unknown')?.owner,
+      grace: Number(db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get()?.value || 0)
+    }));
+    if (unknownState.owner !== 'unknown-owner' || unknownState.grace < unknownNow + 120) {
+      fail(`unknown owner grace was not persisted for 120 seconds:\n${JSON.stringify(unknownState, null, 2)}`);
+    }
+
+    clockHcc(['register', '--peer', 'dead-owner', '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+    clockHcc(['lock', 'acquire', '--peer', 'dead-owner', '--resource', 'src/clock-dead', '--ttl', '90']);
+    rewind('src/clock-dead', 'dead');
+    const deadAttempt = clockHccMaybe(['lock', 'acquire', '--peer', 'dead-taker', '--resource', 'src/clock-dead', '--ttl', '90']);
+    if (deadAttempt.status !== 0) {
+      fail(`verified-dead owner was delayed after a CLI-only clock gap:\n${deadAttempt.stdout}\n${deadAttempt.stderr}`);
+    }
+    const deadState = withClockDb((db) => ({
+      owner: db.prepare('SELECT owner FROM locks WHERE resource = ?').get('src/clock-dead')?.owner,
+      grace: db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get() || null,
+      watermark: db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get()?.value
+    }));
+    if (deadState.owner !== 'dead-taker' || deadState.grace !== null) {
+      fail(`verified-dead evidence entered grace or retained ownership:\n${JSON.stringify(deadState, null, 2)}`);
+    }
+
+    clockHcc(['register', '--peer', 'unavailable-owner', '--kind', 'shell', '--pid', String(process.pid), '--status', 'working']);
+    clockHcc(['lock', 'acquire', '--peer', 'unavailable-owner', '--resource', 'src/clock-unavailable', '--ttl', '90']);
+    const unavailableNow = Math.floor(Date.now() / 1000);
+    withClockDb((db) => {
+      db.prepare(`
+        UPDATE peers
+        SET last_seen_at = ?, pid_start_token = NULL, pid_command_hash = NULL
+        WHERE id = 'unavailable-owner'
+      `).run(unavailableNow - 86400);
+      db.prepare('UPDATE locks SET created_at = ?, expires_at = ? WHERE resource = ?')
+        .run(unavailableNow - 86400, unavailableNow - 60, 'src/clock-unavailable');
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(unavailableNow - 86400));
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_grace_until', 'corrupt')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run();
+    });
+    const unavailableAttempt = clockHccMaybe(['--json', 'lock', 'acquire', '--peer', 'unavailable-taker', '--resource', 'src/clock-unavailable']);
+    if (unavailableAttempt.status === 0 || !String(unavailableAttempt.stderr).includes('CLOCK_SAFETY_UNAVAILABLE')) {
+      fail(`clock safety persistence failure did not fail closed:\n${unavailableAttempt.stdout}\n${unavailableAttempt.stderr}`);
+    }
+    const unavailablePublicText = String(unavailableAttempt.stderr).split(/\n\(node:/, 1)[0].trim();
+    const unavailablePublicError = JSON.parse(unavailablePublicText);
+    if (JSON.stringify(unavailablePublicError) !== JSON.stringify({
+      ok: false,
+      error: {
+        code: 'CLOCK_SAFETY_UNAVAILABLE',
+        message: 'Clock safety state could not be persisted; ownership was left unchanged'
+      }
+    }) || /corrupt|sqlite|schema|invalid persisted/i.test(unavailablePublicText)) {
+      fail(`clock safety public error leaked internal persistence details:\n${unavailableAttempt.stderr}`);
+    }
+    const unavailableState = withClockDb((db) => ({
+      owner: db.prepare('SELECT owner FROM locks WHERE resource = ?').get('src/clock-unavailable')?.owner,
+      watermark: db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get()?.value,
+      grace: db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get()?.value
+    }));
+    if (unavailableState.owner !== 'unavailable-owner' ||
+        unavailableState.watermark !== String(unavailableNow - 86400) ||
+        unavailableState.grace !== 'corrupt') {
+      fail(`clock safety failure changed ownership state:\n${JSON.stringify(unavailableState, null, 2)}`);
+    }
+
+    withClockDb((db) => db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run());
+    const readOnlyWatermark = unavailableState.watermark;
+    clockHcc(['status']);
+    clockHcc(['lock', 'list']);
+    clockHcc(['doctor']);
+    const afterReadOnly = withClockDb((db) => ({
+      watermark: db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get()?.value,
+      grace: db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get() || null
+    }));
+    if (afterReadOnly.watermark !== readOnlyWatermark || afterReadOnly.grace !== null) {
+      fail(`status/list/doctor mutated clock safety state:\n${JSON.stringify({ readOnlyWatermark, afterReadOnly }, null, 2)}`);
+    }
+  } finally {
+    fs.rmSync(clockRoot, { recursive: true, force: true });
+    fs.rmSync(clockHome, { recursive: true, force: true });
+  }
+}
+
+function gcClockSubjectDriftWorkflow() {
+  log('GC clock safety: concurrently introduced expired lock is not swept');
+  const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-clock-root-${testId}-`));
+  const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-clock-home-${testId}-`));
+  const gcEnv = { ...env, HOME: gcHome };
+  for (const key of Object.keys(gcEnv)) {
+    if (key.startsWith('HCC_')) delete gcEnv[key];
+  }
+  const gcDbPath = path.join(gcRoot, '.hello-cc', 'mesh.db');
+  const gcHcc = (args) => run(process.execPath, [hccBin, '--root', gcRoot, ...args], { env: gcEnv });
+
+  try {
+    gcHcc(['init', '--no-guidance']);
+    const t = Math.floor(Date.now() / 1000);
+    const db = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(t));
+      db.exec(`
+        CREATE TRIGGER inject_expired_lock_during_gc_observation
+        AFTER UPDATE OF value ON meta
+        WHEN NEW.key = 'clock_last_observed_at'
+        BEGIN
+          INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at, ttl_sec)
+          VALUES ('gc-concurrent-expired', 'gc-concurrent-expired', '*', 'gc-concurrent-unknown',
+                  'inserted after GC subject validation', ${t - 60}, ${t - 120}, 90);
+          INSERT INTO messages(sender, recipient, kind, body, created_at)
+          VALUES ('gc-concurrent', 'reader', 'note', 'backdated after GC subject validation', ${t - 10000 * 86400});
+        END;
+      `);
+    } finally {
+      db.close();
+    }
+
+    gcHcc(['gc', '--older-than', '9999', '--yes']);
+    const verify = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      const lock = verify.prepare(`
+        SELECT owner, expires_at FROM locks WHERE resource = 'gc-concurrent-expired'
+      `).get();
+      const message = verify.prepare(`
+        SELECT body FROM messages WHERE body = 'backdated after GC subject validation'
+      `).get();
+      if (lock?.owner !== 'gc-concurrent-unknown' || Number(lock.expires_at) !== t - 60) {
+        fail(`GC swept an expired unknown lock introduced after subject validation:\n${JSON.stringify(lock, null, 2)}`);
+      }
+      if (message?.body !== 'backdated after GC subject validation') {
+        fail(`GC swept a backdated history row introduced after subject validation:\n${JSON.stringify(message, null, 2)}`);
+      }
+    } finally {
+      verify.close();
+    }
+  } finally {
+    fs.rmSync(gcRoot, { recursive: true, force: true });
+    fs.rmSync(gcHome, { recursive: true, force: true });
+  }
+}
+
+function gcOutputConsistencyWorkflow() {
+  log('GC output: text and JSON report the same snapshot counts');
+  const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-output-root-${testId}-`));
+  const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-output-home-${testId}-`));
+  const gcEnv = { ...env, HOME: gcHome };
+  for (const key of Object.keys(gcEnv)) {
+    if (key.startsWith('HCC_')) delete gcEnv[key];
+  }
+  const gcDbPath = path.join(gcRoot, '.hello-cc', 'mesh.db');
+  const gcHcc = (args) => run(process.execPath, [hccBin, '--root', gcRoot, ...args], { env: gcEnv });
+
+  try {
+    gcHcc(['init', '--no-guidance']);
+    const t = Math.floor(Date.now() / 1000);
+    const old = t - 10 * 86400;
+    const db = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    try {
+      db.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(t));
+      const event = db.prepare("INSERT INTO events(type, actor, payload, created_at) VALUES ('note', 'seed', '{}', ?)");
+      const task = db.prepare("INSERT INTO tasks(title, status, created_at, updated_at) VALUES ('done', 'done', ?, ?)");
+      const message = db.prepare("INSERT INTO messages(sender, kind, body, created_at) VALUES ('seed', 'note', 'old', ?)");
+      const handoff = db.prepare("INSERT INTO handoffs(from_peer, summary, created_at) VALUES ('seed', 'old', ?)");
+      db.exec('BEGIN');
+      for (let index = 0; index < 17; index += 1) {
+        event.run(old);
+        task.run(old, old);
+        message.run(old);
+        handoff.run(old);
+      }
+      db.exec('COMMIT');
+    } finally {
+      db.close();
+    }
+
+    const text = gcHcc(['gc', '--older-than', '1']);
+    const json = JSON.parse(gcHcc(['--json', 'gc', '--older-than', '1'])).data;
+    for (const [key, label] of [
+      ['old_events', 'old events'],
+      ['old_tasks', 'old tasks'],
+      ['old_messages', 'old messages'],
+      ['old_handoffs', 'old handoffs'],
+      ['deferred_history', 'history rows deferred after subject change']
+    ]) {
+      const match = text.match(new RegExp(`^\\s*${label}:\\s*(\\d+)`, 'm'));
+      const textCount = match ? Number(match[1]) : 0;
+      if (textCount !== json[key]) {
+        fail(`gc text/json count mismatch for ${key}: text=${textCount}, json=${json[key]}\n${text}`);
+      }
+    }
+    for (const key of ['old_events', 'old_tasks', 'old_messages', 'old_handoffs']) {
+      if (json[key] !== 17) fail(`gc output fixture count wrong for ${key}: ${json[key]}`);
+    }
+    if (json.deferred_history !== 0) fail(`gc output fixture unexpectedly deferred ${json.deferred_history} rows`);
+  } finally {
+    fs.rmSync(gcRoot, { recursive: true, force: true });
+    fs.rmSync(gcHome, { recursive: true, force: true });
+  }
+}
+
 // Name-authoritative re-adoption + dead-peer reaper (session leak hardening).
 async function sessionRecoveryWorkflow() {
   if (!tmuxAvailable()) {
@@ -8062,6 +8362,13 @@ function gcCoverageWorkflow() {
       INSERT INTO locks(resource, base_resource, scope, owner, reason, expires_at, created_at)
       VALUES (?, ?, '*', 'gc-peer', 'live', ?, ?)
     `).run(liveLockResource, liveLockResource, t + 3600, t);
+    // This fixture exercises ordinary retention, not an earlier workflow's
+    // unknown-evidence grace window. Establish a current observation baseline.
+    db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+    db.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(t));
   });
 
   const out = hcc(['gc', '--older-than', '0', '--yes']);
@@ -8096,6 +8403,9 @@ async function main() {
   await waitRuntime();
   hcc(['peer', 'list']);
   await dbWorkflow();
+  cliOnlyClockSafetyWorkflow();
+  gcClockSubjectDriftWorkflow();
+  gcOutputConsistencyWorkflow();
   await processEvidenceWorkflow();
   await multiProjectWebWorkflow();
   await tmuxBackedStartWorkflow();

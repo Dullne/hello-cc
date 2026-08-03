@@ -7,17 +7,23 @@ import path from 'node:path';
 import process from 'node:process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { CliError } from '../lib/shared/errors.mjs';
+import { publicCliFailure } from '../lib/shared/errors.mjs';
 import {
   CLOCK_GRACE_SEC,
-  classifyClockJump,
+  classifyClockDrift,
   clockGraceSuppressed,
-  readClockGraceUntil,
-  writeClockGraceUntil
+  readClockGraceUntil
 } from '../lib/shared/clock-grace.mjs';
+import {
+  clockSafetyUnavailable,
+  observeClockSafety,
+  observeClockSafetyInTransaction
+} from '../lib/core/coordination/clock-safety.mjs';
 import {
   DB_SCHEMA_VERSION,
   execWithBusyRetry,
@@ -186,11 +192,19 @@ import {
 } from '../lib/core/coordination/locks.mjs';
 import {
   captureLockAcquireSubject,
+  clockCandidatesFromLocks,
   observeLockOwnerEvidence,
   sameLockAcquireSubject
 } from '../lib/core/coordination/lock-evidence.mjs';
 import { runOptimisticEvidenceMutation } from '../lib/core/coordination/optimistic-evidence.mjs';
-import { pruneOldEventsPreservingTmuxAuthority } from '../lib/core/coordination/event-retention.mjs';
+import {
+  captureGcLockSubjects,
+  captureHistoryGcPlan,
+  createHistoryGcSnapshot,
+  finalizeGcLockSubjects,
+  finalizeHistoryGcBatches,
+  runWithHistoryGcSnapshotCleanup
+} from '../lib/core/coordination/gc-plan.mjs';
 import {
   assignTeamWorkers,
   expandTeamWorkers,
@@ -437,6 +451,77 @@ function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate) {
   return { changed: false, evidence: { state: 'unknown', reason: 'subject_changed' } };
 }
 
+function observeClockSafetyOrThrow(db, options) {
+  try {
+    return observeClockSafety(db, options);
+  } catch (err) {
+    throw clockSafetyUnavailable(err);
+  }
+}
+
+function observeClockSafetyInTransactionOrThrow(db, options) {
+  try {
+    return observeClockSafetyInTransaction(db, options);
+  } catch (err) {
+    throw clockSafetyUnavailable(err);
+  }
+}
+
+function prepareLockClockObservation(db, subject, evidenceByOwner) {
+  return observeClockSafetyInTransactionOrThrow(db, {
+    operation: 'ownership',
+    candidates: clockCandidatesFromLocks(subject, evidenceByOwner),
+    nowSec: subject.observedAt
+  });
+}
+
+function observeLockClockSafety(db, projectCtx, {
+  requested = null,
+  taskId = null,
+  owner = null,
+  observedAt = now()
+} = {}) {
+  try {
+    const subject = captureLockAcquireSubject(db, {
+      taskId,
+      requested,
+      now: observedAt
+    });
+    const evidenceByOwner = observeLockOwnerEvidence(subject, (row, binding) =>
+      observePeerEvidence(projectCtx, row, binding));
+    const candidates = subject.locks
+      .filter((lock) => Number(lock.expires_at) <= observedAt && (!owner || lock.owner === owner))
+      .map((lock) => ({
+        boundary: Number(lock.expires_at),
+        evidence: evidenceByOwner.get(lock.owner)?.state || 'unknown',
+        owner: lock.owner,
+        resource: lock.resource
+      }));
+    return observeClockSafetyOrThrow(db, {
+      operation: 'ownership',
+      candidates,
+      nowSec: observedAt
+    });
+  } catch (err) {
+    throw clockSafetyUnavailable(err);
+  }
+}
+
+function observeTaskTakeoverClockSafety({ db, row, ownerRow, evidence, staleAfter }) {
+  const boundary = ownerRow
+    ? Number(ownerRow.last_seen_at || 0) + Number(staleAfter)
+    : 0;
+  return observeClockSafetyOrThrow(db, {
+    operation: 'ownership',
+    candidates: row?.owner ? [{
+      boundary,
+      evidence: evidence?.state || 'unknown',
+      owner: row.owner
+    }] : [],
+    nowSec: now()
+  });
+}
+
 function splitProcessArgs(line) {
   const args = [];
   let current = '';
@@ -505,6 +590,7 @@ const {
   activePeerTtl: ACTIVE_PEER_TTL,
   addEvent,
   now,
+  observeClockSafety: observeTaskTakeoverClockSafety,
   sendMessage
 });
 const {
@@ -534,6 +620,7 @@ const {
   defaultLockTtl: DEFAULT_LOCK_TTL,
   detectBranch,
   now,
+  observeClockSafetyInTransaction,
   observePeerEvidence,
   positiveIntOpt,
   peerEvidenceFromDb,
@@ -995,17 +1082,21 @@ async function cmdHeartbeat(ctx, args) {
   const ttlOverride = opts.ttl === undefined ? null : intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const db = connect(ctx);
   const t = now();
+  const clockObservation = opts['renew-locks']
+    ? observeLockClockSafety(db, ctx, { owner: peer, observedAt: t })
+    : null;
   touchCurrentPeer(db, ctx, identity, status, 'shell');
   let renewed = 0;
   if (opts['renew-locks']) {
-    const grace = clockGraceSuppressed(t, readClockGraceUntil(db));
     const evidenceLive = peerEvidenceFromDb(db, ctx, peer).state === 'live';
-    if (ttlOverride !== null) {
-      renewed = grace || evidenceLive
+    if (clockObservation?.renewed > 0 && ttlOverride === null) {
+      renewed = clockObservation.renewed;
+    } else if (ttlOverride !== null) {
+      renewed = evidenceLive
         ? db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ?').run(t, ttlOverride, ttlOverride, peer).changes
         : db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ? AND expires_at > ?').run(t, ttlOverride, ttlOverride, peer, t).changes;
     } else {
-      renewed = grace || evidenceLive
+      renewed = evidenceLive
         ? db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ?').run(t, peer).changes
         : db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ? AND expires_at > ?').run(t, peer, t).changes;
     }
@@ -2048,17 +2139,25 @@ async function lockAcquire(ctx, args) {
   let lock;
   try {
     const acquisitionNow = now();
-    lock = runOptimisticEvidenceMutation(db, {
-      capture: (subjectDb) => captureLockAcquireSubject(subjectDb, {
-        taskId,
-        requested,
-        now: acquisitionNow
-      }),
+    const outcome = runOptimisticEvidenceMutation(db, {
+      capture: (subjectDb) => {
+        try {
+          return captureLockAcquireSubject(subjectDb, {
+            taskId,
+            requested,
+            now: acquisitionNow
+          });
+        } catch (err) {
+          throw clockSafetyUnavailable(err);
+        }
+      },
       observe: (subject) => observeLockOwnerEvidence(subject, (row, binding) =>
         observePeerEvidence(ctx, row, binding)),
       same: sameLockAcquireSubject,
+      beforeMutate: (subject, evidenceByOwner) =>
+        prepareLockClockObservation(db, subject, evidenceByOwner),
       changedMessage: `Lock subjects changed while acquiring ${lockLabel(requested)}; retry`,
-      mutate: (subject, evidenceByOwner) => {
+      mutate: (subject, evidenceByOwner, clockObservation) => {
       const t = subject.observedAt;
       if (taskId) {
         const task = subject.task;
@@ -2067,7 +2166,7 @@ async function lockAcquire(ctx, args) {
       }
       // During clock grace, every retained lock row still conflicts. A fixed
       // look-back cannot protect locks across an arbitrarily long sleep.
-      const activeLocks = clockGraceSuppressed(t, subject.graceUntil)
+      const activeLocks = clockGraceSuppressed(t, clockObservation.graceUntil)
         ? subject.locks
         : subject.locks.filter((row) =>
             Number(row.expires_at) > t ||
@@ -2075,14 +2174,14 @@ async function lockAcquire(ctx, args) {
           );
       const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
       if (conflict) {
-        throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
+        return { error: new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
           resource: requested.base_resource,
           scope: requested.scope,
           lock_resource: conflict.resource,
           lock_scope: lockScope(conflict),
           owner: conflict.owner,
           expires_at: iso(conflict.expires_at)
-        });
+        }) };
       }
       const existing = subject.locks.find((row) => row.resource === requested.resource) || null;
       db.prepare(`
@@ -2099,9 +2198,11 @@ async function lockAcquire(ctx, args) {
           ttl_sec = excluded.ttl_sec
       `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, t, ttl);
       addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
-      return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
+      return { lock: db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource) };
       }
     });
+    if (outcome.error) throw outcome.error;
+    lock = outcome.lock;
   } catch (err) {
     notifyTaskOwnerConflict(ctx, err);
     throw err;
@@ -3236,19 +3337,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // managed session are skipped: their own exit poller owns their transition.
   const REAPER_GRACE_SEC = 120;
   let reaperInFlight = false;
-  // Wall-clock jump detector (hb-05): the reaper ticks every 30s, so any delta
-  // much larger than that between probes means the machine slept or NTP stepped
-  // the clock forward; a negative delta is a backward step. On a jump, persist
-  // a grace deadline so every process suppresses age-based stale/takeover/lock
-  // decisions for one window instead of mass-reaping live peers.
-  let lastClockProbeMs = Date.now();
+  // Compare wall time with a monotonic clock so an event-loop stall or machine
+  // sleep does not look like a wall-clock step. Only their drift is safety
+  // relevant; on a jump, the shared observer evaluates current owner evidence.
+  let lastClockProbe = { wallMs: Date.now(), monotonicMs: performance.now() };
   function detectClockJump() {
-    const nowMs = Date.now();
-    const delta = nowMs - lastClockProbeMs;
-    lastClockProbeMs = nowMs;
-    const jump = classifyClockJump(delta);
+    const current = { wallMs: Date.now(), monotonicMs: performance.now() };
+    const wallDeltaMs = current.wallMs - lastClockProbe.wallMs;
+    const monotonicDeltaMs = current.monotonicMs - lastClockProbe.monotonicMs;
+    lastClockProbe = current;
+    const jump = classifyClockDrift({ wallDeltaMs, monotonicDeltaMs });
     if (jump) {
-      console.error(`[${new Date().toISOString()}] wall-clock ${jump.kind} jump detected (${delta >= 0 ? '+' : ''}${Math.round(delta / 1000)}s); suppressing stale/takeover/lock decisions until +${CLOCK_GRACE_SEC}s`);
+      console.error(`[${new Date().toISOString()}] wall-clock ${jump.kind} drift detected (${jump.driftMs >= 0 ? '+' : ''}${Math.round(jump.driftMs / 1000)}s); evaluating ownership evidence with a ${CLOCK_GRACE_SEC}s unknown-evidence grace window`);
     }
     return jump;
   }
@@ -3272,20 +3372,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (reaperInFlight) return;
     reaperInFlight = true;
     try {
-      // Probe exactly once per scheduler tick. A clock jump is machine-wide,
-      // so persist the same grace deadline to every project served by this
-      // runtime rather than only the project that started the web process.
+      // Probe exactly once per scheduler tick. A clock jump is machine-wide;
+      // each project feeds that signal and its own evidence snapshot through
+      // the shared observer rather than maintaining runtime-only grace state.
       const jump = detectClockJump();
-      const graceUntil = jump ? now() + CLOCK_GRACE_SEC : null;
       for (const projectCtx of runtimeProjectContexts()) {
         let db = null;
         try {
           db = connect(projectCtx, { migrateRegistered: false, create: false });
           const t = now();
-          if (graceUntil) writeClockGraceUntil(db, graceUntil);
-          // hb-05: skip the whole reap pass during a clock grace window — age
-          // is untrustworthy after sleep or an NTP step.
-          if (clockGraceSuppressed(t, readClockGraceUntil(db))) continue;
           const managedPeerIds = new Set();
           for (const session of sessionsForProject(projectCtx)) {
             if (session.status !== 'running') continue;
@@ -3295,7 +3390,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             }
           }
           const rows = db.prepare(`
-            SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
+            SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash, p.last_seen_at,
                    b.transport, b.runtime_target
             FROM peers p
             LEFT JOIN peer_bindings b ON b.peer = p.id
@@ -3303,6 +3398,23 @@ async function cmdWeb(ctx, args, startMeta = {}) {
               AND p.pid IS NOT NULL
               AND p.last_seen_at < ?
           `).all(t - REAPER_GRACE_SEC);
+          const candidates = rows.map((row) => {
+            const evidence = peerEvidenceFromDb(db, projectCtx, row.id);
+            return {
+              boundary: Number(row.last_seen_at) + REAPER_GRACE_SEC,
+              evidence: evidence.state,
+              owner: row.id
+            };
+          });
+          observeClockSafetyOrThrow(db, {
+            operation: 'ownership',
+            candidates,
+            nowSec: t,
+            clockJump: jump
+          });
+          // Unknown evidence is the only reason a jump opens blanket grace.
+          // Probes above completed before the observer's write transaction.
+          if (clockGraceSuppressed(t, readClockGraceUntil(db))) continue;
           for (const row of rows) {
             if (managedPeerIds.has(row.id)) continue;
             mutateConfirmedDeadPeer(db, projectCtx, row.id, (subject, evidence) => {
@@ -5514,8 +5626,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
     } catch (err) {
-      const detail = err instanceof CliError || process.env.HCC_DEBUG ? err.message : 'internal server error';
-      sendJson(res, webErrorStatus(err), { ok: false, error: { code: err.code || 'SERVER_ERROR', message: detail } });
+      const publicFailure = publicCliFailure(err);
+      const publicError = publicFailure?.error || err;
+      const detail = publicFailure || process.env.HCC_DEBUG
+        ? publicError.message
+        : 'internal server error';
+      sendJson(res, webErrorStatus(publicError), {
+        ok: false,
+        error: {
+          code: publicError.code || 'SERVER_ERROR',
+          message: detail,
+          ...(publicFailure?.cleanupFailed ? { cleanup_failed: true } : {})
+        }
+      });
     }
   };
   const server = useTls
@@ -6156,18 +6279,24 @@ async function cmdHook(ctx, args) {
     // hb-06: an active hook is proof the peer is working. During clock grace,
     // renew retained locks even when the wall-clock jump made them look expired.
     const hookNow = now();
-    const hookGrace = clockGraceSuppressed(hookNow, readClockGraceUntil(db));
-    const hookLockRenewals = hookGrace
-      ? db.prepare(`
-          UPDATE locks
-          SET expires_at = ? + MIN(ttl_sec, 3600)
-          WHERE owner = ?
-        `).run(hookNow, peerId).changes
-      : db.prepare(`
-          UPDATE locks
-          SET expires_at = ? + MIN(ttl_sec, 3600)
-          WHERE owner = ? AND expires_at > ?
-        `).run(hookNow, peerId, hookNow).changes;
+    const hookClockObservation = observeLockClockSafety(db, hookCtx, {
+      owner: peerId,
+      observedAt: hookNow
+    });
+    const hookEvidenceLive = peerEvidenceFromDb(db, hookCtx, peerId).state === 'live';
+    const hookLockRenewals = hookClockObservation.renewed > 0
+      ? hookClockObservation.renewed
+      : hookEvidenceLive
+        ? db.prepare(`
+            UPDATE locks
+            SET expires_at = ? + MIN(ttl_sec, 3600)
+            WHERE owner = ?
+          `).run(hookNow, peerId).changes
+        : db.prepare(`
+            UPDATE locks
+            SET expires_at = ? + MIN(ttl_sec, 3600)
+            WHERE owner = ? AND expires_at > ?
+          `).run(hookNow, peerId, hookNow).changes;
     if (hookLockRenewals > 0) {
       addEvent(db, 'lock.renewed_by_hook', peerId, null, { renewed: hookLockRenewals });
     }
@@ -7270,6 +7399,106 @@ async function cmdTmux(ctx, args) {
 // stale bufs) so automatic background gc bounds DB growth without deleting
 // user-meaningful history (peers/tasks/messages/handoffs stay for `hcc gc`).
 // `db` is used open; the caller owns its lifecycle.
+function captureGcClockSubject(db, {
+  olderThanDays,
+  observedAt,
+  historyCategories,
+  includeStalePeers,
+  historySnapshot
+}) {
+  const retentionSec = olderThanDays * 86400;
+  const cutoff = observedAt - retentionSec;
+  const lockSubjects = captureGcLockSubjects(db, observedAt);
+  const historyPlan = captureHistoryGcPlan(db, cutoff, {
+    categories: historyCategories,
+    snapshot: historySnapshot
+  });
+
+  const stalePeers = includeStalePeers
+    ? db.prepare(`
+        SELECT p.id
+        FROM peers p
+        WHERE p.last_seen_at <= ?
+        ORDER BY p.id ASC
+      `).all(cutoff).map(({ id }) => peerMutationSubject(db, id))
+    : [];
+
+  const ownerIds = new Set(lockSubjects.map(({ lock }) => lock.owner));
+  for (const subject of stalePeers) {
+    if (subject.peer?.id) ownerIds.add(subject.peer.id);
+  }
+  const owners = [...ownerIds].sort().map((owner) => ({
+    owner,
+    ...peerMutationSubject(db, owner)
+  }));
+
+  return {
+    lockSubjects,
+    stalePeers,
+    owners,
+    historyPlan,
+    gcCutoffs: [...historySnapshot.gcCutoffs],
+    graceUntil: readClockGraceUntil(db),
+    olderThanDays,
+    observedAt
+  };
+}
+
+function observeGcClockSafety(ctx, db, {
+  olderThanDays,
+  observedAt,
+  historyCategories,
+  includeStalePeers,
+  historySnapshot
+}) {
+  try {
+    return runOptimisticEvidenceMutation(db, {
+      capture: (subjectDb) => captureGcClockSubject(subjectDb, {
+        olderThanDays,
+        observedAt,
+        historyCategories,
+        includeStalePeers,
+        historySnapshot
+      }),
+      observe: (subject) => new Map(subject.owners.map(({ owner, peer, binding }) => [
+        owner,
+        peer
+          ? observePeerEvidence(ctx, peer, binding)
+          : { state: 'unknown', reason: 'peer_missing' }
+      ])),
+      same: (left, right) => JSON.stringify(left) === JSON.stringify(right),
+      beforeMutate: (subject, evidenceByOwner) => observeClockSafetyInTransactionOrThrow(db, {
+        operation: 'gc',
+        candidates: [
+          ...subject.lockSubjects.map(({ lock }) => ({
+            boundary: Number(lock.expires_at),
+            evidence: evidenceByOwner.get(lock.owner)?.state || 'unknown',
+            owner: lock.owner,
+            resource: lock.resource
+          })),
+          ...subject.stalePeers.map(({ peer }) => ({
+            boundary: Number(peer.last_seen_at) + olderThanDays * 86400,
+            evidence: evidenceByOwner.get(peer.id)?.state || 'unknown',
+            owner: peer.id
+          }))
+        ],
+        gcCutoffs: subject.gcCutoffs,
+        nowSec: subject.observedAt
+      }),
+      changedMessage: 'GC subjects changed while clock evidence was being observed; retry',
+      mutate: (subject, evidenceByOwner, observation) => ({
+        ...observation,
+        subject,
+        evidenceByOwner,
+        expiredLockCount: subject.lockSubjects.length
+      })
+    });
+  } catch (err) {
+    if (err instanceof CliError) throw err;
+    throw clockSafetyUnavailable(err);
+  }
+}
+
 function runGc(ctx, db, {
   olderThanDays = 7,
   dryRun = false,
@@ -7277,7 +7506,46 @@ function runGc(ctx, db, {
   protectedBufFiles = null
 } = {}) {
   const auto = scope === 'auto';
-  const cutoff = now() - olderThanDays * 86400;
+  const historyCategories = auto ? ['events'] : ['events', 'tasks', 'messages', 'handoffs'];
+  const gcNow = now();
+  const retentionSec = olderThanDays * 86400;
+  const historySnapshot = createHistoryGcSnapshot(db, gcNow - retentionSec, {
+    categories: historyCategories,
+    retentionSec
+  });
+  return runWithHistoryGcSnapshotCleanup(
+    db,
+    historySnapshot,
+    () => runGcWithHistorySnapshot(ctx, db, {
+      olderThanDays,
+      dryRun,
+      auto,
+      protectedBufFiles,
+      historyCategories,
+      gcNow,
+      historySnapshot
+    }),
+    'History GC run'
+  );
+}
+
+function runGcWithHistorySnapshot(ctx, db, {
+  olderThanDays,
+  dryRun,
+  auto,
+  protectedBufFiles,
+  historyCategories,
+  gcNow,
+  historySnapshot
+}) {
+  const clockObservation = observeGcClockSafety(ctx, db, {
+    olderThanDays,
+    observedAt: gcNow,
+    historyCategories,
+    includeStalePeers: !auto,
+    historySnapshot
+  });
+  const graceActive = clockGraceSuppressed(gcNow, clockObservation.graceUntil);
   const protectedBuffers = protectedBufFiles instanceof Set
     ? protectedBufFiles
     : new Set(protectedBufFiles || []);
@@ -7290,14 +7558,16 @@ function runGc(ctx, db, {
     old_messages: 0,
     old_handoffs: 0,
     expired_locks: 0,
-    deferred_expired_locks: 0,
-    deferred_unknown_peers: 0
+    deferred_expired_locks: graceActive ? clockObservation.expiredLockCount : 0,
+    deferred_unknown_peers: 0,
+    deferred_history: 0,
+    deferred_age_based: graceActive
   };
 
   // Buffer files (high-volume ephemeral). Auto keeps a shorter 7-day window.
   const bufCutoffMs = Date.now() - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
-  try {
+  if (!graceActive) try {
     for (const f of fs.readdirSync(bufsDir)) {
       const fp = path.join(bufsDir, f);
       try {
@@ -7314,41 +7584,28 @@ function runGc(ctx, db, {
     }
   } catch {}
 
-  // Old events (avoid unbounded growth) — always pruned.
-  results.old_events = pruneOldEventsPreservingTmuxAuthority(db, cutoff, { dryRun });
-
   // A clock jump can make every lock look expired at once. Preserve those rows
   // for the grace window so acquisition and heartbeat logic can recover them.
-  const gcNow = now();
-  const expiredLockRows = db.prepare('SELECT * FROM locks WHERE expires_at < ?').all(gcNow);
-  if (clockGraceSuppressed(gcNow, readClockGraceUntil(db))) {
-    results.deferred_expired_locks = expiredLockRows.length;
+  const expiredLockSubjects = clockObservation.subject.lockSubjects;
+  if (graceActive) {
+    results.deferred_expired_locks = Math.max(results.deferred_expired_locks, expiredLockSubjects.length);
   } else {
-    for (const lock of expiredLockRows) {
-      const evidence = peerEvidenceFromDb(db, ctx, lock.owner);
-      if (evidence.state === 'live') {
-        results.deferred_expired_locks++;
-        continue;
-      }
-      if (!dryRun) db.prepare('DELETE FROM locks WHERE resource = ?').run(lock.resource);
-      results.expired_locks++;
-    }
+    const lockResult = finalizeGcLockSubjects(
+      db,
+      expiredLockSubjects,
+      clockObservation.evidenceByOwner,
+      { dryRun }
+    );
+    results.expired_locks = lockResult.deleted;
+    results.deferred_expired_locks += lockResult.deferred + lockResult.live;
   }
 
-  if (!auto) {
+  if (!auto && !graceActive) {
     // Stale peers (no heartbeat in N days)
-    const stalePeers = db.prepare(`
-      SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
-             b.transport, b.runtime_target
-      FROM peers p
-      LEFT JOIN peer_bindings b ON b.peer = p.id
-      WHERE p.last_seen_at < ?
-    `).all(cutoff);
-    for (const p of stalePeers) {
-      const subject = peerMutationSubject(db, p.id);
-      const evidence = subject.peer
-        ? observePeerEvidence(ctx, subject.peer, subject.binding)
-        : { state: 'unknown', reason: 'peer_missing' };
+    const stalePeers = clockObservation.subject.stalePeers;
+    for (const subject of stalePeers) {
+      const p = subject.peer;
+      const evidence = clockObservation.evidenceByOwner.get(p.id) || { state: 'unknown' };
       if (evidence.state === 'unknown') {
         results.deferred_unknown_peers++;
         continue;
@@ -7365,24 +7622,18 @@ function runGc(ctx, db, {
       if (removed.changed) results.stale_peers++;
     }
 
-    // Old completed tasks
-    const oldTasks = db.prepare(
-      "SELECT COUNT(*) AS n FROM tasks WHERE status IN ('done', 'abandoned') AND updated_at < ?"
-    ).get(cutoff);
-    if (!dryRun) db.prepare(
-      "DELETE FROM tasks WHERE status IN ('done', 'abandoned') AND updated_at < ?"
-    ).run(cutoff);
-    results.old_tasks = oldTasks.n;
+  }
 
-    // Old messages (message_reads cascade via foreign_keys = ON)
-    const oldMessages = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE created_at < ?').get(cutoff);
-    if (!dryRun) db.prepare('DELETE FROM messages WHERE created_at < ?').run(cutoff);
-    results.old_messages = oldMessages.n;
-
-    // Old handoffs
-    const oldHandoffs = db.prepare('SELECT COUNT(*) AS n FROM handoffs WHERE created_at < ?').get(cutoff);
-    if (!dryRun) db.prepare('DELETE FROM handoffs WHERE created_at < ?').run(cutoff);
-    results.old_handoffs = oldHandoffs.n;
+  if (!graceActive) {
+    const historyResult = finalizeHistoryGcBatches(db, clockObservation.subject.historyPlan, {
+      dryRun,
+      dropSnapshot: false
+    });
+    results.old_events = historyResult.old_events;
+    results.old_tasks = historyResult.old_tasks;
+    results.old_messages = historyResult.old_messages;
+    results.old_handoffs = historyResult.old_handoffs;
+    results.deferred_history = historyResult.deferred;
   }
 
   return results;
@@ -7414,6 +7665,8 @@ async function cmdGc(ctx, args) {
     if (r.buf_files)     lines.push(`  buffer files:   ${r.buf_files}`);
     if (r.stale_peers)   lines.push(`  stale peers:    ${r.stale_peers}`);
     if (r.deferred_unknown_peers) lines.push(`  unknown peers deferred: ${r.deferred_unknown_peers}`);
+    if (r.deferred_history) lines.push(`  history rows deferred after subject change: ${r.deferred_history}`);
+    if (r.deferred_age_based) lines.push('  age-based cleanup deferred by clock grace');
     if (r.old_events)    lines.push(`  old events:     ${r.old_events}`);
     if (r.old_tasks)     lines.push(`  old tasks:      ${r.old_tasks}`);
     if (r.old_messages)  lines.push(`  old messages:   ${r.old_messages}`);
@@ -7423,7 +7676,7 @@ async function cmdGc(ctx, args) {
     if (r.wal_checkpoint) lines.push(`  wal checkpoint: ${r.wal_checkpoint.busy ? 'busy' : 'ok'} (log ${r.wal_checkpoint.log}, checkpointed ${r.wal_checkpoint.checkpointed})`);
     if (!r.buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
         !r.old_messages && !r.old_handoffs && !r.expired_locks && !r.deferred_expired_locks &&
-        !r.deferred_unknown_peers) {
+        !r.deferred_unknown_peers && !r.deferred_history && !r.deferred_age_based) {
       lines.push('  nothing to clean');
     }
     return lines.join('\n');
@@ -7583,12 +7836,22 @@ async function main() {
   try {
     await dispatch(ctx, rest);
   } catch (err) {
-    if (err instanceof CliError) {
+    const publicFailure = publicCliFailure(err);
+    if (publicFailure) {
+      const publicError = publicFailure.error;
       if (ctx.json) {
-        console.error(formatJson(false, { code: err.code, message: err.message, ...err.extra }));
+        console.error(formatJson(false, {
+          code: publicError.code,
+          message: publicError.message,
+          ...publicError.extra,
+          ...(publicFailure.cleanupFailed ? { cleanup_failed: true } : {})
+        }));
       } else {
-        console.error(`${CLI_NAME}: ${err.message}`);
-        if (Object.keys(err.extra).length) console.error(JSON.stringify(err.extra));
+        console.error(`${CLI_NAME}: ${publicError.message}`);
+        if (Object.keys(publicError.extra).length) console.error(JSON.stringify(publicError.extra));
+        if (publicFailure.cleanupFailed) {
+          console.error(`${CLI_NAME}: an additional internal cleanup failed`);
+        }
       }
       process.exitCode = 1;
       return;

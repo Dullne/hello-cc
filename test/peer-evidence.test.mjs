@@ -348,6 +348,37 @@ test('optimistic evidence callbacks run outside transactions and reject changed 
   }
 });
 
+test('optimistic preparation runs only after exact subject re-read and inside the mutation transaction', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE values_table (id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+  db.prepare("INSERT INTO values_table VALUES (1, 'initial')").run();
+  let observations = 0;
+  let preparations = 0;
+  const result = runOptimisticEvidenceMutation(db, {
+    capture: (subjectDb) => subjectDb.prepare('SELECT * FROM values_table WHERE id = 1').get(),
+    observe: () => {
+      observations += 1;
+      if (observations === 1) db.prepare("UPDATE values_table SET value = 'changed'").run();
+      return { state: 'unknown' };
+    },
+    same: (left, right) => JSON.stringify(left) === JSON.stringify(right),
+    beforeMutate: (subject, evidence) => {
+      preparations += 1;
+      assert.equal(db.isTransaction, true);
+      assert.equal(subject.value, 'changed');
+      assert.equal(evidence.state, 'unknown');
+      return { graceUntil: 1120 };
+    },
+    mutate: (subject, _evidence, prepared) => ({ subject, prepared })
+  });
+
+  assert.equal(observations, 2);
+  assert.equal(preparations, 1);
+  assert.equal(result.subject.value, 'changed');
+  assert.equal(result.prepared.graceUntil, 1120);
+  db.close();
+});
+
 test('lock evidence captures conflicts and probes only expired conflicting owners', () => {
   const db = new DatabaseSync(':memory:');
   try {
