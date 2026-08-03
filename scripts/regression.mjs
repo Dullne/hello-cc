@@ -2579,7 +2579,7 @@ async function setupRegression() {
   const registryFile = path.join(home, '.hello-cc', 'projects.json');
   ensureFile(registryFile);
   const registry = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
-  if (!(registry.projects || []).some((p) => p.root === childDir)) {
+  if (!(registry.projects || []).some((p) => samePath(p.root, childDir))) {
     fail(`hook project was not auto-registered:\n${JSON.stringify(registry, null, 2)}`);
   }
 
@@ -3291,6 +3291,53 @@ async function multiProjectWebWorkflow() {
   if (!roots.some((projectRoot) => samePath(projectRoot, root)) ||
       !roots.some((projectRoot) => samePath(projectRoot, otherRoot))) {
     fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
+  }
+
+  const activityLockReady = path.join(outDir, 'web-activity-lock-ready');
+  const activityLockRelease = path.join(outDir, 'web-activity-lock-release');
+  const registryPath = path.join(home, '.hello-cc', 'projects.json');
+  const lockModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/shared/file-lock.mjs')).href;
+  const activityHolderSource = String.raw`
+    import fs from 'node:fs';
+    const [moduleUrl, target, ready, release] = process.argv.slice(1);
+    const { withFileLock } = await import(moduleUrl);
+    withFileLock(target, () => {
+      fs.writeFileSync(ready, 'ready');
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (!fs.existsSync(release)) Atomics.wait(wait, 0, 0, 10);
+    });
+  `;
+  const activityHolder = spawn(process.execPath, [
+    '--input-type=module',
+    '-e',
+    activityHolderSource,
+    lockModuleUrl,
+    registryPath,
+    activityLockReady,
+    activityLockRelease
+  ], {
+    cwd: repoRoot,
+    env,
+    stdio: ['ignore', 'ignore', 'pipe']
+  });
+  await waitForFile(activityLockReady, 'ready', 'web activity registry lock');
+  try {
+    const activityStarted = Date.now();
+    const activityResponses = await Promise.all([
+      runtimeFetch('/api/runtime', {}, { root: otherRoot }),
+      runtimeFetch('/api/runtime', {}, { root: otherRoot }),
+      runtimeFetch('/api/runtime', {}, { root: otherRoot })
+    ]);
+    const activityElapsed = Date.now() - activityStarted;
+    if (activityResponses.some((response) => !response.ok)) {
+      fail(`busy registry blocked a Web activity request: ${activityResponses.map((response) => response.status).join(', ')}`);
+    }
+    if (activityElapsed >= 750) {
+      fail(`busy registry delayed repeated Web activity requests by ${activityElapsed}ms`);
+    }
+  } finally {
+    fs.writeFileSync(activityLockRelease, 'go');
+    await waitForProcessExit(activityHolder.pid, 'web activity lock holder exit');
   }
 
   const detectedResponse = await runtimeFetch('/api/detected', {}, { root });
@@ -7710,6 +7757,8 @@ async function syntaxAndHelp() {
     const missingRegistryRoot = path.join(root, 'registry-missing');
     fs.mkdirSync(registryRootA, { recursive: true });
     fs.mkdirSync(registryRootB, { recursive: true });
+    const canonicalRegistryRootA = fs.realpathSync.native(registryRootA);
+    const canonicalRegistryRootB = fs.realpathSync.native(registryRootB);
     const written = projectRegistry.writeProjectRegistry([
       { root: registryRootA, db: '', name: '', last_seen_at: '5' },
       { root: missingRegistryRoot, db: path.join(missingRegistryRoot, 'stale.db'), name: 'Gone', last_seen_at: '20' },
@@ -7718,17 +7767,17 @@ async function syntaxAndHelp() {
     ]);
     if (written.length !== 3 ||
         written[0].root !== path.resolve(missingRegistryRoot) ||
-        written[1].root !== path.resolve(registryRootA) ||
-        written[1].db !== path.resolve(path.join(registryRootA, 'new.db')) ||
+        written[1].root !== canonicalRegistryRootA ||
+        written[1].db !== path.join(canonicalRegistryRootA, 'new.db') ||
         written[1].name !== 'Aye' ||
         written[1].last_seen_at !== 15 ||
-        written[2].root !== path.resolve(registryRootB)) {
+        written[2].root !== canonicalRegistryRootB) {
       fail(`project registry write/dedupe/sort changed: ${JSON.stringify(written)}`);
     }
     const readBack = projectRegistry.readProjectRegistry();
     if (readBack.length !== 2 ||
-        readBack[0].root !== path.resolve(registryRootA) ||
-        readBack[1].root !== path.resolve(registryRootB) ||
+        readBack[0].root !== canonicalRegistryRootA ||
+        readBack[1].root !== canonicalRegistryRootB ||
         readBack.some((p) => p.root === path.resolve(missingRegistryRoot))) {
       fail(`project registry kept missing root: ${JSON.stringify(readBack)}`);
     }
@@ -7736,8 +7785,8 @@ async function syntaxAndHelp() {
       root: path.resolve(registryRootB),
       dbPath: path.join(registryRootB, 'mesh.db')
     }, () => 123);
-    if (recorded.root !== path.resolve(registryRootB) ||
-        recorded.db !== path.join(registryRootB, 'mesh.db') ||
+    if (recorded.root !== canonicalRegistryRootB ||
+        recorded.db !== path.join(canonicalRegistryRootB, 'mesh.db') ||
         recorded.name !== 'registry-b' ||
         recorded.last_seen_at !== 123) {
       fail(`project registry record changed: ${JSON.stringify(recorded)}`);
@@ -7746,9 +7795,19 @@ async function syntaxAndHelp() {
       root: path.resolve(registryRootB),
       dbPath: path.join(registryRootB, 'mesh.db')
     });
-    if (registered[0].root !== path.resolve(registryRootB) ||
-        registered.filter((p) => p.root === path.resolve(registryRootB)).length !== 1) {
+    if (registered[0].root !== canonicalRegistryRootB ||
+        registered.filter((p) => p.root === canonicalRegistryRootB).length !== 1) {
       fail(`project registry register changed: ${JSON.stringify(registered)}`);
+    }
+    const reboundDb = path.join(registryRootB, 'rebound.db');
+    const rebound = projectRegistry.registerProject({
+      root: path.join(registryRootB, '.'),
+      dbPath: path.join(registryRootB, 'nested', '..', 'rebound.db')
+    });
+    if (rebound[0].root !== canonicalRegistryRootB ||
+        rebound[0].db !== path.join(canonicalRegistryRootB, path.basename(reboundDb)) ||
+        fs.existsSync(`${path.join(home, '.hello-cc', 'projects.json')}.lock`)) {
+      fail(`project registry DB rebind was throttled or leaked its lock: ${JSON.stringify(rebound)}`);
     }
   } finally {
     if (savedHome === undefined) delete process.env.HOME;

@@ -2897,10 +2897,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return randomBytes(32).toString('base64url');
   }
 
-  function rememberProject(projectCtx) {
+  function rememberProject(projectCtx, { activity = false } = {}) {
     const normalized = contextForProject(projectCtx.root, projectCtx.dbPath, { cwd: projectCtx.cwd, json: ctx.json });
     projectContexts.set(normalized.root, normalized);
-    registerProject(normalized);
+    if (activity) registerProjectActivity(normalized);
+    else registerProject(normalized);
     return normalized;
   }
 
@@ -2942,7 +2943,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       req.headers['x-hcc-db'] ||
       path.join(resolvedRoot, '.hello-cc', 'mesh.db');
     assertDbUnderRoot(resolvedRoot, db);
-    return rememberProject(contextForProject(resolvedRoot, db, { cwd: resolvedRoot, json: ctx.json }));
+    return rememberProject(
+      contextForProject(resolvedRoot, db, { cwd: resolvedRoot, json: ctx.json }),
+      { activity: true }
+    );
   }
 
   function sessionKey(projectCtx, id) {
