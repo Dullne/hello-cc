@@ -27,7 +27,9 @@
     "release:github": "node ./scripts/github-release.mjs",
     "release:github:dry-run": "node ./scripts/github-release.mjs --dry-run",
     "smoke": "node ./bin/hcc.mjs --help",
-    "test": "node ./scripts/regression.mjs",
+    "pretest": "npm run test:unit",
+    "test": "npm run test:regression",
+    "test:unit": "node --test test/*.test.mjs",
     "test:regression": "node ./scripts/regression.mjs"
   },
   "repository": {
