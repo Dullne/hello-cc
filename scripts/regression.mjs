@@ -2,6 +2,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -158,6 +159,29 @@ function withMeshDb(fn) {
   } finally {
     db.close();
   }
+}
+
+function assertPersistedLockRenewal(resource, {
+  ttlSec,
+  createdAt,
+  before,
+  after,
+  renewalSec = ttlSec,
+  label = resource
+}) {
+  const row = withMeshDb((db) => db.prepare(`
+    SELECT resource, owner, created_at, expires_at, ttl_sec
+    FROM locks
+    WHERE resource = ?
+  `).get(resource));
+  if (!row ||
+      row.ttl_sec !== ttlSec ||
+      row.created_at !== createdAt ||
+      row.expires_at < before + renewalSec ||
+      row.expires_at > after + renewalSec) {
+    fail(`${label} renewal changed or inflated its persisted TTL:\n${JSON.stringify({ row, ttlSec, createdAt, before, after, renewalSec }, null, 2)}`);
+  }
+  return row;
 }
 
 function providerBindingRows(provider, sessionName) {
@@ -568,7 +592,8 @@ function createLegacyBindingDb(dbPath) {
   }
 }
 
-function createLegacySchemaDb(dbPath) {
+function createLegacySchemaDb(dbPath, version) {
+  if (version !== 5 && version !== 6) fail(`unsupported legacy schema fixture version: ${version}`);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
@@ -578,7 +603,13 @@ function createLegacySchemaDb(dbPath) {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
-      INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+      INSERT INTO meta(key, value) VALUES ('schema_version', '${version}');
+
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
 
       CREATE TABLE peers (
         id TEXT PRIMARY KEY,
@@ -603,6 +634,7 @@ function createLegacySchemaDb(dbPath) {
         command TEXT,
         transport TEXT NOT NULL,
         runtime_session_id TEXT,
+        runtime_target TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -614,6 +646,8 @@ function createLegacySchemaDb(dbPath) {
         status TEXT NOT NULL DEFAULT 'pending',
         assignee TEXT,
         owner TEXT,
+        parent_id INTEGER,
+        team_role TEXT,
         priority INTEGER NOT NULL DEFAULT 100,
         created_by TEXT,
         claimed_at INTEGER,
@@ -629,6 +663,8 @@ function createLegacySchemaDb(dbPath) {
         task_id INTEGER,
         kind TEXT NOT NULL DEFAULT 'note',
         body TEXT NOT NULL,
+        reply_to INTEGER,
+        thread_id INTEGER,
         created_at INTEGER NOT NULL
       );
 
@@ -641,11 +677,13 @@ function createLegacySchemaDb(dbPath) {
 
       CREATE TABLE locks (
         resource TEXT PRIMARY KEY,
+        base_resource TEXT,
+        scope TEXT NOT NULL DEFAULT '*',
         owner TEXT NOT NULL,
         task_id INTEGER,
         reason TEXT,
         expires_at INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL${version >= 6 ? ',\n        ttl_sec INTEGER NOT NULL DEFAULT 900' : ''}
       );
 
       CREATE TABLE handoffs (
@@ -677,56 +715,115 @@ function createLegacySchemaDb(dbPath) {
 
       INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
       VALUES ('legacy-peer', 'codex', 'peer', '${root.replace(/'/g, "''")}', '', NULL, 'idle', 'legacy', ${t}, ${t});
-      INSERT INTO peer_bindings(peer, provider, provider_session_id, provider_session_name, resume_mode, resume_arg, command, transport, runtime_session_id, created_at, updated_at)
-      VALUES ('legacy-peer', 'codex', NULL, 'legacy-session', 'detected', NULL, NULL, 'detected', 'legacy-peer', ${t}, ${t});
-      INSERT INTO messages(sender, recipient, task_id, kind, body, created_at)
-      VALUES ('legacy-peer', 'all', NULL, 'note', 'legacy-message', ${t});
+      INSERT INTO peer_bindings(peer, provider, provider_session_id, provider_session_name, resume_mode, resume_arg, command, transport, runtime_session_id, runtime_target, created_at, updated_at)
+      VALUES ('legacy-peer', 'codex', NULL, 'legacy-session', 'detected', NULL, NULL, 'detected', 'legacy-peer', NULL, ${t}, ${t});
+      INSERT INTO messages(sender, recipient, task_id, kind, body, reply_to, thread_id, created_at)
+      VALUES ('legacy-peer', 'all', NULL, 'note', 'legacy-message', NULL, NULL, ${t});
+      UPDATE messages SET thread_id = id WHERE body = 'legacy-message';
+      INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at${version >= 6 ? ', ttl_sec' : ''})
+      VALUES
+        ('legacy-lock-capped', 'legacy-lock-capped', '*', 'legacy-peer', NULL, 'legacy excessive ttl', ${t + 7200}, ${t}${version >= 6 ? ', 3600' : ''}),
+        ('legacy-lock-derived', 'legacy-lock-derived', '*', 'legacy-peer', NULL, 'legacy positive ttl', ${t + 120}, ${t}${version >= 6 ? ', 120' : ''}),
+        ('legacy-lock-fallback', 'legacy-lock-fallback', '*', 'legacy-peer', NULL, 'legacy invalid ttl', ${t}, ${t}${version >= 6 ? ', 900' : ''});
+
+      PRAGMA user_version = ${version};
     `);
+    const migrationNames = [
+      'baseline',
+      'peer binding runtime targets',
+      'threaded messages',
+      'team task hierarchy',
+      'scoped advisory locks',
+      'persist lock ttl'
+    ];
+    const insertMigration = db.prepare(`
+      INSERT INTO schema_migrations(version, name, applied_at)
+      VALUES (?, ?, ?)
+    `);
+    for (let migration = 1; migration <= version; migration += 1) {
+      insertMigration.run(migration, migrationNames[migration - 1], t);
+    }
   } finally {
     db.close();
   }
 }
 
-function assertLegacySchemaMigration() {
-  const legacyRoot = path.join(os.tmpdir(), `hcc-reg-legacy-schema-root-${testId}`);
-  const legacyDb = path.join(legacyRoot, '.hello-cc', 'mesh.db');
+function assertPreV7MigrationBackup(dbPath, fromVersion) {
+  const prefix = `${path.basename(dbPath)}.pre-v${fromVersion}-to-v7.`;
+  const backups = fs.readdirSync(path.dirname(dbPath))
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.bak'));
+  if (backups.length !== 1) {
+    fail(`expected one v${fromVersion} migration backup beside ${dbPath}, found ${backups.length}`);
+  }
+  const backupPath = path.join(path.dirname(dbPath), backups[0]);
+  const backup = new DatabaseSync(backupPath, { readOnly: true });
   try {
-    createLegacySchemaDb(legacyDb);
-    run(process.execPath, [hccBin, '--root', legacyRoot, 'status', '--peer', 'legacy-check'], { env });
-    const db = new DatabaseSync(legacyDb);
-    try {
-      const peerBindingColumns = new Set(db.prepare('PRAGMA table_info(peer_bindings)').all().map((row) => row.name));
-      if (!peerBindingColumns.has('runtime_target')) fail('legacy migration did not add peer_bindings.runtime_target');
-      const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((row) => row.name));
-      for (const column of ['reply_to', 'thread_id']) {
-        if (!messageColumns.has(column)) fail(`legacy migration did not add messages.${column}`);
-      }
-      const taskColumns = new Set(db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name));
-      for (const column of ['parent_id', 'team_role']) {
-        if (!taskColumns.has(column)) fail(`legacy migration did not add tasks.${column}`);
-      }
-      const lockColumns = new Set(db.prepare('PRAGMA table_info(locks)').all().map((row) => row.name));
-      for (const column of ['base_resource', 'scope']) {
-        if (!lockColumns.has(column)) fail(`legacy migration did not add locks.${column}`);
-      }
-      const message = db.prepare('SELECT id, thread_id FROM messages WHERE body = ?').get('legacy-message');
-      if (!message || message.thread_id !== message.id) {
-        fail(`legacy message thread_id not backfilled:\n${JSON.stringify(message, null, 2)}`);
-      }
-      const metaVersion = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
-      const pragmaVersion = db.prepare('PRAGMA user_version').get().user_version;
-      if (metaVersion !== '5' || pragmaVersion !== 5) {
-        fail(`schema version not synchronized: meta=${metaVersion} pragma=${pragmaVersion}`);
-      }
-      const migrations = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
-      if (migrations.length !== 5 || migrations[4].version !== 5 || migrations[4].name !== 'scoped advisory locks') {
-        fail(`schema migrations history wrong:\n${JSON.stringify(migrations, null, 2)}`);
-      }
-    } finally {
-      db.close();
+    const quickCheck = backup.prepare('PRAGMA quick_check').get()?.quick_check;
+    const metaVersion = backup.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
+    const userVersion = backup.prepare('PRAGMA user_version').get()?.user_version;
+    const peer = backup.prepare('SELECT capabilities FROM peers WHERE id = ?').get('legacy-peer');
+    const peerColumns = new Set(backup.prepare('PRAGMA table_info(peers)').all().map((row) => row.name));
+    const lockColumns = new Set(backup.prepare('PRAGMA table_info(locks)').all().map((row) => row.name));
+    if (quickCheck !== 'ok' || metaVersion !== String(fromVersion) || userVersion !== fromVersion ||
+        peer?.capabilities !== 'legacy' || peerColumns.has('pid_start_token') || peerColumns.has('pid_command_hash') ||
+        lockColumns.has('ttl_sec') !== (fromVersion >= 6)) {
+      fail(`v${fromVersion} migration backup did not preserve its original state:\n${JSON.stringify({
+        quickCheck,
+        metaVersion,
+        userVersion,
+        peer,
+        peerColumns: [...peerColumns],
+        lockColumns: [...lockColumns]
+      }, null, 2)}`);
     }
   } finally {
-    try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch {}
+    backup.close();
+  }
+}
+
+function assertLegacySchemaMigration() {
+  for (const fromVersion of [5, 6]) {
+    const legacyRoot = path.join(os.tmpdir(), `hcc-reg-legacy-schema-v${fromVersion}-root-${testId}`);
+    const legacyDb = path.join(legacyRoot, '.hello-cc', 'mesh.db');
+    try {
+      createLegacySchemaDb(legacyDb, fromVersion);
+      run(process.execPath, [hccBin, '--root', legacyRoot, 'status', '--peer', `legacy-v${fromVersion}-check`], { env });
+      assertPreV7MigrationBackup(legacyDb, fromVersion);
+      const db = new DatabaseSync(legacyDb);
+      try {
+        const peerColumns = new Set(db.prepare('PRAGMA table_info(peers)').all().map((row) => row.name));
+        for (const column of ['pid_start_token', 'pid_command_hash']) {
+          if (!peerColumns.has(column)) fail(`v${fromVersion} migration did not add peers.${column}`);
+        }
+        const lockColumns = new Set(db.prepare('PRAGMA table_info(locks)').all().map((row) => row.name));
+        if (!lockColumns.has('ttl_sec')) fail(`v${fromVersion} migration did not add locks.ttl_sec`);
+        const migratedLocks = db.prepare(`
+          SELECT resource, ttl_sec
+          FROM locks
+          WHERE resource LIKE 'legacy-lock-%'
+          ORDER BY resource
+        `).all();
+        if (migratedLocks.length !== 3 ||
+            migratedLocks[0].resource !== 'legacy-lock-capped' || migratedLocks[0].ttl_sec !== 3600 ||
+            migratedLocks[1].resource !== 'legacy-lock-derived' || migratedLocks[1].ttl_sec !== 120 ||
+            migratedLocks[2].resource !== 'legacy-lock-fallback' || migratedLocks[2].ttl_sec !== 900) {
+          fail(`v${fromVersion} lock TTL migration wrong:\n${JSON.stringify(migratedLocks, null, 2)}`);
+        }
+        const metaVersion = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
+        const pragmaVersion = db.prepare('PRAGMA user_version').get().user_version;
+        if (metaVersion !== '7' || pragmaVersion !== 7) {
+          fail(`schema version not synchronized: meta=${metaVersion} pragma=${pragmaVersion}`);
+        }
+        const migrations = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all();
+        if (migrations.length !== 7 || migrations[6].version !== 7 || migrations[6].name !== 'peer process identity fingerprints') {
+          fail(`schema migrations history wrong:\n${JSON.stringify(migrations, null, 2)}`);
+        }
+      } finally {
+        db.close();
+      }
+    } finally {
+      try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch {}
+    }
   }
 }
 
@@ -735,7 +832,7 @@ function assertRegisteredProjectDbMigration() {
   const otherDb = path.join(otherRoot, '.hello-cc', 'mesh.db');
   const registryFile = path.join(home, '.hello-cc', 'projects.json');
   try {
-    createLegacySchemaDb(otherDb);
+    createLegacySchemaDb(otherDb, 6);
     fs.mkdirSync(path.dirname(registryFile), { recursive: true });
     fs.writeFileSync(registryFile, JSON.stringify({
       projects: [
@@ -750,13 +847,79 @@ function assertRegisteredProjectDbMigration() {
       if (!taskColumns.has('parent_id') || !taskColumns.has('team_role')) {
         fail(`registered project DB was not migrated:\n${JSON.stringify([...taskColumns], null, 2)}`);
       }
+      const lockColumns = new Set(db.prepare('PRAGMA table_info(locks)').all().map((row) => row.name));
+      if (!lockColumns.has('ttl_sec')) {
+        fail(`registered project DB did not add locks.ttl_sec:\n${JSON.stringify([...lockColumns], null, 2)}`);
+      }
+      const peerColumns = new Set(db.prepare('PRAGMA table_info(peers)').all().map((row) => row.name));
+      if (!peerColumns.has('pid_start_token') || !peerColumns.has('pid_command_hash')) {
+        fail(`registered project DB did not add peer identity columns:\n${JSON.stringify([...peerColumns], null, 2)}`);
+      }
       const version = db.prepare('PRAGMA user_version').get().user_version;
-      if (version !== 5) fail(`registered project DB user_version wrong: ${version}`);
+      if (version !== 7) fail(`registered project DB user_version wrong: ${version}`);
+    } finally {
+      db.close();
+    }
+    assertPreV7MigrationBackup(otherDb, 6);
+  } finally {
+    try { fs.rmSync(otherRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function assertRegisteredProjectDbMigrationBackupFailure() {
+  const siblingRoot = path.join(os.tmpdir(), `hcc-reg-registered-backup-failure-root-${testId}`);
+  const siblingDb = path.join(siblingRoot, '.hello-cc', 'mesh.db');
+  const preloadFile = path.join(siblingRoot, 'fail-migration-backup.mjs');
+  const registryFile = path.join(home, '.hello-cc', 'projects.json');
+  try {
+    createLegacySchemaDb(siblingDb, 6);
+    fs.writeFileSync(preloadFile, `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const originalMkdtempSync = fs.mkdtempSync;
+      fs.mkdtempSync = function (prefix, ...args) {
+        if (String(prefix).includes('.migration-backup-')) {
+          throw Object.assign(new Error('injected migration backup staging failure'), { code: 'EACCES' });
+        }
+        return originalMkdtempSync.call(this, prefix, ...args);
+      };
+      syncBuiltinESMExports();
+    `);
+    fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+    fs.writeFileSync(registryFile, JSON.stringify({
+      projects: [
+        { root, db: path.join(root, '.hello-cc', 'mesh.db'), name: 'current', last_seen_at: 2 },
+        { root: siblingRoot, db: siblingDb, name: 'registered-backup-failure', last_seen_at: 1 }
+      ]
+    }, null, 2));
+
+    const nodeOptions = [env.NODE_OPTIONS, `--import=${pathToFileURL(preloadFile).href}`]
+      .filter(Boolean)
+      .join(' ');
+    const result = hccMaybe(['status', '--peer', 'registered-backup-failure-check'], {
+      env: { ...env, NODE_OPTIONS: nodeOptions }
+    });
+    if (result.status !== 0) {
+      fail(`sibling backup failure aborted the active command:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+    }
+    if (!String(result.stderr || '').includes('skipping registered project DB migration') ||
+        !String(result.stderr || '').includes(siblingDb) ||
+        !String(result.stderr || '').includes('injected migration backup staging failure')) {
+      fail(`sibling backup failure was not logged:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+    }
+
+    const db = new DatabaseSync(siblingDb, { readOnly: true });
+    try {
+      const version = db.prepare('PRAGMA user_version').get()?.user_version;
+      const peerColumns = new Set(db.prepare('PRAGMA table_info(peers)').all().map((row) => row.name));
+      if (version !== 6 || peerColumns.has('pid_start_token') || peerColumns.has('pid_command_hash')) {
+        fail(`sibling changed after its backup failure: ${JSON.stringify({ version, peerColumns: [...peerColumns] })}`);
+      }
     } finally {
       db.close();
     }
   } finally {
-    try { fs.rmSync(otherRoot, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(siblingRoot, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -785,7 +948,7 @@ function assertFutureSchemaMigrationHistoryRejected() {
       db.close();
     }
     const result = runMaybe(process.execPath, [hccBin, '--root', futureRoot, 'status', '--peer', 'future-schema-check'], { env });
-    if (result.status === 0 || !`${result.stdout}\n${result.stderr}`.includes('Database schema version 999 is newer than this hcc (5)')) {
+    if (result.status === 0 || !`${result.stdout}\n${result.stderr}`.includes('Database schema version 999 is newer than this hcc (7)')) {
       fail(`future schema migration history was not rejected:\nstdout=${result.stdout}\nstderr=${result.stderr}`);
     }
   } finally {
@@ -1145,6 +1308,123 @@ async function openTerminalWebSocket(peer) {
   });
 }
 
+// The per-session action token is delivered only via the terminal WS snapshot
+// frame (net-05), not the session list. Fetch it by opening the socket.
+async function fetchSessionActionToken(peer) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(runtimeWsUrl(peer));
+    const timer = setTimeout(() => reject(new Error(`${peer} action token fetch timeout`)), 5000);
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw));
+      if (msg.type === 'snapshot') {
+        clearTimeout(timer);
+        try { ws.close(); } catch {}
+        resolve(msg.action_token || '');
+      }
+    });
+    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+async function openCookieTerminalWebSocket(peer, sid, params = {}) {
+  const runtime = currentRuntime();
+  const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
+  const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, baseUrl);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(url, {
+      headers: {
+        Cookie: `hcc_sid=${sid}`,
+        Origin: new URL(baseUrl).origin
+      }
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} cookie websocket snapshot timeout`));
+    }, 5000);
+    const rejectBeforeSnapshot = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    };
+    ws.on('message', (raw) => {
+      let message;
+      try { message = JSON.parse(String(raw)); } catch { return; }
+      if (message.type !== 'snapshot' || settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ws);
+    });
+    ws.on('error', rejectBeforeSnapshot);
+    ws.on('close', (code) => rejectBeforeSnapshot(new Error(`${peer} cookie websocket closed before snapshot: ${code}`)));
+  });
+}
+
+async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
+  const runtime = currentRuntime();
+  const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
+  const origin = new URL(baseUrl).origin;
+  const login = await fetch(new URL('/login', baseUrl), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: runtime.token || '' }),
+    redirect: 'manual'
+  });
+  const setCookie = login.headers.get('set-cookie') || '';
+  const sid = setCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+  if (login.status !== 302 || !sid) {
+    fail(`cookie websocket login failed: status=${login.status} cookie=${setCookie}`);
+  }
+
+  const ws = await openCookieTerminalWebSocket(peer, sid, params);
+  try {
+    const closed = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${peer} cookie websocket logout close timeout`)), 5000);
+      ws.once('close', (code, reason) => {
+        clearTimeout(timer);
+        resolve({ code, reason: String(reason || '') });
+      });
+      ws.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    const [logout, closeResult] = await Promise.all([
+      fetch(new URL('/logout', baseUrl), {
+        method: 'POST',
+        headers: {
+          Cookie: `hcc_sid=${sid}`,
+          Origin: origin
+        }
+      }),
+      closed
+    ]);
+    if (logout.status !== 204 || !(logout.headers.get('set-cookie') || '').includes('Max-Age=0')) {
+      fail(`cookie websocket logout did not expire its session: status=${logout.status}`);
+    }
+    if (closeResult.code !== 4001 || ws.readyState !== WebSocket.CLOSED) {
+      fail(`cookie websocket logout did not close the established socket with 4001:\n${JSON.stringify({ closeResult, readyState: ws.readyState }, null, 2)}`);
+    }
+    const revoked = await fetch(new URL('/api/runtime', baseUrl), {
+      headers: { Cookie: `hcc_sid=${sid}` }
+    });
+    if (revoked.status !== 401) {
+      fail(`cookie websocket logout left the old cookie authorized: ${revoked.status}`);
+    }
+  } finally {
+    if (ws.readyState !== WebSocket.CLOSED) {
+      try { ws.terminate(); } catch {}
+    }
+  }
+}
+
 async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
@@ -1176,6 +1456,7 @@ async function expectWebSocketInputVisible(peer, marker) {
     let sent = false;
     let sawMarkerAfterInput = false;
     let sawFrameAfterInput = false;
+    let actionToken = '';
     const ws = new WebSocket(runtimeWsUrl(peer));
     const timer = setTimeout(() => reject(new Error(`${peer} websocket input visibility timeout`)), 5000);
     ws.on('message', (raw) => {
@@ -1183,9 +1464,10 @@ async function expectWebSocketInputVisible(peer, marker) {
       const data = String(msg.data || '');
       if (msg.type === 'snapshot') {
         sawSnapshot = true;
+        if (msg.action_token) actionToken = msg.action_token;
         if (!sent) {
           sent = true;
-          ws.send(JSON.stringify({ type: 'input', data: `echo ${marker}\r` }));
+          ws.send(JSON.stringify({ type: 'input', data: `echo ${marker}\r`, action_token: actionToken }));
         }
         return;
       }
@@ -1301,6 +1583,120 @@ fi
     }
   } finally {
     try { fs.rmSync(fallbackDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function assertGeneratedShimPeerHash(generateShim) {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-shim-peer-hash-${testId}-`));
+  try {
+    const hashBin = path.join(testDir, 'bin');
+    const fakeHcc = path.join(testDir, 'hcc');
+    const realBin = path.join(testDir, 'real-provider');
+    const opensslLog = path.join(testDir, 'openssl.log');
+    fs.mkdirSync(hashBin, { recursive: true });
+    fs.writeFileSync(fakeHcc, `#!/usr/bin/env bash
+case "\${1:-}" in
+  find-root)
+    printf '%s\\n' "$HCC_FAKE_ROOT"
+    exit 0
+    ;;
+  peer)
+    if [ "\${2:-}" = "start" ]; then
+      printf '%s\\n' 'hcc: No running web runtime found. Start hcc web first.' >&2
+      exit 1
+    fi
+    ;;
+esac
+exit 1
+`, { mode: 0o755 });
+    fs.writeFileSync(realBin, `#!/usr/bin/env bash
+printf '%s\\n' "$HCC_PEER"
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(hashBin, 'sha1sum'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(hashBin, 'shasum'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(hashBin, 'openssl'), `#!/usr/bin/env node
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const chunks = [];
+process.stdin.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+process.stdin.on('end', () => {
+  const input = Buffer.concat(chunks);
+  const digest = crypto.createHash('sha1').update(input).digest('hex').toUpperCase();
+  process.stdout.write('SHA1(stdin)= ' + digest + '\\n');
+  fs.appendFileSync(process.env.HCC_OPENSSL_LOG, process.argv.slice(2).join(' ') + '\\t' + input.toString('hex') + '\\n');
+});
+`, { mode: 0o755 });
+
+    const cases = [
+      {
+        tool: { name: 'claude', kind: 'claude', resumeFlag: '--resume' },
+        providerId: `linux-openssl-claude-${testId}`,
+        args(providerId) { return ['--resume', providerId]; }
+      },
+      {
+        tool: { name: 'codex', kind: 'codex' },
+        providerId: `linux-openssl-codex-${testId}`,
+        args(providerId) { return ['resume', providerId]; }
+      }
+    ];
+
+    for (const entry of cases) {
+      const shimBin = path.join(testDir, entry.tool.name);
+      fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
+      const result = runMaybe(shimBin, entry.args(entry.providerId), {
+        cwd: testDir,
+        env: {
+          ...env,
+          PATH: `${hashBin}${path.delimiter}${env.PATH || ''}`,
+          HCC_FAKE_ROOT: testDir,
+          HCC_OPENSSL_LOG: opensslLog,
+          HCC_SHIM_ENSURED: '1',
+          HCC_SHIM_NO_ATTACH: '1'
+        }
+      });
+      const expected = `${entry.tool.kind}-${shortHash(entry.providerId)}`;
+      if (result.status !== 0 || String(result.stdout || '').trim() !== expected) {
+        fail(`${entry.tool.name} generated shim peer hash did not match JS shortHash:\nexpected=${expected}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+    }
+    const opensslCalls = fs.existsSync(opensslLog)
+      ? fs.readFileSync(opensslLog, 'utf8').trim().split('\n').map((line) => line.split('\t'))
+      : [];
+    if (opensslCalls.length !== cases.length || opensslCalls.some((call, index) =>
+      call[0] !== 'dgst -sha1' || call[1] !== Buffer.from(cases[index].providerId).toString('hex'))) {
+      fail(`generated shims did not hash the full provider id through OpenSSL:\n${JSON.stringify(opensslCalls, null, 2)}`);
+    }
+
+    // If no hashing tool can produce a valid digest, identity derivation is
+    // unavailable. The shim must preserve provider usability by transparently
+    // executing the real binary with the original argv.
+    fs.writeFileSync(path.join(hashBin, 'openssl'), '#!/usr/bin/env bash\nexit 97\n', { mode: 0o755 });
+    fs.writeFileSync(realBin, `#!/usr/bin/env bash
+printf 'real-provider'
+for arg in "$@"; do printf ' %s' "$arg"; done
+printf '\\n'
+`, { mode: 0o755 });
+    for (const entry of cases) {
+      const shimBin = path.join(testDir, `${entry.tool.name}-no-hash`);
+      fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
+      const args = entry.args(entry.providerId);
+      const result = runMaybe(shimBin, args, {
+        cwd: testDir,
+        env: {
+          ...env,
+          PATH: `${hashBin}${path.delimiter}${env.PATH || ''}`,
+          HCC_FAKE_ROOT: testDir,
+          HCC_SHIM_ENSURED: '1',
+          HCC_SHIM_NO_ATTACH: '1'
+        }
+      });
+      const expected = `real-provider ${args.join(' ')}`;
+      if (result.status !== 0 || String(result.stdout || '').trim() !== expected) {
+        fail(`${entry.tool.name} shim did not fall back to the real provider when hashing failed:\nexpected=${expected}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
+    }
+  } finally {
+    try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -1568,11 +1964,36 @@ async function setupRegression() {
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(path.join(home, '.profile'), 'if [ "$BASH" ]; then . "$HOME/.bashrc"; fi\n');
   fs.writeFileSync(path.join(home, '.bashrc'), '# regression rc\n[ -z "$PS1" ] && return\nexport PATH="/late:$PATH"\n');
+  // A quiet external session may have old mtimes even while its wrapper is
+  // alive. Startup auto-GC must adopt and protect all of its buffer files.
+  const liveBufferId = `auto-gc-live-${testId}`;
+  const liveBufferDir = path.join(root, '.hello-cc', 'bufs');
+  fs.mkdirSync(liveBufferDir, { recursive: true });
+  const liveBufferFiles = ['out', 'in', 'resize', 'meta']
+    .map((suffix) => path.join(liveBufferDir, `${liveBufferId}.${suffix}`));
+  fs.writeFileSync(liveBufferFiles[0], 'quiet but live\n');
+  fs.writeFileSync(liveBufferFiles[1], '');
+  fs.writeFileSync(liveBufferFiles[2], '');
+  fs.writeFileSync(liveBufferFiles[3], JSON.stringify({
+    id: liveBufferId,
+    kind: 'shell',
+    role: 'peer',
+    command: 'regression probe',
+    cwd: root,
+    pid: process.pid,
+    wrapper_pid: process.pid,
+    cols: 120,
+    rows: 40
+  }));
+  const oldBufferTime = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+  for (const file of liveBufferFiles) fs.utimesSync(file, oldBufferTime, oldBufferTime);
   const output = hcc(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance']);
   const match = output.match(/^pid:\s*(\d+)/m);
   if (!match) fail(`hcc web did not print background pid during bootstrap:\n${output}`);
   runtimePid = Number.parseInt(match[1], 10);
   await waitRuntime();
+  for (const file of liveBufferFiles) ensureFile(file);
+  for (const file of liveBufferFiles) fs.rmSync(file, { force: true });
   ensureFile(path.join(root, '.hello-cc', 'mesh.db'));
   if (fs.existsSync(path.join(root, '.hello-cc', 'HCC.md'))) fail('web --no-guidance should not write HCC.md');
   if (fs.existsSync(path.join(root, 'CLAUDE.md'))) fail('web --no-guidance should not write CLAUDE.md');
@@ -1649,10 +2070,11 @@ async function setupRegression() {
   assertPeerBindingUniqueConstraints();
   assertLegacySchemaMigration();
   assertRegisteredProjectDbMigration();
+  assertRegisteredProjectDbMigrationBackupFailure();
   assertFutureSchemaMigrationHistoryRejected();
   assertLegacyBindingRepair();
 
-  const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--trust-proxy', '--no-discover', '--no-guidance']);
   const tokenMatch = tokenOutput.match(/^pid:\s*(\d+)/m);
   if (!tokenMatch) fail(`token web did not print background pid:\n${tokenOutput}`);
   runtimePid = Number.parseInt(tokenMatch[1], 10);
@@ -1661,13 +2083,135 @@ async function setupRegression() {
   }
   await waitRuntime();
   const tokenRuntime = currentRuntime();
-  if (tokenRuntime.host !== '0.0.0.0' || !tokenRuntime.token || tokenRuntime.token.length < 24) {
+  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || !tokenRuntime.token || tokenRuntime.token.length < 24) {
     fail(`default web runtime did not store remote token data:\n${JSON.stringify(tokenRuntime, null, 2)}`);
   }
   const unauthorizedResponse = await fetch(`${tokenRuntime.base_url}/api/runtime`);
   if (unauthorizedResponse.status !== 401) fail(`default web API allowed missing token: ${unauthorizedResponse.status}`);
   const tokenResponse = await runtimeFetch('/api/runtime');
   if (!tokenResponse.ok) fail(`default web API rejected runtime token: ${tokenResponse.status}`);
+
+  // net-02: a browser-style navigation with ?token is exchanged once for an
+  // HttpOnly SameSite cookie; API/WS then authenticate via that cookie.
+  const cookieToken = tokenRuntime.token;
+  const baseUrl = tokenRuntime.base_url;
+  // (a) browser navigation with ?token → 302 + Set-Cookie (token stripped from URL)
+  const exchange = await fetch(`${baseUrl}/?token=${encodeURIComponent(cookieToken)}`, {
+    headers: { Accept: 'text/html' },
+    redirect: 'manual'
+  });
+  if (exchange.status !== 302) fail(`browser-nav ?token did not exchange to a cookie redirect: ${exchange.status}`);
+  const setCookie = exchange.headers.get('set-cookie') || '';
+  if (!setCookie.includes('hcc_sid=') || !setCookie.includes('HttpOnly') || !setCookie.includes('SameSite=Lax')) {
+    fail(`exchange did not set an HttpOnly SameSite cookie: ${setCookie}`);
+  }
+  const sidMatch = setCookie.match(/hcc_sid=([^;]+)/);
+  if (!sidMatch) fail(`exchange did not return a session id: ${setCookie}`);
+  const sid = sidMatch[1];
+  // (b) API with the session cookie → 200
+  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}` } });
+  if (!withCookie.ok) fail(`API with session cookie required auth: ${withCookie.status}`);
+  // (c) API with a bogus session cookie → 401
+  const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: 'hcc_sid=bogus' } });
+  if (bogusCookie.status !== 401) fail(`API with bogus session cookie did not 401: ${bogusCookie.status}`);
+  // (d) cookie-authenticated writes require an exact same-origin Origin header.
+  const crossOriginCookieWrite = await fetch(`${baseUrl}/api/csrf-probe`, {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${sid}`,
+      Origin: `http://127.0.0.1:${port + 1}`,
+      'Content-Type': 'application/json'
+    },
+    body: '{}'
+  });
+  if (crossOriginCookieWrite.status !== 403) {
+    fail(`cross-origin cookie write was not rejected: ${crossOriginCookieWrite.status}`);
+  }
+  const crossOriginCookieBody = await crossOriginCookieWrite.json();
+  if (crossOriginCookieBody?.error?.code !== 'CSRF_ORIGIN') {
+    fail(`cross-origin cookie write did not return CSRF_ORIGIN:\n${JSON.stringify(crossOriginCookieBody, null, 2)}`);
+  }
+  const sameOriginCookieWrite = await fetch(`${baseUrl}/api/csrf-probe`, {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${sid}`,
+      Origin: new URL(baseUrl).origin,
+      'Content-Type': 'application/json'
+    },
+    body: '{}'
+  });
+  if (sameOriginCookieWrite.status !== 404) {
+    fail(`same-origin cookie write did not pass the CSRF gate: ${sameOriginCookieWrite.status}`);
+  }
+  // (e) API-style fetch of /?token (Accept: */*) → HTML directly, no redirect
+  const apiStyle = await fetch(`${baseUrl}/?token=${encodeURIComponent(cookieToken)}`);
+  if (apiStyle.status !== 200 || !(await apiStyle.text()).includes('<html')) {
+    fail(`API-style /?token did not serve HTML directly: ${apiStyle.status}`);
+  }
+  // (f) browser-style bare / with no cookie → login page
+  const loginPage = await fetch(`${baseUrl}/`, { headers: { Accept: 'text/html' } });
+  if (loginPage.status !== 200 || !(await loginPage.text()).includes('Access token')) {
+    fail(`bare browser navigation did not serve the login page: ${loginPage.status}`);
+  }
+  // (g) POST /login with the token → 302 + cookie
+  const loginPost = await fetch(`${baseUrl}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: cookieToken }),
+    redirect: 'manual'
+  });
+  if (loginPost.status !== 302 || !(loginPost.headers.get('set-cookie') || '').includes('hcc_sid=')) {
+    fail(`POST /login did not issue a session cookie: ${loginPost.status}`);
+  }
+
+  // (h) logout revokes the opaque session and expires the browser cookie.
+  const logout = await fetch(`${baseUrl}/logout`, {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${sid}`,
+      Origin: new URL(baseUrl).origin
+    }
+  });
+  const logoutCookie = logout.headers.get('set-cookie') || '';
+  if (logout.status !== 204 || !logoutCookie.includes('hcc_sid=') || !logoutCookie.includes('Max-Age=0')) {
+    fail(`logout did not revoke and expire the session cookie: status=${logout.status} cookie=${logoutCookie}`);
+  }
+  const revokedCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}` } });
+  if (revokedCookie.status !== 401) fail(`logout left the old session cookie authorized: ${revokedCookie.status}`);
+
+  // (i) trusted loopback reverse-proxy headers mark issued and expired cookies
+  // Secure. The same headers are ignored unless --trust-proxy was explicit.
+  const proxyOrigin = 'https://public.example.test:9443';
+  const proxyHeaders = {
+    Accept: 'text/html',
+    'X-Forwarded-Host': 'public.example.test:9443',
+    'X-Forwarded-Proto': 'https'
+  };
+  const proxyExchange = await fetch(`${baseUrl}/?token=${encodeURIComponent(cookieToken)}`, {
+    headers: proxyHeaders,
+    redirect: 'manual'
+  });
+  const proxySetCookie = proxyExchange.headers.get('set-cookie') || '';
+  const proxySid = proxySetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+  if (proxyExchange.status !== 302 || !proxySid || !proxySetCookie.includes('Secure')) {
+    fail(`trusted proxy login did not issue a Secure cookie: status=${proxyExchange.status} cookie=${proxySetCookie}`);
+  }
+  const proxyLogout = await fetch(`${baseUrl}/logout`, {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${proxySid}`,
+      Origin: proxyOrigin,
+      'X-Forwarded-Host': 'public.example.test:9443',
+      'X-Forwarded-Proto': 'https'
+    }
+  });
+  const proxyLogoutCookie = proxyLogout.headers.get('set-cookie') || '';
+  if (proxyLogout.status !== 204 || !proxyLogoutCookie.includes('Max-Age=0') || !proxyLogoutCookie.includes('Secure')) {
+    fail(`trusted proxy logout did not expire a Secure cookie: status=${proxyLogout.status} cookie=${proxyLogoutCookie}`);
+  }
+  const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}` } });
+  if (revokedProxyCookie.status !== 401) fail(`trusted proxy logout left the old cookie authorized: ${revokedProxyCookie.status}`);
+
   const badJsonResponse = await runtimeFetch('/api/projects', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1683,7 +2227,7 @@ async function setupRegression() {
   const tokenFile = path.join(home, '.hello-cc', 'web-token');
   ensureFile(tokenFile, tokenRuntime.token);
   fs.rmSync(tokenFile, { force: true });
-  const existingTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const existingTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--trust-proxy', '--no-discover', '--no-guidance']);
   if (!existingTokenOutput.includes('web already running in background')) {
     fail(`web did not reuse existing token runtime:\n${existingTokenOutput}`);
   }
@@ -1806,6 +2350,49 @@ async function dbWorkflow() {
   }
   hcc(['lock', 'acquire', '--peer', 'codex-a', '--task', taskId, '--resource', 'src/router', '--ttl', '60', '--reason', 'regression']);
   hcc(['lock', 'renew', '--peer', 'codex-a', '--resource', 'src/router', '--ttl', '60']);
+
+  // hb-06: heartbeat renewal uses the lock's persisted TTL, not its age or
+  // the default TTL. Repeated renewals must never compound the expiry.
+  const heartbeatPeer = 'heartbeat-ttl-peer';
+  const heartbeatResource = 'src/heartbeat-ttl';
+  hcc(['lock', 'acquire', '--peer', heartbeatPeer, '--resource', heartbeatResource, '--ttl', '60']);
+  const heartbeatCreatedAt = Math.floor(Date.now() / 1000) - 7200;
+  withMeshDb((db) => db.prepare('UPDATE locks SET created_at = ? WHERE resource = ?').run(heartbeatCreatedAt, heartbeatResource));
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const before = Math.floor(Date.now() / 1000);
+    const output = hcc(['heartbeat', '--peer', heartbeatPeer, '--renew-locks']);
+    const after = Math.floor(Date.now() / 1000);
+    if (!output.includes('renewed locks: 1')) fail(`heartbeat did not renew the persisted-TTL lock:\n${output}`);
+    assertPersistedLockRenewal(heartbeatResource, {
+      ttlSec: 60,
+      createdAt: heartbeatCreatedAt,
+      before,
+      after,
+      label: `heartbeat attempt ${attempt}`
+    });
+  }
+  const overrideBefore = Math.floor(Date.now() / 1000);
+  hcc(['heartbeat', '--peer', heartbeatPeer, '--renew-locks', '--ttl', '75']);
+  const overrideAfter = Math.floor(Date.now() / 1000);
+  assertPersistedLockRenewal(heartbeatResource, {
+    ttlSec: 75,
+    createdAt: heartbeatCreatedAt,
+    before: overrideBefore,
+    after: overrideAfter,
+    label: 'heartbeat TTL override'
+  });
+  const retainedBefore = Math.floor(Date.now() / 1000);
+  hcc(['heartbeat', '--peer', heartbeatPeer, '--renew-locks']);
+  const retainedAfter = Math.floor(Date.now() / 1000);
+  assertPersistedLockRenewal(heartbeatResource, {
+    ttlSec: 75,
+    createdAt: heartbeatCreatedAt,
+    before: retainedBefore,
+    after: retainedAfter,
+    label: 'heartbeat persisted TTL after override'
+  });
+  hcc(['lock', 'release', '--peer', heartbeatPeer, '--resource', heartbeatResource]);
+
   hcc(['msg', 'send', '--from', 'codex-a', '--to', 'claude-a', '--task', taskId, '--body', 'please review']);
   const inbox = hcc(['msg', 'inbox', '--peer', 'claude-a', '--wait', '0']);
   if (!inbox.includes('please review')) fail('inbox did not include message');
@@ -2145,6 +2732,99 @@ async function dbWorkflow() {
   }
   hcc(['task', 'done', '--peer', 'codex-taker', '--id', takeoverTaskId, '--summary', 'takeover done']);
 
+  // hb-05: a persisted clock grace window (written by the runtime after a
+  // wall-clock jump) suppresses age-based staleness — a genuinely old owner is
+  // NOT stale during grace, so `takeover --policy stale` must be rejected.
+  const graceDbPath = path.join(root, '.hello-cc', 'mesh.db');
+  const graceNow = Math.floor(Date.now() / 1000);
+  const graceTask = hcc(['task', 'create', '--from', 'human', '--to', 'grace-owner', '--title', 'clock grace task']);
+  const graceTaskMatch = graceTask.match(/created task #(\d+):/);
+  if (!graceTaskMatch) fail(`cannot parse grace task id: ${graceTask}`);
+  const graceTaskId = graceTaskMatch[1];
+  hcc(['task', 'claim', '--peer', 'grace-owner', '--id', graceTaskId]);
+  // Make the owner old by age (would normally be stale) for a baseline.
+  const graceDb = new DatabaseSync(graceDbPath, { timeout: 5000 });
+  graceDb.exec('PRAGMA foreign_keys = ON;');
+  graceDb.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(graceNow - 1000, 'grace-owner');
+  graceDb.close();
+  const graceBaseline = hccMaybe(['task', 'takeover', '--peer', 'grace-taker', '--id', graceTaskId, '--reason', 'baseline', '--policy', 'stale']);
+  if (graceBaseline.status !== 0 || !graceBaseline.stdout.includes('took over task')) {
+    fail(`grace baseline: stale owner should be takeable without grace:\n${graceBaseline.stdout}\n${graceBaseline.stderr}`);
+  }
+  // Give the task back, re-age the owner (takeover refreshes last_seen_at),
+  // and set the grace window → takeover must be rejected.
+  hcc(['task', 'takeover', '--peer', 'grace-owner', '--id', graceTaskId, '--reason', 'give back', '--force']);
+  const graceDb2 = new DatabaseSync(graceDbPath, { timeout: 5000 });
+  graceDb2.exec('PRAGMA foreign_keys = ON;');
+  graceDb2.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(graceNow - 1000, 'grace-owner');
+  graceDb2.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(graceNow + 60));
+  graceDb2.close();
+  const graceRejected = hccMaybe(['task', 'takeover', '--peer', 'grace-taker', '--id', graceTaskId, '--reason', 'during grace', '--policy', 'stale']);
+  if (graceRejected.status === 0 || !String(graceRejected.stderr || graceRejected.stdout).includes('does not match takeover policy')) {
+    fail(`takeover during clock grace window was not rejected:\n${graceRejected.stdout}\n${graceRejected.stderr}`);
+  }
+  // Removing the grace window → takeover succeeds again.
+  const graceDb3 = new DatabaseSync(graceDbPath, { timeout: 5000 });
+  graceDb3.exec('PRAGMA foreign_keys = ON;');
+  graceDb3.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+  graceDb3.close();
+  const graceAfter = hcc(['task', 'takeover', '--peer', 'grace-taker', '--id', graceTaskId, '--reason', 'grace over', '--policy', 'stale']);
+  if (!graceAfter.includes('took over task')) fail(`takeover after grace window should succeed:\n${graceAfter}`);
+  hcc(['task', 'done', '--peer', 'grace-taker', '--id', graceTaskId, '--summary', 'grace done']);
+
+  // hb-05: lock acquire during grace treats an expired conflicting lock as held.
+  hcc(['lock', 'acquire', '--peer', 'grace-lock-owner', '--resource', 'src/grace-lock', '--ttl', '900']);
+  const lockDb = new DatabaseSync(graceDbPath, { timeout: 5000 });
+  lockDb.exec('PRAGMA foreign_keys = ON;');
+  lockDb.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?').run(graceNow - 3600, 'src/grace-lock');
+  lockDb.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(graceNow + 60));
+  lockDb.close();
+  const graceLockList = hccJson(['lock', 'list']);
+  if (!graceLockList.some((row) => row.resource === 'src/grace-lock')) {
+    fail(`default lock list hid a retained lock during clock grace:\n${JSON.stringify(graceLockList, null, 2)}`);
+  }
+  const graceGc = hcc(['gc', '--older-than', '9999', '--yes']);
+  if (!graceGc.includes('expired locks deferred by clock grace')) {
+    fail(`gc did not report the clock-grace lock deferral:\n${graceGc}`);
+  }
+  const retainedGraceLock = withMeshDb((db) => db.prepare('SELECT owner FROM locks WHERE resource = ?').get('src/grace-lock'));
+  if (retainedGraceLock?.owner !== 'grace-lock-owner') {
+    fail(`gc deleted the retained lock during clock grace: ${JSON.stringify(retainedGraceLock)}`);
+  }
+  const graceLockTask = hcc(['task', 'create', '--from', 'human', '--to', 'grace-lock-taker', '--title', 'clock grace lock automation']);
+  const graceLockTaskMatch = graceLockTask.match(/created task #(\d+):/);
+  if (!graceLockTaskMatch) fail(`cannot parse grace lock task id: ${graceLockTask}`);
+  const graceLockTaskId = graceLockTaskMatch[1];
+  hcc(['task', 'claim', '--peer', 'grace-lock-taker', '--id', graceLockTaskId]);
+  const graceConflictState = hccJson(['state', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
+  if (graceConflictState.clock_grace_active !== true ||
+      !graceConflictState.locks.some((row) => row.resource === 'src/grace-lock') ||
+      graceConflictState.automation.phase !== 'coordinate_lock' ||
+      graceConflictState.automation.next_action.kind !== 'msg.send' ||
+      graceConflictState.automation.next_action.lock_owner !== 'grace-lock-owner') {
+    fail(`state automation did not preserve the expired lock conflict during grace:\n${JSON.stringify(graceConflictState, null, 2)}`);
+  }
+  const lockDuringGrace = hccMaybe(['lock', 'acquire', '--peer', 'grace-lock-taker', '--task', graceLockTaskId, '--resource', 'src/grace-lock', '--ttl', '900']);
+  if (lockDuringGrace.status === 0 || !String(lockDuringGrace.stderr || lockDuringGrace.stdout).includes('conflicts with lock')) {
+    fail(`lock acquire during grace window should see the expired lock as held:\n${lockDuringGrace.stdout}\n${lockDuringGrace.stderr}`);
+  }
+  // After grace, both automation and the mutation path agree that the expired
+  // lock is acquirable again.
+  const lockDb2 = new DatabaseSync(graceDbPath, { timeout: 5000 });
+  lockDb2.exec('PRAGMA foreign_keys = ON;');
+  lockDb2.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+  lockDb2.close();
+  const graceEndedState = hccJson(['state', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
+  if (graceEndedState.clock_grace_active !== false ||
+      graceEndedState.locks.some((row) => row.resource === 'src/grace-lock') ||
+      graceEndedState.automation.phase !== 'acquire_lock' ||
+      graceEndedState.automation.next_action.kind !== 'lock.acquire') {
+    fail(`state automation did not release the expired conflict after grace:\n${JSON.stringify(graceEndedState, null, 2)}`);
+  }
+  hcc(['lock', 'acquire', '--peer', 'grace-lock-taker', '--task', graceLockTaskId, '--resource', 'src/grace-lock', '--ttl', '900']);
+  hcc(['lock', 'release', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
+  hcc(['task', 'done', '--peer', 'grace-lock-taker', '--id', graceLockTaskId, '--summary', 'grace lock automation done']);
+
   const abandoned = hcc(['task', 'create', '--from', 'human', '--title', 'abandoned regression task']);
   const abandonedMatch = abandoned.match(/created task #(\d+):/);
   if (!abandonedMatch) fail(`cannot parse abandoned task id: ${abandoned}`);
@@ -2166,7 +2846,41 @@ async function dbWorkflow() {
   hcc(['msg', 'send', '--from', 'human', '--to', 'claude-hook', '--task', hookTaskId, '--body', 'hook-only-message']);
   const hookPayload = JSON.stringify({ session_id: 'claude-hook-session', cwd: root, hook_event_name: 'UserPromptSubmit', prompt: 'status?' });
   const hookEnv = { ...env, HCC_PEER: 'claude-hook' };
-  const firstHook = hookContext(hcc(['hook', 'userpromptsubmit'], { env: hookEnv, input: hookPayload }), 'UserPromptSubmit');
+  const hookTtlResource = 'src/hook-ttl';
+  const hookTtlSec = 60;
+  const hookCappedTtlResource = 'src/hook-capped-ttl';
+  const hookCappedTtlSec = 7200;
+  hcc(['lock', 'acquire', '--peer', 'claude-hook', '--resource', hookTtlResource, '--ttl', String(hookTtlSec)]);
+  hcc(['lock', 'acquire', '--peer', 'claude-hook', '--resource', hookCappedTtlResource, '--ttl', String(hookCappedTtlSec)]);
+  const hookLockCreatedAt = Math.floor(Date.now() / 1000) - 7200;
+  const hookCappedLockCreatedAt = hookLockCreatedAt - 60;
+  withMeshDb((db) => {
+    const updateCreatedAt = db.prepare('UPDATE locks SET created_at = ? WHERE resource = ?');
+    updateCreatedAt.run(hookLockCreatedAt, hookTtlResource);
+    updateCreatedAt.run(hookCappedLockCreatedAt, hookCappedTtlResource);
+  });
+  const runHookWithStableTtl = (args, input, label) => {
+    const before = Math.floor(Date.now() / 1000);
+    const output = hcc(args, { env: hookEnv, input });
+    const after = Math.floor(Date.now() / 1000);
+    assertPersistedLockRenewal(hookTtlResource, {
+      ttlSec: hookTtlSec,
+      createdAt: hookLockCreatedAt,
+      before,
+      after,
+      label
+    });
+    assertPersistedLockRenewal(hookCappedTtlResource, {
+      ttlSec: hookCappedTtlSec,
+      createdAt: hookCappedLockCreatedAt,
+      before,
+      after,
+      renewalSec: 3600,
+      label: `${label} capped TTL`
+    });
+    return output;
+  };
+  const firstHook = hookContext(runHookWithStableTtl(['hook', 'userpromptsubmit'], hookPayload, 'first active hook'), 'UserPromptSubmit');
   if (!firstHook.includes('[hello-cc coordination]') || !firstHook.includes('[hello-cc open tasks]') || !firstHook.includes(`#${hookTaskId} running`)) {
     fail(`UserPromptSubmit hook did not include open task snapshot:\n${firstHook}`);
   }
@@ -2179,7 +2893,7 @@ async function dbWorkflow() {
   if (!firstHook.includes('[hello-cc next action]') || !firstHook.includes('phase: reply_message') || !firstHook.includes('hcc msg reply')) {
     fail(`UserPromptSubmit hook missing executable next action:\n${firstHook}`);
   }
-  const secondHook = hookContext(hcc(['hook', 'userpromptsubmit'], { env: hookEnv, input: hookPayload }), 'UserPromptSubmit');
+  const secondHook = hookContext(runHookWithStableTtl(['hook', 'userpromptsubmit'], hookPayload, 'second active hook'), 'UserPromptSubmit');
   if (!secondHook.includes(`#${hookTaskId} running`)) {
     fail(`UserPromptSubmit hook stopped showing open task after first read:\n${secondHook}`);
   }
@@ -2190,10 +2904,40 @@ async function dbWorkflow() {
     fail(`UserPromptSubmit hook dropped next action after ack:\n${secondHook}`);
   }
   const sessionHookPayload = JSON.stringify({ session_id: 'claude-hook-session', cwd: root, hook_event_name: 'SessionStart', source: 'resume' });
-  const sessionHook = hookContext(hcc(['hook', 'sessionstart'], { env: hookEnv, input: sessionHookPayload }), 'SessionStart');
+  const sessionHook = hookContext(runHookWithStableTtl(['hook', 'sessionstart'], sessionHookPayload, 'session-start hook'), 'SessionStart');
   if (!sessionHook.includes(`#${hookTaskId} running`) || sessionHook.includes('hook-only-message')) {
     fail(`SessionStart hook context wrong:\n${sessionHook}`);
   }
+  // A clock jump can leave a retained lock apparently expired. An active hook
+  // during the grace window must recover it using the persisted TTL.
+  const hookGraceNow = Math.floor(Date.now() / 1000);
+  withMeshDb((db) => {
+    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?').run(hookGraceNow - 120, hookTtlResource);
+    db.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(hookGraceNow + 60));
+  });
+  let graceRecoveryHook;
+  try {
+    graceRecoveryHook = hookContext(runHookWithStableTtl(
+      ['hook', 'userpromptsubmit'],
+      hookPayload,
+      'clock-grace expired-lock hook'
+    ), 'UserPromptSubmit');
+  } finally {
+    withMeshDb((db) => db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run());
+  }
+  if (!graceRecoveryHook.includes(`#${hookTaskId} running`)) {
+    fail(`clock-grace hook recovery lost coordination context:\n${graceRecoveryHook}`);
+  }
+  const hookRenewals = eventPayloads('lock.renewed_by_hook', 20)
+    .filter((event) => event.actor === 'claude-hook');
+  if (hookRenewals.length < 4 || hookRenewals.slice(0, 4).some((event) => Number(event.payload?.renewed || 0) < 2)) {
+    fail(`active hooks did not report persisted-TTL lock renewal:\n${JSON.stringify(hookRenewals, null, 2)}`);
+  }
+  hcc(['lock', 'release', '--peer', 'claude-hook', '--resource', hookTtlResource]);
+  hcc(['lock', 'release', '--peer', 'claude-hook', '--resource', hookCappedTtlResource]);
   hcc(['task', 'done', '--peer', 'codex-hook', '--id', hookTaskId, '--summary', 'hook regression done']);
   hcc(['event', 'tail', '--limit', '5']);
 
@@ -2320,6 +3064,10 @@ async function multiProjectWebWorkflow() {
   ]) {
     if (!html.includes(expected)) fail(`web UI missing i18n support: ${expected}`);
   }
+  if (!html.includes('id="logoutBtn"') ||
+      !html.includes("fetch('/logout', { method: 'POST', headers })")) {
+    fail('web UI missing logout control or session revocation request');
+  }
   if (!html.includes('id="startMode"') || !html.includes('id="resumeArg"') || !html.includes('syncStartModeOptions') || !html.includes("mode === 'resume'")) {
     fail('web form missing provider resume controls');
   }
@@ -2388,7 +3136,7 @@ async function multiProjectWebWorkflow() {
   }
   for (const expected of [
     'term.onData((data) => {',
-    "ws.send(JSON.stringify({ type: 'input', data }))"
+    "ws.send(JSON.stringify({ type: 'input', data, action_token: sessionActionTokens[active] || '' }))"
   ]) {
     if (!html.includes(expected)) fail(`web terminal input forwarding missing: ${expected}`);
   }
@@ -2519,21 +3267,77 @@ async function multiProjectWebWorkflow() {
   }
 
   const managedActionSession = await startProvider({ kind: 'shell', command: 'bash --noprofile --norc' });
-  if (!managedActionSession.action_token) {
-    fail(`managed web session did not include action token:\n${JSON.stringify(managedActionSession, null, 2)}`);
+  const managedActionPeer = managedActionSession.peer_id || managedActionSession.id;
+  // net-05: the action token is no longer in the session response; fetch it
+  // from the terminal WS snapshot frame.
+  const managedActionToken = await fetchSessionActionToken(managedActionPeer);
+  if (!managedActionToken) {
+    fail(`managed web session did not deliver an action token over the WS snapshot:\n${JSON.stringify(managedActionSession, null, 2)}`);
   }
   const runtimeActionToken = currentRuntime().token || '';
-  if (managedActionSession.action_token === runtimeActionToken || managedActionSession.action_token.length < 32) {
-    fail(`managed web session action token is not an independent session token:\n${JSON.stringify({ runtimeActionToken, managedActionSession }, null, 2)}`);
+  if (managedActionToken === runtimeActionToken || managedActionToken.length < 32) {
+    fail(`managed web session action token is not an independent session token:\n${JSON.stringify({ runtimeActionToken, managedActionToken }, null, 2)}`);
   }
   const actionNext = await (await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/task-next`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionSession.action_token })
+    body: JSON.stringify({ action_token: managedActionToken })
   }, { root })).json();
   if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
     fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
   }
+  // Cookie-authenticated terminal sockets are tied to the opaque browser
+  // session and must be revoked immediately on logout.
+  await assertLogoutClosesCookieWebSocket(managedActionPeer, { root });
+  // The web heartbeat path is independent from the CLI command. Verify it also
+  // renews from ttl_sec without compounding, including an explicit override.
+  const webTtlResource = 'web/persisted-ttl-lock';
+  const webLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action_token: managedActionToken,
+      resource: webTtlResource,
+      task: Number(taskMatch[1]),
+      ttl: 60
+    })
+  }, { root });
+  const webLock = await webLockResponse.json();
+  if (!webLockResponse.ok || !webLock.ok || webLock.action !== 'lock-acquire' || webLock.data?.lock?.ttl_sec !== 60) {
+    fail(`web lock-acquire did not persist its TTL:\n${JSON.stringify(webLock, null, 2)}`);
+  }
+  const webLockCreatedAt = Math.floor(Date.now() / 1000) - 7200;
+  withMeshDb((db) => db.prepare('UPDATE locks SET created_at = ? WHERE resource = ?').run(webLockCreatedAt, webTtlResource));
+  const runWebHeartbeatWithStableTtl = async (ttlSec, label, ttlOverride = null) => {
+    const before = Math.floor(Date.now() / 1000);
+    const response = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action_token: managedActionToken,
+        renew_locks: true,
+        ...(ttlOverride === null ? {} : { ttl: ttlOverride })
+      })
+    }, { root });
+    const payload = await response.json();
+    const after = Math.floor(Date.now() / 1000);
+    if (!response.ok || !payload.ok || payload.action !== 'heartbeat' || payload.data?.renewed !== 1) {
+      fail(`${label} failed to renew exactly one lock:\n${JSON.stringify(payload, null, 2)}`);
+    }
+    assertPersistedLockRenewal(webTtlResource, {
+      ttlSec,
+      createdAt: webLockCreatedAt,
+      before,
+      after,
+      label
+    });
+  };
+  await runWebHeartbeatWithStableTtl(60, 'first web heartbeat');
+  await runWebHeartbeatWithStableTtl(60, 'second web heartbeat');
+  await runWebHeartbeatWithStableTtl(75, 'web heartbeat TTL override', 75);
+  await runWebHeartbeatWithStableTtl(75, 'web heartbeat persisted TTL after override');
+  hcc(['lock', 'release', '--peer', managedActionPeer, '--resource', webTtlResource]);
+
   const actionHeartbeat = await (await runtimeFetch('/api/peers/web-action-peer/actions/heartbeat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2551,7 +3355,7 @@ async function multiProjectWebWorkflow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      action_token: managedActionSession.action_token,
+      action_token: managedActionToken,
       resource: 'web/identity-spoof-lock',
       task: Number(ownerTaskMatch[1])
     })
@@ -2587,7 +3391,7 @@ async function multiProjectWebWorkflow() {
 
   const claudeResumeName = `web-claude-resume-${testId}`;
   const claudeResume = await startProvider({ kind: 'claude', mode: 'resume', resume: claudeResumeName });
-  const expectedClaudePeer = `claude-${claudeResumeName.slice(0, 8)}`;
+  const expectedClaudePeer = `claude-${shortHash(claudeResumeName)}`;
   if (!claudeResume.command.includes(`claude --resume ${claudeResumeName}`)) {
     fail(`web claude resume command wrong:\n${JSON.stringify(claudeResume, null, 2)}`);
   }
@@ -2610,7 +3414,7 @@ async function multiProjectWebWorkflow() {
 
   const codexResumeName = `web-codex-resume-${testId}`;
   const codexResume = await startProvider({ kind: 'codex', mode: 'resume', resume: codexResumeName });
-  const expectedCodexPeer = `codex-${codexResumeName.slice(0, 8)}`;
+  const expectedCodexPeer = `codex-${shortHash(codexResumeName)}`;
   if (!codexResume.command.includes(`codex resume ${codexResumeName}`)) {
     fail(`web codex resume command wrong:\n${JSON.stringify(codexResume, null, 2)}`);
   }
@@ -3515,7 +4319,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
       !hccSource.includes("} from '../lib/web/runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web/http.mjs'") ||
-      !hccSource.includes("import { webIndexHtml } from '../lib/web/ui-template.mjs'") ||
+      !hccSource.includes("webIndexHtml, webLoginPage } from '../lib/web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
     fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
@@ -3658,6 +4462,7 @@ async function syntaxAndHelp() {
   if (typeof integrationShimScript.generateShim !== 'function') fail('integrations shim script module missing generateShim export');
   if (shimScriptCompat.generateShim !== integrationShimScript.generateShim) fail('shim script compatibility export mismatch');
   assertShimRuntimeUnavailableFallback(integrationShimScript.generateShim);
+  assertGeneratedShimPeerHash(integrationShimScript.generateShim);
   await assertShimIgnoresGlobalRuntime(integrationShimScript.generateShim);
   for (const name of ['installPathEntry', 'uninstallPathEntry']) {
     if (typeof shellPath[name] !== 'function') fail(`shell path module missing export: ${name}`);
@@ -4380,6 +5185,32 @@ async function syntaxAndHelp() {
       conflictAutomation.next_action.lock_owner !== 'other-peer') {
     fail(`automation lock conflict action changed: ${JSON.stringify(conflictAutomation, null, 2)}`);
   }
+  const expiredConflictLock = {
+    resource: 'scoped:grace-runtime',
+    base_resource: 'bin/hcc.mjs',
+    scope: 'automation',
+    owner: 'other-peer',
+    task_id: 99,
+    expires_at: 900
+  };
+  const graceConflictAutomation = automationModule.deriveAutomation({
+    ...automationSnapshot,
+    clock_grace_active: true,
+    locks: [expiredConflictLock]
+  }, 'peer-a', { resource: 'bin/hcc.mjs', scope: 'automation' }, automationConfig);
+  const afterGraceAutomation = automationModule.deriveAutomation({
+    ...automationSnapshot,
+    clock_grace_active: false,
+    locks: [expiredConflictLock]
+  }, 'peer-a', { resource: 'bin/hcc.mjs', scope: 'automation' }, automationConfig);
+  if (graceConflictAutomation.phase !== 'coordinate_lock' ||
+      graceConflictAutomation.next_action.kind !== 'msg.send' ||
+      graceConflictAutomation.next_action.lock_owner !== 'other-peer' ||
+      graceConflictAutomation.next_action.argv.includes('--force') ||
+      afterGraceAutomation.phase !== 'acquire_lock' ||
+      afterGraceAutomation.next_action.kind !== 'lock.acquire') {
+    fail(`automation clock-grace lock conflict semantics changed:\n${JSON.stringify({ graceConflictAutomation, afterGraceAutomation }, null, 2)}`);
+  }
   const automationContext = automationModule.renderAutomationContext(acquireAutomation);
   if (!automationContext.includes('phase: acquire_lock') ||
       !automationContext.includes('why: task #10 needs bin/hcc.mjs [automation] lock')) {
@@ -4707,6 +5538,22 @@ async function syntaxAndHelp() {
     }
   } finally {
     taskDb.close();
+  }
+  // hb-05: clock-grace helpers behave as expected (jump classification + window).
+  {
+    const clockGrace = await import(path.join(repoRoot, 'lib', 'shared', 'clock-grace.mjs'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (clockGrace.clockGraceSuppressed(nowSec, nowSec + 60) !== true ||
+        clockGrace.clockGraceSuppressed(nowSec, nowSec - 1) !== false ||
+        clockGrace.clockGraceSuppressed(nowSec, 0) !== false) {
+      fail('clock grace window suppression semantics changed');
+    }
+    const fwd = clockGrace.classifyClockJump(120000);
+    const bwd = clockGrace.classifyClockJump(-12000);
+    const norm = clockGrace.classifyClockJump(30000);
+    if (fwd?.kind !== 'forward' || bwd?.kind !== 'backward' || norm !== null) {
+      fail(`clock jump classification changed: ${JSON.stringify({ fwd, bwd, norm })}`);
+    }
   }
   for (const helper of [
     'function parseTaskIds(',
@@ -5539,7 +6386,8 @@ async function syntaxAndHelp() {
     delete process.env.CODEX_MANAGED_BY_NPM;
     delete process.env.CODEX_MANAGED_BY_BUN;
     const autoPeer = integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, {}, 'peer', 'shell');
-    if (!autoPeer.auto || autoPeer.id !== 'codex-01234567') {
+    // sess-04: peer id is a hash of the full provider session id, not the first 8 chars.
+    if (!autoPeer.auto || autoPeer.id !== `codex-${shortHash('0123456789abcdef')}`) {
       fail(`peer identity auto peer id changed: ${JSON.stringify(autoPeer)}`);
     }
     const explicitPeer = integrationPeerIdentity.resolveCurrentPeer({ root: repoRoot }, { peer: 'manual-peer' }, 'peer', 'shell');
@@ -5662,9 +6510,9 @@ async function syntaxAndHelp() {
   const compatWebPeerActions = await import(path.join(repoRoot, 'lib', 'web-peer-actions.mjs'));
   const compatWebUiTemplate = await import(path.join(repoRoot, 'lib', 'web-ui-template.mjs'));
   for (const [moduleName, mod, names] of [
-    ['web/runtime', webRuntime, ['runtimeConnectHost', 'runtimeBaseUrl', 'runtimeApiUrl', 'requestUrl', 'isLoopbackHost', 'nextSessionId', 'listenServer', 'publicRuntimeUrl', 'localRuntimeUrl', 'makeWebToken', 'expectedWebHost', 'webRuntimeMatchesRequest', 'rememberRuntimeToken']],
+    ['web/runtime', webRuntime, ['runtimeConnectHost', 'runtimeBaseUrl', 'runtimeApiUrl', 'runtimeHttpRequest', 'requestUrl', 'isLoopbackHost', 'nextSessionId', 'listenServer', 'publicRuntimeUrl', 'localRuntimeUrl', 'makeWebToken', 'expectedWebHost', 'webRuntimeMatchesRequest', 'rememberRuntimeToken']],
     ['web-runtime compat', compatWebRuntime, ['runtimeConnectHost', 'runtimeBaseUrl', 'runtimeApiUrl', 'requestUrl', 'isLoopbackHost', 'nextSessionId', 'listenServer', 'publicRuntimeUrl', 'localRuntimeUrl', 'makeWebToken', 'expectedWebHost', 'webRuntimeMatchesRequest', 'rememberRuntimeToken']],
-    ['web/http', webHttp, ['readJsonRequest', 'sendHttp', 'sendJson', 'sendFile', 'authOk']],
+    ['web/http', webHttp, ['readJsonRequest', 'sendHttp', 'sendJson', 'sendFile', 'authOk', 'tokenMatches', 'requestIsSecure', 'requestOriginMatches']],
     ['web-http compat', compatWebHttp, ['readJsonRequest', 'sendHttp', 'sendJson', 'sendFile', 'authOk']],
     ['web-peer-actions compat', compatWebPeerActions, ['createWebPeerActions']],
     ['web/ui-template', webUiTemplate, ['webIndexHtml']],
@@ -5710,9 +6558,42 @@ async function syntaxAndHelp() {
       webHttp.authOk(new URL('http://example.test/?token=bad'), { headers: {} }, 'tok')) {
     fail('web HTTP helper authOk token checks failed');
   }
+  const sameOriginHttpRequest = {
+    headers: { origin: 'http://example.test:8787', host: 'example.test:8787' },
+    socket: { encrypted: false }
+  };
+  if (!webHttp.requestOriginMatches(sameOriginHttpRequest) ||
+      webHttp.requestOriginMatches({ ...sameOriginHttpRequest, headers: { ...sameOriginHttpRequest.headers, origin: 'http://example.test:8788' } }) ||
+      webHttp.requestOriginMatches({ ...sameOriginHttpRequest, socket: { encrypted: true } }) ||
+      webHttp.requestOriginMatches({ ...sameOriginHttpRequest, headers: { host: 'example.test:8787' } })) {
+    fail('web HTTP helper same-origin checks failed');
+  }
+  const trustedProxyOriginRequest = {
+    headers: {
+      origin: 'https://public.example.test:9443',
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': 'public.example.test:9443, internal-proxy:8787',
+      'x-forwarded-proto': 'https, http'
+    },
+    socket: { encrypted: false, remoteAddress: '::ffff:127.0.0.1' }
+  };
+  if (!webHttp.requestOriginMatches(trustedProxyOriginRequest, { trustProxy: true }) ||
+      webHttp.requestOriginMatches(trustedProxyOriginRequest) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, { trustProxy: true }) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-host': 'other.example.test:9443' } }, { trustProxy: true }) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'http' } }, { trustProxy: true }) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'file' } }, { trustProxy: true })) {
+    fail('web HTTP helper trusted-proxy forwarded origin checks failed');
+  }
+  if (!webHttp.requestIsSecure(trustedProxyOriginRequest, { trustProxy: true }) ||
+      webHttp.requestIsSecure(trustedProxyOriginRequest) ||
+      webHttp.requestIsSecure({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, { trustProxy: true }) ||
+      !webHttp.requestIsSecure({ headers: {}, socket: { encrypted: true, remoteAddress: '203.0.113.9' } })) {
+    fail('web HTTP helper trusted-proxy secure-request checks failed');
+  }
   const wildcardRuntime = { host: '0.0.0.0', port: 8787, token: 'tok' };
   const ipv6WildcardRuntime = { host: '::', port: 8788, token: 'tok' };
-  const localRuntime = { host: '127.0.0.1', port: 8789, token: 'tok' };
+  const localRuntime = { host: '127.0.0.1', port: 8789, token: 'tok', tls: false, base_url: 'http://127.0.0.1:8789' };
   expectEqual(webRuntime.runtimeBaseUrl('0.0.0.0', 8787), 'http://127.0.0.1:8787', 'runtimeBaseUrl 0.0.0.0');
   expectEqual(webRuntime.runtimeBaseUrl('::', 8788), 'http://127.0.0.1:8788', 'runtimeBaseUrl ::');
   expectEqual(String(webRuntime.runtimeApiUrl({ base_url: 'http://127.0.0.1:8787/base' }, '/api/state?peer=a b')), 'http://127.0.0.1:8787/api/state?peer=a%20b', 'runtimeApiUrl route');
@@ -5729,6 +6610,16 @@ async function syntaxAndHelp() {
     ['a', { id: 'codex-1' }],
     ['b', 'codex-2']
   ]), 'codex'), 'codex-3', 'nextSessionId map');
+  const localMatchOpts = { local: true, port: 8789, token: 'tok' };
+  const tlsRuntime = { ...localRuntime, tls: true, base_url: 'https://127.0.0.1:8789' };
+  const legacyTlsRuntime = { host: '127.0.0.1', port: 8789, token: 'tok', base_url: 'https://127.0.0.1:8789' };
+  if (!webRuntime.webRuntimeMatchesRequest(localRuntime, localMatchOpts) ||
+      webRuntime.webRuntimeMatchesRequest(localRuntime, { ...localMatchOpts, tls: true }) ||
+      !webRuntime.webRuntimeMatchesRequest(tlsRuntime, { ...localMatchOpts, tls: true }) ||
+      webRuntime.webRuntimeMatchesRequest(tlsRuntime, localMatchOpts) ||
+      !webRuntime.webRuntimeMatchesRequest(legacyTlsRuntime, { ...localMatchOpts, tls: true })) {
+    fail('web runtime TLS mode matching checks failed');
+  }
   const listenProbe = http.createServer((req, res) => res.end('ok'));
   try {
     const listenPort = await webRuntime.listenServer(listenProbe, '127.0.0.1', 0, false);
@@ -5737,6 +6628,130 @@ async function syntaxAndHelp() {
     }
   } finally {
     await new Promise((resolve) => listenProbe.close(resolve));
+  }
+  const tlsHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-tls-${testId}-`));
+  const savedTlsHome = process.env.HOME;
+  let tlsCredentials;
+  try {
+    process.env.HOME = tlsHome;
+    const webTls = await import(path.join(repoRoot, 'lib', 'web', 'tls.mjs'));
+    tlsCredentials = webTls.ensureSelfSignedCert();
+    const tlsDir = path.join(tlsHome, '.hello-cc', 'tls');
+    const currentPointerPath = path.join(tlsDir, 'current.json');
+    const currentGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
+    const generationNames = {
+      initialCurrent: currentGeneration,
+      previous: `generation-previous-${testId}`,
+      recent: `generation-recent-candidate-${testId}`,
+      switchedCurrent: `generation-switched-current-${testId}`,
+      activeCreating: `generation-active-creating-${testId}`,
+      deadCreating: `generation-dead-creating-${testId}`
+    };
+    const initialGenerationDir = path.join(tlsDir, currentGeneration);
+    const cleanupNow = Date.now();
+    const generationFixtures = [
+      { kind: 'previous', ageMs: 5 * 60 * 1000, complete: true, marker: '.published', pid: process.pid },
+      { kind: 'recent', ageMs: 30 * 60 * 1000 },
+      { kind: 'switchedCurrent', ageMs: 90 * 60 * 1000, complete: true, marker: '.published', pid: process.pid },
+      { kind: 'activeCreating', ageMs: 2 * 60 * 60 * 1000, marker: '.creating', pid: process.pid },
+      { kind: 'deadCreating', ageMs: 3 * 60 * 60 * 1000, marker: '.creating', pid: 99999999 }
+    ];
+    for (const fixture of generationFixtures) {
+      const generation = generationNames[fixture.kind];
+      const generationDir = path.join(tlsDir, generation);
+      fs.mkdirSync(generationDir, { mode: 0o700 });
+      if (fixture.complete) {
+        fs.copyFileSync(path.join(initialGenerationDir, 'self-signed.key'), path.join(generationDir, 'self-signed.key'));
+        fs.copyFileSync(path.join(initialGenerationDir, 'self-signed.crt'), path.join(generationDir, 'self-signed.crt'));
+      }
+      if (fixture.marker) {
+        fs.writeFileSync(path.join(generationDir, fixture.marker), `${fixture.pid}\n`, { mode: 0o600 });
+      }
+      const modifiedAt = new Date(cleanupNow - fixture.ageMs);
+      fs.utimesSync(generationDir, modifiedAt, modifiedAt);
+    }
+    const originalTlsCert = tlsCredentials.cert;
+    const originalTlsCertPath = tlsCredentials.certPath;
+    const originalReadFileSync = fs.readFileSync;
+    let pointerReads = 0;
+    let pointerSwitchedBeforeDelete = false;
+    fs.readFileSync = (file, ...args) => {
+      if (path.resolve(String(file)) === path.resolve(currentPointerPath)) {
+        pointerReads += 1;
+        // Read 1 validates the old current; read 2 starts cleanup; read 3 is
+        // the deletion-time TOCTOU guard for the stale switched-current row.
+        if (pointerReads === 3) {
+          const nextPointerPath = path.join(tlsDir, `.current-regression-${testId}.tmp`);
+          fs.writeFileSync(nextPointerPath, `${JSON.stringify({ generation: generationNames.switchedCurrent })}\n`, { mode: 0o600 });
+          fs.renameSync(nextPointerPath, currentPointerPath);
+          pointerSwitchedBeforeDelete = true;
+        }
+      }
+      return originalReadFileSync(file, ...args);
+    };
+    try {
+      tlsCredentials = webTls.ensureSelfSignedCert();
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+    const publishedGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
+    const remainingGenerations = fs.readdirSync(tlsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('generation-'))
+      .map((entry) => entry.name)
+      .sort();
+    const expectedRemainingGenerations = [
+      generationNames.initialCurrent,
+      generationNames.previous,
+      generationNames.recent,
+      generationNames.switchedCurrent,
+      generationNames.activeCreating
+    ].sort();
+    if (tlsCredentials.cert !== originalTlsCert ||
+        tlsCredentials.certPath !== originalTlsCertPath ||
+        !pointerSwitchedBeforeDelete || pointerReads < 4 ||
+        publishedGeneration !== generationNames.switchedCurrent ||
+        !fs.existsSync(path.join(tlsDir, generationNames.initialCurrent, '.published')) ||
+        !fs.existsSync(path.join(tlsDir, generationNames.switchedCurrent, '.published')) ||
+        !fs.existsSync(path.join(tlsDir, generationNames.activeCreating, '.creating')) ||
+        fs.existsSync(path.join(tlsDir, generationNames.deadCreating)) ||
+        JSON.stringify(remainingGenerations) !== JSON.stringify(expectedRemainingGenerations)) {
+      fail(`TLS generation cleanup violated current/previous/candidate lifecycle protection:\n${JSON.stringify({ generationNames, pointerReads, pointerSwitchedBeforeDelete, publishedGeneration, remainingGenerations }, null, 2)}`);
+    }
+  } finally {
+    if (savedTlsHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedTlsHome;
+  }
+  const tlsProbe = https.createServer({ key: tlsCredentials.key, cert: tlsCredentials.cert }, (req, res) => res.end('tls-ok'));
+  try {
+    const tlsPort = await new Promise((resolve, reject) => {
+      tlsProbe.once('error', reject);
+      // Bind the unspecified address so localhost works whether Node resolves
+      // it to IPv4 or IPv6 first (the order differs across target platforms).
+      tlsProbe.listen(0, () => {
+        tlsProbe.off('error', reject);
+        resolve(tlsProbe.address().port);
+      });
+    });
+    const tlsBaseUrl = `https://localhost:${tlsPort}`;
+    let rejectedUntrustedCertificate = false;
+    try {
+      await webRuntime.runtimeHttpRequest({ base_url: tlsBaseUrl }, '/probe', { timeoutMs: 3000 });
+    } catch {
+      rejectedUntrustedCertificate = true;
+    }
+    if (!rejectedUntrustedCertificate) {
+      fail('runtime HTTPS request accepted a self-signed certificate without an explicit CA');
+    }
+    const trustedTlsResponse = await webRuntime.runtimeHttpRequest({
+      base_url: tlsBaseUrl,
+      tls_cert: tlsCredentials.cert
+    }, '/probe', { timeoutMs: 3000 });
+    if (!trustedTlsResponse.ok || trustedTlsResponse.text !== 'tls-ok') {
+      fail(`runtime HTTPS request rejected its configured CA: ${JSON.stringify(trustedTlsResponse)}`);
+    }
+  } finally {
+    if (tlsProbe.listening) await new Promise((resolve) => tlsProbe.close(resolve));
+    fs.rmSync(tlsHome, { recursive: true, force: true });
   }
   expectEqual(webRuntime.publicRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl wildcard');
   expectEqual(webRuntime.localRuntimeUrl(wildcardRuntime, '/tmp/hcc project'), 'http://127.0.0.1:8787/?token=tok&project=%2Ftmp%2Fhcc%20project', 'localRuntimeUrl wildcard');
@@ -6020,11 +7035,115 @@ async function sessionRecoveryWorkflow() {
   });
 }
 
+function doctorReadOnlyWorkflow() {
+  log('doctor read-only behavior');
+  const doctorRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-doctor-${testId}-`));
+  const futureRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-doctor-future-${testId}-`));
+  const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-doctor-missing-${testId}-`));
+  try {
+    const stateDir = path.join(doctorRoot, '.hello-cc');
+    const dbPath = path.join(stateDir, 'mesh.db');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const legacyDb = new DatabaseSync(dbPath);
+    try {
+      legacyDb.exec(`
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+        PRAGMA user_version = 1;
+      `);
+    } finally {
+      legacyDb.close();
+    }
+
+    const doctor = runMaybe(process.execPath, [hccBin, '--root', doctorRoot, '--json', 'doctor'], { env });
+    if (doctor.status !== 0) {
+      fail(`doctor rejected a readable legacy database:\n${doctor.stdout}\n${doctor.stderr}`);
+    }
+    const payload = JSON.parse(doctor.stdout);
+    if (!payload.ok || payload.data?.schema_version !== 1 || payload.data?.user_version !== 1) {
+      fail(`doctor changed or misreported the legacy schema version:\n${doctor.stdout}`);
+    }
+
+    const inspectedDb = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const tables = inspectedDb.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `).all().map((row) => row.name);
+      const userVersion = inspectedDb.prepare('PRAGMA user_version').get().user_version;
+      if (tables.length !== 1 || tables[0] !== 'meta' || userVersion !== 1) {
+        fail(`doctor migrated or initialized the database: ${JSON.stringify({ tables, userVersion })}`);
+      }
+    } finally {
+      inspectedDb.close();
+    }
+
+    const futureStateDir = path.join(futureRoot, '.hello-cc');
+    const futureDbPath = path.join(futureStateDir, 'mesh.db');
+    fs.mkdirSync(futureStateDir, { recursive: true });
+    const futureDb = new DatabaseSync(futureDbPath);
+    try {
+      futureDb.exec(`
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '999');
+        PRAGMA user_version = 999;
+      `);
+    } finally {
+      futureDb.close();
+    }
+    const futureDoctor = runMaybe(process.execPath, [hccBin, '--root', futureRoot, '--json', 'doctor'], { env });
+    if (futureDoctor.status === 0) {
+      fail(`doctor accepted a schema newer than this hcc:\n${futureDoctor.stdout}\n${futureDoctor.stderr}`);
+    }
+    let futurePayload;
+    try {
+      futurePayload = JSON.parse(futureDoctor.stdout);
+    } catch {
+      fail(`doctor did not return JSON diagnostics for a newer schema:\n${futureDoctor.stdout}\n${futureDoctor.stderr}`);
+    }
+    if (!futurePayload.ok ||
+        futurePayload.data?.schema_version !== 999 ||
+        futurePayload.data?.supported_schema_version !== 7 ||
+        futurePayload.data?.schema_compatible !== false ||
+        futurePayload.data?.migration_required !== false) {
+      fail(`doctor misreported newer-schema compatibility:\n${futureDoctor.stdout}`);
+    }
+    const futureInspected = new DatabaseSync(futureDbPath, { readOnly: true });
+    try {
+      const schemaVersion = futureInspected.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
+      const userVersion = futureInspected.prepare('PRAGMA user_version').get().user_version;
+      if (schemaVersion !== '999' || userVersion !== 999) {
+        fail(`doctor mutated the newer database: ${JSON.stringify({ schemaVersion, userVersion })}`);
+      }
+    } finally {
+      futureInspected.close();
+    }
+
+    const missing = runMaybe(process.execPath, [hccBin, '--root', missingRoot, '--json', 'doctor'], { env });
+    if (missing.status === 0) {
+      fail(`doctor created a missing database instead of failing:\n${missing.stdout}`);
+    }
+    if (fs.existsSync(path.join(missingRoot, '.hello-cc'))) {
+      fail('doctor created project state while checking a missing database');
+    }
+  } finally {
+    fs.rmSync(doctorRoot, { recursive: true, force: true });
+    fs.rmSync(futureRoot, { recursive: true, force: true });
+    fs.rmSync(missingRoot, { recursive: true, force: true });
+  }
+}
+
 // `hcc gc` must cover messages/handoffs/expired locks (not just events/tasks).
 function gcCoverageWorkflow() {
   log('gc coverage: messages + handoffs + expired locks');
   const t = Math.floor(Date.now() / 1000);
   const liveLockResource = 'gc-live-lock';
+  // Track the exact message row we insert. Assert per-row afterwards: a late
+  // async message write from an earlier workflow (e.g. broadcast) can land with
+  // a created_at that gc's second-resolution cutoff excludes, so whole-table
+  // counts would be flaky; our row's deletion is the deterministic signal.
+  let gcMessageId = 0;
   withMeshDb((db) => {
     db.prepare(`
       INSERT INTO peers(id, kind, role, worktree, branch, pid, status, capabilities, created_at, last_seen_at)
@@ -6035,8 +7154,8 @@ function gcCoverageWorkflow() {
       INSERT INTO messages(sender, recipient, kind, body, thread_id, created_at)
       VALUES ('gc-peer', 'gc-peer', 'note', 'stale', NULL, ?)
     `).run(t - 100000);
-    const messageId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
-    db.prepare('INSERT INTO message_reads(message_id, peer, read_at) VALUES (?, ?, ?)').run(messageId, 'gc-peer', t);
+    gcMessageId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    db.prepare('INSERT INTO message_reads(message_id, peer, read_at) VALUES (?, ?, ?)').run(gcMessageId, 'gc-peer', t);
     db.prepare(`
       INSERT INTO handoffs(task_id, from_peer, to_peer, summary, created_at)
       VALUES (NULL, 'gc-peer', NULL, 'stale handoff', ?)
@@ -6057,8 +7176,8 @@ function gcCoverageWorkflow() {
   if (!/expired locks:\s+[1-9]/.test(out)) fail(`gc did not report expired locks:\n${out}`);
 
   withMeshDb((db) => {
-    if (db.prepare('SELECT COUNT(*) AS n FROM messages').get().n !== 0) fail('gc left messages behind');
-    if (db.prepare('SELECT COUNT(*) AS n FROM message_reads').get().n !== 0) fail('message_reads did not cascade-delete with messages');
+    if (db.prepare('SELECT COUNT(*) AS n FROM messages WHERE id = ?').get(gcMessageId).n !== 0) fail('gc left our message behind');
+    if (db.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE message_id = ?').get(gcMessageId).n !== 0) fail('message_reads did not cascade-delete with our message');
     if (db.prepare('SELECT COUNT(*) AS n FROM handoffs').get().n !== 0) fail('gc left handoffs behind');
     if (db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(t).n !== 0) fail('gc left expired locks behind');
     const live = db.prepare('SELECT resource FROM locks WHERE resource = ?').get(liveLockResource);
@@ -6089,6 +7208,7 @@ async function main() {
   gcCoverageWorkflow();
   oldNameScan();
   identityEnforcementWorkflow();
+  doctorReadOnlyWorkflow();
   await syntaxAndHelp();
   uninstallWorkflow();
   assertNoRealProjectRegistryLeak();

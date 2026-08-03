@@ -2,6 +2,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import process from 'node:process';
 import { randomBytes } from 'node:crypto';
@@ -11,11 +12,20 @@ import { URL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { CliError } from '../lib/shared/errors.mjs';
 import {
+  CLOCK_GRACE_SEC,
+  classifyClockJump,
+  clockGraceSuppressed,
+  readClockGraceUntil,
+  writeClockGraceUntil
+} from '../lib/shared/clock-grace.mjs';
+import {
   DB_SCHEMA_VERSION,
   execWithBusyRetry,
   initSchema,
+  readSchemaVersion,
   tx
 } from '../lib/db/schema.mjs';
+import { ensureMigrationBackup } from '../lib/db/migration-backup.mjs';
 import {
   intOpt,
   parseOpts,
@@ -114,12 +124,16 @@ import {
 import {
   authOk,
   readJsonRequest,
+  requestIsSecure,
+  requestOriginMatches,
   sendFile,
   sendHttp,
-  sendJson
+  sendJson,
+  tokenMatches
 } from '../lib/web/http.mjs';
 import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
-import { webIndexHtml } from '../lib/web/ui-template.mjs';
+import { ensureSelfSignedCert } from '../lib/web/tls.mjs';
+import { webIndexHtml, webLoginPage } from '../lib/web/ui-template.mjs';
 import {
   bindingFromRun,
   buildPeerCommand,
@@ -397,16 +411,31 @@ function resolveTargetPeer(ctx, opts = {}, key = 'peer', kindHint = 'shell') {
 let projectMigrationFanoutDepth = 0;
 const migratedRegisteredProjectDbs = new Set();
 
-function connect(ctx) {
-  fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+function connect(ctx, options = {}) {
+  if (options.create === false && !fs.existsSync(ctx.dbPath)) {
+    throw new CliError('NOT_FOUND', `Project database does not exist: ${ctx.dbPath}`);
+  }
+  if (options.create !== false) fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
   const db = new DatabaseSync(ctx.dbPath, { timeout: 5000 });
   db.exec('PRAGMA busy_timeout = 5000;');
   execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
   db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA wal_autocheckpoint = 1000;');
   db.exec('PRAGMA foreign_keys = ON;');
-  initSchema(db, { beforePostMigrationIndexes: dedupePeerBindings });
-  migrateRegisteredProjectDbs(ctx);
+  initSchema(db, {
+    beforeMigration: ({ fromVersion, toVersion }) =>
+      ensureMigrationBackup(db, ctx.dbPath, fromVersion, toVersion),
+    beforePostMigrationIndexes: dedupePeerBindings
+  });
+  if (options.migrateRegistered !== false) migrateRegisteredProjectDbs(ctx);
   return db;
+}
+
+function connectReadOnly(ctx) {
+  if (!fs.existsSync(ctx.dbPath) || !fs.statSync(ctx.dbPath).isFile()) {
+    throw new CliError('NOT_FOUND', `Project database does not exist: ${ctx.dbPath}`);
+  }
+  return new DatabaseSync(ctx.dbPath, { timeout: 5000, readOnly: true });
 }
 
 function migrateRegisteredProjectDbs(ctx) {
@@ -430,7 +459,11 @@ function migrateRegisteredProjectDbs(ctx) {
         execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
         db.exec('PRAGMA synchronous = NORMAL;');
         db.exec('PRAGMA foreign_keys = ON;');
-        initSchema(db, { beforePostMigrationIndexes: dedupePeerBindings });
+        initSchema(db, {
+          beforeMigration: ({ fromVersion, toVersion }) =>
+            ensureMigrationBackup(db, dbPath, fromVersion, toVersion),
+          beforePostMigrationIndexes: dedupePeerBindings
+        });
         migratedRegisteredProjectDbs.add(cacheKey);
       } catch (err) {
         // A corrupt or busy sibling project DB must not fail commands or crash
@@ -508,7 +541,10 @@ function upsertPeer(db, peer) {
       worktree = excluded.worktree,
       branch = excluded.branch,
       pid = excluded.pid,
-      status = excluded.status,
+      -- hb-08: an incidental upsert with the default 'idle' status must not
+      -- resurrect a peer that was explicitly marked exited/detached.
+      status = CASE WHEN excluded.status = 'idle' AND peers.status IN ('exited', 'detached')
+                    THEN peers.status ELSE excluded.status END,
       capabilities = excluded.capabilities,
       last_seen_at = excluded.last_seen_at
   `).run(
@@ -703,16 +739,22 @@ async function cmdHeartbeat(ctx, args) {
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const status = opts.status || null;
-  const ttl = intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
+  const ttlOverride = opts.ttl === undefined ? null : intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const db = connect(ctx);
   const t = now();
   touchCurrentPeer(db, ctx, identity, status, 'shell');
   let renewed = 0;
   if (opts['renew-locks']) {
-    renewed = db.prepare(`
-      UPDATE locks SET expires_at = ?
-      WHERE owner = ? AND expires_at > ?
-    `).run(t + ttl, peer, t).changes;
+    const grace = clockGraceSuppressed(t, readClockGraceUntil(db));
+    if (ttlOverride !== null) {
+      renewed = grace
+        ? db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ?').run(t, ttlOverride, ttlOverride, peer).changes
+        : db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ? AND expires_at > ?').run(t, ttlOverride, ttlOverride, peer, t).changes;
+    } else {
+      renewed = grace
+        ? db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ?').run(t, peer).changes
+        : db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ? AND expires_at > ?').run(t, peer, t).changes;
+    }
   }
   addEvent(db, 'peer.heartbeat', peer, null, { status, renewed });
   printResult(ctx, { peer, status, renewed }, (data) => `heartbeat ${data.peer}${data.renewed ? `, renewed locks: ${data.renewed}` : ''}`);
@@ -722,6 +764,7 @@ async function cmdPeers(ctx, args) {
   parseOpts(args);
   const db = connect(ctx);
   const t = now();
+  const graceActive = clockGraceSuppressed(t, readClockGraceUntil(db));
   const rows = db.prepare(`
     SELECT *, (? - last_seen_at) AS age_sec
     FROM peers
@@ -733,7 +776,7 @@ async function cmdPeers(ctx, args) {
     { label: 'role', value: (r) => r.role || '' },
     { label: 'status', value: (r) => r.status },
     { label: 'age', value: (r) => `${r.age_sec}s` },
-    { label: 'active', value: (r) => r.age_sec <= ACTIVE_PEER_TTL ? 'yes' : 'stale' },
+    { label: 'active', value: (r) => graceActive || r.age_sec <= ACTIVE_PEER_TTL ? 'yes' : 'stale' },
     { label: 'branch', value: (r) => r.branch || '' }
   ]));
 }
@@ -1016,8 +1059,11 @@ async function taskList(ctx, args) {
     SELECT id, status, last_seen_at, (? - last_seen_at) AS age_sec
     FROM peers
   `).all(t);
-  const locks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
-  rows = annotateTasksWithLiveness(rows, peers, locks, t, ACTIVE_PEER_TTL);
+  const graceUntil = readClockGraceUntil(db);
+  const locks = clockGraceSuppressed(t, graceUntil)
+    ? db.prepare('SELECT * FROM locks').all()
+    : db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+  rows = annotateTasksWithLiveness(rows, peers, locks, t, ACTIVE_PEER_TTL, graceUntil);
   printResult(ctx, rows, (data) => table(data, [
     { label: 'id', value: (r) => `#${r.id}` },
     { label: 'status', value: (r) => r.status },
@@ -1731,7 +1777,12 @@ async function lockAcquire(ctx, args) {
         if (!task) throw new CliError('NOT_FOUND', `Task #${taskId} does not exist`);
         assertTaskOwnerForMutation(db, peer, task, 'lock-acquire');
       }
-      const activeLocks = db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
+      // During clock grace, every retained lock row still conflicts. A fixed
+      // look-back cannot protect locks across an arbitrarily long sleep.
+      const graceUntil = readClockGraceUntil(db);
+      const activeLocks = clockGraceSuppressed(t, graceUntil)
+        ? db.prepare('SELECT * FROM locks').all()
+        : db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
       const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
       if (conflict) {
         throw new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
@@ -1745,16 +1796,18 @@ async function lockAcquire(ctx, args) {
       }
       const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
       db.prepare(`
-        INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at, ttl_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(resource) DO UPDATE SET
           base_resource = excluded.base_resource,
           scope = excluded.scope,
           owner = excluded.owner,
           task_id = excluded.task_id,
           reason = excluded.reason,
-          expires_at = excluded.expires_at
-      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, existing ? existing.created_at : t);
+          expires_at = excluded.expires_at,
+          created_at = excluded.created_at,
+          ttl_sec = excluded.ttl_sec
+      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, t, ttl);
       addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
       return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
     });
@@ -1797,7 +1850,7 @@ async function lockRenew(ctx, args) {
     const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
     if (!existing) throw new CliError('NOT_FOUND', `No lock for ${lockLabel(requested)}`);
     if (existing.owner !== peer) throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
-    db.prepare('UPDATE locks SET expires_at = ? WHERE resource = ?').run(now() + ttl, requested.resource);
+    db.prepare('UPDATE locks SET expires_at = ?, ttl_sec = ? WHERE resource = ?').run(now() + ttl, ttl, requested.resource);
     addEvent(db, 'lock.renewed', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl });
     return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
   });
@@ -1807,9 +1860,10 @@ async function lockRenew(ctx, args) {
 async function lockList(ctx, args) {
   const opts = parseOpts(args, { booleans: ['all'] });
   const db = connect(ctx);
-  const rows = opts.all
+  const t = now();
+  const rows = opts.all || clockGraceSuppressed(t, readClockGraceUntil(db))
     ? db.prepare('SELECT * FROM locks ORDER BY resource ASC').all()
-    : db.prepare('SELECT * FROM locks WHERE expires_at > ? ORDER BY resource ASC').all(now());
+    : db.prepare('SELECT * FROM locks WHERE expires_at > ? ORDER BY resource ASC').all(t);
   printResult(ctx, rows, (data) => table(data, [
     { label: 'resource', value: (r) => lockBaseResource(r) },
     { label: 'scope', value: (r) => lockScope(r) },
@@ -2149,21 +2203,19 @@ function webExposureWarning(host, port) {
 // cross-site WebSocket hijack (CSWSH) is rejected. Non-browser clients (the CLI,
 // the `ws` library, regression tests) send no Origin and are allowed through to
 // the token gate.
-function webSocketOriginAllowed(req) {
+function webSocketOriginAllowed(req, trustProxy = false) {
   const origin = req.headers.origin;
   if (!origin) return true;
-  let originHost;
-  try { originHost = new URL(origin).host; } catch { return false; }
-  return originHost === (req.headers.host || '');
+  return requestOriginMatches(req, { trustProxy });
 }
 
 async function startWebBackground(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
+  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy'] });
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy']);
   validateWebTokenOpts(opts);
   const requestedHost = expectedWebHost(opts);
   assertWebTokenForHost(requestedHost, !opts['no-token']);
-  if (!isLoopbackHost(requestedHost)) console.error(webExposureWarning(requestedHost, intOpt(opts, 'port', 8787)));
+  if (!isLoopbackHost(requestedHost)) console.error(webExposureWarning(requestedHost, intOpt(opts, 'port', 8787)) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.'));
   ensureTmuxAvailable({ autoInstall: true });
   const setup = await prepareLocalBus(ctx, {
     ...opts,
@@ -2192,6 +2244,13 @@ async function startWebBackground(ctx, args) {
 
   const logFile = webLogPath(ctx);
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  // bg-05: rotate web.log once it grows past 5 MB (keep the previous .1).
+  try {
+    if (fs.statSync(logFile).size > 5 * 1024 * 1024) {
+      try { fs.rmSync(`${logFile}.1`, { force: true }); } catch {}
+      try { fs.renameSync(logFile, `${logFile}.1`); } catch {}
+    }
+  } catch {}
   fs.appendFileSync(logFile, `\n[${new Date().toISOString()}] ${CLI_NAME} web ${args.join(' ')}\n`, { mode: 0o600 });
   // The runtime echoes token-bearing URLs into web.log; keep it owner-only so a
   // co-tenant on the machine cannot read the token (net-02).
@@ -2318,14 +2377,102 @@ async function cmdDown(ctx, args) {
 async function cmdWeb(ctx, args, startMeta = {}) {
   if (args[0] === '--help' || args[0] === '-h') return helpWeb();
   if (process.env[WEB_CHILD_ENV] !== '1') return startWebBackground(ctx, args);
-  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover']);
+  const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy'] });
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy']);
   validateWebTokenOpts(opts);
   const host = expectedWebHost(opts);
   const port = intOpt(opts, 'port', 8787);
   const token = makeWebToken(opts);
   assertWebTokenForHost(host, Boolean(token));
-  if (!isLoopbackHost(host)) console.error(webExposureWarning(host, port));
+  if (!isLoopbackHost(host)) console.error(webExposureWarning(host, port) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.'));
+  const useTls = Boolean(opts.tls);
+  const trustProxy = Boolean(opts['trust-proxy']);
+  const tlsCredentials = useTls ? ensureSelfSignedCert([host]) : null;
+  // Browser sessions: a token printed in the URL is exchanged once for an
+  // HttpOnly cookie so the token stops travelling in every fetch/WS URL
+  // (net-02). The cookie carries an opaque session id (not the token); it is
+  // meaningless outside this runtime and is lost on restart.
+  const WEB_SESSION_TTL_SEC = 30 * 24 * 60 * 60;
+  const MAX_WEB_SESSIONS = 256;
+  const webSessions = new Map();
+  function parseCookieSid(req) {
+    const header = req.headers.cookie || '';
+    for (const part of header.split(';')) {
+      const [k, ...rest] = part.trim().split('=');
+      if (k === 'hcc_sid') {
+        try { return decodeURIComponent(rest.join('=')); } catch { return ''; }
+      }
+    }
+    return '';
+  }
+  function closeWebSession(sid, reason = 'session revoked') {
+    const session = webSessions.get(sid);
+    webSessions.delete(sid);
+    for (const ws of session?.sockets || []) {
+      try { ws.close(4001, reason); } catch {}
+    }
+    session?.sockets?.clear();
+  }
+  function pruneWebSessions(t = now()) {
+    for (const [sid, session] of webSessions) {
+      if (session.expiresAt <= t) closeWebSession(sid, 'session expired');
+    }
+  }
+  function issueSession() {
+    pruneWebSessions();
+    while (webSessions.size >= MAX_WEB_SESSIONS) {
+      const oldest = webSessions.keys().next().value;
+      if (!oldest) break;
+      closeWebSession(oldest, 'session limit reached');
+    }
+    const sid = randomBytes(24).toString('base64url');
+    webSessions.set(sid, { expiresAt: now() + WEB_SESSION_TTL_SEC, sockets: new Set() });
+    return sid;
+  }
+  function sessionCookieHeader(sid, req) {
+    const parts = [`hcc_sid=${sid}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${WEB_SESSION_TTL_SEC}`];
+    if (requestIsSecure(req, { trustProxy })) parts.push('Secure');
+    return parts.join('; ');
+  }
+  function expiredSessionCookieHeader(req) {
+    const parts = ['hcc_sid=', 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+    if (requestIsSecure(req, { trustProxy })) parts.push('Secure');
+    return parts.join('; ');
+  }
+  function cookieSessionRecord(req) {
+    const sid = parseCookieSid(req);
+    if (!sid) return null;
+    const session = webSessions.get(sid);
+    if (!session || session.expiresAt <= now()) {
+      if (session) closeWebSession(sid, 'session expired');
+      return null;
+    }
+    return { sid, session };
+  }
+  function cookieSessionOk(req) {
+    return Boolean(cookieSessionRecord(req));
+  }
+  function cookieSocketValid(ws) {
+    const auth = ws?.hccCookieAuth;
+    if (!auth) return true;
+    const current = webSessions.get(auth.sid);
+    if (current === auth.session && current.expiresAt > now()) return true;
+
+    const reason = current === auth.session ? 'session expired' : 'session revoked';
+    if (current === auth.session) {
+      closeWebSession(auth.sid, reason);
+    } else {
+      auth.session.sockets.delete(ws);
+      try { ws.close(4001, reason); } catch {}
+    }
+    return false;
+  }
+  const webSessionPruner = setInterval(pruneWebSessions, 60000);
+  webSessionPruner.unref?.();
+  function webAuthMode(url, req) {
+    if (authOk(url, req, token)) return 'token';
+    return cookieSessionOk(req) ? 'cookie' : null;
+  }
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');
@@ -2551,6 +2698,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         session.buffer += data;
         if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
         broadcast(session, { type: 'data', data });
+        refreshPeerIoHeartbeat(session);
       } catch {
         // File removed or truncated — close and stop polling
         if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
@@ -2620,22 +2768,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   // ── Auto-attach detected peers that are in tmux panes ─────────────────────
   function listTmuxPanesOnce() {
+    // Use '|' not '\t' as the field separator: older tmux (3.3a) replaces
+    // whitespace in -F output with '_'. Path is last and rejoined so a '|'
+    // inside a path is safe.
     const result = runTmux([
       'list-panes',
       '-a',
       '-F',
-      '#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_name}'
+      '#{pane_id}|#{pane_pid}|#{pane_current_command}|#{session_name}|#{pane_current_path}'
     ]);
     return result.trim().split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [pane, panePid, command, cwd, sessionName] = line.split('\t');
+        const parts = line.split('|');
         return {
-          pane,
-          pid: Number.parseInt(panePid || '0', 10) || null,
-          command: command || '',
-          cwd: cwd || '',
-          sessionName: sessionName || ''
+          pane: parts[0],
+          pid: Number.parseInt(parts[1] || '0', 10) || null,
+          command: parts[2] || '',
+          sessionName: parts[3] || '',
+          cwd: parts.slice(4).join('|') || ''
         };
       })
       .filter((pane) => pane.pane && pane.pid);
@@ -2687,7 +2838,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       // peers whose process is gone. Sweep first so its live set protects
       // still-alive sessions from being reaped.
       const liveManaged = reAdoptOrphanManagedTmuxSessions(ctx);
-      reapDeadPeers(ctx, liveManaged, db);
+      reapDeadPeersForProject(ctx, liveManaged, db);
 
       const rows = db.prepare(`
         SELECT p.id, p.kind, p.role, p.worktree, p.pid,
@@ -2781,41 +2932,144 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // managed session are skipped: their own exit poller owns their transition.
   const REAPER_GRACE_SEC = 120;
   let reaperInFlight = false;
-  function reapDeadPeers() {
-    if (reaperInFlight) return;
-    reaperInFlight = true;
-    let db = null;
-    try {
-      db = connect(ctx);
-      const t = now();
-      const managedPeerIds = new Set();
-      for (const s of sessions.values()) {
-        if (s.status === 'running') {
-          const managedId = s.peerId || s.id;
-          if (managedId) managedPeerIds.add(managedId);
+  // Wall-clock jump detector (hb-05): the reaper ticks every 30s, so any delta
+  // much larger than that between probes means the machine slept or NTP stepped
+  // the clock forward; a negative delta is a backward step. On a jump, persist
+  // a grace deadline so every process suppresses age-based stale/takeover/lock
+  // decisions for one window instead of mass-reaping live peers.
+  let lastClockProbeMs = Date.now();
+  function detectClockJump() {
+    const nowMs = Date.now();
+    const delta = nowMs - lastClockProbeMs;
+    lastClockProbeMs = nowMs;
+    const jump = classifyClockJump(delta);
+    if (jump) {
+      console.error(`[${new Date().toISOString()}] wall-clock ${jump.kind} jump detected (${delta >= 0 ? '+' : ''}${Math.round(delta / 1000)}s); suppressing stale/takeover/lock decisions until +${CLOCK_GRACE_SEC}s`);
+    }
+    return jump;
+  }
+
+  function runtimeProjectContexts() {
+    const contexts = new Map([[path.resolve(ctx.root), ctx]]);
+    for (const projectCtx of projectContexts.values()) {
+      if (!sameResolvedPath(projectCtx.root, ctx.root)) {
+        try {
+          if (!fs.statSync(projectCtx.root).isDirectory() || !fs.statSync(projectCtx.dbPath).isFile()) continue;
+        } catch {
+          continue;
         }
       }
-      const rows = db.prepare(`
-        SELECT id, pid FROM peers
-        WHERE status IN ('running', 'working', 'busy')
-          AND pid IS NOT NULL
-          AND last_seen_at < ?
-      `).all(t - REAPER_GRACE_SEC);
-      for (const row of rows) {
-        if (managedPeerIds.has(row.id)) continue;
-        if (isAlive(Number(row.pid))) continue;
-        db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
-        db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(t, row.id);
-        try { addEvent(db, 'peer.reaped', 'web-runtime', null, { peer: row.id, pid: row.pid }); } catch {}
+      contexts.set(path.resolve(projectCtx.root), projectCtx);
+    }
+    return [...contexts.values()];
+  }
+
+  function runClockAwareReaper() {
+    if (reaperInFlight) return;
+    reaperInFlight = true;
+    try {
+      // Probe exactly once per scheduler tick. A clock jump is machine-wide,
+      // so persist the same grace deadline to every project served by this
+      // runtime rather than only the project that started the web process.
+      const jump = detectClockJump();
+      const graceUntil = jump ? now() + CLOCK_GRACE_SEC : null;
+      for (const projectCtx of runtimeProjectContexts()) {
+        let db = null;
+        try {
+          db = connect(projectCtx, { migrateRegistered: false, create: false });
+          const t = now();
+          if (graceUntil) writeClockGraceUntil(db, graceUntil);
+          // hb-05: skip the whole reap pass during a clock grace window — age
+          // is untrustworthy after sleep or an NTP step.
+          if (clockGraceSuppressed(t, readClockGraceUntil(db))) continue;
+          const managedPeerIds = new Set();
+          for (const session of sessionsForProject(projectCtx)) {
+            if (session.status !== 'running') continue;
+            const managedId = session.peerId || session.id;
+            if (managedId) managedPeerIds.add(managedId);
+          }
+          const rows = db.prepare(`
+            SELECT id, pid FROM peers
+            WHERE status IN ('running', 'working', 'busy')
+              AND pid IS NOT NULL
+              AND last_seen_at < ?
+          `).all(t - REAPER_GRACE_SEC);
+          for (const row of rows) {
+            if (managedPeerIds.has(row.id)) continue;
+            if (isAlive(Number(row.pid))) continue;
+            db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
+            db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(t, row.id);
+            try { addEvent(db, 'peer.reaped', 'web-runtime', null, { peer: row.id, pid: row.pid }); } catch {}
+          }
+        } catch (err) {
+          console.error(`[${new Date().toISOString()}] liveness reaper failed for ${projectCtx.root}: ${err?.message || err}`);
+        } finally {
+          try { db?.close(); } catch {}
+        }
       }
-    } catch (err) {
-      console.error(`[${new Date().toISOString()}] liveness reaper failed: ${err?.message || err}`);
     } finally {
-      try { db?.close(); } catch {}
       reaperInFlight = false;
     }
   }
-  const reaperPoller = setInterval(reapDeadPeers, 30000);
+  const reaperPoller = setInterval(runClockAwareReaper, 30000);
+
+  // ── Automatic GC ──────────────────────────────────────────────────────────
+  // Bound events/WAL growth without manual `hcc gc` (conc-05). Auto scope only
+  // prunes high-volume/ephemeral items (events >14d, expired locks, stale bufs),
+  // never peers/tasks/messages/handoffs. Runs once at startup then every 6h.
+  let autoGcInFlight = false;
+  function protectedBufferFileNames(projectCtx) {
+    const names = new Set();
+    const projectBufsDir = path.resolve(path.join(projectCtx.root, '.hello-cc', BUFS_DIR_NAME));
+    // Buffer adoption/watchers are still primary-project scoped. Until they
+    // are split per project, preserve every sibling buffer rather than deleting
+    // a live file the primary runtime cannot see.
+    if (!sameResolvedPath(projectCtx.root, ctx.root)) {
+      try {
+        for (const file of fs.readdirSync(projectBufsDir)) names.add(file);
+      } catch {}
+      return names;
+    }
+    // tmux FIFO storage currently uses the primary bufsDir even for sibling
+    // sessions, so protect by actual file location rather than session owner.
+    for (const session of sessions.values()) {
+      if (session.status !== 'running') continue;
+      for (const file of [session.outFile, session.inFile, session.resizeFile, session.pipeFile]) {
+        if (file && path.resolve(path.dirname(file)) === projectBufsDir) names.add(path.basename(file));
+      }
+      if (session.type === 'external' && session.id && sameResolvedPath(session.root, projectCtx.root)) {
+        names.add(path.basename(`${session.id}.meta`));
+      }
+    }
+    return names;
+  }
+  function runAutoGc() {
+    if (autoGcInFlight) return;
+    autoGcInFlight = true;
+    try {
+      for (const projectCtx of runtimeProjectContexts()) {
+        let db = null;
+        try {
+          db = connect(projectCtx, { migrateRegistered: false, create: false });
+          runGc(projectCtx, db, {
+            olderThanDays: 14,
+            dryRun: false,
+            scope: 'auto',
+            protectedBufFiles: protectedBufferFileNames(projectCtx)
+          });
+          try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); } catch {}
+        } catch (err) {
+          console.error(`[${new Date().toISOString()}] auto-gc failed for ${projectCtx.root}: ${err?.message || err}`);
+        } finally {
+          try { db?.close(); } catch {}
+        }
+      }
+    } finally {
+      autoGcInFlight = false;
+    }
+  }
+  runAutoGc();
+  const gcPoller = setInterval(runAutoGc, 6 * 60 * 60 * 1000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
   function resolveSessionPeerId(db, session) {
@@ -2945,14 +3199,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       binding,
       provider_session_known: Boolean(providerSessionLabel),
       provider_session_label: providerSessionLabel,
-      action_token: session.actionToken || null,
+      // action_token is intentionally NOT serialized here: it used to be leaked
+      // to every client via GET /api/sessions. It is now delivered only to the
+      // client that opens the session's terminal WebSocket (see the snapshot
+      // frame), so only the controlling client can use it (net-05).
       warning: session.warning || null
     };
   }
 
   function broadcast(session, payload) {
     const text = JSON.stringify(payload);
-    for (const client of session.clients) {
+    for (const client of [...session.clients]) {
+      if (!cookieSocketValid(client)) {
+        session.clients.delete(client);
+        continue;
+      }
       if (client.readyState === client.OPEN) client.send(text);
     }
   }
@@ -2961,6 +3222,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     if (!session?.clients?.size) return false;
     let open = false;
     for (const client of [...session.clients]) {
+      if (!cookieSocketValid(client)) {
+        session.clients.delete(client);
+        continue;
+      }
       if (client.readyState === client.OPEN || client.readyState === 1) {
         open = true;
       } else {
@@ -3054,6 +3319,24 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // browser via `tmux pipe-pane`, so xterm.js renders incrementally — no
   // screenshot-poll, no full-screen reset, no flicker — and the program's own
   // cursor sequences are mirrored verbatim (works for bash, codex, claude, vim).
+  function startTmuxReplacePoller(session, warning = null) {
+    if (session.replacePoller) clearInterval(session.replacePoller);
+    if (warning) {
+      session.warning = {
+        code: 'TMUX_STREAM_FALLBACK',
+        message: `Raw tmux streaming unavailable; using capture polling: ${warning}`
+      };
+    }
+    session.lastBroadcastTime = Date.now();
+    session.replacePoller = setInterval(() => {
+      if (session.status !== 'running') return;
+      if (Date.now() - (session.lastBroadcastTime || 0) > 4000) {
+        session.lastBroadcastTime = Date.now();
+        broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
+      }
+    }, 1600);
+  }
+
   function startTmuxStream(session) {
     const safePane = String(session.pane).replace(/[^A-Za-z0-9_-]/g, '');
     const safeId = String(session.id).replace(/[^A-Za-z0-9_.-]/g, '_');
@@ -3084,18 +3367,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       try { fs.chmodSync(pipeFile, 0o600); } catch {}
       session.streamFd = fs.openSync(pipeFile, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-    } catch {
-      session.streamFd = null;
-      return;
+    } catch (err) {
+      const message = err?.message || String(err);
+      stopTmuxStream(session);
+      startTmuxReplacePoller(session, message);
+      return 'poll';
     }
 
     // Enable raw output piping after the read end is open. This avoids the
     // old "enable pipe, then seek to EOF" window that could skip early output.
     try {
       runTmux(['pipe-pane', '-t', session.pane, `cat > ${shellQuoteArg(pipeFile)}`]);
-    } catch {
+    } catch (err) {
       stopTmuxStream(session);
-      return;
+      startTmuxReplacePoller(session, err?.message || String(err));
+      return 'poll';
     }
     session.streamPoller = setInterval(() => {
       try {
@@ -3120,6 +3406,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
         session.lastBroadcastTime = Date.now();
         broadcast(session, { type: 'data', data });
+        refreshPeerIoHeartbeat(session);
       } catch {
         if (session.streamFd !== null && session.streamFd !== undefined) {
           try { fs.closeSync(session.streamFd); } catch {}
@@ -3132,14 +3419,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     // (e.g. pipe-pane output is fully buffered), send a fresh capture-pane
     // snapshot so the browser stays current. This also recovers from any
     // silent FIFO-read failures on restored panes.
-    session.lastBroadcastTime = Date.now();
-    session.replacePoller = setInterval(() => {
-      if (session.status !== 'running') return;
-      if (Date.now() - (session.lastBroadcastTime || 0) > 4000) {
-        session.lastBroadcastTime = Date.now();
-        broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
-      }
-    }, 1600);
+    startTmuxReplacePoller(session);
+    return 'stream';
   }
 
   function stopTmuxStream(session) {
@@ -3515,7 +3796,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const existing = sessions.get(key);
     if (existing && existing.status === 'running') {
       if (existing.type === 'tmux' && existing.pane === info.pane) return existing;
-      throw new CliError('SESSION_EXISTS', `Session ${id} is already running`);
+      if (existing !== input.replaceSession) {
+        throw new CliError('SESSION_EXISTS', `Session ${id} is already running`);
+      }
     }
 
     const kind = inferPeerKind(id, input.kind || null, info.command);
@@ -3552,7 +3835,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       exitPoller: null
     };
     sessions.set(key, session);
-    startTmuxStream(session);
+    try {
+      startTmuxStream(session);
+      if (!session.streamPoller && !session.replacePoller) {
+        throw new CliError('TMUX_STREAM_ERROR', `Could not establish output tracking for ${info.pane}`);
+      }
+    } catch (err) {
+      stopTmuxStream(session);
+      if (sessions.get(key) === session) sessions.delete(key);
+      throw err;
+    }
     let rebindOldTarget = null;
     let rebindOldPeer = null;
     let rebindOldPlan = null;
@@ -3568,71 +3860,84 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         } else {
           deadCount = 0;
         }
-      } catch { deadCount++; if (deadCount >= 3) detachTmuxSession(session, 'exited'); }
-    }, 3000);
-
-    const db = connect(pctx);
-    try {
-      upsertPeer(db, {
-        id,
-        kind,
-        role,
-        worktree: cwd,
-        branch: detectBranch(cwd),
-        pid: info.pid,
-        status: 'running',
-        capabilities: 'tmux'
-      });
-      const binding = input.binding || {};
-      const nextBinding = {
-        peer: id,
-        provider: binding.provider || kind,
-        provider_session_id: binding.provider_session_id || null,
-        provider_session_name: binding.provider_session_name || null,
-        resume_mode: binding.resume_mode || 'attached',
-        resume_arg: binding.resume_arg || info.pane,
-        command: binding.command || command,
-        transport: 'tmux',
-        runtime_session_id: id,
-        runtime_target: info.pane
-      };
-      if (input.rebindOldTmux && !input.skipProviderRebindCleanup && (nextBinding.provider_session_id || nextBinding.provider_session_name)) {
-        const existingPeerBinding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(id);
-        const conflictBinding = findProviderSessionBinding(db, nextBinding);
-        const oldBinding = [existingPeerBinding, conflictBinding]
-          .filter((row) => providerSessionBindingMatches(row, nextBinding))
-          .find((row) => row?.transport === 'tmux' && row.runtime_target && row.runtime_target !== info.pane);
-        if (oldBinding) {
-          rebindOldTarget = oldBinding.runtime_target;
-          rebindOldPeer = oldBinding.peer;
-          rebindOldPlan = assertOldTmuxCanRebind(pctx, rebindOldPeer, rebindOldTarget, info.pane, id, db, {
-            force: Boolean(input.providerForce)
-          });
+      } catch (err) {
+        // sess-03: only a definitive "pane/session is gone" error counts toward
+        // detach; a transient tmux failure (busy server, momentary hiccup) must
+        // not detach a live session after 3 attempts.
+        const message = err?.code === 'TMUX_ERROR' ? String(err.message || '') : '';
+        const definitivelyGone = /can't find pane|can't find session|no server running/i.test(message);
+        if (definitivelyGone) {
+          deadCount++;
+          if (deadCount >= 3) detachTmuxSession(session, 'exited');
         }
       }
-      const providerForce = Boolean(input.providerForce);
-      const canonical = upsertCanonicalPeerBinding(db, nextBinding, providerForce, {
-        override: Boolean(input.rebindOldTmux && providerForce)
+    }, 3000);
+
+    let db = null;
+    try {
+      db = connect(pctx);
+      tx(db, () => {
+        upsertPeer(db, {
+          id,
+          kind,
+          role,
+          worktree: cwd,
+          branch: detectBranch(cwd),
+          pid: info.pid,
+          status: 'running',
+          capabilities: 'tmux'
+        });
+        const binding = input.binding || {};
+        const nextBinding = {
+          peer: id,
+          provider: binding.provider || kind,
+          provider_session_id: binding.provider_session_id || null,
+          provider_session_name: binding.provider_session_name || null,
+          resume_mode: binding.resume_mode || 'attached',
+          resume_arg: binding.resume_arg || info.pane,
+          command: binding.command || command,
+          transport: 'tmux',
+          runtime_session_id: id,
+          runtime_target: info.pane
+        };
+        if (input.rebindOldTmux && !input.skipProviderRebindCleanup && (nextBinding.provider_session_id || nextBinding.provider_session_name)) {
+          const existingPeerBinding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(id);
+          const conflictBinding = findProviderSessionBinding(db, nextBinding);
+          const oldBinding = [existingPeerBinding, conflictBinding]
+            .filter((row) => providerSessionBindingMatches(row, nextBinding))
+            .find((row) => row?.transport === 'tmux' && row.runtime_target && row.runtime_target !== info.pane);
+          if (oldBinding) {
+            rebindOldTarget = oldBinding.runtime_target;
+            rebindOldPeer = oldBinding.peer;
+            rebindOldPlan = assertOldTmuxCanRebind(pctx, rebindOldPeer, rebindOldTarget, info.pane, id, db, {
+              force: Boolean(input.providerForce)
+            });
+          }
+        }
+        const providerForce = Boolean(input.providerForce);
+        const canonical = upsertCanonicalPeerBinding(db, nextBinding, providerForce, {
+          override: Boolean(input.rebindOldTmux && providerForce)
+        });
+        session.peerId = canonical.peer;
+        session.binding = { ...canonical.binding };
+        addEvent(db, 'tmux.session.attached', actorPeer, null, auditPayload({
+          actor: actorPeer,
+          target: session.peerId || id,
+          source: auditSource,
+          admin: actorPeer !== (session.peerId || id),
+          pane: info.pane,
+          command,
+          cwd,
+          pid: info.pid
+        }));
       });
-      session.peerId = canonical.peer;
-      session.binding = { ...canonical.binding };
-      addEvent(db, 'tmux.session.attached', actorPeer, null, auditPayload({
-        actor: actorPeer,
-        target: session.peerId || id,
-        source: auditSource,
-        admin: actorPeer !== (session.peerId || id),
-        pane: info.pane,
-        command,
-        cwd,
-        pid: info.pid
-      }));
     } catch (err) {
       stopTmuxStream(session);
       if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
-      sessions.delete(key);
+      if (sessions.get(key) === session) sessions.delete(key);
       throw err;
     } finally {
-      db.close();
+      try { db?.close(); } catch {}
     }
     if (rebindOldTarget) {
       try {
@@ -3667,6 +3972,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return session;
   }
 
+  // hb-04: real terminal I/O is a liveness signal. Throttle-refresh the peer's
+  // last_seen_at (~30s) so an actively-used but hook-quiet terminal is not
+  // judged stale/takeover-able. Never throws — I/O hot paths stay safe.
+  function refreshPeerIoHeartbeat(session) {
+    try {
+      const t = now();
+      if (session.lastIoRefreshAt && t - session.lastIoRefreshAt < 30) return;
+      session.lastIoRefreshAt = t;
+      const peerId = session.peerId || session.id;
+      if (!peerId) return;
+      const ioDb = connect(session.ctx || ctx);
+      try {
+        ioDb.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(t, peerId);
+      } finally {
+        ioDb.close();
+      }
+    } catch {}
+  }
+
   function writeSessionInput(session, data) {
     if (session.type === 'external') {
       try { fs.appendFileSync(session.inFile, data); } catch {}
@@ -3676,6 +4000,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     } else {
       session.pty.write(data);
     }
+    refreshPeerIoHeartbeat(session);
   }
 
   function scheduleTmuxInputRefresh(session) {
@@ -3735,13 +4060,41 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const oldTmuxTargetsForRebind = [];
     const parkedOldTmuxSessions = [];
     let createdTmuxSession = false;
+    let pendingOldSession = null;
+    let pendingRestartAudit = null;
 
     function restoreParkedOldTmuxSessions() {
+      const failures = [];
+      const quarantined = [];
       for (const parked of [...parkedOldTmuxSessions].reverse()) {
-        if (!tmuxHasSession(parked.parkedName)) continue;
-        if (tmuxHasSession(parked.originalName)) continue;
-        try { runTmux(['rename-session', '-t', parked.parkedName, parked.originalName]); } catch {}
+        if (!tmuxHasSession(parked.parkedName)) {
+          failures.push(`parked session missing: ${parked.parkedName}`);
+          continue;
+        }
+        let quarantineName = null;
+        if (tmuxHasSession(parked.originalName)) {
+          quarantineName = `hcc-rollback-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+          try {
+            runTmux(['rename-session', '-t', parked.originalName, quarantineName]);
+          } catch (err) {
+            failures.push(`could not quarantine failed replacement ${parked.originalName}: ${err?.message || err}`);
+            continue;
+          }
+        }
+        try {
+          runTmux(['rename-session', '-t', parked.parkedName, parked.originalName]);
+        } catch (err) {
+          failures.push(`could not restore ${parked.parkedName} to ${parked.originalName}: ${err?.message || err}`);
+          if (quarantineName && !tmuxHasSession(parked.originalName)) {
+            try { runTmux(['rename-session', '-t', quarantineName, parked.originalName]); } catch {}
+          }
+          continue;
+        }
+        if (quarantineName) {
+          try { tmuxKillSession(quarantineName); } catch { quarantined.push(quarantineName); }
+        }
       }
+      return { failures, quarantined };
     }
 
     function restartExistingTmuxSession(reason) {
@@ -3779,27 +4132,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       if (oldTarget) oldTmuxTargetsForRebind.push({ oldPeer: id, oldTarget, allowedSessionName: parkedName });
       if (existing) {
         oldTarget = oldTarget || existing.pane || null;
-        stopTmuxStream(existing);
-        if (existing.exitPoller) { clearInterval(existing.exitPoller); existing.exitPoller = null; }
-        existing.status = 'detached';
-        existing.exitedAt = now();
-        sessions.delete(sessionKey(pctx, existing.id));
+        // sess-06: do NOT tear down the in-memory session yet — keep it fully
+        // alive until the replacement tmux session exists, so a failed restart
+        // leaves the old session (stream/pollers/clients) intact.
+        pendingOldSession = existing;
       }
       hasSession = false;
-      const db = connect(pctx);
-      try {
-        addEvent(db, 'tmux.session.restarted', actorPeer, null, auditPayload({
-          actor: actorPeer,
-          target: id,
-          source: auditSource,
-          admin: true,
-          reason,
-          old_runtime_target: oldTarget,
-          old_tmux_session: parkedName
-        }));
-      } finally {
-        db.close();
-      }
+      pendingRestartAudit = { reason, oldTarget, parkedName };
     }
 
     if (hasSession && input.restartOnEnvChange) {
@@ -3868,14 +4207,77 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         providerForce: Boolean(input.providerForce),
         rebindOldTmux: true,
         skipProviderRebindCleanup: oldTmuxTargetsForRebind.length > 0,
+        replaceSession: pendingOldSession,
         force: true
       });
     } catch (err) {
       if (createdTmuxSession) {
         try { tmuxKillSession(sessionName); } catch {}
       }
-      restoreParkedOldTmuxSessions();
+      const rollback = restoreParkedOldTmuxSessions();
+      // attachTmuxSession removes a failed candidate from the map. Restore the
+      // parked session, whose stream/pollers/clients were deliberately kept
+      // alive until the replacement completed its DB transaction.
+      if (pendingOldSession && rollback.failures.length === 0) {
+        sessions.set(sessionKey(pctx, pendingOldSession.id), pendingOldSession);
+      }
+      if (pendingRestartAudit) {
+        try {
+          const eventDb = connect(pctx);
+          try {
+            addEvent(eventDb, 'tmux.session.restart_failed', actorPeer, null, auditPayload({
+              actor: actorPeer,
+              target: id,
+              source: auditSource,
+              admin: true,
+              reason: pendingRestartAudit.reason,
+              old_runtime_target: pendingRestartAudit.oldTarget,
+              old_tmux_session: pendingRestartAudit.parkedName,
+              error: err?.message || String(err),
+              rollback_failures: rollback.failures,
+              quarantined_sessions: rollback.quarantined
+            }));
+          } finally {
+            eventDb.close();
+          }
+        } catch {}
+      }
+      pendingOldSession = null;
+      if (rollback.failures.length) {
+        throw new CliError('TMUX_RESTART_ROLLBACK_FAILED', `Session ${id} restart failed and the previous tmux session could not be restored`, {
+          peer: id,
+          original_error: err?.message || String(err),
+          rollback_failures: rollback.failures,
+          quarantined_sessions: rollback.quarantined
+        });
+      }
       throw err;
+    }
+    if (pendingRestartAudit) {
+      try {
+        const eventDb = connect(pctx);
+        try {
+          addEvent(eventDb, 'tmux.session.restarted', actorPeer, null, auditPayload({
+            actor: actorPeer,
+            target: id,
+            source: auditSource,
+            admin: true,
+            reason: pendingRestartAudit.reason,
+            old_runtime_target: pendingRestartAudit.oldTarget,
+            old_tmux_session: pendingRestartAudit.parkedName,
+            new_runtime_target: pane
+          }));
+        } finally {
+          eventDb.close();
+        }
+      } catch {}
+    }
+    if (pendingOldSession) {
+      stopTmuxStream(pendingOldSession);
+      if (pendingOldSession.exitPoller) { clearInterval(pendingOldSession.exitPoller); pendingOldSession.exitPoller = null; }
+      pendingOldSession.status = 'detached';
+      pendingOldSession.exitedAt = now();
+      pendingOldSession = null;
     }
     for (const oldInfo of oldTmuxTargetsForRebind) {
       try {
@@ -4060,7 +4462,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // Mark peers whose OS process is gone as exited so crashed/killed sessions
   // stop lingering as 'running'. Conservative: never reap a peer that still owns
   // a live managed tmux session, is tracked in memory, or whose pid is alive.
-  function reapDeadPeers(projectCtx, liveManagedPeerIds, db) {
+  function reapDeadPeersForProject(projectCtx, liveManagedPeerIds, db) {
     let rows;
     try {
       rows = db.prepare(`
@@ -4189,6 +4591,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       session.buffer += data;
       if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
       broadcast(session, { type: 'data', data });
+      refreshPeerIoHeartbeat(session);
     });
     child.onExit((event) => {
       session.status = 'exited';
@@ -4267,7 +4670,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   const restoredTmuxDbs = new Set();
-  for (const projectCtx of projectContexts.values()) {
+  for (const projectCtx of runtimeProjectContexts()) {
     const dbKey = path.resolve(projectCtx.dbPath);
     if (restoredTmuxDbs.has(dbKey)) continue;
     restoredTmuxDbs.add(dbKey);
@@ -4275,10 +4678,36 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     reconcileRunningBindings(projectCtx);
   }
 
-  const server = http.createServer(async (req, res) => {
+  const handleWebRequest = async (req, res) => {
     const url = requestUrl(req);
     try {
       if (req.method === 'GET' && url.pathname === '/') {
+        const accept = req.headers.accept || '';
+        const isBrowserNav = req.headers['sec-fetch-mode'] === 'navigate' || accept.includes('text/html');
+        const queryToken = url.searchParams.get('token') || '';
+        const hasCookie = cookieSessionOk(req);
+        // Browser navigation with a valid ?token → exchange it for a session
+        // cookie and redirect to the bare URL (strips the token from the
+        // address bar). API-style fetches (Accept: */*) still get the HTML
+        // directly so existing CLI/test callers are unaffected.
+        if (isBrowserNav && queryToken && token && tokenMatches(queryToken, token)) {
+          const sid = issueSession();
+          const params = new URLSearchParams();
+          for (const key of ['project', 'root']) {
+            const value = url.searchParams.get(key);
+            if (value) params.set(key, value);
+          }
+          const location = '/' + (params.toString() ? `?${params}` : '');
+          res.writeHead(302, { Location: location, 'Set-Cookie': sessionCookieHeader(sid, req) });
+          res.end();
+          return;
+        }
+        // Browser navigation with no credential at all → login page (bare-URL
+        // fallback, e.g. a bookmarked URL after the runtime restarted).
+        if (isBrowserNav && !hasCookie && !queryToken && token) {
+          sendHttp(res, 200, 'text/html; charset=utf-8', webLoginPage());
+          return;
+        }
         sendHttp(res, 200, 'text/html; charset=utf-8', webIndexHtml());
         return;
       }
@@ -4290,8 +4719,33 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         sendFile(res, path.join(packageRoot(), 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css'), 'text/css; charset=utf-8');
         return;
       }
-      if (!authOk(url, req, token)) {
+      if (req.method === 'POST' && url.pathname === '/login') {
+        const input = await readJsonRequest(req);
+        const loginToken = String(input.token || '');
+        if (!token || !tokenMatches(loginToken, token)) {
+          sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Invalid token' } });
+          return;
+        }
+        const sid = issueSession();
+        res.writeHead(302, { Location: '/', 'Set-Cookie': sessionCookieHeader(sid, req) });
+        res.end();
+        return;
+      }
+      const authMode = webAuthMode(url, req);
+      if (!authMode) {
         sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Missing or invalid token' } });
+        return;
+      }
+      const safeMethod = ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '');
+      if (authMode === 'cookie' && !safeMethod && !requestOriginMatches(req, { trustProxy })) {
+        sendJson(res, 403, { ok: false, error: { code: 'CSRF_ORIGIN', message: 'Cookie-authenticated writes require a same-origin request' } });
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/logout') {
+        const sid = parseCookieSid(req);
+        if (sid) closeWebSession(sid, 'logged out');
+        res.writeHead(204, { 'Set-Cookie': expiredSessionCookieHeader(req) });
+        res.end();
         return;
       }
       const reqCtx = projectFromRequest(req, url);
@@ -4318,8 +4772,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           db: projectCtx.dbPath,
           host,
           port: actualPort,
-          base_url: runtimeBaseUrl(host, actualPort),
+          base_url: runtimeBaseUrl(host, actualPort, useTls),
           token,
+          tls: useTls,
+          trust_proxy: trustProxy,
+          tls_cert: useTls ? tlsCredentials.cert : undefined,
           global_runtime: true,
           started_at: now()
         });
@@ -4474,6 +4931,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       const inputMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/input$/);
       if (req.method === 'POST' && inputMatch) {
+        // This HTTP input route is the admin injection path used by the CLI
+        // (hcc inject / ask / broadcast). It is gated by the runtime token
+        // (authOk above) and intentionally does NOT require the per-session
+        // action token — the browser types via the WebSocket input frame
+        // (which DOES require it), and the CLI cannot obtain the action token.
         const id = decodeURIComponent(inputMatch[1]);
         const lookupDb = connect(reqCtx);
         let session;
@@ -4645,18 +5107,28 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const detail = err instanceof CliError || process.env.HCC_DEBUG ? err.message : 'internal server error';
       sendJson(res, webErrorStatus(err), { ok: false, error: { code: err.code || 'SERVER_ERROR', message: detail } });
     }
-  });
+  };
+  const server = useTls
+    ? https.createServer({ key: tlsCredentials.key, cert: tlsCredentials.cert }, handleWebRequest)
+    : http.createServer(handleWebRequest);
 
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     try {
     const url = requestUrl(req);
-    if (!authOk(url, req, token)) {
+    const upgradeAuthMode = webAuthMode(url, req);
+    if (!upgradeAuthMode) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
-    if (!webSocketOriginAllowed(req)) {
+    const cookieAuth = upgradeAuthMode === 'cookie' ? cookieSessionRecord(req) : null;
+    if (upgradeAuthMode === 'cookie' && !cookieAuth) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (!webSocketOriginAllowed(req, trustProxy)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
@@ -4682,12 +5154,25 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.hccCookieAuth = cookieAuth;
       session.clients.add(ws);
-      ws.send(JSON.stringify({ type: 'snapshot', data: refreshTmuxSnapshot(session) }));
+      if (cookieAuth) cookieAuth.session.sockets.add(ws);
+      if (!cookieSocketValid(ws)) {
+        session.clients.delete(ws);
+        return;
+      }
+      // Deliver the per-session action token only to the client that completed
+      // the upgrade for THIS session's terminal socket (net-05): it is not in
+      // the public session list.
+      ws.send(JSON.stringify({ type: 'snapshot', data: refreshTmuxSnapshot(session), action_token: session.actionToken || null }));
       ws.on('message', (raw) => {
         try {
+          if (!cookieSocketValid(ws)) return;
           const msg = JSON.parse(String(raw));
           if (msg.type === 'input' && session.status === 'running') {
+            // Require the per-session action token on terminal input (the RCE
+            // path). The controlling client received it in the snapshot frame.
+            if (session.actionToken && msg.action_token !== session.actionToken) return;
             const data = String(msg.data || '');
             writeSessionInput(session, data);
           } else if (msg.type === 'resize' && session.status === 'running') {
@@ -4700,7 +5185,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           // Ignore malformed terminal frames.
         }
       });
-      ws.on('close', () => session.clients.delete(ws));
+      ws.on('close', () => {
+        session.clients.delete(ws);
+        if (cookieAuth) cookieAuth.session.sockets.delete(ws);
+      });
     });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] ws upgrade failed: ${err?.message || err}`);
@@ -4751,6 +5239,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     clearInterval(externalScanPoller);
     clearInterval(autoAttachPoller);
     clearInterval(reaperPoller);
+    clearInterval(gcPoller);
+    clearInterval(webSessionPruner);
     try { bufsWatcher?.close(); } catch {}
     for (const session of sessions.values()) {
       closeSessionClients(session);
@@ -4825,8 +5315,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     db: ctx.dbPath,
     host,
     port: actualPort,
-    base_url: runtimeBaseUrl(host, actualPort),
+    base_url: runtimeBaseUrl(host, actualPort, useTls),
     token,
+    tls: useTls,
+    trust_proxy: trustProxy,
+    tls_cert: useTls ? tlsCredentials.cert : undefined,
     started_at: now()
   };
   const runtimeFile = writeRuntime(ctx, runtime);
@@ -5163,7 +5656,7 @@ async function cmdHook(ctx, args) {
   }
   if (!peerId) {
     peerId = sessionId
-      ? `${kind}-${sanitizePeerPart(sessionId.slice(0, 8), shortHash(sessionId))}`
+      ? `${kind}-${shortHash(sessionId)}`
       : `${kind}-${shortHash(`${hookCtx.root}:${autoPeerBasis(kind)}`)}`;
   }
 
@@ -5222,6 +5715,24 @@ async function cmdHook(ctx, args) {
       session_id: sessionId,
       cwd: hookCwd
     }));
+    // hb-06: an active hook is proof the peer is working. During clock grace,
+    // renew retained locks even when the wall-clock jump made them look expired.
+    const hookNow = now();
+    const hookGrace = clockGraceSuppressed(hookNow, readClockGraceUntil(db));
+    const hookLockRenewals = hookGrace
+      ? db.prepare(`
+          UPDATE locks
+          SET expires_at = ? + MIN(ttl_sec, 3600)
+          WHERE owner = ?
+        `).run(hookNow, peerId).changes
+      : db.prepare(`
+          UPDATE locks
+          SET expires_at = ? + MIN(ttl_sec, 3600)
+          WHERE owner = ? AND expires_at > ?
+        `).run(hookNow, peerId, hookNow).changes;
+    if (hookLockRenewals > 0) {
+      addEvent(db, 'lock.renewed_by_hook', peerId, null, { renewed: hookLockRenewals });
+    }
     try {
       reconcileRunningPeerBindings(db, hookCtx, {
         inspectProcess: inspectProviderProcess,
@@ -5915,32 +6426,73 @@ async function cmdTmux(ctx, args) {
 
 // ─── hcc gc ───────────────────────────────────────────────────────────────────
 
-async function cmdGc(ctx, args) {
-  if (wantsHelp(args)) return helpGc();
-  const opts = parseOpts(args, { booleans: ['yes', 'force'] });
-  const olderThanDays = intOpt(opts, 'older-than', 7);
-  const dryRun = !opts.yes && !opts.force;
+// Prune stale state. scope='full' cleans everything (peers/events/tasks/
+// messages/handoffs/locks/bufs) — used by the explicit `hcc gc` command.
+// scope='auto' cleans only high-volume/ephemeral items (events, expired locks,
+// stale bufs) so automatic background gc bounds DB growth without deleting
+// user-meaningful history (peers/tasks/messages/handoffs stay for `hcc gc`).
+// `db` is used open; the caller owns its lifecycle.
+function runGc(ctx, db, {
+  olderThanDays = 7,
+  dryRun = false,
+  scope = 'full',
+  protectedBufFiles = null
+} = {}) {
+  const auto = scope === 'auto';
   const cutoff = now() - olderThanDays * 86400;
-  const db = connect(ctx);
-  const results = { buf_files: 0, stale_peers: 0, old_events: 0, old_tasks: 0, old_messages: 0, old_handoffs: 0, expired_locks: 0 };
+  const protectedBuffers = protectedBufFiles instanceof Set
+    ? protectedBufFiles
+    : new Set(protectedBufFiles || []);
+  const results = {
+    buf_files: 0,
+    protected_buf_files: 0,
+    stale_peers: 0,
+    old_events: 0,
+    old_tasks: 0,
+    old_messages: 0,
+    old_handoffs: 0,
+    expired_locks: 0,
+    deferred_expired_locks: 0
+  };
 
+  // Buffer files (high-volume ephemeral). Auto keeps a shorter 7-day window.
+  const bufCutoffMs = Date.now() - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
+  const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
   try {
-    // 1. Clean stale buffer files
-    const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
-    try {
-      for (const f of fs.readdirSync(bufsDir)) {
-        const fp = path.join(bufsDir, f);
-        try {
-          const st = fs.statSync(fp);
-          if (st.mtimeMs < Date.now() - olderThanDays * 86400000) {
-            if (!dryRun) fs.unlinkSync(fp);
-            results.buf_files++;
+    for (const f of fs.readdirSync(bufsDir)) {
+      const fp = path.join(bufsDir, f);
+      try {
+        const st = fs.statSync(fp);
+        if (st.mtimeMs < bufCutoffMs) {
+          if (auto && protectedBuffers.has(f)) {
+            results.protected_buf_files++;
+            continue;
           }
-        } catch {}
-      }
-    } catch {}
+          if (!dryRun) fs.unlinkSync(fp);
+          results.buf_files++;
+        }
+      } catch {}
+    }
+  } catch {}
 
-    // 2. Remove stale peers (no heartbeat in N days)
+  // Old events (avoid unbounded growth) — always pruned.
+  const oldEvents = db.prepare('SELECT COUNT(*) AS n FROM events WHERE created_at < ?').get(cutoff);
+  if (!dryRun) db.prepare('DELETE FROM events WHERE created_at < ?').run(cutoff);
+  results.old_events = oldEvents.n;
+
+  // A clock jump can make every lock look expired at once. Preserve those rows
+  // for the grace window so acquisition and heartbeat logic can recover them.
+  const gcNow = now();
+  const expiredLocks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(gcNow).n;
+  if (clockGraceSuppressed(gcNow, readClockGraceUntil(db))) {
+    results.deferred_expired_locks = expiredLocks;
+  } else {
+    if (!dryRun) db.prepare('DELETE FROM locks WHERE expires_at < ?').run(gcNow);
+    results.expired_locks = expiredLocks;
+  }
+
+  if (!auto) {
+    // Stale peers (no heartbeat in N days)
     const stalePeers = db.prepare('SELECT id FROM peers WHERE last_seen_at < ?').all(cutoff);
     for (const p of stalePeers) {
       if (!dryRun) {
@@ -5950,12 +6502,7 @@ async function cmdGc(ctx, args) {
       results.stale_peers++;
     }
 
-    // 3. Remove old events (avoid unbounded growth)
-    const oldEvents = db.prepare('SELECT COUNT(*) AS n FROM events WHERE created_at < ?').get(cutoff);
-    if (!dryRun) db.prepare('DELETE FROM events WHERE created_at < ?').run(cutoff);
-    results.old_events = oldEvents.n;
-
-    // 4. Remove old completed tasks
+    // Old completed tasks
     const oldTasks = db.prepare(
       "SELECT COUNT(*) AS n FROM tasks WHERE status IN ('done', 'abandoned') AND updated_at < ?"
     ).get(cutoff);
@@ -5964,21 +6511,37 @@ async function cmdGc(ctx, args) {
     ).run(cutoff);
     results.old_tasks = oldTasks.n;
 
-    // 5. Remove old messages (message_reads cascade via foreign_keys = ON)
+    // Old messages (message_reads cascade via foreign_keys = ON)
     const oldMessages = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE created_at < ?').get(cutoff);
     if (!dryRun) db.prepare('DELETE FROM messages WHERE created_at < ?').run(cutoff);
     results.old_messages = oldMessages.n;
 
-    // 6. Remove old handoffs
+    // Old handoffs
     const oldHandoffs = db.prepare('SELECT COUNT(*) AS n FROM handoffs WHERE created_at < ?').get(cutoff);
     if (!dryRun) db.prepare('DELETE FROM handoffs WHERE created_at < ?').run(cutoff);
     results.old_handoffs = oldHandoffs.n;
+  }
 
-    // 7. Remove already-expired advisory lock rows (queries already ignore them)
-    const expiredLocks = db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(now());
-    if (!dryRun) db.prepare('DELETE FROM locks WHERE expires_at < ?').run(now());
-    results.expired_locks = expiredLocks.n;
+  return results;
+}
 
+async function cmdGc(ctx, args) {
+  if (wantsHelp(args)) return helpGc();
+  const opts = parseOpts(args, { booleans: ['yes', 'force'] });
+  const olderThanDays = intOpt(opts, 'older-than', 7);
+  const dryRun = !opts.yes && !opts.force;
+  const db = connect(ctx);
+  let results;
+  try {
+    results = runGc(ctx, db, { olderThanDays, dryRun, scope: 'full' });
+    if (!dryRun) {
+      // Reclaim WAL after deleting many rows (conc-05). Best-effort: may be busy
+      // with other connections; the result is reported but never blocks.
+      try {
+        const cp = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+        if (cp) results.wal_checkpoint = cp;
+      } catch {}
+    }
   } finally {
     db.close();
   }
@@ -5992,12 +6555,93 @@ async function cmdGc(ctx, args) {
     if (r.old_messages)  lines.push(`  old messages:   ${r.old_messages}`);
     if (r.old_handoffs)  lines.push(`  old handoffs:   ${r.old_handoffs}`);
     if (r.expired_locks) lines.push(`  expired locks:  ${r.expired_locks}`);
+    if (r.deferred_expired_locks) lines.push(`  expired locks deferred by clock grace: ${r.deferred_expired_locks}`);
+    if (r.wal_checkpoint) lines.push(`  wal checkpoint: ${r.wal_checkpoint.busy ? 'busy' : 'ok'} (log ${r.wal_checkpoint.log}, checkpointed ${r.wal_checkpoint.checkpointed})`);
     if (!r.buf_files && !r.stale_peers && !r.old_events && !r.old_tasks &&
-        !r.old_messages && !r.old_handoffs && !r.expired_locks) {
+        !r.old_messages && !r.old_handoffs && !r.expired_locks && !r.deferred_expired_locks) {
       lines.push('  nothing to clean');
     }
     return lines.join('\n');
   });
+}
+
+// ─── hcc doctor ─────────────────────────────────────────────────────────────
+// Health self-check: SQLite integrity, schema version, WAL/DB size, row counts.
+async function cmdDoctor(ctx, args) {
+  if (wantsHelp(args)) {
+    console.log(`${CLI_NAME} doctor [--json]
+
+Runs a read-only health check on the project database: PRAGMA integrity_check,
+schema compatibility, persistent journal mode, DB and WAL file sizes, and
+per-table row counts. Exits non-zero for corruption or an unsupported schema.
+`);
+    return;
+  }
+  const db = connectReadOnly(ctx);
+  let report;
+  try {
+    const integrity = db.prepare('PRAGMA integrity_check').get();
+    const quick = db.prepare('PRAGMA quick_check').get();
+    const schemaVersion = readSchemaVersion(db);
+    const journalMode = db.prepare('PRAGMA journal_mode').get();
+    const synchronous = db.prepare('PRAGMA synchronous').get();
+    const walAutocheckpoint = db.prepare('PRAGMA wal_autocheckpoint').get();
+    const userVersion = db.prepare('PRAGMA user_version').get();
+    const fk = db.prepare('PRAGMA foreign_keys').get();
+    const counts = {};
+    for (const table of ['peers', 'peer_bindings', 'tasks', 'messages', 'message_reads', 'locks', 'handoffs', 'events']) {
+      try { counts[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n; } catch { counts[table] = null; }
+    }
+    report = {
+      root: ctx.root,
+      db: ctx.dbPath,
+      integrity_check: integrity ? Object.values(integrity)[0] : null,
+      quick_check: quick ? Object.values(quick)[0] : null,
+      schema_version: schemaVersion,
+      supported_schema_version: DB_SCHEMA_VERSION,
+      schema_compatible: schemaVersion > 0 && schemaVersion <= DB_SCHEMA_VERSION,
+      migration_required: schemaVersion > 0 && schemaVersion < DB_SCHEMA_VERSION,
+      user_version: userVersion ? Object.values(userVersion)[0] : 0,
+      journal_mode: journalMode ? Object.values(journalMode)[0] : null,
+      diagnostic_connection: {
+        synchronous: synchronous ? Object.values(synchronous)[0] : null,
+        wal_autocheckpoint: walAutocheckpoint ? Object.values(walAutocheckpoint)[0] : null,
+        foreign_keys: fk ? Object.values(fk)[0] : null
+      },
+      runtime_connection_defaults: {
+        synchronous: 'NORMAL',
+        wal_autocheckpoint: 1000,
+        foreign_keys: true
+      },
+      row_counts: counts
+    };
+  } finally {
+    db.close();
+  }
+  // File sizes (best-effort).
+  try {
+    report.db_size_bytes = fs.statSync(ctx.dbPath).size;
+    const walPath = `${ctx.dbPath}-wal`;
+    report.wal_size_bytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+  } catch {}
+
+  const healthy = report.integrity_check === 'ok' &&
+    report.quick_check === 'ok' &&
+    report.schema_compatible;
+  printResult(ctx, report, (r) => {
+    const lines = [
+      `doctor (${r.root}):`,
+      `  integrity_check: ${r.integrity_check}`,
+      `  quick_check:     ${r.quick_check}`,
+      `  schema:          ${r.schema_version} (supported ${r.supported_schema_version}; ${r.schema_compatible ? (r.migration_required ? 'migration available' : 'compatible') : 'unsupported'})`,
+      `  journal_mode:    ${r.journal_mode}`,
+      `  diagnostic connection: synchronous=${r.diagnostic_connection.synchronous}  wal_autocheckpoint=${r.diagnostic_connection.wal_autocheckpoint}  foreign_keys=${r.diagnostic_connection.foreign_keys}`,
+      `  db size:         ${r.db_size_bytes ?? '?'} bytes${r.wal_size_bytes ? `  (wal ${r.wal_size_bytes})` : ''}`,
+      `  rows:            ` + Object.entries(r.row_counts).map(([k, v]) => `${k}=${v}`).join('  ')
+    ];
+    return lines.join('\n');
+  });
+  if (!healthy) process.exitCode = 1;
 }
 
 // ─── hcc find-root ───────────────────────────────────────────────────────────
@@ -6061,6 +6705,7 @@ async function dispatch(ctx, rest) {
   if (command === 'shim') return cmdShim(ctx, args);
   if (command === 'setup') return cmdSetup(ctx, args);
   if (command === 'scan') return cmdScan(ctx, args);
+  if (command === 'doctor') return cmdDoctor(ctx, args);
   if (command === 'gc') return cmdGc(ctx, args);
   if (command === 'find-root') return cmdFindRoot(ctx, args);
   if (command === 'which-real') return cmdWhichReal(ctx, args);
