@@ -38,11 +38,13 @@ import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import {
   intOpt,
   parseOpts,
+  positiveSafeIntOpt,
   required,
   splitGlobalArgs,
   validateOpts,
   wantsHelp
 } from '../lib/cli-args.mjs';
+import { leaseDeadline, renewOwnedLocks } from '../lib/core/coordination/lease-renewal.mjs';
 import {
   commandPath,
   createContext as createCliContext,
@@ -112,9 +114,15 @@ import {
 import { createHelpFunctions } from '../lib/ui/help.mjs';
 import { createMessageStore } from '../lib/core/coordination/messages.mjs';
 import { createTaskStore } from '../lib/core/coordination/tasks.mjs';
-import { classifyPeerActivity, resolvePeerEvidence } from '../lib/core/peers/evidence.mjs';
+import {
+  classifyPeerActivity,
+  peerEvidenceAllowsReap,
+  resolvePeerEvidence
+} from '../lib/core/peers/evidence.mjs';
+import { refreshHookOwnerIdentity } from '../lib/core/peers/hook-owner.mjs';
 import {
   conditionalTmuxKill,
+  conditionalTmuxRename,
   finalizeTmuxGcBindingMutation,
   validateTmuxDestructiveEvidence,
   validateTmuxGcBindingEvidence,
@@ -142,9 +150,9 @@ import {
   WEB_CHILD_ENV,
   childSessionEnv,
   isolatedEnvCommandArgs,
-  isLikelyShellCommand,
   isRelaunchableProviderSession,
-  launchFingerprint
+  launchFingerprint,
+  providerRestartReason
 } from '../lib/core/sessions/launch.mjs';
 import {
   expectedWebHost,
@@ -277,6 +285,7 @@ const CLI_NAME = 'hcc';
 const NPM_PACKAGE_NAME = PACKAGE_META.name;
 const DEFAULT_LOCK_TTL = 900;
 const ACTIVE_PEER_TTL = 600;
+const UNKNOWN_EVIDENCE_GRACE_SEC = 120;
 // Detected peers older than this (seconds, last_seen) or already exited are
 // hidden from the Web "Detected" list so it reflects recent activity instead of
 // accumulating every peer/test fixture that ever registered.
@@ -411,7 +420,6 @@ function inspectTmuxTarget(expectedSession, target) {
 }
 
 function observePeerEvidence(projectCtx, row, binding = null) {
-  if (row?.status === 'exited') return resolvePeerEvidence({ peer: row });
   if (binding?.transport !== 'tmux') {
     return resolvePeerEvidence({ peer: row, processes: [processEvidenceFromRow(row)] });
   }
@@ -422,7 +430,7 @@ function observePeerEvidence(projectCtx, row, binding = null) {
   const panePid = target.paneInfo?.pid || row.pid;
   const paneProcess = {
     name: 'pane',
-    storedIdentity: storedPeerIdentity(row),
+    storedIdentity: Number(row?.pid) === Number(panePid) ? storedPeerIdentity(row) : null,
     current: inspectProcessIdentity(panePid)
   };
   const actualRoot = target.session.actual
@@ -438,6 +446,7 @@ function observePeerEvidence(projectCtx, row, binding = null) {
   }
   return resolvePeerEvidence({
     peer: row,
+    processes: [processEvidenceFromRow(row, 'owner')],
     tmux: {
       managed: true,
       session: target.session,
@@ -460,6 +469,16 @@ function peerEvidenceFromDb(db, projectCtx, peerId) {
   return observePeerEvidence(projectCtx, row, binding);
 }
 
+function providerOwnerEvidenceFromDb(db, peerId) {
+  const row = db.prepare(`
+    SELECT id, status, pid, pid_start_token, pid_command_hash
+    FROM peers WHERE id = ?
+  `).get(peerId);
+  return row
+    ? resolvePeerEvidence({ peer: row, processes: [processEvidenceFromRow(row, 'provider-owner')] })
+    : { state: 'unknown', reason: 'peer_missing' };
+}
+
 function peerMutationSubject(db, peerId) {
   const peer = db.prepare(`
     SELECT id, status, pid, pid_start_token, pid_command_hash, last_seen_at
@@ -472,12 +491,15 @@ function peerMutationSubject(db, peerId) {
   return { peer, binding };
 }
 
-function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate, options = {}) {
+function mutatePeerWithEvidence(db, projectCtx, peerId, mutate, options = {}) {
+  const acceptEvidence = typeof options.acceptEvidence === 'function'
+    ? options.acceptEvidence
+    : (evidence) => evidence.state === 'dead';
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const subject = peerMutationSubject(db, peerId);
     if (!subject.peer) return { changed: false, evidence: { state: 'unknown', reason: 'peer_missing' } };
     const evidence = observePeerEvidence(projectCtx, subject.peer, subject.binding);
-    if (evidence.state !== 'dead') return { changed: false, evidence };
+    if (!acceptEvidence(evidence, subject)) return { changed: false, evidence };
     let subjectChanged = false;
     let blocked = false;
     const changed = tx(db, () => {
@@ -497,6 +519,10 @@ function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate, options = {}) {
     if (!subjectChanged) return { changed, evidence };
   }
   return { changed: false, evidence: { state: 'unknown', reason: 'subject_changed' } };
+}
+
+function mutateConfirmedDeadPeer(db, projectCtx, peerId, mutate, options = {}) {
+  return mutatePeerWithEvidence(db, projectCtx, peerId, mutate, options);
 }
 
 function observeClockSafetyOrThrow(db, options) {
@@ -1161,9 +1187,10 @@ async function cmdHeartbeat(ctx, args) {
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const status = opts.status || null;
-  const ttlOverride = opts.ttl === undefined ? null : intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
-  const db = connect(ctx);
+  const ttlOverride = opts.ttl === undefined ? null : positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const t = now();
+  if (ttlOverride !== null) leaseDeadline(t, ttlOverride);
+  const db = connect(ctx);
   const clockObservation = opts['renew-locks']
     ? observeLockClockSafety(db, ctx, { owner: peer, observedAt: t })
     : null;
@@ -1174,13 +1201,18 @@ async function cmdHeartbeat(ctx, args) {
     if (clockObservation?.renewed > 0 && ttlOverride === null) {
       renewed = clockObservation.renewed;
     } else if (ttlOverride !== null) {
-      renewed = evidenceLive
-        ? db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ?').run(t, ttlOverride, ttlOverride, peer).changes
-        : db.prepare('UPDATE locks SET expires_at = ? + ?, ttl_sec = ? WHERE owner = ? AND expires_at > ?').run(t, ttlOverride, ttlOverride, peer, t).changes;
+      renewed = renewOwnedLocks(db, {
+        owner: peer,
+        nowSec: t,
+        ttlOverride,
+        includeExpired: evidenceLive
+      });
     } else {
-      renewed = evidenceLive
-        ? db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ?').run(t, peer).changes
-        : db.prepare('UPDATE locks SET expires_at = ? + ttl_sec WHERE owner = ? AND expires_at > ?').run(t, peer, t).changes;
+      renewed = renewOwnedLocks(db, {
+        owner: peer,
+        nowSec: t,
+        includeExpired: evidenceLive
+      });
     }
   }
   addEvent(db, 'peer.heartbeat', peer, null, { status, renewed });
@@ -2073,11 +2105,16 @@ async function peerStart(ctx, args) {
           });
         }
       }
+      const previousOwner = db.prepare(`
+        SELECT pid, pid_start_token, pid_command_hash
+        FROM peers WHERE id = ?
+      `).get(id) || null;
       upsertPeer(db, {
         id, kind, role,
         worktree: cwd,
         branch: detectBranch(cwd),
-        pid: null,
+        pid: previousOwner?.pid || null,
+        processIdentity: storedPeerIdentity(previousOwner),
         status: 'starting',
         capabilities: 'tmux'
       });
@@ -2214,13 +2251,14 @@ async function lockAcquire(ctx, args) {
   const peer = identity.id;
   const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
   const taskId = intOpt(opts, 'task', null);
-  const ttl = intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
+  const ttl = positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
   const reason = opts.reason || '';
+  const acquisitionNow = now();
+  leaseDeadline(acquisitionNow, ttl);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   let lock;
   try {
-    const acquisitionNow = now();
     const outcome = runOptimisticEvidenceMutation(db, {
       capture: (subjectDb) => {
         try {
@@ -2266,6 +2304,7 @@ async function lockAcquire(ctx, args) {
         }) };
       }
       const existing = subject.locks.find((row) => row.resource === requested.resource) || null;
+      const expiresAt = leaseDeadline(t, ttl);
       db.prepare(`
         INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at, ttl_sec)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2278,7 +2317,7 @@ async function lockAcquire(ctx, args) {
           expires_at = excluded.expires_at,
           created_at = excluded.created_at,
           ttl_sec = excluded.ttl_sec
-      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, t + ttl, t, ttl);
+      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, expiresAt, t, ttl);
       addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
       return { lock: db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource) };
       }
@@ -2317,14 +2356,16 @@ async function lockRenew(ctx, args) {
   const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
   const peer = identity.id;
   const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
-  const ttl = intOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
+  const ttl = positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
+  const renewalNow = now();
+  const expiresAt = leaseDeadline(renewalNow, ttl);
   const db = connect(ctx);
   touchCurrentPeer(db, ctx, identity, 'working', 'shell');
   const lock = tx(db, () => {
     const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
     if (!existing) throw new CliError('NOT_FOUND', `No lock for ${lockLabel(requested)}`);
     if (existing.owner !== peer) throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
-    db.prepare('UPDATE locks SET expires_at = ?, ttl_sec = ? WHERE resource = ?').run(now() + ttl, ttl, requested.resource);
+    db.prepare('UPDATE locks SET expires_at = ?, ttl_sec = ? WHERE resource = ?').run(expiresAt, ttl, requested.resource);
     addEvent(db, 'lock.renewed', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl });
     return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
   });
@@ -3495,11 +3536,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   // ── Liveness reaper ───────────────────────────────────────────────────────
   // Backstop for peers that died without an exit signal (kill -9, crash, a
-  // provider Stop hook that never fired). A peer is reaped only when it has
-  // been silent beyond REAPER_GRACE AND its pid is gone, so a live-but-quiet
-  // peer is never mistaken for dead (hb-02). Peers backed by an in-memory
-  // managed session are skipped: their own exit poller owns their transition.
-  const REAPER_GRACE_SEC = 120;
+  // provider Stop hook that never fired). Confirmed-dead owners are reaped
+  // immediately; unknown evidence must remain stale through the shared grace.
+  // This only detaches DB state and never authorizes tmux destruction.
   let reaperInFlight = false;
   // Compare wall time with a monotonic clock so an event-loop stall or machine
   // sleep does not look like a wall-clock step. Only their drift is safety
@@ -3559,13 +3598,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             FROM peers p
             LEFT JOIN peer_bindings b ON b.peer = p.id
             WHERE p.status IN ('running', 'working', 'busy')
-              AND p.pid IS NOT NULL
               AND p.last_seen_at < ?
-          `).all(t - REAPER_GRACE_SEC);
+          `).all(t - UNKNOWN_EVIDENCE_GRACE_SEC);
           const candidates = rows.map((row) => {
             const evidence = peerEvidenceFromDb(db, projectCtx, row.id);
             return {
-              boundary: Number(row.last_seen_at) + REAPER_GRACE_SEC,
+              boundary: Number(row.last_seen_at) + UNKNOWN_EVIDENCE_GRACE_SEC,
               evidence: evidence.state,
               owner: row.id
             };
@@ -3581,7 +3619,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           if (clockGraceSuppressed(t, readClockGraceUntil(db))) continue;
           for (const row of rows) {
             if (managedPeerIds.has(row.id)) continue;
-            mutateConfirmedDeadPeer(db, projectCtx, row.id, (subject, evidence) => {
+            mutatePeerWithEvidence(db, projectCtx, row.id, (subject, evidence) => {
               db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
               db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(t, row.id);
               try {
@@ -3591,6 +3629,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
                   reason: evidence.reason
                 });
               } catch {}
+            }, {
+              acceptEvidence: (currentEvidence, subject) => peerEvidenceAllowsReap(currentEvidence, {
+                nowSec: now(),
+                lastSeenAt: Number(subject.peer.last_seen_at),
+                staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+                graceUntil: readClockGraceUntil(db)
+              }),
+              beforeMutate: ({ subject, evidence: currentEvidence }) => peerEvidenceAllowsReap(currentEvidence, {
+                nowSec: now(),
+                lastSeenAt: Number(subject.peer.last_seen_at),
+                staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+                graceUntil: readClockGraceUntil(db)
+              })
             });
           }
         } catch (err) {
@@ -4867,10 +4918,31 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try {
         oldTarget = tmuxPaneInfo(paneTarget).pane;
       } catch {}
+      if (!oldTarget) {
+        throw new CliError('TMUX_DESTRUCTIVE_EVIDENCE_INVALID',
+          'Refusing destructive tmux restart: pane target could not be resolved', {
+            peer: id,
+            tmux_session: sessionName,
+            reason
+          });
+      }
+      const authorityDb = connectWebProject(pctx);
+      let storedAuthority;
+      try {
+        storedAuthority = tmuxAttachmentEvidence(authorityDb, id, oldTarget);
+        assertTmuxDestructiveEvidence(
+          storedAuthority,
+          observeTmuxDestructiveEvidence(pctx, oldTarget),
+          { peer: id, tmux_session: sessionName, reason }
+        );
+      } finally {
+        authorityDb.close();
+      }
       const parkedName = `${sessionName}-old-${Date.now().toString(36)}`.slice(0, 80);
       try {
-        runTmux(['rename-session', '-t', sessionName, parkedName]);
+        conditionalTmuxRename(runTmux, storedAuthority, parkedName);
       } catch (err) {
+        if (err instanceof CliError && err.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH') throw err;
         throw new CliError('TMUX_REBIND_PREPARE_FAILED', `Could not park old tmux session ${sessionName} before rebind: ${err.message}`, {
           peer: id,
           tmux_session: sessionName,
@@ -4899,14 +4971,20 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     if (hasSession && relaunchableProvider) {
       const providerState = tmuxProviderState(sessionName);
-      if (providerState === 'exited') {
-        restartExistingTmuxSession('provider_exited');
-      } else if (!providerState) {
-        const info = tmuxPaneInfo(paneTarget);
-        if (isLikelyShellCommand(info.command)) {
-          restartExistingTmuxSession('provider_fallback_shell');
-        }
+      const info = tmuxPaneInfo(paneTarget);
+      const ownerDb = connectWebProject(pctx);
+      let ownerEvidence;
+      try {
+        ownerEvidence = providerOwnerEvidenceFromDb(ownerDb, id);
+      } finally {
+        ownerDb.close();
       }
+      const reason = providerRestartReason({
+        providerState,
+        ownerEvidence,
+        paneCommand: info.command
+      });
+      if (reason) restartExistingTmuxSession(reason);
     }
 
     let session;
@@ -5215,27 +5293,53 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return live;
   }
 
-  // Mark peers whose OS process is gone as exited so crashed/killed sessions
-  // stop lingering as 'running'. Conservative: never reap a peer that still owns
-  // a live managed tmux session, is tracked in memory, or whose pid is alive.
+  // Mark dead or grace-expired unknown peers as exited so crashed/killed
+  // sessions stop lingering as running. This path only detaches DB state.
   function reapDeadPeersForProject(projectCtx, liveManagedPeerIds, db) {
     let rows;
     try {
       rows = db.prepare(`
         SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
+               p.last_seen_at,
                b.transport, b.runtime_target
         FROM peers p
         LEFT JOIN peer_bindings b ON b.peer = p.id
-        WHERE p.status IN ('running', 'working', 'busy') AND p.pid IS NOT NULL
+        WHERE p.status IN ('running', 'working', 'busy')
       `).all();
     } catch {
       return;
     }
     if (!rows.length) return;
+    const observedAt = now();
+    const evidenceByPeer = new Map(rows.map((row) => [
+      row.id,
+      observePeerEvidence(projectCtx, row, row)
+    ]));
+    let clockObservation;
+    try {
+      clockObservation = observeClockSafetyOrThrow(db, {
+        operation: 'ownership',
+        candidates: rows.map((row) => ({
+          boundary: Math.max(0, Number(row.last_seen_at || 0) + UNKNOWN_EVIDENCE_GRACE_SEC),
+          evidence: evidenceByPeer.get(row.id)?.state || 'unknown',
+          owner: row.id
+        })),
+        nowSec: observedAt
+      });
+    } catch {
+      return;
+    }
     for (const row of rows) {
       if (liveManagedPeerIds.has(row.id)) continue;
+      const evidence = evidenceByPeer.get(row.id) || { state: 'unknown' };
+      if (!peerEvidenceAllowsReap(evidence, {
+        nowSec: observedAt,
+        lastSeenAt: Number(row.last_seen_at || 0),
+        staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+        graceUntil: clockObservation.graceUntil
+      })) continue;
       try {
-        mutateConfirmedDeadPeer(db, projectCtx, row.id, (subject, evidence) => {
+        mutatePeerWithEvidence(db, projectCtx, row.id, (subject, currentEvidence) => {
           // Preserve last_seen_at (see detachTmuxSession) — only flip status.
           db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', row.id);
           db.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), row.id);
@@ -5245,8 +5349,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             source: 'runtime',
             peer: row.id,
             pid: subject.peer.pid,
-            reason: evidence.reason
+            reason: currentEvidence.reason
           }));
+        }, {
+          acceptEvidence: (currentEvidence, subject) => peerEvidenceAllowsReap(currentEvidence, {
+            nowSec: now(),
+            lastSeenAt: Number(subject.peer.last_seen_at || 0),
+            staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+            graceUntil: readClockGraceUntil(db)
+          }),
+          beforeMutate: ({ subject, evidence: currentEvidence }) => peerEvidenceAllowsReap(currentEvidence, {
+            nowSec: now(),
+            lastSeenAt: Number(subject.peer.last_seen_at || 0),
+            staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+            graceUntil: readClockGraceUntil(db)
+          })
         });
       } catch {}
     }
@@ -6597,22 +6714,27 @@ async function cmdHook(ctx, args) {
   const db = connect(hookCtx);
   try {
     const status = hookKey === 'stop' ? 'idle' : 'working';
+    const providerAncestor = readAncestorCliInfo();
+    const providerPid = providerAncestor?.kind === kind ? Number(providerAncestor.pid) : null;
+    const providerIdentity = providerPid ? liveProcessIdentity(providerPid) : null;
     const existing = db.prepare('SELECT id FROM peers WHERE id = ?').get(peerId);
     if (!existing) {
       upsertPeer(db, {
         id: peerId, kind, role: 'peer',
         worktree: hookCwd,
         branch: detectBranch(hookCwd),
-        pid: process.ppid,
+        pid: providerIdentity?.pid || null,
+        processIdentity: providerIdentity,
         status,
         capabilities: `hook-${hookKey}`
       });
     } else {
-      db.prepare(`
-        UPDATE peers
-        SET last_seen_at = ?, status = COALESCE(?, status)
-        WHERE id = ?
-      `).run(now(), status, peerId);
+      refreshHookOwnerIdentity(db, {
+        peerId,
+        status,
+        observedAt: now(),
+        processIdentity: providerIdentity
+      });
     }
     const hookBinding = {
       peer: peerId,
@@ -6628,11 +6750,12 @@ async function cmdHook(ctx, args) {
     if (canonical.peer !== peerId) {
       const previousPeer = peerId;
       peerId = canonical.peer;
-      db.prepare(`
-        UPDATE peers
-        SET last_seen_at = ?, status = COALESCE(?, status)
-        WHERE id = ?
-      `).run(now(), status, peerId);
+      refreshHookOwnerIdentity(db, {
+        peerId,
+        status,
+        observedAt: now(),
+        processIdentity: providerIdentity
+      });
       addEvent(db, 'provider.session.merged', peerId, null, auditPayload({
         actor: peerId,
         target: peerId,
@@ -6656,20 +6779,16 @@ async function cmdHook(ctx, args) {
       owner: peerId,
       observedAt: hookNow
     });
-    const hookEvidenceLive = peerEvidenceFromDb(db, hookCtx, peerId).state === 'live';
     const hookLockRenewals = hookClockObservation.renewed > 0
       ? hookClockObservation.renewed
-      : hookEvidenceLive
-        ? db.prepare(`
-            UPDATE locks
-            SET expires_at = ? + MIN(ttl_sec, 3600)
-            WHERE owner = ?
-          `).run(hookNow, peerId).changes
-        : db.prepare(`
-            UPDATE locks
-            SET expires_at = ? + MIN(ttl_sec, 3600)
-            WHERE owner = ? AND expires_at > ?
-          `).run(hookNow, peerId, hookNow).changes;
+      : renewOwnedLocks(db, {
+          owner: peerId,
+          nowSec: hookNow,
+          ttlCap: 3600,
+          // Receiving the hook is direct lease-heartbeat evidence. It does not
+          // grant provider-restart or tmux-destructive authority.
+          includeExpired: true
+        });
     if (hookLockRenewals > 0) {
       addEvent(db, 'lock.renewed_by_hook', peerId, null, { renewed: hookLockRenewals });
     }
@@ -7287,8 +7406,15 @@ function validateTmuxGcDeadRebindEvidence(candidate) {
 
 function validateTmuxGcBindingCandidate(subject) {
   const observed = observeTmuxConditionalTarget(subject?.runtime_target || '');
+  const ownerEvidence = subject
+    ? resolvePeerEvidence({
+        peer: subject,
+        processes: [processEvidenceFromRow(subject, 'owner')]
+      })
+    : { state: 'unknown', reason: 'peer_missing' };
   const validationSubject = subject ? {
     ...subject,
+    owner_evidence: ownerEvidence,
     expected_root: canonicalRoot(subject.expected_root),
     authority: subject.authority ? {
       ...subject.authority,
@@ -8071,13 +8197,18 @@ function runGcWithHistorySnapshot(ctx, db, {
     for (const subject of stalePeers) {
       const p = subject.peer;
       const evidence = clockObservation.evidenceByOwner.get(p.id) || { state: 'unknown' };
-      if (evidence.state === 'unknown') {
-        results.deferred_unknown_peers++;
-        results.deferred_stale_peers++;
+      if (evidence.state === 'live') {
+        results.protected_stale_peers++;
         continue;
       }
-      if (evidence.state !== 'dead') {
-        results.protected_stale_peers++;
+      if (evidence.state === 'unknown' && !peerEvidenceAllowsReap(evidence, {
+        nowSec: gcNow,
+        lastSeenAt: Number(p.last_seen_at || 0),
+        staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+        graceUntil: clockObservation.graceUntil
+      })) {
+        results.deferred_unknown_peers++;
+        results.deferred_stale_peers++;
         continue;
       }
       if (dryRun) {
@@ -8088,10 +8219,18 @@ function runGcWithHistorySnapshot(ctx, db, {
         results.deferred_stale_peers++;
         continue;
       }
-      const removed = mutateConfirmedDeadPeer(db, ctx, p.id, () => {
+      const removed = mutatePeerWithEvidence(db, ctx, p.id, () => {
         db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(p.id);
         db.prepare('DELETE FROM peers WHERE id = ?').run(p.id);
-      }, { beforeMutate: beforeDatabaseMutate });
+      }, {
+        acceptEvidence: (currentEvidence, currentSubject) => peerEvidenceAllowsReap(currentEvidence, {
+          nowSec: now(),
+          lastSeenAt: Number(currentSubject.peer.last_seen_at || 0),
+          staleAfterSec: UNKNOWN_EVIDENCE_GRACE_SEC,
+          graceUntil: readClockGraceUntil(db)
+        }),
+        beforeMutate: beforeDatabaseMutate
+      });
       if (removed.changed) results.stale_peers++;
       else if (removed.evidence?.state === 'live') results.protected_stale_peers++;
       else {

@@ -132,6 +132,73 @@ for (const mode of ['replace', 'missing']) {
   });
 }
 
+test('manual GC protects unknown owner for 120 seconds, then removes only DB ownership', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-local-gc-unknown-grace-'));
+  const root = path.join(sandbox, 'project');
+  const home = path.join(sandbox, 'home');
+  fs.mkdirSync(root);
+  fs.mkdirSync(home);
+  try {
+    runHcc(root, home, ['init', '--no-guidance']);
+    const dbPath = path.join(root, '.hello-cc', 'mesh.db');
+    const nowSec = Math.floor(Date.now() / 1000);
+    const db = new DatabaseSync(dbPath, { timeout: 5000 });
+    try {
+      db.prepare(`
+        INSERT INTO peers(
+          id, kind, role, worktree, branch, pid, pid_start_token,
+          pid_command_hash, status, capabilities, created_at, last_seen_at
+        ) VALUES ('unknown-gc-owner', 'shell', 'peer', ?, '', ?, NULL, NULL,
+          'working', '', ?, ?)
+      `).run(root, process.pid, nowSec - 3600, nowSec - 10);
+      db.prepare(`
+        INSERT INTO locks(resource, base_resource, scope, owner, reason,
+          expires_at, created_at, ttl_sec)
+        VALUES ('unknown-gc-lock', 'unknown-gc-lock', '*', 'unknown-gc-owner',
+          'expired', ?, ?, 60)
+      `).run(nowSec - 300, nowSec - 3600);
+      db.prepare(`
+        INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(nowSec));
+    } finally {
+      db.close();
+    }
+
+    const first = JSON.parse(runHcc(
+      root,
+      home,
+      ['--json', 'gc', '--older-than', '0', '--yes']
+    )).data;
+    assert.equal(first.stale_peers, 0);
+    assert.equal(first.deferred_unknown_peers, 1);
+    assert.equal(first.deferred_stale_peers, 1);
+    const protectedDb = new DatabaseSync(dbPath, { timeout: 5000 });
+    try {
+      assert.ok(protectedDb.prepare("SELECT 1 FROM peers WHERE id = 'unknown-gc-owner'").get());
+      protectedDb.prepare(`
+        UPDATE peers SET last_seen_at = ? WHERE id = 'unknown-gc-owner'
+      `).run(nowSec - 121);
+    } finally {
+      protectedDb.close();
+    }
+
+    const afterGrace = JSON.parse(runHcc(
+      root,
+      home,
+      ['--json', 'gc', '--older-than', '0', '--yes']
+    )).data;
+    assert.equal(afterGrace.stale_peers, 1);
+    assertRows(dbPath, {
+      peer: 'unknown-gc-owner',
+      lock: 'unknown-gc-lock',
+      event: 'missing-event'
+    }, false);
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
 for (const scenario of [
   { phase: 'before-first-buffer-batch', deleted: 0, deferred: 130 },
   { phase: 'after-first-buffer-batch', deleted: 64, deferred: 66 }

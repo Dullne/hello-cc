@@ -274,14 +274,14 @@ test('grace writes reject invalid deadlines without changing persisted state', (
   db.close();
 });
 
-test('grace writes reject corrupt persisted deadlines without reporting success', () => {
+test('grace writes repair corrupt persisted deadlines', () => {
   for (const corrupt of ['not-a-number', '-1', '1.5', '9007199254740992', '012']) {
     const db = new DatabaseSync(':memory:');
     db.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?)").run(corrupt);
 
-    assert.throws(() => writeClockGraceUntil(db, 300), /persisted deadline/);
-    assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get().value, corrupt);
+    assert.equal(writeClockGraceUntil(db, 300), 300);
+    assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get().value, '300');
     db.close();
   }
 });
@@ -299,7 +299,7 @@ test('grace reads accept a missing row and canonical non-negative integer text',
   db.close();
 });
 
-test('grace reads reject corrupt persisted deadline text without truncation', () => {
+test('grace reads recover corrupt persisted deadline text as no active grace', () => {
   for (const corrupt of [
     '12junk',
     '1.5',
@@ -314,9 +314,20 @@ test('grace reads reject corrupt persisted deadline text without truncation', ()
     db.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', ?)").run(corrupt);
 
-    assert.throws(() => readClockGraceUntil(db), /persisted deadline/);
+    assert.equal(readClockGraceUntil(db), 0);
     db.close();
   }
+});
+
+test('grace reads ignore only a missing meta table and surface unreadable storage', () => {
+  const missing = new DatabaseSync(':memory:');
+  assert.equal(readClockGraceUntil(missing), 0);
+  missing.close();
+
+  const unreadable = new Error('disk I/O error');
+  unreadable.code = 'SQLITE_IOERR';
+  const db = { prepare: () => { throw unreadable; } };
+  assert.throws(() => readClockGraceUntil(db), (error) => error === unreadable);
 });
 
 test('observer atomically renews verified-live retained locks and advances watermark', () => {
@@ -396,7 +407,7 @@ test('observer grants unknown evidence exactly one grace window and dead evidenc
   });
 });
 
-test('observer rolls back grace and watermark together when persistence fails', () => {
+test('observer repairs corrupt grace and advances the watermark atomically', () => {
   const db = new DatabaseSync(':memory:');
   db.exec(`
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -404,15 +415,20 @@ test('observer rolls back grace and watermark together when persistence fails', 
     INSERT INTO meta(key, value) VALUES ('clock_grace_until', 'corrupt');
   `);
 
-  assert.throws(() => observeClockSafety(db, {
+  assert.deepEqual(observeClockSafety(db, {
     operation: 'ownership',
     nowSec: 1000,
     candidates: [{ boundary: 500, evidence: 'unknown' }]
-  }), /persisted deadline/);
+  }), {
+    decision: { enterGrace: true, renewOwners: false, reason: 'unknown-evidence' },
+    graceUntil: 1120,
+    renewed: 0
+  });
   assert.equal(
     db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get().value,
-    '100'
+    '1000'
   );
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get().value, '1120');
   db.close();
 });
 

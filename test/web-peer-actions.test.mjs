@@ -166,28 +166,68 @@ for (const evidence of ['live', 'dead', 'unknown']) {
   });
 }
 
-test('Web heartbeat reports CLOCK_SAFETY_UNAVAILABLE and leaves ownership unchanged', () => {
+test('Web heartbeat repairs corrupt grace state and keeps unknown ownership retained', () => {
   const fixture = createFixture();
   try {
     seedOwner(fixture, { peer: 'worker' });
     fixture.write((db) => db.prepare(`
       INSERT INTO meta(key, value) VALUES ('clock_grace_until', 'corrupt')
     `).run());
-    let error;
-    try {
-      fixture.actions.webPeerAction(
+    const result = fixture.actions.webPeerAction(
+      { root: '/repo', cwd: '/repo' },
+      'worker',
+      'heartbeat',
+      { actorPeer: 'worker', renew_locks: true }
+    );
+    assert.equal(result.data.renewed, 0);
+    assert.deepEqual(fixture.read((db) => ({
+      expiresAt: db.prepare("SELECT expires_at FROM locks WHERE resource = 'shared'").get().expires_at,
+      grace: db.prepare("SELECT value FROM meta WHERE key = 'clock_grace_until'").get().value
+    })), { expiresAt: 500, grace: '1120' });
+  } finally {
+    fixture.close();
+  }
+});
+
+test('Web heartbeat never shortens a longer existing lease', () => {
+  const fixture = createFixture();
+  try {
+    seedOwner(fixture, { peer: 'worker', evidence: 'live' });
+    fixture.write((db) => db.prepare(`
+      UPDATE locks SET expires_at = 5000, ttl_sec = 3600 WHERE resource = 'shared'
+    `).run());
+    fixture.actions.webPeerAction(
+      { root: '/repo', cwd: '/repo' },
+      'worker',
+      'heartbeat',
+      { actorPeer: 'worker', renew_locks: true, ttl: 75 }
+    );
+    assert.deepEqual(fixture.read((db) => ({ ...db.prepare(`
+      SELECT expires_at, ttl_sec FROM locks WHERE resource = 'shared'
+    `).get() })), { expires_at: 5000, ttl_sec: 75 });
+  } finally {
+    fixture.close();
+  }
+});
+
+test('Web lock and heartbeat TTL inputs reject malformed or non-positive values', () => {
+  const fixture = createFixture();
+  try {
+    seedOwner(fixture, { peer: 'worker', evidence: 'live' });
+    for (const ttl of ['1e30', '12junk', '1.5', 0, -1, Number.MAX_SAFE_INTEGER]) {
+      assert.throws(() => fixture.actions.webPeerAction(
         { root: '/repo', cwd: '/repo' },
         'worker',
         'heartbeat',
-        { actorPeer: 'worker', renew_locks: true }
-      );
-    } catch (caught) {
-      error = caught;
+        { actorPeer: 'worker', renew_locks: true, ttl }
+      ), (error) => error?.code === 'BAD_ARGS');
+      assert.throws(() => fixture.actions.webPeerAction(
+        { root: '/repo', cwd: '/repo' },
+        'worker',
+        'lock-acquire',
+        { actorPeer: 'worker', resource: `bad-${String(ttl)}`, ttl }
+      ), (error) => error?.code === 'BAD_ARGS');
     }
-    assert.equal(error?.code, 'CLOCK_SAFETY_UNAVAILABLE');
-    assert.equal(error.message, 'Clock safety state could not be persisted; ownership was left unchanged');
-    assert.deepEqual(error.extra, {});
-    assert.equal(fixture.read((db) => db.prepare("SELECT expires_at FROM locks WHERE resource = 'shared'").get().expires_at), 500);
   } finally {
     fixture.close();
   }

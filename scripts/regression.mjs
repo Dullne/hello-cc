@@ -47,6 +47,7 @@ const env = {
 for (const key of Object.keys(env)) {
   if (key.startsWith('HCC_')) delete env[key];
 }
+if (process.env.HCC_REGRESSION_DEBUG === '1') env.HCC_DEBUG = '1';
 delete env.TMUX;
 delete env.TMUX_PANE;
 
@@ -169,6 +170,7 @@ function assertPersistedLockRenewal(resource, {
   before,
   after,
   renewalSec = ttlSec,
+  expectedExpiresAt = null,
   label = resource
 }) {
   const row = withMeshDb((db) => db.prepare(`
@@ -179,9 +181,10 @@ function assertPersistedLockRenewal(resource, {
   if (!row ||
       row.ttl_sec !== ttlSec ||
       row.created_at !== createdAt ||
-      row.expires_at < before + renewalSec ||
-      row.expires_at > after + renewalSec) {
-    fail(`${label} renewal changed or inflated its persisted TTL:\n${JSON.stringify({ row, ttlSec, createdAt, before, after, renewalSec }, null, 2)}`);
+      (expectedExpiresAt === null
+        ? row.expires_at < before + renewalSec || row.expires_at > after + renewalSec
+        : row.expires_at !== expectedExpiresAt)) {
+    fail(`${label} renewal changed, shortened, or inflated its persisted TTL:\n${JSON.stringify({ row, ttlSec, createdAt, before, after, renewalSec, expectedExpiresAt }, null, 2)}`);
   }
   return row;
 }
@@ -3777,7 +3780,11 @@ async function dbWorkflow() {
   if (lockAfterGrace.status === 0 || !String(lockAfterGrace.stderr || lockAfterGrace.stdout).includes('conflicts with lock')) {
     fail(`verified-live lock owner was released after clock grace:\n${lockAfterGrace.stdout}\n${lockAfterGrace.stderr}`);
   }
-  withMeshDb((db) => db.prepare("UPDATE peers SET status = 'exited' WHERE id = ?").run('grace-lock-owner'));
+  withMeshDb((db) => db.prepare(`
+    UPDATE peers
+    SET status = 'exited', pid = NULL, pid_start_token = NULL, pid_command_hash = NULL
+    WHERE id = ?
+  `).run('grace-lock-owner'));
   hcc(['lock', 'acquire', '--peer', 'grace-lock-taker', '--task', graceLockTaskId, '--resource', 'src/grace-lock', '--ttl', '900']);
   hcc(['lock', 'release', '--peer', 'grace-lock-taker', '--resource', 'src/grace-lock']);
   hcc(['task', 'done', '--peer', 'grace-lock-taker', '--id', graceLockTaskId, '--summary', 'grace lock automation done']);
@@ -3817,6 +3824,9 @@ async function dbWorkflow() {
     updateCreatedAt.run(hookCappedLockCreatedAt, hookCappedTtlResource);
   });
   const runHookWithStableTtl = (args, input, label) => {
+    const cappedExpiresAt = withMeshDb((db) => db.prepare(
+      'SELECT expires_at FROM locks WHERE resource = ?'
+    ).get(hookCappedTtlResource)?.expires_at ?? null);
     const before = Math.floor(Date.now() / 1000);
     const output = hcc(args, { env: hookEnv, input });
     const after = Math.floor(Date.now() / 1000);
@@ -3832,7 +3842,7 @@ async function dbWorkflow() {
       createdAt: hookCappedLockCreatedAt,
       before,
       after,
-      renewalSec: 3600,
+      expectedExpiresAt: cappedExpiresAt,
       label: `${label} capped TTL`
     });
     return output;
@@ -4881,27 +4891,29 @@ async function multiProjectWebWorkflow() {
     fail(`status/state/lock-list mutated peer evidence:\n${JSON.stringify({ evidenceOwnerBeforeReads, evidenceOwnerAfterReads }, null, 2)}`);
   }
 
-  const unknownEvidenceState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
-  const unknownEvidenceTask = (unknownEvidenceState.data?.tasks || []).find((task) => Number(task.id) === evidenceTaskId);
-  if (!unknownEvidenceState.ok || unknownEvidenceTask?.owner_evidence_state !== 'unknown' ||
-      unknownEvidenceTask?.owner_stale || unknownEvidenceTask?.takeover_ready) {
-    fail(`state API aged an exact live tmux owner with uncertain process evidence into stale:\n${JSON.stringify(unknownEvidenceTask, null, 2)}`);
+  const reusedOwnerState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
+  const reusedOwnerTask = (reusedOwnerState.data?.tasks || []).find((task) => Number(task.id) === evidenceTaskId);
+  if (!reusedOwnerState.ok || reusedOwnerTask?.owner_evidence_state !== 'dead' ||
+      !reusedOwnerTask?.owner_stale || !reusedOwnerTask?.takeover_ready) {
+    fail(`state API let a live tmux target override reused owner-process evidence:\n${JSON.stringify(reusedOwnerTask, null, 2)}`);
   }
-  const unknownTakeoverResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/task-takeover`, {
+  const reusedOwnerTakeoverResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/task-takeover`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       action_token: managedActionToken,
       id: evidenceTaskId,
-      reason: 'must reject uncertain live tmux owner',
+      reason: 'owner process identity was reused',
       policy: 'stale',
       stale_after: 60
     })
   }, { root });
-  const unknownTakeover = await unknownTakeoverResponse.json();
-  if (unknownTakeoverResponse.ok || unknownTakeover.error?.code !== 'TAKEOVER_POLICY') {
-    fail(`web takeover treated uncertain live tmux evidence as process-dead/stale:\n${JSON.stringify(unknownTakeover, null, 2)}`);
+  const reusedOwnerTakeover = await reusedOwnerTakeoverResponse.json();
+  if (!reusedOwnerTakeoverResponse.ok || reusedOwnerTakeover.data?.task?.owner !== managedActionPeer) {
+    fail(`web takeover let a live tmux target retain dead owner authority:\n${JSON.stringify(reusedOwnerTakeover, null, 2)}`);
   }
+  hcc(['task', 'takeover', '--peer', evidenceOwner, '--id', String(evidenceTaskId),
+    '--reason', 'restore verified owner fixture', '--force']);
 
   withMeshDb((db) => db.prepare(`
     UPDATE peers
@@ -6079,7 +6091,30 @@ async function shimTmuxWorkflow() {
   const fallbackFile = path.join(outDir, 'shim-exited-fallback');
   hcc(['inject', exitedPeer, `printf '%s\\n' fallback > ${sh(fallbackFile)}`]);
   await waitForFile(fallbackFile, 'fallback', 'shim exited fallback shell');
-  const exitedSecond = run(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  const exitedProviderPid = spawnSync('true', [], { stdio: 'ignore' }).pid;
+  withMeshDb((db) => db.prepare(`
+    UPDATE peers
+    SET pid = ?, pid_start_token = 'dead:shim-provider', pid_command_hash = ?
+    WHERE id = ?
+  `).run(exitedProviderPid, 'd'.repeat(64), exitedPeer));
+  const exitedSecondResult = runMaybe(shim, ['--resume', exitedResume], { cwd: root, env: exitedEnv });
+  if (exitedSecondResult.status !== 0) {
+    const restartEvents = withMeshDb((db) => db.prepare(`
+      SELECT type, payload
+      FROM events
+      WHERE actor = ? OR json_extract(payload, '$.target_peer') = ?
+      ORDER BY id DESC
+      LIMIT 20
+    `).all(exitedPeer, exitedPeer));
+    const tmuxState = runMaybe('tmux', ['list-sessions', '-F',
+      '#{session_name}|#{session_created}|#{session_id}|#{session_attached}']);
+    const webLog = path.join(root, '.hello-cc', 'web.log');
+    const webLogTail = fs.existsSync(webLog)
+      ? fs.readFileSync(webLog, 'utf8').split('\n').slice(-80).join('\n')
+      : '(web log missing)';
+    fail(`${sh([shim, '--resume', exitedResume].join(' '))} failed on provider relaunch\n${exitedSecondResult.stdout || ''}${exitedSecondResult.stderr || ''}\nevents:\n${JSON.stringify(restartEvents, null, 2)}\ntmux:\n${tmuxState.stdout || ''}${tmuxState.stderr || ''}\nweb log:\n${webLogTail}`);
+  }
+  const exitedSecond = exitedSecondResult.stdout || '';
   parsePane(exitedSecond);
   await waitForFileLineCount(exitedLog, 2, 'shim exited resume relaunch');
   hcc(['peer', 'stop', exitedPeer]);
@@ -9575,7 +9610,7 @@ async function processEvidenceWorkflow() {
     const pane = run('tmux', ['display-message', '-p', '-t', `${session}:0.0`, '#{pane_id}']).trim();
     const panePid = Number(run('tmux', ['display-message', '-p', '-t', pane, '#{pane_pid}']).trim());
     const paneIdentity = inspectProcessIdentity(panePid).identity;
-    const rootTask = createOwnedTask(rootPeer, 'root mismatch remains unknown');
+    const rootTask = createOwnedTask(rootPeer, 'root mismatch does not override live owner');
     withMeshDb((db) => {
       const t = Math.floor(Date.now() / 1000) - 7200;
       db.prepare(`
@@ -9589,8 +9624,9 @@ async function processEvidenceWorkflow() {
       `).run(rootPeer, rootPeer, pane, t, t);
     });
     const rootRow = taskRow(rootTask);
-    if (rootRow?.owner_evidence_state !== 'unknown' || rootRow?.owner_evidence_reason !== 'tmux_root_mismatch') {
-      fail(`tmux root mismatch was not preserved as unknown: ${JSON.stringify(rootRow)}`);
+    if (rootRow?.owner_evidence_state !== 'live' || rootRow?.owner_evidence_reason !== 'process_identity_match' ||
+        rootRow?.owner_stale || rootRow?.takeover_ready) {
+      fail(`tmux root mismatch overrode matching owner-process evidence: ${JSON.stringify(rootRow)}`);
     }
     cleanupTask(rootTask);
     runMaybe('tmux', ['kill-session', '-t', session]);
@@ -9743,11 +9779,11 @@ async function processEvidenceWorkflow() {
   }, 'legacy external adoption', 10000);
   legacyProcess.kill('SIGKILL');
   await waitForProcessExit(legacyProcess.pid, 'legacy external process exit');
-  await sleep(2500);
+  await waitFor(() => !fs.existsSync(legacyFiles[3]), 'legacy external cleanup', 10000);
   const legacySessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
-  if (!fs.existsSync(legacyFiles[3]) ||
-      !(legacySessions.sessions || []).some((session) => session.id === legacyExternalId)) {
-    fail('legacy external metadata was converted from unknown to dead/cleaned');
+  if (fs.existsSync(legacyFiles[3]) ||
+      (legacySessions.sessions || []).some((session) => session.id === legacyExternalId)) {
+    fail('legacy external metadata with a confirmed-missing process was not cleaned');
   }
   for (const file of legacyFiles) fs.rmSync(file, { force: true });
 }
@@ -9783,7 +9819,7 @@ function cliOnlyClockSafetyWorkflow() {
         WHERE id = 'unknown-owner'
       `).run();
     } else if (ownerMode === 'dead') {
-      db.prepare("UPDATE peers SET status = 'exited' WHERE id = 'dead-owner'").run();
+      db.prepare("UPDATE peers SET pid = 2147483647 WHERE id = 'dead-owner'").run();
     }
     return t;
   });
@@ -9858,10 +9894,15 @@ function cliOnlyClockSafetyWorkflow() {
         INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run(String(unavailableNow - 86400));
-      db.prepare(`
-        INSERT INTO meta(key, value) VALUES ('clock_grace_until', 'corrupt')
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `).run();
+      db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run();
+      db.exec(`
+        CREATE TRIGGER force_clock_grace_write_failure
+        BEFORE INSERT ON meta
+        WHEN NEW.key = 'clock_grace_until'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced clock grace storage failure');
+        END;
+      `);
     });
     const unavailableAttempt = clockHccMaybe(['--json', 'lock', 'acquire', '--peer', 'unavailable-taker', '--resource', 'src/clock-unavailable']);
     if (unavailableAttempt.status === 0 || !String(unavailableAttempt.stderr).includes('CLOCK_SAFETY_UNAVAILABLE')) {
@@ -9885,11 +9926,11 @@ function cliOnlyClockSafetyWorkflow() {
     }));
     if (unavailableState.owner !== 'unavailable-owner' ||
         unavailableState.watermark !== String(unavailableNow - 86400) ||
-        unavailableState.grace !== 'corrupt') {
+        unavailableState.grace !== undefined) {
       fail(`clock safety failure changed ownership state:\n${JSON.stringify(unavailableState, null, 2)}`);
     }
 
-    withClockDb((db) => db.prepare("DELETE FROM meta WHERE key = 'clock_grace_until'").run());
+    withClockDb((db) => db.exec('DROP TRIGGER force_clock_grace_write_failure'));
     const readOnlyWatermark = unavailableState.watermark;
     clockHcc(['status']);
     clockHcc(['lock', 'list']);
@@ -10435,7 +10476,7 @@ async function sessionRecoveryWorkflow() {
     .find((row) => String(row.id) === String(detachedTaskId));
   const detachedTakeover = hccMaybe(['task', 'takeover', '--peer', 'detached-taker', '--id', detachedTaskId, '--reason', 'must reject live tmux', '--policy', 'stale', '--stale-after', '60']);
   if (detachedRow?.owner_evidence_state !== 'live' ||
-      detachedRow?.owner_evidence_reason !== 'tmux_identity_match' ||
+      detachedRow?.owner_evidence_reason !== 'process_identity_match' ||
       detachedTakeover.status === 0) {
     fail(`live detached tmux pane did not block takeover: ${JSON.stringify(detachedRow)}\n${detachedTakeover.stdout}\n${detachedTakeover.stderr}`);
   }
@@ -10630,7 +10671,7 @@ function gcCoverageWorkflow() {
       VALUES (?, 'shell', 'peer', ?, '', NULL, NULL, NULL, 'working', '', ?, ?)
       ON CONFLICT(id) DO UPDATE SET pid = NULL, pid_start_token = NULL, pid_command_hash = NULL,
         status = 'working', last_seen_at = excluded.last_seen_at
-    `).run(unknownPeer, root, t - 100000, t - 100000);
+    `).run(unknownPeer, root, t - 10, t - 10);
     db.prepare(`
       INSERT INTO peers(id, kind, role, worktree, branch, pid, pid_start_token, pid_command_hash, status, capabilities, created_at, last_seen_at)
       VALUES (?, 'shell', 'peer', ?, '', NULL, NULL, NULL, 'exited', '', ?, ?)
@@ -10676,7 +10717,7 @@ function gcCoverageWorkflow() {
     if (db.prepare('SELECT COUNT(*) AS n FROM locks WHERE expires_at < ?').get(t).n !== 0) fail('gc left expired locks behind');
     const live = db.prepare('SELECT resource FROM locks WHERE resource = ?').get(liveLockResource);
     if (!live) fail('gc deleted a not-yet-expired lock');
-    if (!db.prepare('SELECT id FROM peers WHERE id = ?').get(unknownPeer)) fail('gc deleted a legacy peer with unknown evidence');
+    if (!db.prepare('SELECT id FROM peers WHERE id = ?').get(unknownPeer)) fail('gc deleted an unknown peer inside the 120-second evidence grace');
     if (db.prepare('SELECT id FROM peers WHERE id = ?').get(deadPeer)) fail('gc retained a confirmed-dead peer');
     // Cleanup
     db.prepare('DELETE FROM locks WHERE resource = ?').run(liveLockResource);

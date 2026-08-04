@@ -55,12 +55,12 @@ function verifiedTmux(options = {}) {
 
 const fixtures = [
   {
-    name: 'explicit exited peer is dead',
+    name: 'matching live process identity overrides stale explicit exited status',
     input: {
       peer: { status: 'exited' },
       processes: [processEvidence(101)]
     },
-    expected: { state: 'dead', reason: 'explicit_exited' }
+    expected: { state: 'live', reason: 'process_identity_match' }
   },
   {
     name: 'detached non-tmux peer with matching identity is live',
@@ -97,7 +97,7 @@ const fixtures = [
     expected: { state: 'unknown', reason: 'process_identity_incomplete' }
   },
   {
-    name: 'legacy missing process without a stored full identity is unknown',
+    name: 'legacy missing process without a stored full identity is dead',
     input: {
       peer: { status: 'working' },
       processes: [processEvidence(104, {
@@ -106,7 +106,7 @@ const fixtures = [
         currentIdentity: null
       })]
     },
-    expected: { state: 'unknown', reason: 'process_identity_incomplete' }
+    expected: { state: 'dead', reason: 'process_missing' }
   },
   {
     name: 'non-tmux peer with confirmed missing wrapper and child is dead',
@@ -145,6 +145,24 @@ const fixtures = [
       tmux: verifiedTmux({ root: { state: 'mismatch', expected: '/repo', actual: '/other' } })
     },
     expected: { state: 'unknown', reason: 'tmux_root_mismatch' }
+  },
+  {
+    name: 'matching owner process stays live despite a foreign tmux target',
+    input: {
+      peer: { status: 'working' },
+      processes: [processEvidence(701)],
+      tmux: verifiedTmux({ root: { state: 'mismatch', expected: '/repo', actual: '/other' } })
+    },
+    expected: { state: 'live', reason: 'process_identity_match' }
+  },
+  {
+    name: 'dead owner process is dead despite a separately live tmux target',
+    input: {
+      peer: { status: 'working' },
+      processes: [processEvidence(701, { state: 'dead', currentIdentity: null })],
+      tmux: verifiedTmux()
+    },
+    expected: { state: 'dead', reason: 'process_missing' }
   },
   {
     name: 'tmux-managed root mismatch stays unknown despite dead process evidence',
@@ -229,6 +247,28 @@ test('shared activity policy gives evidence precedence over heartbeat age', () =
   assert.deepEqual(classify({ evidence_state: 'unknown', age_sec: 3600 }, { activePeerTtl: 60, graceActive: true }), { active: true, stale: false });
 });
 
+test('reaper allows dead immediately and unknown only after 120 second grace', () => {
+  const allows = peerEvidence.peerEvidenceAllowsReap;
+  assert.equal(allows({ state: 'live' }, {
+    nowSec: 1120, lastSeenAt: 1000, staleAfterSec: 120, graceUntil: 0
+  }), false);
+  assert.equal(allows({ state: 'dead' }, {
+    nowSec: 1000, lastSeenAt: 1000, staleAfterSec: 120, graceUntil: 1200
+  }), true);
+  assert.equal(allows({ state: 'unknown' }, {
+    nowSec: 1119, lastSeenAt: 1000, staleAfterSec: 120, graceUntil: 0
+  }), false);
+  assert.equal(allows({ state: 'unknown' }, {
+    nowSec: 1120, lastSeenAt: 1000, staleAfterSec: 120, graceUntil: 1121
+  }), false);
+  assert.equal(allows({ state: 'unknown' }, {
+    nowSec: 1120, lastSeenAt: 1000, staleAfterSec: 120, graceUntil: 1120
+  }), true);
+  assert.equal(allows({ state: 'unknown' }, {
+    nowSec: 1120, lastSeenAt: Number.NaN, staleAfterSec: 120, graceUntil: 0
+  }), false);
+});
+
 function taskStoreDb() {
   const db = new DatabaseSync(':memory:');
   db.exec(`
@@ -296,6 +336,32 @@ test('aged tmux-unknown owner follows age policy instead of staying active forev
       ownerEvidenceFor: () => ({ state: 'unknown', reason: 'tmux_evidence_incomplete' })
     });
     assert.equal(task.owner, 'taker');
+  } finally {
+    db.close();
+  }
+});
+
+test('unknown takeover protection expires when the persisted 120 second grace ends', () => {
+  const db = taskStoreDb();
+  let nowSec = 1000;
+  try {
+    db.prepare("INSERT INTO tasks VALUES (1, 'work', 'running', NULL, 'owner-a', NULL, 1)").run();
+    db.prepare("INSERT INTO peers VALUES ('owner-a', 'working', 700, NULL, NULL, 1)").run();
+    db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', '1120')").run();
+    const store = createTaskStore({ now: () => nowSec });
+    const options = {
+      reason: 'bounded unknown evidence',
+      policy: 'stale',
+      staleAfter: 60,
+      ownerEvidenceFor: () => ({ state: 'unknown', reason: 'process_identity_incomplete' })
+    };
+
+    assert.throws(
+      () => store.takeOverTaskForPeer(db, 'taker', 1, options),
+      (error) => error?.code === 'TAKEOVER_POLICY'
+    );
+    nowSec = 1120;
+    assert.equal(store.takeOverTaskForPeer(db, 'taker', 1, options).owner, 'taker');
   } finally {
     db.close();
   }
@@ -583,6 +649,10 @@ test('tmux binding GC selects only strict explicit-exit-live or dead-process mod
   };
 
   assert.deepEqual(validate(subject, liveObserved), { ok: true, mode: 'explicit_exit_live' });
+  assert.deepEqual(validate({
+    ...subject,
+    owner_evidence: { state: 'live', reason: 'process_identity_match' }
+  }, liveObserved), { ok: false, reason: 'tmux_owner_process_live' });
   assert.deepEqual(validate({ ...subject, status: 'idle' }, deadObserved), { ok: true, mode: 'dead_process' });
   assert.deepEqual(validate(subject, {
     ...liveObserved,
@@ -787,6 +857,100 @@ test('conditional tmux kill leaves a replacement created after prevalidation ali
   } finally {
     try { runTmux(['kill-session', '-t', session]); } catch {}
   }
+});
+
+test('conditional tmux rename leaves a replacement created after prevalidation untouched', async (t) => {
+  if (spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status !== 0) {
+    t.skip('tmux unavailable');
+    return;
+  }
+  const tmuxSafety = await import('../lib/core/peers/tmux-safety.mjs');
+  const { runTmux, tmuxHasSession } = await import('../lib/tmux.mjs');
+  const session = `hcc-conditional-rename-${process.pid}`;
+  const parked = `${session}-old`;
+  try {
+    try { runTmux(['kill-session', '-t', session]); } catch {}
+    try { runTmux(['kill-session', '-t', parked]); } catch {}
+    runTmux(['new-session', '-d', '-s', session, 'sleep', '120']);
+    const format = runTmux(['display-message', '-p', '-t', session,
+      '#{session_created}|#{session_id}|#{pane_id}|#{pane_pid}']).trim().split('|');
+    const stored = {
+      session,
+      session_created: format[0],
+      session_id: format[1],
+      pane: format[2],
+      process_identity: identityForTmux(Number(format[3]))
+    };
+    assert.throws(() => tmuxSafety.conditionalTmuxRename(runTmux, stored, parked, {
+      beforeConditional: () => {
+        runTmux(['kill-session', '-t', session]);
+        runTmux(['new-session', '-d', '-s', session, 'sleep', '120']);
+      }
+    }), (error) => error?.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH');
+    assert.equal(tmuxHasSession(session), true);
+    assert.equal(tmuxHasSession(parked), false);
+  } finally {
+    try { runTmux(['kill-session', '-t', session]); } catch {}
+    try { runTmux(['kill-session', '-t', parked]); } catch {}
+  }
+});
+
+test('conditional tmux rename parks the exact unattached session', async (t) => {
+  if (spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status !== 0) {
+    t.skip('tmux unavailable');
+    return;
+  }
+  const { conditionalTmuxRename } = await import('../lib/core/peers/tmux-safety.mjs');
+  const { runTmux, tmuxHasSession } = await import('../lib/tmux.mjs');
+  const session = `hcc-conditional-success-${process.pid}`;
+  const parked = `${session}-old`;
+  try {
+    try { runTmux(['kill-session', '-t', session]); } catch {}
+    try { runTmux(['kill-session', '-t', parked]); } catch {}
+    runTmux(['new-session', '-d', '-s', session, 'sleep', '120']);
+    const format = runTmux(['display-message', '-p', '-t', session,
+      '#{session_created}|#{session_id}|#{pane_id}|#{pane_pid}']).trim().split('|');
+    conditionalTmuxRename(runTmux, {
+      session,
+      session_created: format[0],
+      session_id: format[1],
+      pane: format[2],
+      process_identity: identityForTmux(Number(format[3]))
+    }, parked);
+    const names = new Set(runTmux(['list-sessions', '-F', '#{session_name}'])
+      .trim().split('\n').filter(Boolean));
+    assert.equal(names.has(session), false);
+    assert.equal(names.has(parked), true);
+  } finally {
+    try { runTmux(['kill-session', '-t', session]); } catch {}
+    try { runTmux(['kill-session', '-t', parked]); } catch {}
+  }
+});
+
+test('conditional tmux rename atomically checks identity and attached clients', async () => {
+  const { conditionalTmuxRename } = await import('../lib/core/peers/tmux-safety.mjs');
+  let command = null;
+  const stored = {
+    session: 'hcc-root-peer',
+    session_created: '100',
+    session_id: '$1',
+    pane: '%7',
+    process_identity: identityForTmux(700)
+  };
+  assert.deepEqual(conditionalTmuxRename((args) => {
+    command = args;
+    return 'HCC_CONDITIONAL_RENAME_OK\n';
+  }, stored, 'hcc-root-peer-old'), {
+    renamed: true,
+    session: 'hcc-root-peer-old'
+  });
+  assert.match(command[4], /session_created/);
+  assert.match(command[4], /session_attached/);
+  assert.match(command[5], /rename-session -t '\$1' hcc-root-peer-old/);
+  assert.throws(
+    () => conditionalTmuxRename(() => 'HCC_CONDITIONAL_RENAME_MISMATCH\n', stored, 'hcc-root-peer-old'),
+    (error) => error?.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH'
+  );
 });
 
 test('conditional tmux kill dead mode rechecks pane death atomically', async () => {
