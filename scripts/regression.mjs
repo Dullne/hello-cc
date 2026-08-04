@@ -2917,7 +2917,14 @@ async function setupRegression() {
     }
   });
   const apiVersionCurrentBody = await apiVersionCurrent.json();
-  if (!apiVersionCurrent.ok || apiVersionCurrentBody.api_version !== 2) {
+  if (!apiVersionCurrent.ok || apiVersionCurrentBody.api_version !== 2 ||
+      !Number.isInteger(tokenRuntime.process_identity?.pid) ||
+      !tokenRuntime.process_identity?.startToken ||
+      !tokenRuntime.process_identity?.commandHash ||
+      apiVersionCurrentBody.pid !== tokenRuntime.pid ||
+      apiVersionCurrentBody.process_identity?.pid !== tokenRuntime.process_identity?.pid ||
+      apiVersionCurrentBody.process_identity?.startToken !== tokenRuntime.process_identity?.startToken ||
+      apiVersionCurrentBody.process_identity?.commandHash !== tokenRuntime.process_identity?.commandHash) {
     fail(`protected API did not accept or advertise Runtime API v2:\n${JSON.stringify({ status: apiVersionCurrent.status, body: apiVersionCurrentBody }, null, 2)}`);
   }
   for (const publicPath of ['/', '/login', '/assets/xterm.css']) {
@@ -3991,6 +3998,15 @@ async function multiProjectWebWorkflow() {
     }
     const arbitraryDb = path.join(arbitraryRoot, '.hello-cc', 'mesh.db');
     if (!fs.lstatSync(arbitraryDb).isFile()) fail('arbitrary project did not create a regular mesh database');
+    const arbitraryRuntime = JSON.parse(fs.readFileSync(
+      path.join(arbitraryRoot, '.hello-cc', 'runtime.json'),
+      'utf8'
+    ));
+    if (arbitraryRuntime.process_identity?.pid !== runtimePid ||
+        arbitraryRuntime.process_identity?.startToken !== otherRuntime.process_identity?.startToken ||
+        !arbitraryRuntime.process_identity?.commandHash) {
+      fail(`project API runtime pointer omitted the shared runtime fingerprint:\n${JSON.stringify(arbitraryRuntime, null, 2)}`);
+    }
 
     const assertRejected = async (label, input) => {
       const response = await runtimeFetch('/api/projects', {
@@ -5404,6 +5420,29 @@ async function bufferGcArbitrationWorkflow() {
     return (data.sessions || []).some((session) => session.id === legacyId);
   }, 'buffer GC legacy external adoption');
 
+  const siblingLiveId = `gc-sibling-external-${testId}`;
+  const siblingLiveFiles = ['out', 'in', 'resize', 'meta']
+    .map((suffix) => path.join(siblingBufs, `${siblingLiveId}.${suffix}`));
+  for (const file of siblingLiveFiles.slice(0, 3)) fs.writeFileSync(file, '');
+  fs.writeFileSync(siblingLiveFiles[3], JSON.stringify({
+    id: siblingLiveId,
+    kind: 'shell',
+    role: 'peer',
+    command: 'regression sibling external',
+    cwd: secondProjectRoot,
+    pid: process.pid,
+    wrapper_pid: process.pid,
+    child_identity: identity,
+    wrapper_identity: identity,
+    cols: 120,
+    rows: 40
+  }));
+  await waitFor(async () => {
+    const data = await (await runtimeFetch('/api/sessions', {}, { root: secondProjectRoot })).json();
+    return (data.sessions || []).some((session) => session.id === siblingLiveId);
+  }, 'buffer GC sibling external adoption');
+  for (const file of siblingLiveFiles) fs.utimesSync(file, oldTime, oldTime);
+
   const isolatedProjectPreviewResponse = await runtimeFetch('/api/runtime/gc-buffers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -5422,7 +5461,7 @@ async function bufferGcArbitrationWorkflow() {
     const pane = parsePane(started);
     const safePane = pane.replace(/[^a-zA-Z0-9_-]/g, '');
     const safeId = siblingPeer.replace(/[^a-zA-Z0-9_-]/g, '');
-    siblingPipe = path.join(rootBufs, `tmux-${safePane}-${safeId}.pipe`);
+    siblingPipe = path.join(siblingBufs, `tmux-${safePane}-${safeId}.pipe`);
     await waitFor(() => fs.existsSync(siblingPipe), 'sibling-project tmux FIFO');
     fs.utimesSync(siblingPipe, oldTime, oldTime);
   }
@@ -5459,7 +5498,7 @@ async function bufferGcArbitrationWorkflow() {
   }, { root: secondProjectRoot });
   const graceRaceApply = await graceRaceApplyResponse.json();
   if (!graceRaceApplyResponse.ok || Number(graceRaceApply.deleted || 0) !== 0 ||
-      Number(graceRaceApply.deferred || 0) < 2 || graceRaceApply.complete !== false ||
+      Number(graceRaceApply.deferred || 0) < 1 || graceRaceApply.complete !== false ||
       !fs.existsSync(rootOrphan) || !fs.existsSync(siblingOrphan)) {
     fail(`runtime buffer apply ignored grace extended after prepare: ${JSON.stringify(graceRaceApply)}`);
   }
@@ -5481,14 +5520,37 @@ async function bufferGcArbitrationWorkflow() {
   fs.rmSync(aliasContainer, { recursive: true, force: true });
   const gcPayload = JSON.parse(gcOutput);
   const result = gcPayload.data || {};
-  const expectedProtected = liveFiles.length + legacyFiles.length + (siblingPipe ? 1 : 0);
-  if (result.buf_files !== 2 || result.protected_buf_files < expectedProtected || result.deferred_buf_files !== 0) {
-    fail(`buffer GC endpoint returned incomplete counts: ${JSON.stringify(result)}`);
+  const expectedSiblingProtected = siblingLiveFiles.length + (siblingPipe ? 1 : 0);
+  if (result.buf_files !== 1 || result.protected_buf_files < expectedSiblingProtected ||
+      result.deferred_buf_files !== 0) {
+    fail(`sibling buffer GC endpoint returned incomplete counts: ${JSON.stringify(result)}`);
   }
-  for (const file of [rootOrphan, siblingOrphan]) {
-    if (fs.existsSync(file)) fail(`sibling-root buffer GC did not remove old orphan: ${file}`);
+  if (fs.existsSync(siblingOrphan) || !fs.existsSync(rootOrphan)) {
+    fail('sibling buffer GC crossed project directory ownership');
   }
-  for (const file of [...liveFiles, ...legacyFiles, ...(siblingPipe ? [siblingPipe] : [])]) {
+
+  const rootGcClockDb = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  try {
+    rootGcClockDb.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+    rootGcClockDb.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(Math.floor(Date.now() / 1000)));
+  } finally {
+    rootGcClockDb.close();
+  }
+  const rootGcPayload = JSON.parse(hcc(['--json', 'gc', '--older-than', '0', '--yes']));
+  const rootGcResult = rootGcPayload.data || {};
+  if (rootGcResult.buf_files !== 1 || rootGcResult.protected_buf_files < liveFiles.length ||
+      rootGcResult.deferred_buf_files < legacyFiles.length || fs.existsSync(rootOrphan)) {
+    fail(`primary buffer GC endpoint returned incomplete evidence counts: ${JSON.stringify(rootGcResult)}`);
+  }
+  for (const file of [
+    ...liveFiles,
+    ...legacyFiles,
+    ...siblingLiveFiles,
+    ...(siblingPipe ? [siblingPipe] : [])
+  ]) {
     if (!fs.existsSync(file)) fail(`buffer GC removed active/unknown file: ${file}`);
   }
   if (siblingPeer) hccFromMaybe(['peer', 'stop', siblingPeer], secondProjectRoot);
@@ -5529,7 +5591,7 @@ async function bufferGcArbitrationWorkflow() {
     }
   };
 
-  const gapOrphan = path.join(rootBufs, `gc-actual-dir-gap-${testId}.out`);
+  const gapOrphan = path.join(siblingBufs, `gc-actual-dir-gap-${testId}.out`);
   fs.writeFileSync(gapOrphan, 'actual directory pending gap');
   fs.utimesSync(gapOrphan, oldTime, oldTime);
   const unifiedIds = {};
@@ -5582,7 +5644,7 @@ async function bufferGcArbitrationWorkflow() {
   const gapGc = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--history', '--yes'], secondProjectRoot)).data;
   if (!fs.existsSync(gapOrphan) || Number(gapGc.buf_files || 0) !== 0 ||
       Number(gapGc.deferred_buf_files || 0) < 1 ||
-      Number(gapGc.protected_buf_files || 0) < liveFiles.length + legacyFiles.length ||
+      Number(gapGc.protected_buf_files || 0) < siblingLiveFiles.length ||
       Number(gapGc.deferred_old_events || 0) < 1 ||
       Number(gapGc.deferred_expired_locks || 0) < 1 ||
       Number(gapGc.deferred_stale_peers || 0) < 1) {
@@ -5600,7 +5662,7 @@ async function bufferGcArbitrationWorkflow() {
   }
 
   clearSiblingClockSafety();
-  const normalOrphan = path.join(rootBufs, `gc-actual-dir-normal-${testId}.out`);
+  const normalOrphan = path.join(siblingBufs, `gc-actual-dir-normal-${testId}.out`);
   fs.writeFileSync(normalOrphan, 'actual directory normal baseline');
   fs.utimesSync(normalOrphan, oldTime, oldTime);
   const normalGc = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--yes'], secondProjectRoot)).data;
@@ -5610,7 +5672,7 @@ async function bufferGcArbitrationWorkflow() {
 
   const failureRetentionDays = 100;
   const failureRetentionSec = failureRetentionDays * 86400;
-  const failureOrphan = path.join(rootBufs, `gc-actual-dir-clock-failure-${testId}.out`);
+  const failureOrphan = path.join(siblingBufs, `gc-actual-dir-clock-failure-${testId}.out`);
   const failureMtime = new Date((Math.floor(Date.now() / 1000) - 101 * 86400) * 1000);
   fs.writeFileSync(failureOrphan, 'actual directory clock persistence failure');
   fs.utimesSync(failureOrphan, failureMtime, failureMtime);
@@ -5645,7 +5707,9 @@ async function bufferGcArbitrationWorkflow() {
     cleanupFailureDb.close();
   }
   fs.rmSync(failureOrphan, { force: true });
-  for (const file of [...liveFiles, ...legacyFiles]) fs.rmSync(file, { force: true });
+  for (const file of [...liveFiles, ...legacyFiles, ...siblingLiveFiles]) {
+    fs.rmSync(file, { force: true });
+  }
 
   for (const status of ['unreachable', 404, 426]) {
     const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-${status}-${testId}-`));
@@ -7250,6 +7314,27 @@ async function syntaxAndHelp() {
     }
     runtimeState.clearRuntime(runtimeCtx, 999999);
     if (fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime did not remove the dead-pid global pointer');
+
+    runtimeState.writeGlobalRuntime({
+      base_url: 'http://127.0.0.1:14',
+      token: 'reused-pid-token',
+      pid: process.pid,
+      process_identity: {
+        pid: process.pid,
+        startToken: 'definitely-not-the-current-process',
+        commandHash: 'c'.repeat(64)
+      }
+    });
+    try {
+      runtimeState.readRuntime(runtimeCtx);
+      fail('runtime state readRuntime returned a reused-pid global pointer');
+    } catch (err) {
+      if (err?.code !== 'RUNTIME_NOT_RUNNING') throw err;
+    }
+    runtimeState.clearRuntime(runtimeCtx, process.pid);
+    if (fs.existsSync(globalRuntimeFile)) {
+      fail('runtime state clearRuntime did not remove the reused-pid global pointer');
+    }
 
     fs.writeFileSync(globalRuntimeFile, '{bad');
     if (runtimeState.readGlobalRuntimeFile() !== null) {
@@ -9727,7 +9812,15 @@ async function processEvidenceWorkflow() {
     env: { ...env, HCC_INTERNAL_WEB_MANAGED_RUN: '1' },
     stdio: 'ignore'
   });
-  await waitFor(() => fs.existsSync(externalMetaFile), 'external producer metadata', 10000);
+  await waitFor(() => {
+    try {
+      const meta = JSON.parse(fs.readFileSync(externalMetaFile, 'utf8'));
+      return meta.publishing !== true && meta.wrapper_identity?.pid === meta.wrapper_pid &&
+        meta.child_identity?.pid === meta.pid;
+    } catch {
+      return false;
+    }
+  }, 'complete external producer metadata', 10000);
   const externalMeta = JSON.parse(fs.readFileSync(externalMetaFile, 'utf8'));
   if (externalMeta.wrapper_pid !== producer.pid ||
       !externalMeta.pid || externalMeta.pid === externalMeta.wrapper_pid ||
@@ -9743,6 +9836,53 @@ async function processEvidenceWorkflow() {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
     return (data.sessions || []).some((session) => session.id === externalId);
   }, 'external session adoption', 10000);
+  const duplicateProducer = runMaybe(process.execPath, [
+    hccBin,
+    '--root', root,
+    'run', '--peer', externalId, '--kind', 'shell', '--',
+    '/bin/bash', '--noprofile', '--norc', '-c', 'sleep 30'
+  ], {
+    cwd: root,
+    env: { ...env, HCC_INTERNAL_WEB_MANAGED_RUN: '1' }
+  });
+  const duplicateMeta = JSON.parse(fs.readFileSync(externalMetaFile, 'utf8'));
+  const duplicateDbPeer = withMeshDb((db) => db.prepare(
+    'SELECT pid, pid_start_token, pid_command_hash, status FROM peers WHERE id = ?'
+  ).get(externalId));
+  if (duplicateProducer.status === 0 ||
+      !String(duplicateProducer.stderr || '').includes('already has a live or unknown owner') ||
+      duplicateMeta.generation !== externalMeta.generation ||
+      duplicateDbPeer?.pid !== producer.pid || duplicateDbPeer?.status !== 'running' ||
+      inspectProcessIdentity(externalMeta.pid).state !== 'live') {
+    fail(`same-id external producer replaced a live generation: ${JSON.stringify({
+      status: duplicateProducer.status,
+      stderr: duplicateProducer.stderr,
+      duplicateMeta,
+      duplicateDbPeer
+    })}`);
+  }
+  const replacementIdentity = inspectProcessIdentity(process.pid);
+  if (replacementIdentity.state !== 'live') fail('replacement DB fingerprint unavailable');
+  withMeshDb((db) => {
+    db.prepare(`
+      UPDATE peers
+      SET pid = ?, pid_start_token = ?, pid_command_hash = ?, status = 'running'
+      WHERE id = ?
+    `).run(
+      process.pid,
+      replacementIdentity.identity.startToken,
+      replacementIdentity.identity.commandHash,
+      externalId
+    );
+    const bindingMutation = db.prepare(`
+      UPDATE peer_bindings
+      SET runtime_target = 'replacement-owner', updated_at = ?
+      WHERE peer = ?
+    `).run(Math.floor(Date.now() / 1000), externalId);
+    if (Number(bindingMutation.changes || 0) !== 1) {
+      fail('external replacement binding fixture was not created');
+    }
+  });
   producer.kill('SIGKILL');
   await waitForProcessExit(producer.pid, 'external wrapper SIGKILL');
   await sleep(2500);
@@ -9754,6 +9894,17 @@ async function processEvidenceWorkflow() {
   }
   process.kill(externalMeta.pid, 'SIGKILL');
   await waitFor(() => !fs.existsSync(externalMetaFile), 'external aggregate cleanup', 10000);
+  const replacementAfterExit = withMeshDb((db) => ({
+    peer: db.prepare('SELECT pid, pid_start_token, pid_command_hash, status FROM peers WHERE id = ?').get(externalId),
+    binding: db.prepare('SELECT runtime_target FROM peer_bindings WHERE peer = ?').get(externalId)
+  }));
+  if (replacementAfterExit.peer?.pid !== process.pid ||
+      replacementAfterExit.peer?.status !== 'running' ||
+      replacementAfterExit.peer?.pid_start_token !== replacementIdentity.identity.startToken ||
+      replacementAfterExit.peer?.pid_command_hash !== replacementIdentity.identity.commandHash ||
+      replacementAfterExit.binding?.runtime_target !== 'replacement-owner') {
+    fail(`external exit poller overwrote replacement DB ownership: ${JSON.stringify(replacementAfterExit)}`);
+  }
 
   const legacyExternalId = `evidence-external-legacy-${testId}`;
   const legacyProcess = spawn('sleep', ['30'], { stdio: 'ignore' });

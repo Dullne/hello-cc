@@ -133,3 +133,61 @@ test('runtime clients send v2 and probes reject legacy runtime metadata', async 
 
   assert.deepEqual(observed, ['2', '2', '2', '2', '2', '2']);
 });
+
+test('runtime probe binds fingerprinted pointers to the responding process identity', async (t) => {
+  const storedIdentity = {
+    pid: 73,
+    startToken: 'boot:stored',
+    commandHash: 'a'.repeat(64)
+  };
+  let runtimeMetadata = {
+    product: 'hello-cc',
+    api_version: API_VERSION,
+    pid: storedIdentity.pid,
+    process_identity: { ...storedIdentity, startToken: 'boot:reused' }
+  };
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(runtimeMetadata));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const runtime = {
+    base_url: `http://127.0.0.1:${server.address().port}`,
+    product: 'hello-cc',
+    pid: storedIdentity.pid,
+    process_identity: storedIdentity
+  };
+
+  assert.equal(await probeRuntime(runtime), false);
+  runtimeMetadata = {
+    product: 'hello-cc',
+    api_version: API_VERSION,
+    pid: storedIdentity.pid + 1,
+    process_identity: { ...storedIdentity, pid: storedIdentity.pid + 1 }
+  };
+  assert.equal(await probeRuntime(runtime), false);
+  runtimeMetadata = {
+    product: 'other-product',
+    api_version: API_VERSION,
+    pid: storedIdentity.pid,
+    process_identity: storedIdentity
+  };
+  assert.equal(await probeRuntime(runtime), false);
+  runtimeMetadata = {
+    product: 'hello-cc',
+    api_version: API_VERSION,
+    pid: storedIdentity.pid
+  };
+  assert.equal(await probeRuntime(runtime), false);
+  runtimeMetadata = {
+    product: 'hello-cc',
+    api_version: API_VERSION,
+    pid: storedIdentity.pid,
+    process_identity: storedIdentity
+  };
+  assert.equal(await probeRuntime(runtime), true);
+});

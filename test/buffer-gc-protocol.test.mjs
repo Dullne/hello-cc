@@ -6,6 +6,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import { planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
+import { collectBufferEvidence } from '../lib/runtime/buffer-evidence.mjs';
 import {
   BUFFER_GC_APPLY_BATCH_SIZE,
   applyClockSafeBufferPlan,
@@ -146,5 +147,202 @@ test('buffer GC marks a drifted would-delete entry incomplete so database apply 
     graceActive: false
   });
   assert.equal(fs.readFileSync(candidate, 'utf8'), 'changed after prepare');
+  db.close();
+});
+
+test('buffer GC refreshes owner evidence inside every apply batch', (t) => {
+  const root = tempRoot(t);
+  const directory = path.join(root, 'bufs');
+  const dbPath = path.join(root, 'mesh.db');
+  fs.mkdirSync(directory);
+  for (let index = 0; index < BUFFER_GC_APPLY_BATCH_SIZE + 1; index += 1) {
+    const file = path.join(directory, `candidate-${String(index).padStart(3, '0')}.out`);
+    fs.writeFileSync(file, String(index));
+    fs.utimesSync(file, new Date(100_000), new Date(100_000));
+  }
+  const plan = planBufferFiles({ directories: [directory], cutoffMs: 500_000 });
+  const liveCandidate = plan.deleteEntries.at(-1).path;
+  const liveId = path.basename(liveCandidate, '.out');
+  const identity = {
+    pid: 91,
+    startToken: 'boot:started',
+    commandHash: 'c'.repeat(64)
+  };
+  const db = clockDb(dbPath);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '1000')").run();
+  let evidenceCollections = 0;
+
+  const result = applyClockSafeBufferPlan({
+    db,
+    plan,
+    retentionSec: 0,
+    nowSec: () => 1000,
+    collectEvidence: () => {
+      evidenceCollections += 1;
+      return collectBufferEvidence({
+        directories: [directory],
+        inspectProcess: () => ({ state: 'live', identity })
+      });
+    },
+    afterBatch: () => {
+      if (evidenceCollections !== 1) return;
+      fs.writeFileSync(path.join(directory, `${liveId}.meta`), JSON.stringify({
+        wrapper_pid: identity.pid,
+        wrapper_identity: identity
+      }));
+    }
+  });
+
+  assert.equal(evidenceCollections, 2);
+  assert.deepEqual(result, {
+    deleted: BUFFER_GC_APPLY_BATCH_SIZE,
+    protected: 1,
+    deferred: 0,
+    complete: true,
+    graceActive: false
+  });
+  assert.equal(fs.existsSync(liveCandidate), true);
+  db.close();
+});
+
+test('buffer GC counts an apply-time unknown entry exactly once', (t) => {
+  const root = tempRoot(t);
+  const directory = path.join(root, 'bufs');
+  const dbPath = path.join(root, 'mesh.db');
+  fs.mkdirSync(directory);
+  const candidate = path.join(directory, 'candidate.out');
+  fs.writeFileSync(candidate, 'planned');
+  fs.utimesSync(candidate, new Date(100_000), new Date(100_000));
+  const plan = planBufferFiles({ directories: [directory], cutoffMs: 500_000 });
+  const db = clockDb(dbPath);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '1000')").run();
+
+  const result = applyClockSafeBufferPlan({
+    db,
+    plan,
+    retentionSec: 0,
+    nowSec: () => 1000,
+    collectEvidence: () => ({
+      protectedPaths: new Set(),
+      unknownPaths: new Set([candidate])
+    })
+  });
+
+  assert.deepEqual(result, {
+    deleted: 0,
+    protected: 0,
+    deferred: 1,
+    complete: false,
+    graceActive: false
+  });
+  assert.equal(fs.existsSync(candidate), true);
+  db.close();
+});
+
+test('clock grace preserves refreshed protected counts and defers only non-protected entries', (t) => {
+  const root = tempRoot(t);
+  const directory = path.join(root, 'bufs');
+  const dbPath = path.join(root, 'mesh.db');
+  fs.mkdirSync(directory);
+  const protectedFile = path.join(directory, 'protected.out');
+  const unknownFile = path.join(directory, 'unknown.out');
+  for (const file of [protectedFile, unknownFile]) {
+    fs.writeFileSync(file, 'planned');
+    fs.utimesSync(file, new Date(100_000), new Date(100_000));
+  }
+  const plan = planBufferFiles({ directories: [directory], cutoffMs: 500_000 });
+  const db = clockDb(dbPath);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '1000')").run();
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_grace_until', '2000')").run();
+
+  const result = applyClockSafeBufferPlan({
+    db,
+    plan,
+    retentionSec: 0,
+    nowSec: () => 1000,
+    collectEvidence: () => ({
+      protectedPaths: new Set([protectedFile]),
+      unknownPaths: new Set([unknownFile])
+    })
+  });
+
+  assert.deepEqual(result, {
+    deleted: 0,
+    protected: 1,
+    deferred: 1,
+    complete: false,
+    graceActive: true
+  });
+  assert.equal(fs.existsSync(protectedFile), true);
+  assert.equal(fs.existsSync(unknownFile), true);
+  db.close();
+});
+
+test('apply-time unknown expiry cutoff opens clock grace after a forward jump', (t) => {
+  const root = tempRoot(t);
+  const directory = path.join(root, 'bufs');
+  const dbPath = path.join(root, 'mesh.db');
+  fs.mkdirSync(directory);
+  const candidate = path.join(directory, 'candidate.out');
+  fs.writeFileSync(candidate, 'planned');
+  fs.utimesSync(candidate, new Date(100_000), new Date(100_000));
+  const plan = planBufferFiles({ directories: [directory], cutoffMs: 500_000 });
+  const db = clockDb(dbPath);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '100')").run();
+
+  const result = applyClockSafeBufferPlan({
+    db,
+    plan,
+    retentionSec: 0,
+    nowSec: () => 1_000,
+    collectEvidence: () => ({
+      protectedPaths: new Set(),
+      unknownPaths: new Set(),
+      gcCutoffs: [220]
+    })
+  });
+
+  assert.deepEqual(result, {
+    deleted: 0,
+    protected: 0,
+    deferred: 1,
+    complete: false,
+    graceActive: true
+  });
+  assert.equal(fs.existsSync(candidate), true);
+  db.close();
+});
+
+test('prepared unknown expiry cutoff survives when its metadata disappears before apply', (t) => {
+  const root = tempRoot(t);
+  const directory = path.join(root, 'bufs');
+  const dbPath = path.join(root, 'mesh.db');
+  fs.mkdirSync(directory);
+  const candidate = path.join(directory, 'candidate.out');
+  fs.writeFileSync(candidate, 'planned');
+  fs.utimesSync(candidate, new Date(100_000), new Date(100_000));
+  const plan = planBufferFiles({
+    directories: [directory],
+    cutoffMs: 500_000,
+    evidenceGcCutoffs: [220]
+  });
+  const db = clockDb(dbPath);
+  db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '100')").run();
+
+  const result = applyClockSafeBufferPlan({
+    db,
+    plan,
+    retentionSec: 0,
+    nowSec: () => 1_000,
+    collectEvidence: () => ({
+      protectedPaths: new Set(),
+      unknownPaths: new Set(),
+      gcCutoffs: []
+    })
+  });
+
+  assert.equal(result.deleted, 0);
+  assert.equal(result.graceActive, true);
+  assert.equal(fs.existsSync(candidate), true);
   db.close();
 });

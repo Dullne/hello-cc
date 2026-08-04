@@ -79,6 +79,8 @@ import {
   readHealthyRuntime,
   readRuntime,
   readRuntimeFile,
+  reclaimRuntimePointerFiles,
+  runtimeProcessIdentity,
   writeGlobalRuntime,
   writeRuntime
 } from '../lib/runtime/state.mjs';
@@ -87,6 +89,7 @@ import { runtimeBufferGcUnavailable, runtimeRequest } from '../lib/runtime/clien
 import {
   applyBufferPlan,
   bufferPlanGcCutoffs,
+  deferBufferPlan,
   planBufferFiles,
   pruneBufferFiles
 } from '../lib/runtime/buffer-gc.mjs';
@@ -94,6 +97,13 @@ import {
   applyClockSafeBufferPlan,
   createBufferGcPlanStore
 } from '../lib/runtime/buffer-gc-protocol.mjs';
+import {
+  collectBufferEvidence,
+  externalBufferEvidence,
+  externalBufferOwnerKey,
+  readExternalBufferMetadata
+} from '../lib/runtime/buffer-evidence.mjs';
+import { withBufferDirectoryLease } from '../lib/runtime/buffer-directory-lease.mjs';
 import {
   detectBranch,
   detectRoot
@@ -2939,6 +2949,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const MAX_WEB_SESSIONS = 256;
   const webSessions = new Map();
   const bufferGcPlanStore = createBufferGcPlanStore();
+  const bufferUnknownTracker = new Map();
   const bufferDirectoriesByProject = new Map();
   function parseCookieSid(req) {
     const header = req.headers.cookie || '';
@@ -3205,55 +3216,49 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
   fs.mkdirSync(bufsDir, { recursive: true });
 
-  // External metadata records full wrapper/child identities. Legacy PID-only
-  // metadata is intentionally unknown: a recycled PID must never prove life.
-  function externalSessionDead(meta) {
-    const wrapperPid = meta?.wrapper_pid || meta?.wrapperPid || null;
-    const pid = meta?.pid || null;
-    const processes = [];
-    if (wrapperPid) processes.push({
-      name: 'wrapper',
-      storedIdentity: meta?.wrapper_identity || meta?.wrapperIdentity || null,
-      current: inspectProcessIdentity(wrapperPid)
-    });
-    if (pid) processes.push({
-      name: 'child',
-      storedIdentity: meta?.child_identity || meta?.childIdentity || null,
-      current: inspectProcessIdentity(pid)
-    });
-    return resolvePeerEvidence({ peer: { status: 'running' }, processes }).state === 'dead';
-  }
-
-  function cleanupExternalBufferFiles(id) {
+  function removeExternalBufferFiles(id, directory = bufsDir) {
     for (const suffix of ['out', 'in', 'resize', 'meta']) {
-      try { fs.rmSync(path.join(bufsDir, `${id}.${suffix}`), { force: true }); } catch {}
+      fs.rmSync(path.join(directory, `${id}.${suffix}`), { force: true });
     }
   }
 
-  function adoptExternalSession(id) {
-    const pctx = ctx;
+  function adoptExternalSession(id, pctx = ctx, directory = bufsDir) {
     const key = sessionKey(pctx, id);
     if (sessions.has(key)) return;
-    const outFile  = path.join(bufsDir, `${id}.out`);
-    const inFile   = path.join(bufsDir, `${id}.in`);
-    const resizeFile = path.join(bufsDir, `${id}.resize`);
-    const metaFile = path.join(bufsDir, `${id}.meta`);
-    if (!fs.existsSync(outFile)) return;
-    // An output file without producer metadata is an orphan, not a running
-    // session. The external wrapper writes metadata during startup and the
-    // watcher retries, so waiting here also avoids inventing PID-less sessions.
-    if (!fs.existsSync(metaFile)) return;
-
-    let meta = { kind: 'external', role: 'peer', command: '(shim)', cwd: ctx.root, pid: null, wrapper_pid: null, cols: 120, rows: 40 };
-    try { meta = { ...meta, ...JSON.parse(fs.readFileSync(metaFile, 'utf8')) }; } catch {}
-
-    // The .out file exists but the process is gone → a wrapper that was killed
-    // before it could clean up. Remove the stale buffers instead of adopting a
-    // ghost session that would show as 'running' forever.
-    if (externalSessionDead(meta)) {
-      cleanupExternalBufferFiles(id);
-      return;
-    }
+    const outFile  = path.join(directory, `${id}.out`);
+    const inFile   = path.join(directory, `${id}.in`);
+    const resizeFile = path.join(directory, `${id}.resize`);
+    const metaFile = path.join(directory, `${id}.meta`);
+    let adopted = null;
+    try {
+      adopted = withBufferDirectoryLease(directory, () => {
+        if (!fs.existsSync(outFile) || !fs.existsSync(metaFile)) return null;
+        let meta;
+        try { meta = readExternalBufferMetadata(metaFile); } catch { return null; }
+        // The producer publishes wrapper evidence before the PTY child identity
+        // is complete. Do not cache that transitional snapshot as a session;
+        // the next scan adopts the final metadata instead.
+        if (meta.publishing === true) return null;
+        const ownerKey = externalBufferOwnerKey(meta);
+        if (!ownerKey) return null;
+        const evidence = externalBufferEvidence(meta, inspectProcessIdentity);
+        // Re-read and remove in one producer-coordinated lease. A new producer
+        // with the same id cannot publish between this decision and deletion.
+        if (evidence.state === 'dead') {
+          removeExternalBufferFiles(id, directory);
+          return null;
+        }
+        return { meta, ownerKey };
+      });
+    } catch { return; }
+    if (!adopted) return;
+    const { meta, ownerKey } = adopted;
+    const wrapperOwnerPid = meta.wrapper_pid || meta.wrapperPid || null;
+    const wrapperOwnerIdentity = meta.wrapper_identity || meta.wrapperIdentity || null;
+    const dbOwnerPid = wrapperOwnerPid || meta.pid || null;
+    const dbOwnerIdentity = wrapperOwnerPid
+      ? wrapperOwnerIdentity
+      : meta.child_identity || meta.childIdentity || null;
 
     const session = {
       id,
@@ -3264,11 +3269,20 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       kind: meta.kind || 'external',
       role: meta.role || 'peer',
       command: meta.command || '(shim)',
-      cwd: meta.cwd || ctx.root,
+      cwd: meta.cwd || pctx.root,
       pid: meta.pid || null,
       wrapperPid: meta.wrapper_pid || null,
       childIdentity: meta.child_identity || null,
       wrapperIdentity: meta.wrapper_identity || null,
+      externalOwnerKey: ownerKey,
+      externalDbOwner: Number.isInteger(Number(dbOwnerPid)) && dbOwnerIdentity?.startToken &&
+        dbOwnerIdentity?.commandHash
+        ? {
+            pid: Number(dbOwnerPid),
+            startToken: dbOwnerIdentity.startToken,
+            commandHash: dbOwnerIdentity.commandHash
+          }
+        : null,
       type: 'external',
       outFile, inFile, resizeFile, metaFile,
       status: 'running',
@@ -3310,50 +3324,92 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }, 100);
 
-    // Session ended when the .out file is removed (clean exit) or every recorded
-    // process is gone (wrapper SIGKILLed without cleaning up).
+    function finalizeExternalSession({ updateDatabase }) {
+      session.status = 'exited';
+      session.exitedAt = now();
+      broadcast(session, { type: 'exit', event: {} });
+      if (updateDatabase) {
+        try {
+          const exitDb = connectWebProject(session.ctx || ctx);
+          try {
+            const exitPeerId = session.peerId || session.id;
+            if (session.externalDbOwner) {
+              tx(exitDb, () => {
+                const mutation = exitDb.prepare(`
+                  UPDATE peers SET status = ?
+                  WHERE id = ? AND pid = ? AND pid_start_token = ? AND pid_command_hash = ?
+                `).run(
+                  'exited',
+                  exitPeerId,
+                  session.externalDbOwner.pid,
+                  session.externalDbOwner.startToken,
+                  session.externalDbOwner.commandHash
+                );
+                if (Number(mutation.changes || 0) > 0) {
+                  exitDb.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?')
+                    .run(now(), exitPeerId);
+                }
+              });
+            }
+          } finally { exitDb.close(); }
+        } catch {}
+      }
+      if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
+      if (session.outputPoller) clearInterval(session.outputPoller);
+      if (session.exitPoller) clearInterval(session.exitPoller);
+      sessions.delete(key);
+    }
+
+    // Reconcile and mutate the external group under the same lease used by its
+    // producer. Owner changes detach only this stale in-memory view; they never
+    // mark the replacement producer exited or remove its files.
     session.exitPoller = setInterval(() => {
       try {
-        const outGone = !fs.existsSync(outFile);
-        const procDead = externalSessionDead({
-          wrapper_pid: session.wrapperPid,
-          pid: session.pid,
-          wrapper_identity: session.wrapperIdentity,
-          child_identity: session.childIdentity
-        });
-        if (outGone || procDead) {
-          session.status = 'exited';
-          session.exitedAt = now();
-          broadcast(session, { type: 'exit', event: {} });
-          // hb-03: persist the exit in the peers table so hcc peers/status no
-          // longer shows this session as active once its .out vanished.
+        withBufferDirectoryLease(directory, () => {
+          const outExists = fs.existsSync(outFile);
+          let currentMeta;
           try {
-            const exitDb = connectWebProject(session.ctx || ctx);
-            try {
-              const exitPeerId = session.peerId || session.id;
-              exitDb.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', exitPeerId);
-              exitDb.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), exitPeerId);
-            } finally { exitDb.close(); }
-          } catch {}
-          if (session.outputFd) { try { fs.closeSync(session.outputFd); } catch {} session.outputFd = null; }
-          if (session.outputPoller) clearInterval(session.outputPoller);
-          if (session.exitPoller) clearInterval(session.exitPoller);
-          sessions.delete(key);
-          // Crashed without removing its own buffers → clean them so the next
-          // scan does not re-adopt a ghost.
-          if (procDead && !outGone) cleanupExternalBufferFiles(id);
-        }
+            currentMeta = readExternalBufferMetadata(metaFile);
+          } catch {
+            // A producer removes the whole group in one lease. No out and no
+            // metadata is therefore a clean exit; an unreadable metadata file
+            // is unknown and must not mutate DB ownership.
+            if (!outExists && !fs.existsSync(metaFile)) {
+              finalizeExternalSession({ updateDatabase: true });
+            }
+            return;
+          }
+          const currentOwnerKey = externalBufferOwnerKey(currentMeta);
+          if (!currentOwnerKey) return;
+          if (currentOwnerKey !== session.externalOwnerKey) {
+            finalizeExternalSession({ updateDatabase: false });
+            return;
+          }
+          if (!outExists) {
+            finalizeExternalSession({ updateDatabase: true });
+            return;
+          }
+          if (externalBufferEvidence(currentMeta, inspectProcessIdentity).state !== 'dead') return;
+          removeExternalBufferFiles(id, directory);
+          finalizeExternalSession({ updateDatabase: true });
+        });
       } catch {}
     }, 2000);
   }
 
   // Adopt any already-running external sessions
   function scanExternalSessions() {
-    try {
-      for (const f of fs.readdirSync(bufsDir)) {
-        if (f.endsWith('.out')) adoptExternalSession(path.basename(f, '.out'));
-      }
-    } catch {}
+    for (const projectCtx of runtimeProjectContexts()) {
+      const directory = bufferDirectory(projectCtx);
+      try {
+        fs.mkdirSync(directory, { recursive: true });
+        for (const f of fs.readdirSync(directory)) {
+          if (f.endsWith('.out')) {
+            adoptExternalSession(path.basename(f, '.out'), projectCtx, directory);
+          }
+        }
+      } catch {}
+    }
   }
 
   scanExternalSessions();
@@ -3365,7 +3421,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   try {
     bufsWatcher = fs.watch(bufsDir, { persistent: false }, (event, filename) => {
       if (filename?.endsWith('.out')) {
-        setTimeout(() => adoptExternalSession(path.basename(filename, '.out')), 300);
+        setTimeout(() => adoptExternalSession(path.basename(filename, '.out'), ctx, bufsDir), 300);
       }
     });
     // An FSWatcher with no 'error' listener re-throws async errors as an
@@ -3677,15 +3733,49 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return { protectedPaths, projectDirectories };
   }
 
+  function collectRuntimeBufferEvidence(directories, candidatePaths = null) {
+    const projectDbs = [];
+    const opened = [];
+    try {
+      for (const projectCtx of runtimeProjectContexts()) {
+        try {
+          const db = connectWebProject(projectCtx, { migrateRegistered: false, create: false });
+          opened.push(db);
+          projectDbs.push({ ctx: projectCtx, db });
+        } catch (error) {
+          projectDbs.push({
+            ctx: projectCtx,
+            db: { prepare() { throw error; } }
+          });
+        }
+      }
+      return collectBufferEvidence({
+        directories,
+        projectDbs,
+        sessions: [...sessions.values()],
+        observePeer: observePeerEvidence,
+        unknownTracker: bufferUnknownTracker,
+        candidatePaths
+      });
+    } finally {
+      for (const db of opened) {
+        try { db.close(); } catch {}
+      }
+    }
+  }
+
   function prepareRuntimeBufferGc(projectCtx, { dryRun, retentionSec }) {
     const observedAt = now();
     const cutoffMs = observedAt * 1000 - retentionSec * 1000;
-    const { protectedPaths, projectDirectories } = runningBufferPathSnapshot(projectCtx);
+    const { projectDirectories } = runningBufferPathSnapshot(projectCtx);
     const directories = new Set([bufferDirectory(projectCtx), ...projectDirectories]);
+    const { protectedPaths, unknownPaths, gcCutoffs } = collectRuntimeBufferEvidence(directories);
     const plan = planBufferFiles({
       directories,
       cutoffMs,
-      protectedPaths
+      protectedPaths,
+      unknownPaths,
+      evidenceGcCutoffs: gcCutoffs
     });
     const prepared = {
       observedAt,
@@ -3721,7 +3811,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         db,
         plan: prepared.plan,
         retentionSec: prepared.retentionSec,
-        nowSec: now
+        nowSec: now,
+        collectEvidence: ({ entries }) => collectRuntimeBufferEvidence(
+          new Set(entries.map((entry) => entry.directory.path)),
+          entries.map((entry) => entry.path)
+        )
       });
     } catch (error) {
       if (error instanceof CliError) throw error;
@@ -3731,17 +3825,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
   }
 
-  function autoGcProtectedBufferPaths(projectCtx) {
-    const { protectedPaths } = runningBufferPathSnapshot(projectCtx);
-    // External adoption remains primary-project scoped. Until sibling watchers
-    // exist, every sibling file is unknown to this runtime and must be retained.
-    if (!sameResolvedPath(projectCtx.root, ctx.root)) {
-      for (const file of bufferDirectoryPaths(bufferDirectory(projectCtx))) {
-        protectedPaths.add(file);
-      }
-    }
-    return protectedPaths;
-  }
   function runAutoGc() {
     if (autoGcInFlight) return;
     autoGcInFlight = true;
@@ -3754,7 +3837,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             olderThanDays: 14,
             dryRun: false,
             scope: 'auto',
-            protectedBufFiles: autoGcProtectedBufferPaths(projectCtx)
+            collectBufferEvidenceNow: () => collectRuntimeBufferEvidence([
+              bufferDirectory(projectCtx)
+            ])
           });
           const appliedDatabaseRows = result.expired_locks + result.old_events;
           if (appliedDatabaseRows > 0) {
@@ -3770,7 +3855,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       autoGcInFlight = false;
     }
   }
-  runAutoGc();
   const gcPoller = setInterval(runAutoGc, 6 * 60 * 60 * 1000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
@@ -4042,7 +4126,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function startTmuxStream(session) {
     const safePane = String(session.pane).replace(/[^A-Za-z0-9_-]/g, '');
     const safeId = String(session.id).replace(/[^A-Za-z0-9_.-]/g, '_');
-    const pipeFile = path.join(bufsDir, `tmux-${safePane}-${safeId}.pipe`);
+    const streamDirectory = bufferDirectory(session.ctx || ctx);
+    fs.mkdirSync(streamDirectory, { recursive: true });
+    const pipeFile = path.join(streamDirectory, `tmux-${safePane}-${safeId}.pipe`);
     session.pipeFile = pipeFile;
     // Restored panes may still have pipe-pane writers from a previous runtime.
     // Disable first so tmux tears down the stale writer before this runtime
@@ -4058,17 +4144,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     // implementation capped session.buffer but let .hello-cc/bufs grow forever
     // for long-lived tmux panes.
     try {
-      fs.rmSync(pipeFile, { force: true });
-      const mkfifo = spawnSync('mkfifo', [pipeFile], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe']
+      withBufferDirectoryLease(path.dirname(pipeFile), () => {
+        fs.rmSync(pipeFile, { force: true });
+        const mkfifo = spawnSync('mkfifo', [pipeFile], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+        if (mkfifo.status !== 0) {
+          const message = (mkfifo.stderr || mkfifo.stdout || '').trim() || 'mkfifo failed';
+          throw new CliError('TMUX_STREAM_ERROR', message);
+        }
+        try { fs.chmodSync(pipeFile, 0o600); } catch {}
+        session.streamFd = fs.openSync(pipeFile, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
       });
-      if (mkfifo.status !== 0) {
-        const message = (mkfifo.stderr || mkfifo.stdout || '').trim() || 'mkfifo failed';
-        throw new CliError('TMUX_STREAM_ERROR', message);
-      }
-      try { fs.chmodSync(pipeFile, 0o600); } catch {}
-      session.streamFd = fs.openSync(pipeFile, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
     } catch (err) {
       const message = err?.message || String(err);
       stopTmuxStream(session);
@@ -4136,7 +4224,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try { fs.closeSync(session.streamFd); } catch {}
       session.streamFd = null;
     }
-    if (session.pipeFile) { try { fs.unlinkSync(session.pipeFile); } catch {} session.pipeFile = null; }
+    if (session.pipeFile) {
+      try {
+        withBufferDirectoryLease(path.dirname(session.pipeFile), () => {
+          fs.unlinkSync(session.pipeFile);
+        });
+      } catch {}
+      session.pipeFile = null;
+    }
   }
 
   function tmuxSessionNameForPane(pane) {
@@ -5546,6 +5641,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     restoreTmuxManagedSessions(projectCtx);
     reconcileRunningBindings(projectCtx);
   }
+  runAutoGc();
 
   const handleWebRequest = async (req, res) => {
     const url = requestUrl(req);
@@ -5646,6 +5742,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           version: VERSION,
           api_version: API_VERSION,
           pid: process.pid,
+          ...(processIdentity ? { process_identity: processIdentity } : {}),
           root: projectCtx.root,
           db: projectCtx.dbPath,
           host,
@@ -5773,6 +5870,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           version: VERSION,
           api_version: API_VERSION,
           pid: process.pid,
+          ...(processIdentity ? { process_identity: processIdentity } : {}),
           root: reqCtx.root,
           db: reqCtx.dbPath,
           projects: knownProjects(),
@@ -6264,11 +6362,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   });
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
+  const processIdentity = runtimeProcessIdentity();
   const runtime = {
     product: PRODUCT_NAME,
     version: VERSION,
     api_version: API_VERSION,
     pid: process.pid,
+    ...(processIdentity ? { process_identity: processIdentity } : {}),
     root: ctx.root,
     db: ctx.dbPath,
     host,
@@ -6402,32 +6502,82 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
   const inFile  = path.join(bufsDir, `${id}.in`);
   const resizeFile = path.join(bufsDir, `${id}.resize`);
   const metaFile = path.join(bufsDir, `${id}.meta`);
+  const bufferFiles = [outFile, inFile, resizeFile, metaFile];
+  const bufferGeneration = randomBytes(18).toString('base64url');
 
-  // Wipe stale input file
-  try { fs.writeFileSync(inFile, ''); } catch {}
-  try { fs.writeFileSync(resizeFile, ''); } catch {}
+  const ownsExternalBufferGroup = () => {
+    try {
+      return externalBufferOwnerKey(readExternalBufferMetadata(metaFile)) ===
+        `generation:${bufferGeneration}`;
+    } catch {
+      return false;
+    }
+  };
 
-  const db = connect(ctx);
-  try {
-    upsertPeer(db, {
-      id, kind, role,
-      worktree: cwd,
-      branch: detectBranch(cwd),
-      pid: process.pid,
-      status: 'running',
-      capabilities: 'run-pty'
-    });
-    upsertCanonicalPeerBinding(db, binding, force);
-    addEvent(db, 'run.session.started', id, null, auditPayload({
-      actor: id,
-      target: id,
+  const removeOwnedExternalBufferGroup = () => withBufferDirectoryLease(bufsDir, () => {
+    if (!ownsExternalBufferGroup()) return false;
+    for (const file of bufferFiles) {
+      fs.rmSync(file, { force: true });
+    }
+    return true;
+  });
+
+  // Publish live wrapper evidence in the same lease that creates the group.
+  // This closes the pre-.meta window even for `gc --older-than 0`.
+  const publishingWrapperIdentity = runtimeProcessIdentity();
+  withBufferDirectoryLease(bufsDir, () => {
+    const existingFiles = bufferFiles.filter((file) => fs.existsSync(file));
+    if (existingFiles.length > 0) {
+      let existingMeta;
+      try { existingMeta = readExternalBufferMetadata(metaFile); } catch {
+        throw new CliError('EXTERNAL_SESSION_EXISTS', `External session ${id} has unresolved buffer ownership`);
+      }
+      if (externalBufferEvidence(existingMeta, inspectProcessIdentity).state !== 'dead') {
+        throw new CliError('EXTERNAL_SESSION_EXISTS', `External session ${id} already has a live or unknown owner`);
+      }
+      for (const file of bufferFiles) fs.rmSync(file, { force: true });
+    }
+    fs.writeFileSync(inFile, '');
+    fs.writeFileSync(resizeFile, '');
+    fs.writeFileSync(metaFile, JSON.stringify({
+      id,
+      generation: bufferGeneration,
+      kind,
+      role,
       command: [command, ...commandArgs].join(' '),
       cwd,
-      webManaged: true
+      wrapper_pid: process.pid,
+      ...(publishingWrapperIdentity ? { wrapper_identity: publishingWrapperIdentity } : {}),
+      publishing: true
     }));
-  } finally {
-    db.close();
-  }
+
+    const db = connect(ctx);
+    try {
+      tx(db, () => {
+        upsertPeer(db, {
+          id, kind, role,
+          worktree: cwd,
+          branch: detectBranch(cwd),
+          pid: process.pid,
+          status: 'running',
+          capabilities: 'run-pty'
+        });
+        upsertCanonicalPeerBinding(db, binding, force);
+        addEvent(db, 'run.session.started', id, null, auditPayload({
+          actor: id,
+          target: id,
+          command: [command, ...commandArgs].join(' '),
+          cwd,
+          webManaged: true
+        }));
+      });
+    } catch (error) {
+      for (const file of bufferFiles) fs.rmSync(file, { force: true });
+      throw error;
+    } finally {
+      db.close();
+    }
+  });
 
   // Estimate terminal size from current process
   const cols = process.stdout.columns || 120;
@@ -6439,11 +6589,7 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
   });
   const childExit = trackPtyExit(child);
   const wrapperTermination = installPtyTerminationHandlers(child);
-  let outFd = fs.openSync(outFile, 'w');
-  child.onData((data) => {
-    process.stdout.write(data);
-    try { fs.write(outFd, data, () => {}); } catch {}
-  });
+  let outFd;
 
   const failStartup = async (reason, childIdentity = null) => {
     const termination = await stopPtyAfterStartupFailure(child, childExit);
@@ -6455,67 +6601,91 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     try { fs.closeSync(outFd); } catch {}
     outFd = null;
     let metadataPreserved = false;
+    let ownedFailureRecord = false;
     if (disposition.preserveEvidence) {
       try {
-        fs.writeFileSync(metaFile, JSON.stringify({
-          id,
-          kind,
-          role,
-          command: [command, ...commandArgs].join(' '),
-          cwd,
-          pid: child.pid,
-          ...(childIdentity ? { child_identity: childIdentity } : {}),
-          startup_failed: true,
-          termination_unconfirmed: true,
-          error: reason,
-          cols,
-          rows
-        }));
-        metadataPreserved = true;
+        metadataPreserved = withBufferDirectoryLease(bufsDir, () => {
+          if (!ownsExternalBufferGroup()) return false;
+          fs.writeFileSync(metaFile, JSON.stringify({
+            id,
+            generation: bufferGeneration,
+            kind,
+            role,
+            command: [command, ...commandArgs].join(' '),
+            cwd,
+            pid: child.pid,
+            ...(childIdentity ? { child_identity: childIdentity } : {}),
+            startup_failed: true,
+            termination_unconfirmed: true,
+            error: reason,
+            cols,
+            rows
+          }));
+          return true;
+        });
+        ownedFailureRecord = metadataPreserved;
       } catch {}
     } else {
-      for (const file of [outFile, inFile, resizeFile, metaFile]) {
-        try { fs.rmSync(file, { force: true }); } catch {}
-      }
+      try {
+        ownedFailureRecord = removeOwnedExternalBufferGroup();
+      } catch {}
     }
-    const failedDb = connect(ctx);
-    try {
-      if (disposition.preserveEvidence) {
-        failedDb.prepare(`
-          UPDATE peers
-          SET status = ?, last_seen_at = ?, pid = ?, pid_start_token = ?, pid_command_hash = ?
-          WHERE id = ?
-        `).run(
-          disposition.status,
-          now(),
-          child.pid,
-          childIdentity?.startToken || null,
-          childIdentity?.commandHash || null,
-          id
-        );
-      } else {
-        failedDb.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?')
-          .run(disposition.status, now(), id);
+    if (ownedFailureRecord) {
+      const failedDb = connect(ctx);
+      try {
+        const mutation = disposition.preserveEvidence
+          ? failedDb.prepare(`
+              UPDATE peers
+              SET status = ?, last_seen_at = ?, pid = ?, pid_start_token = ?, pid_command_hash = ?
+              WHERE id = ? AND pid = ?
+            `).run(
+              disposition.status,
+              now(),
+              child.pid,
+              childIdentity?.startToken || null,
+              childIdentity?.commandHash || null,
+              id,
+              process.pid
+            )
+          : failedDb.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ? AND pid = ?')
+            .run(disposition.status, now(), id, process.pid);
+        if (Number(mutation.changes || 0) > 0) {
+          addEvent(failedDb, disposition.eventType, id, null, auditPayload({
+            actor: id,
+            target: id,
+            startup: true,
+            error: reason,
+            childTerminationConfirmed: termination.exited,
+            childPid: child.pid,
+            childIdentity,
+            metadataPreserved,
+            ...(termination.event || {})
+          }));
+        }
+      } finally {
+        failedDb.close();
       }
-      addEvent(failedDb, disposition.eventType, id, null, auditPayload({
-        actor: id,
-        target: id,
-        startup: true,
-        error: reason,
-        childTerminationConfirmed: termination.exited,
-        childPid: child.pid,
-        childIdentity,
-        metadataPreserved,
-        ...(termination.event || {})
-      }));
-    } finally {
-      failedDb.close();
     }
     const signal = ptyTerminationSignal(wrapperTermination.signal, null);
     wrapperTermination.dispose();
     if (signal) process.kill(process.pid, signal);
     throw new CliError('PROCESS_START_FAILED', `Process identity could not be recorded (${reason}): ${command}`);
   };
+
+  try {
+    withBufferDirectoryLease(bufsDir, () => {
+      if (!ownsExternalBufferGroup()) {
+        throw new CliError('EXTERNAL_SESSION_SUPERSEDED', `External session ${id} was replaced during startup`);
+      }
+      outFd = fs.openSync(outFile, 'w');
+    });
+  } catch (error) {
+    await failStartup(error?.code || 'external_buffer_open_failed');
+  }
+  child.onData((data) => {
+    process.stdout.write(data);
+    try { fs.write(outFd, data, () => {}); } catch {}
+  });
 
   // Capture immutable process evidence before publishing the session. The
   // exit listener above is installed synchronously so a short-lived PTY cannot
@@ -6533,21 +6703,28 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
   if (childExit.event !== null) {
     await failStartup('child_exited_before_identity', childIdentity);
   }
-  const writeExternalMeta = (metaCols, metaRows) => fs.writeFileSync(metaFile, JSON.stringify({
-    id,
-    kind,
-    role,
-    command: [command, ...commandArgs].join(' '),
-    cwd,
-    pid: child.pid,
-    wrapper_pid: process.pid,
-    ...(childIdentity ? { child_identity: childIdentity } : {}),
-    wrapper_identity: wrapperIdentity,
-    cols: metaCols,
-    rows: metaRows
-  }));
+  const writeExternalMeta = (metaCols, metaRows) => withBufferDirectoryLease(bufsDir, () => {
+    if (!ownsExternalBufferGroup()) return false;
+    fs.writeFileSync(metaFile, JSON.stringify({
+      id,
+      generation: bufferGeneration,
+      kind,
+      role,
+      command: [command, ...commandArgs].join(' '),
+      cwd,
+      pid: child.pid,
+      wrapper_pid: process.pid,
+      ...(childIdentity ? { child_identity: childIdentity } : {}),
+      wrapper_identity: wrapperIdentity,
+      cols: metaCols,
+      rows: metaRows
+    }));
+    return true;
+  });
   // Write metadata so hcc web can discover this session
-  writeExternalMeta(cols, rows);
+  if (!writeExternalMeta(cols, rows)) {
+    await failStartup('external_buffer_owner_changed', childIdentity);
+  }
 
   // Poll for browser input (written to .in file by hcc web)
   let inOffset = 0;
@@ -6612,22 +6789,29 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     try { process.stdin.setRawMode(false); } catch {}
   }
   try { fs.closeSync(outFd); } catch {}
-  // Clean up buffer files
-  try { fs.unlinkSync(outFile); } catch {}
-  try { fs.unlinkSync(inFile); } catch {}
-  try { fs.unlinkSync(resizeFile); } catch {}
-  try { fs.unlinkSync(metaFile); } catch {}
-
-  const db2 = connect(ctx);
+  // Clean up only the generation this producer published. A replacement with
+  // the same peer id owns its own files and DB status.
+  let removedOwnedBufferGroup = false;
   try {
-    db2.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
-    addEvent(db2, 'run.session.exited', id, null, auditPayload({
-      actor: id,
-      target: id,
-      ...exitCode
-    }));
-  } finally {
-    db2.close();
+    removedOwnedBufferGroup = removeOwnedExternalBufferGroup();
+  } catch {}
+
+  if (removedOwnedBufferGroup) {
+    const db2 = connect(ctx);
+    try {
+      const mutation = db2.prepare(
+        'UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ? AND pid = ?'
+      ).run('exited', now(), id, process.pid);
+      if (Number(mutation.changes || 0) > 0) {
+        addEvent(db2, 'run.session.exited', id, null, auditPayload({
+          actor: id,
+          target: id,
+          ...exitCode
+        }));
+      }
+    } finally {
+      db2.close();
+    }
   }
 
   const signal = ptyTerminationSignal(wrapperTermination.signal, exitCode.signal);
@@ -8039,6 +8223,7 @@ function runGc(ctx, db, {
   dryRun = false,
   scope = 'full',
   protectedBufFiles = null,
+  collectBufferEvidenceNow = null,
   bufferCutoffMs = null,
   skipBufferFiles = false,
   history = false,
@@ -8053,6 +8238,9 @@ function runGc(ctx, db, {
     ? bufferCutoffMs
     : gcNow * 1000 - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
   const bufferRetentionSec = (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400;
+  const preparedBufferEvidence = !skipBufferFiles && collectBufferEvidenceNow
+    ? collectBufferEvidenceNow()
+    : null;
   const bufferGcCutoffs = bufferDirectoryPaths(bufferDirectory(ctx)).flatMap((file) => {
     try {
       const stat = fs.lstatSync(file);
@@ -8061,6 +8249,7 @@ function runGc(ctx, db, {
       return [];
     }
   });
+  bufferGcCutoffs.push(...(preparedBufferEvidence?.gcCutoffs || []));
   const historySnapshot = createHistoryGcSnapshot(db, gcNow - retentionSec, {
     categories: historyCategories,
     retentionSec
@@ -8074,7 +8263,10 @@ function runGc(ctx, db, {
       auto,
       applyHistory,
       protectedBufFiles,
+      collectBufferEvidenceNow,
+      preparedBufferEvidence,
       bufferCutoffMs: fixedBufferCutoffMs,
+      bufferRetentionSec,
       skipBufferFiles,
       bufferGcCutoffs,
       historyCategories,
@@ -8091,7 +8283,10 @@ function runGcWithHistorySnapshot(ctx, db, {
   auto,
   applyHistory,
   protectedBufFiles,
+  collectBufferEvidenceNow,
+  preparedBufferEvidence,
   bufferCutoffMs,
+  bufferRetentionSec,
   skipBufferFiles,
   bufferGcCutoffs,
   historyCategories,
@@ -8158,11 +8353,38 @@ function runGcWithHistorySnapshot(ctx, db, {
     : gcNow * 1000 - (auto ? Math.min(olderThanDays, 7) : olderThanDays) * 86400000;
   const bufsDir = path.join(ctx.root, '.hello-cc', BUFS_DIR_NAME);
   if (!graceActive && !skipBufferFiles) {
-    const bufferResult = pruneBufferFiles({
-      directories: [bufsDir],
-      cutoffMs: bufCutoffMs,
-      protectedPaths: protectedBuffers,
-      dryRun
+    const bufferResult = withBufferDirectoryLease(bufsDir, () => {
+      const currentEvidence = collectBufferEvidenceNow
+        ? collectBufferEvidenceNow()
+        : preparedBufferEvidence || { protectedPaths: protectedBuffers, unknownPaths: new Set(), gcCutoffs: [] };
+      const currentPlan = planBufferFiles({
+        directories: [bufsDir],
+        cutoffMs: bufCutoffMs,
+        protectedPaths: currentEvidence.protectedPaths,
+        unknownPaths: currentEvidence.unknownPaths,
+        evidenceGcCutoffs: [
+          ...(preparedBufferEvidence?.gcCutoffs || []),
+          ...(currentEvidence.gcCutoffs || [])
+        ]
+      });
+      const currentObservedAt = now();
+      const currentObservation = tx(db, () => observeClockSafetyInTransaction(db, {
+        operation: 'gc',
+        gcCutoffs: bufferPlanGcCutoffs(currentPlan, bufferRetentionSec),
+        nowSec: currentObservedAt
+      }));
+      if (clockGraceSuppressed(currentObservedAt, currentObservation.graceUntil)) {
+        databaseGraceActive = true;
+        return deferBufferPlan(currentPlan);
+      }
+      if (dryRun) {
+        return {
+          deleted: currentPlan.deleteEntries.length,
+          protected: currentPlan.protectedEntries.length,
+          deferred: currentPlan.unknownEntries.length
+        };
+      }
+      return applyBufferPlan(currentPlan);
     });
     results.buf_files = bufferResult.deleted;
     results.protected_buf_files = bufferResult.protected;
@@ -8298,84 +8520,32 @@ function deferEligibleBufferFiles(directory, cutoffMs) {
   });
 }
 
-function externalBufferEvidence(meta) {
-  const processes = [];
-  const wrapperPid = meta?.wrapper_pid || meta?.wrapperPid || null;
-  const childPid = meta?.pid || null;
-  if (wrapperPid) processes.push({
-    name: 'wrapper',
-    storedIdentity: meta?.wrapper_identity || meta?.wrapperIdentity || null,
-    current: inspectProcessIdentity(wrapperPid)
+function localBufferEvidence(ctx, db, directory, unknownTracker = null, candidatePaths = null) {
+  return collectBufferEvidence({
+    directories: [directory],
+    projectDbs: [{ ctx, db }],
+    observePeer: observePeerEvidence,
+    unknownTracker,
+    candidatePaths
   });
-  if (childPid) processes.push({
-    name: 'child',
-    storedIdentity: meta?.child_identity || meta?.childIdentity || null,
-    current: inspectProcessIdentity(childPid)
-  });
-  return resolvePeerEvidence({ peer: { status: 'running' }, processes });
-}
-
-function addExternalBufferGroup(target, directory, id) {
-  for (const suffix of ['out', 'in', 'resize', 'meta']) {
-    target.add(path.resolve(directory, `${id}.${suffix}`));
-  }
-}
-
-function localBufferEvidence(ctx, db, directory) {
-  const protectedPaths = new Set();
-  const unknownPaths = new Set();
-
-  for (const file of bufferDirectoryPaths(directory)) {
-    if (!file.endsWith('.meta')) continue;
-    const id = path.basename(file, '.meta');
-    let meta;
-    try {
-      const stat = fs.lstatSync(file);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('metadata is not a regular file');
-      meta = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-      addExternalBufferGroup(unknownPaths, directory, id);
-      continue;
-    }
-    const evidence = externalBufferEvidence(meta);
-    if (evidence.state === 'live') addExternalBufferGroup(protectedPaths, directory, id);
-    else if (evidence.state === 'unknown') addExternalBufferGroup(unknownPaths, directory, id);
-  }
-
-  const tmuxPaths = new Set();
-  const rows = db.prepare(`
-    SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
-           b.transport, b.runtime_session_id, b.runtime_target
-    FROM peer_bindings b
-    JOIN peers p ON p.id = b.peer
-    WHERE b.transport = 'tmux' AND b.runtime_target IS NOT NULL
-  `).all();
-  for (const row of rows) {
-    const evidence = observePeerEvidence(ctx, row, row);
-    const safePane = String(row.runtime_target || '').replace(/[^a-zA-Z0-9_-]/g, '');
-    const runtimeIds = new Set([row.runtime_session_id, row.id].filter(Boolean));
-    for (const runtimeId of runtimeIds) {
-      const safeId = String(runtimeId).replace(/[^a-zA-Z0-9_-]/g, '');
-      if (!safePane || !safeId) continue;
-      const file = path.resolve(directory, `tmux-${safePane}-${safeId}.pipe`);
-      tmuxPaths.add(file);
-      if (evidence.state === 'live') protectedPaths.add(file);
-      else if (evidence.state === 'unknown') unknownPaths.add(file);
-    }
-  }
-
-  // A FIFO without a DB identity cannot be proven orphaned. Preserve it as
-  // unknown; exact dead DB/tmux evidence above is the only path to deletion.
-  for (const file of bufferDirectoryPaths(directory)) {
-    if (file.endsWith('.pipe') && !tmuxPaths.has(file)) unknownPaths.add(file);
-  }
-  return { protectedPaths, unknownPaths };
 }
 
 function runtimePointerPresent(ctx) {
   return Boolean(process.env.HCC_RUNTIME_URL ||
     fs.existsSync(runtimePath(ctx)) ||
     fs.existsSync(globalRuntimePath()));
+}
+
+function reclaimUnavailableRuntimePointers(ctx, { dryRun = false } = {}) {
+  if (process.env.HCC_RUNTIME_URL) return { allowed: false, gcCutoffs: [] };
+  const gcCutoffs = [];
+  const result = reclaimRuntimePointerFiles([runtimePath(ctx), globalRuntimePath()], {
+    dryRun,
+    onReclaim: ({ gcCutoff }) => {
+      if (Number.isSafeInteger(gcCutoff)) gcCutoffs.push(gcCutoff);
+    }
+  });
+  return { allowed: !result.blocked, gcCutoffs };
 }
 
 function requireBufferGcResult(value) {
@@ -8420,10 +8590,17 @@ function deferredPreparedBufferGc(prepared, graceActive = false) {
 
 async function prepareManualBufferGc(ctx, db, { retentionSec, dryRun }) {
   const directory = bufferDirectory(ctx);
+  const unknownTracker = new Map();
+  const pointerGcCutoffs = [];
+  const recoverRuntimePointers = () => {
+    const recovery = reclaimUnavailableRuntimePointers(ctx, { dryRun });
+    pointerGcCutoffs.push(...recovery.gcCutoffs);
+    return recovery.allowed;
+  };
   const pointerPresent = runtimePointerPresent(ctx);
   let runtime = null;
   try { runtime = readRuntime(ctx); } catch (error) {
-    if (pointerPresent) {
+    if (pointerPresent && !recoverRuntimePointers()) {
       const observedAt = now();
       const cutoffMs = observedAt * 1000 - retentionSec * 1000;
       const deferred = requireBufferGcResult(deferEligibleBufferFiles(directory, cutoffMs));
@@ -8447,32 +8624,39 @@ async function prepareManualBufferGc(ctx, db, { retentionSec, dryRun }) {
       };
     } catch (error) {
       if (runtimeBufferGcUnavailable(error)) {
-        const observedAt = now();
-        const cutoffMs = observedAt * 1000 - retentionSec * 1000;
-        const deferred = requireBufferGcResult(deferEligibleBufferFiles(directory, cutoffMs));
-        return { mode: 'unavailable', observedAt, cutoffMs, retentionSec, gcCutoffs: [], token: null, ...deferred };
+        if (!recoverRuntimePointers()) {
+          const observedAt = now();
+          const cutoffMs = observedAt * 1000 - retentionSec * 1000;
+          const deferred = requireBufferGcResult(deferEligibleBufferFiles(directory, cutoffMs));
+          return { mode: 'unavailable', observedAt, cutoffMs, retentionSec, gcCutoffs: [], token: null, ...deferred };
+        }
+        runtime = null;
+      } else {
+        throw error;
       }
-      throw error;
     }
   }
 
   const observedAt = now();
   const cutoffMs = observedAt * 1000 - retentionSec * 1000;
-  const { protectedPaths, unknownPaths } = localBufferEvidence(ctx, db, directory);
+  const { protectedPaths, unknownPaths, gcCutoffs } = localBufferEvidence(ctx, db, directory, unknownTracker);
   const plan = planBufferFiles({
     directories: [directory],
     cutoffMs,
     protectedPaths,
-    unknownPaths
+    unknownPaths,
+    evidenceGcCutoffs: gcCutoffs
   });
   return {
     mode: 'local',
     observedAt,
     cutoffMs,
     retentionSec,
-    gcCutoffs: bufferPlanGcCutoffs(plan, retentionSec),
+    gcCutoffs: [...bufferPlanGcCutoffs(plan, retentionSec), ...pointerGcCutoffs],
     token: null,
     plan,
+    directory,
+    unknownTracker,
     deleted: plan.deleteEntries.length,
     protected: plan.protectedEntries.length,
     deferred: plan.unknownEntries.length
@@ -8492,7 +8676,14 @@ async function applyManualBufferGc(ctx, db, prepared, { dryRun, graceActive }) {
       return applyClockSafeBufferPlan({
         db,
         plan: prepared.plan,
-        retentionSec: prepared.retentionSec
+        retentionSec: prepared.retentionSec,
+        collectEvidence: ({ entries }) => localBufferEvidence(
+          ctx,
+          db,
+          prepared.directory,
+          prepared.unknownTracker,
+          entries.map((entry) => entry.path)
+        )
       });
     } catch (error) {
       if (error instanceof CliError) throw error;
