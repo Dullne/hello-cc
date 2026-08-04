@@ -1503,6 +1503,28 @@ async function waitRuntime() {
   }, 'runtime');
 }
 
+function assertHtmlCsp(response, html, label) {
+  const policy = response.headers.get('content-security-policy') || '';
+  const nonce = policy.match(/script-src[^;]*'nonce-([^']+)'/)?.[1] || '';
+  const expected = nonce
+    ? "default-src 'self'; " +
+      `script-src 'self' 'nonce-${nonce}'; ` +
+      "style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data:; " +
+      "connect-src 'self' ws: wss:; " +
+      "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    : '';
+  if (!nonce || policy !== expected) {
+    fail(`${label} missing complete nonce CSP: ${policy || '(missing)'}`);
+  }
+  const inlineScripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
+    .filter((match) => !/\bsrc\s*=/.test(match[1]));
+  if (!inlineScripts.length || inlineScripts.some((match) => !match[1].includes(`nonce="${nonce}"`))) {
+    fail(`${label} has an inline script without the response nonce`);
+  }
+  return nonce;
+}
+
 function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -2439,6 +2461,109 @@ async function cookieSessionExpiryWorkflow() {
   }
 }
 
+async function webSecretRedactionWorkflow() {
+  const secretParts = [
+    `HCC_REDACTION_SECRET_${testId}`,
+    crypto.randomBytes(12).toString('hex')
+  ];
+  const secret = secretParts.join(' ');
+  const sessionId = `redaction-session-${testId}`;
+  let terminalWs = null;
+  const output = hcc([
+    'web', '--local', '--port', String(port), '--token', secret,
+    '--no-discover', '--no-guidance'
+  ]);
+  const match = output.match(/^pid:\s*(\d+)/m);
+  if (!match) fail(`redaction web did not print background pid`);
+  runtimePid = Number.parseInt(match[1], 10);
+
+  try {
+    await waitRuntime();
+    const runtime = currentRuntime();
+    if (runtime.token !== secret) fail('redaction web did not use its explicit test token');
+
+    const login = await fetch(new URL('/login', runtime.base_url), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: secret }),
+      redirect: 'manual'
+    });
+    const sid = (login.headers.get('set-cookie') || '').match(/hcc_sid=([^;]+)/)?.[1] || '';
+    if (login.status !== 302 || !sid) fail(`redaction login failed with status ${login.status}`);
+
+    const create = await runtimeFetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: sessionId,
+        kind: 'shell',
+        backend: 'pty',
+        command: 'bash --noprofile --norc',
+        env: { HOME: home, PATH: env.PATH, SHELL: '/bin/bash' }
+      })
+    }, { root });
+    if (!create.ok) fail(`redaction PTY create failed with status ${create.status}`);
+    terminalWs = await openCookieTerminalWebSocket(sessionId, sid, { root });
+    terminalWs.send(JSON.stringify({ type: 'resize', cols: 90, rows: 28 }));
+
+    const badProject = await fetch(new URL(`/api/projects?token=${encodeURIComponent(secret)}`, runtime.base_url), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json',
+        'X-HCC-API-Version': '2'
+      },
+      body: JSON.stringify({ root: path.join(os.tmpdir(), `missing-${secret}`) })
+    });
+    if (badProject.status < 400) fail(`redaction error request unexpectedly returned ${badProject.status}`);
+
+    const invalidCookie = await fetch(new URL('/api/runtime', runtime.base_url), {
+      headers: {
+        Cookie: `hcc_sid=${secret}`,
+        'X-HCC-API-Version': '2'
+      }
+    });
+    if (invalidCookie.status !== 401) fail(`redaction invalid-cookie request returned ${invalidCookie.status}`);
+
+    const errorUrl = new URL('/ws/terminal/%', runtime.base_url);
+    errorUrl.protocol = 'ws:';
+    errorUrl.searchParams.set('api_version', '2');
+    errorUrl.searchParams.set('token', secret);
+    await new Promise((resolve) => {
+      const ws = new WebSocket(errorUrl, {
+        headers: { Authorization: `Bearer ${secret}` }
+      });
+      const timer = setTimeout(() => {
+        try { ws.terminate(); } catch {}
+        resolve();
+      }, 2000);
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      ws.once('error', done);
+      ws.once('close', done);
+    });
+  } finally {
+    if (terminalWs && terminalWs.readyState !== WebSocket.CLOSED) {
+      try { terminalWs.terminate(); } catch {}
+    }
+    try {
+      await runtimeFetch(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: 'POST' }, { root });
+    } catch {}
+    await stopRuntime();
+  }
+
+  const logFile = path.join(root, '.hello-cc', 'web.log');
+  const logs = [logFile, `${logFile}.1`]
+    .filter((file) => fs.existsSync(file))
+    .map((file) => fs.readFileSync(file, 'utf8'))
+    .join('\n');
+  if (secretParts.some((part) => logs.includes(part))) {
+    fail('Web startup or error logs retained part of the unique redaction secret');
+  }
+}
+
 async function assertWebWrapperParentSurvives() {
   const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-wrapper-root-${testId}-`));
   const wrapperPort = port + 101;
@@ -2711,6 +2836,19 @@ async function setupRegression() {
     const publicResponse = await fetch(new URL(publicPath, tokenRuntime.base_url));
     if (publicResponse.status === 426) fail(`public route unexpectedly required Runtime API v2: ${publicPath}`);
   }
+  const indexCspResponse = await fetch(new URL('/', tokenRuntime.base_url));
+  const indexCspHtml = await indexCspResponse.text();
+  const firstIndexNonce = assertHtmlCsp(indexCspResponse, indexCspHtml, 'web index');
+  const secondIndexCspResponse = await fetch(new URL('/', tokenRuntime.base_url));
+  const secondIndexCspHtml = await secondIndexCspResponse.text();
+  const secondIndexNonce = assertHtmlCsp(secondIndexCspResponse, secondIndexCspHtml, 'second web index');
+  if (firstIndexNonce === secondIndexNonce) fail('web index reused its CSP nonce across responses');
+
+  const loginCspResponse = await fetch(new URL('/', tokenRuntime.base_url), {
+    headers: { Accept: 'text/html' }
+  });
+  const loginCspHtml = await loginCspResponse.text();
+  assertHtmlCsp(loginCspResponse, loginCspHtml, 'web login');
   const wsProbe = new URL('/ws/terminal/api-version-probe', tokenRuntime.base_url);
   wsProbe.protocol = wsProbe.protocol === 'https:' ? 'wss:' : 'ws:';
   if (await websocketUpgradeStatus(wsProbe) !== 426) {
@@ -8432,7 +8570,7 @@ async function syntaxAndHelp() {
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
   };
-  const html = webUiTemplate.webIndexHtml();
+  const html = webUiTemplate.webIndexHtml({ nonce: 'regression-template-nonce' });
   if (!html.includes('<!doctype html>') ||
       !html.includes('<div class="app">') ||
       !html.includes('<script src="/assets/xterm.js"></script>')) {
@@ -10073,6 +10211,7 @@ async function main() {
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
 
   await setupRegression();
+  await webSecretRedactionWorkflow();
   await cookieSessionExpiryWorkflow();
   log('[2/13] runtime');
   startRuntime();

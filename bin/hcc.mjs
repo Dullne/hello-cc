@@ -13,6 +13,7 @@ import { URL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { CliError } from '../lib/shared/errors.mjs';
 import { publicCliFailure } from '../lib/shared/errors.mjs';
+import { redactCliArgs, redactSecrets } from '../lib/shared/redact.mjs';
 import {
   CLOCK_GRACE_SEC,
   classifyClockDrift,
@@ -680,6 +681,13 @@ function iso(ts) {
   return new Date(ts * 1000).toISOString();
 }
 
+function redactedLogText(value) {
+  const redacted = redactSecrets(value);
+  if (typeof redacted === 'string') return redacted;
+  const serialized = JSON.stringify(redacted);
+  return serialized === undefined ? String(redacted) : serialized;
+}
+
 function isLoopbackRemote(req) {
   const address = req?.socket?.remoteAddress || '';
   return address === '::1' || address.startsWith('127.') || address.startsWith('::ffff:127.');
@@ -723,17 +731,22 @@ function requestOriginMatches(req, options = {}) {
   }
 }
 
-function renderWebIndex() {
-  return webUiTemplate.webIndexHtml();
+function renderWebIndex(nonce) {
+  return webUiTemplate.webIndexHtml({ nonce });
 }
 
-function renderWebLogin() {
-  if (typeof webUiTemplate.webLoginPage === 'function') return webUiTemplate.webLoginPage();
+function renderWebLogin(nonce) {
+  if (typeof webUiTemplate.webLoginPage === 'function') return webUiTemplate.webLoginPage({ nonce });
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hello-cc - sign in</title></head><body>
 <main><h1>hello-cc</h1><form action="/" method="get"><label>Access token <input name="token" type="password" required></label><button type="submit">Sign in</button></form></main>
 </body></html>`;
+}
+
+function sendWebHtml(res, render) {
+  const nonce = randomBytes(18).toString('base64url');
+  sendHttp(res, 200, 'text/html; charset=utf-8', render(nonce), { nonce });
 }
 
 function webErrorStatus(err) {
@@ -834,7 +847,7 @@ function migrateRegisteredProjectDbs(ctx) {
       } catch (err) {
         // A corrupt or busy sibling project DB must not fail commands or crash
         // the shared runtime for unrelated projects. Skip it and keep going.
-        console.error(`[${new Date().toISOString()}] skipping registered project DB migration for ${dbPath}: ${err?.message || err}`);
+        console.error(redactedLogText(`[${new Date().toISOString()}] skipping registered project DB migration for ${dbPath}: ${err?.message || err}`));
         continue;
       } finally {
         try { db?.close(); } catch {}
@@ -2640,7 +2653,7 @@ async function startWebBackground(ctx, args) {
   validateWebTokenOpts(opts);
   const requestedHost = expectedWebHost(opts);
   assertWebTokenForHost(requestedHost, !opts['no-token']);
-  if (!isLoopbackHost(requestedHost)) console.error(webExposureWarning(requestedHost, intOpt(opts, 'port', 8787)) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.'));
+  if (!isLoopbackHost(requestedHost)) console.error(redactedLogText(webExposureWarning(requestedHost, intOpt(opts, 'port', 8787)) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.')));
   ensureTmuxAvailable({ autoInstall: true });
   const setup = await prepareLocalBus(ctx, {
     ...opts,
@@ -2695,7 +2708,8 @@ async function startWebBackground(ctx, args) {
       try { fs.renameSync(logFile, `${logFile}.1`); } catch {}
     }
   } catch {}
-  fs.appendFileSync(logFile, `\n[${new Date().toISOString()}] ${CLI_NAME} web ${args.join(' ')}\n`, { mode: 0o600 });
+  const redactedStart = redactedLogText(`${CLI_NAME} web ${redactCliArgs(args).join(' ')}`);
+  fs.appendFileSync(logFile, `\n[${new Date().toISOString()}] ${redactedStart}\n`, { mode: 0o600 });
   // The runtime echoes token-bearing URLs into web.log; keep it owner-only so a
   // co-tenant on the machine cannot read the token (net-02).
   try { fs.chmodSync(logFile, 0o600); } catch {}
@@ -2743,7 +2757,7 @@ async function waitForStartedRuntime(ctx, child, logFile) {
     const runtime = await readHealthyGlobalRuntime();
     if (runtime) return runtime;
     if (exitInfo) {
-      const detail = tailFile(logFile);
+      const detail = redactedLogText(tailFile(logFile));
       throw new CliError('RUNTIME_START_FAILED',
         `${PRODUCT_NAME} runtime exited before it became healthy` +
         ` (code=${exitInfo.code ?? ''}${exitInfo.signal ? ` signal=${exitInfo.signal}` : ''}).` +
@@ -2757,7 +2771,7 @@ async function waitForStartedRuntime(ctx, child, logFile) {
     if (process.platform === 'win32') process.kill(child.pid, 'SIGTERM');
     else process.kill(-child.pid, 'SIGTERM');
   } catch {}
-  const detail = tailFile(logFile);
+  const detail = redactedLogText(tailFile(logFile));
   throw new CliError('RUNTIME_START_TIMEOUT',
     `${PRODUCT_NAME} runtime did not become healthy within 15s.` +
     `${detail ? `\n\nLast log lines:\n${detail}` : ''}`,
@@ -2828,7 +2842,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const port = intOpt(opts, 'port', 8787);
   const token = makeWebToken(opts);
   assertWebTokenForHost(host, Boolean(token));
-  if (!isLoopbackHost(host)) console.error(webExposureWarning(host, port) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.'));
+  if (!isLoopbackHost(host)) console.error(redactedLogText(webExposureWarning(host, port) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.')));
   const useTls = Boolean(opts.tls);
   const trustProxy = Boolean(opts['trust-proxy']);
   const tlsCredentials = useTls ? ensureSelfSignedCert([host]) : null;
@@ -3237,7 +3251,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     // uncaught exception (e.g. inotify limits, bufsDir removed) — keep it
     // contained so the shared runtime survives.
     bufsWatcher.on('error', (err) => {
-      console.error(`[${new Date().toISOString()}] bufs watcher error: ${err?.message || err}`);
+      console.error(redactedLogText(`[${new Date().toISOString()}] bufs watcher error: ${err?.message || err}`));
     });
   } catch {}
 
@@ -3389,7 +3403,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         } catch {}
       }
     } catch (err) {
-      console.error(`[${new Date().toISOString()}] auto-attach scan failed: ${err?.message || err}`);
+      console.error(redactedLogText(`[${new Date().toISOString()}] auto-attach scan failed: ${err?.message || err}`));
     } finally {
       try { db?.close(); } catch {}
       autoAttachScanInFlight = false;
@@ -3418,7 +3432,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     lastClockProbe = current;
     const jump = classifyClockDrift({ wallDeltaMs, monotonicDeltaMs });
     if (jump) {
-      console.error(`[${new Date().toISOString()}] wall-clock ${jump.kind} drift detected (${jump.driftMs >= 0 ? '+' : ''}${Math.round(jump.driftMs / 1000)}s); evaluating ownership evidence with a ${CLOCK_GRACE_SEC}s unknown-evidence grace window`);
+      console.error(redactedLogText(`[${new Date().toISOString()}] wall-clock ${jump.kind} drift detected (${jump.driftMs >= 0 ? '+' : ''}${Math.round(jump.driftMs / 1000)}s); evaluating ownership evidence with a ${CLOCK_GRACE_SEC}s unknown-evidence grace window`));
     }
     return jump;
   }
@@ -3500,7 +3514,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             });
           }
         } catch (err) {
-          console.error(`[${new Date().toISOString()}] liveness reaper failed for ${projectCtx.root}: ${err?.message || err}`);
+          console.error(redactedLogText(`[${new Date().toISOString()}] liveness reaper failed for ${projectCtx.root}: ${err?.message || err}`));
         } finally {
           try { db?.close(); } catch {}
         }
@@ -3616,7 +3630,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get(); } catch {}
           }
         } catch (err) {
-          console.error(`[${new Date().toISOString()}] auto-gc failed for ${projectCtx.root}: ${err?.message || err}`);
+          console.error(redactedLogText(`[${new Date().toISOString()}] auto-gc failed for ${projectCtx.root}: ${err?.message || err}`));
         } finally {
           try { db?.close(); } catch {}
         }
@@ -5356,10 +5370,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         // Browser navigation with no credential at all → login page (bare-URL
         // fallback, e.g. a bookmarked URL after the runtime restarted).
         if (isBrowserNav && !hasCookie && !queryToken && token) {
-          sendHttp(res, 200, 'text/html; charset=utf-8', renderWebLogin());
+          sendWebHtml(res, renderWebLogin);
           return;
         }
-        sendHttp(res, 200, 'text/html; charset=utf-8', renderWebIndex());
+        sendWebHtml(res, renderWebIndex);
         return;
       }
       if (req.method === 'GET' && url.pathname === '/assets/xterm.js') {
@@ -5909,7 +5923,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       });
     });
     } catch (err) {
-      console.error(`[${new Date().toISOString()}] ws upgrade failed: ${err?.message || err}`);
+      console.error(redactedLogText(`[${new Date().toISOString()}] ws upgrade failed: ${err?.message || err}`));
       try { socket.destroy(); } catch {}
     }
   });
@@ -6017,11 +6031,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // that serves every project. Fatal signals still route through shutdown().
   process.on('uncaughtException', (err) => {
     if (shuttingDown) return;
-    console.error(`[${new Date().toISOString()}] uncaughtException in web runtime (kept alive): ${err?.stack || err}`);
+    console.error(redactedLogText(`[${new Date().toISOString()}] uncaughtException in web runtime (kept alive): ${err?.stack || err}`));
   });
   process.on('unhandledRejection', (reason) => {
     if (shuttingDown) return;
-    console.error(`[${new Date().toISOString()}] unhandledRejection in web runtime (kept alive): ${reason?.stack || reason}`);
+    console.error(redactedLogText(`[${new Date().toISOString()}] unhandledRejection in web runtime (kept alive): ${reason?.stack || reason}`));
   });
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
@@ -6060,10 +6074,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   } finally {
     db.close();
   }
-  console.log(`${PRODUCT_NAME} web listening on ${host}:${actualPort}`);
-  console.log(`project: ${ctx.root}`);
-  console.log(`database: ${ctx.dbPath}`);
-  console.log(`open: ${publicRuntimeUrl(runtime, ctx.root)}`);
+  console.log(redactedLogText(`${PRODUCT_NAME} web listening on ${host}:${actualPort}`));
+  console.log(redactedLogText(`project: ${ctx.root}`));
+  console.log(redactedLogText(`database: ${ctx.dbPath}`));
+  console.log(redactedLogText(`open: ${publicRuntimeUrl(runtime, ctx.root)}`));
 }
 
 async function cmdRun(ctx, args) {
@@ -6116,7 +6130,7 @@ async function cmdRun(ctx, args) {
   } finally {
     db.close();
   }
-  console.error(`${CLI_NAME}: running ${id} (${kind}, ${role}) -> ${command} ${commandArgs.join(' ')}`.trim());
+  console.error(redactedLogText(`${CLI_NAME}: running ${id} (${kind}, ${role}) -> ${command} ${commandArgs.join(' ')}`.trim()));
   const child = spawn(command, commandArgs, {
     cwd,
     stdio: 'inherit',
@@ -6125,7 +6139,7 @@ async function cmdRun(ctx, args) {
   const exitCode = await new Promise((resolve) => {
     child.on('exit', (code, signal) => resolve({ code, signal }));
     child.on('error', (err) => {
-      console.error(`${CLI_NAME}: failed to start ${command}: ${err.message}`);
+      console.error(redactedLogText(`${CLI_NAME}: failed to start ${command}: ${err.message}`));
       resolve({ code: 127, signal: null });
     });
   });
@@ -8570,15 +8584,15 @@ async function main() {
     if (publicFailure) {
       const publicError = publicFailure.error;
       if (ctx.json) {
-        console.error(formatJson(false, {
+        console.error(formatJson(false, redactSecrets({
           code: publicError.code,
           message: publicError.message,
           ...publicError.extra,
           ...(publicFailure.cleanupFailed ? { cleanup_failed: true } : {})
-        }));
+        })));
       } else {
-        console.error(`${CLI_NAME}: ${publicError.message}`);
-        if (Object.keys(publicError.extra).length) console.error(JSON.stringify(publicError.extra));
+        console.error(redactedLogText(`${CLI_NAME}: ${publicError.message}`));
+        if (Object.keys(publicError.extra).length) console.error(redactedLogText(publicError.extra));
         if (publicFailure.cleanupFailed) {
           console.error(`${CLI_NAME}: an additional internal cleanup failed`);
         }

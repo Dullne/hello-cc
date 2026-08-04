@@ -82,7 +82,7 @@ test('forces one Runtime API v2 header regardless of caller casing', () => {
 });
 
 test('browser API and terminal WebSocket clients advertise Runtime API v2', () => {
-  const html = webIndexHtml();
+  const html = webIndexHtml({ nonce: 'test-api-version-nonce' });
   assert.match(html, /'X-HCC-API-Version': String\(runtimeApiVersion\)/);
   assert.match(html, /requestQuery\(\{ api_version: runtimeApiVersion \}\)/);
 });

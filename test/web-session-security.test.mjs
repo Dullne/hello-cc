@@ -36,7 +36,7 @@ test('one shared constant-time comparator protects action tokens', async () => {
 });
 
 test('browser receives action tokens only from snapshots and sends them on input', () => {
-  const html = webIndexHtml();
+  const html = webIndexHtml({ nonce: 'test-session-nonce' });
   assert.match(html, /const sessionActionTokens = new Map\(\);/);
   assert.match(html, /sessionActionTokens\.set\(id, msg\.action_token\)/);
   assert.match(html, /type: 'input', data, action_token: sessionActionTokens\.get\(active\) \|\| ''/);
@@ -45,7 +45,7 @@ test('browser receives action tokens only from snapshots and sends them on input
 });
 
 test('browser logout revokes the cookie session', () => {
-  const html = webIndexHtml();
+  const html = webIndexHtml({ nonce: 'test-session-nonce' });
   assert.match(html, /id="logoutBtn"/);
   assert.match(html, /fetch\('\/logout', \{ method: 'POST', headers \}\)/);
 });
