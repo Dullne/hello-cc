@@ -117,7 +117,17 @@ import {
   validateTmuxGcBindingEvidence,
   validateTmuxGcDeadProcessEvidence
 } from '../lib/core/peers/tmux-safety.mjs';
-import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import {
+  inspectProcessIdentity
+} from '../lib/process/identity.mjs';
+import {
+  capturePtyStartupEvidence,
+  installPtyTerminationHandlers,
+  ptyStartupFailureDisposition,
+  ptyTerminationSignal,
+  stopPtyAfterStartupFailure,
+  trackPtyExit
+} from '../lib/process/pty-lifecycle.mjs';
 import {
   parseTaskIds,
   positiveIntOpt,
@@ -6131,8 +6141,102 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     name: 'xterm-256color', cols, rows, cwd,
     env: childSessionEnv({ HCC_PEER: id, HCC_ROOT: ctx.root, HCC_DB: ctx.dbPath, TERM: 'xterm-256color' })
   });
-  const wrapperIdentity = liveProcessIdentity(process.pid);
-  const childIdentity = liveProcessIdentity(child.pid);
+  const childExit = trackPtyExit(child);
+  const wrapperTermination = installPtyTerminationHandlers(child);
+  let outFd = fs.openSync(outFile, 'w');
+  child.onData((data) => {
+    process.stdout.write(data);
+    try { fs.write(outFd, data, () => {}); } catch {}
+  });
+
+  const failStartup = async (reason, childIdentity = null) => {
+    const termination = await stopPtyAfterStartupFailure(child, childExit);
+    const disposition = ptyStartupFailureDisposition({
+      termination,
+      childPid: child.pid,
+      childIdentity
+    });
+    try { fs.closeSync(outFd); } catch {}
+    outFd = null;
+    let metadataPreserved = false;
+    if (disposition.preserveEvidence) {
+      try {
+        fs.writeFileSync(metaFile, JSON.stringify({
+          id,
+          kind,
+          role,
+          command: [command, ...commandArgs].join(' '),
+          cwd,
+          pid: child.pid,
+          ...(childIdentity ? { child_identity: childIdentity } : {}),
+          startup_failed: true,
+          termination_unconfirmed: true,
+          error: reason,
+          cols,
+          rows
+        }));
+        metadataPreserved = true;
+      } catch {}
+    } else {
+      for (const file of [outFile, inFile, resizeFile, metaFile]) {
+        try { fs.rmSync(file, { force: true }); } catch {}
+      }
+    }
+    const failedDb = connect(ctx);
+    try {
+      if (disposition.preserveEvidence) {
+        failedDb.prepare(`
+          UPDATE peers
+          SET status = ?, last_seen_at = ?, pid = ?, pid_start_token = ?, pid_command_hash = ?
+          WHERE id = ?
+        `).run(
+          disposition.status,
+          now(),
+          child.pid,
+          childIdentity?.startToken || null,
+          childIdentity?.commandHash || null,
+          id
+        );
+      } else {
+        failedDb.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?')
+          .run(disposition.status, now(), id);
+      }
+      addEvent(failedDb, disposition.eventType, id, null, auditPayload({
+        actor: id,
+        target: id,
+        startup: true,
+        error: reason,
+        childTerminationConfirmed: termination.exited,
+        childPid: child.pid,
+        childIdentity,
+        metadataPreserved,
+        ...(termination.event || {})
+      }));
+    } finally {
+      failedDb.close();
+    }
+    const signal = ptyTerminationSignal(wrapperTermination.signal, null);
+    wrapperTermination.dispose();
+    if (signal) process.kill(process.pid, signal);
+    throw new CliError('PROCESS_START_FAILED', `Process identity could not be recorded (${reason}): ${command}`);
+  };
+
+  // Capture immutable process evidence before publishing the session. The
+  // exit listener above is installed synchronously so a short-lived PTY cannot
+  // disappear while identity collection is polling under load.
+  const startupEvidence = await capturePtyStartupEvidence({
+    childPid: child.pid,
+    wrapperPid: process.pid,
+    exit: childExit,
+    timeoutMs: 2000
+  });
+  if (startupEvidence.state === 'failed') {
+    await failStartup(startupEvidence.reason, startupEvidence.childIdentity || null);
+  }
+  const { wrapperIdentity, childIdentity } = startupEvidence;
+  if (childExit.event !== null) {
+    await failStartup('child_exited_before_identity', childIdentity);
+  }
   const writeExternalMeta = (metaCols, metaRows) => fs.writeFileSync(metaFile, JSON.stringify({
     id,
     kind,
@@ -6142,37 +6246,12 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     pid: child.pid,
     wrapper_pid: process.pid,
     ...(childIdentity ? { child_identity: childIdentity } : {}),
-    ...(wrapperIdentity ? { wrapper_identity: wrapperIdentity } : {}),
+    wrapper_identity: wrapperIdentity,
     cols: metaCols,
     rows: metaRows
   }));
-  let terminatingSignal = null;
-  let forceKillTimer = null;
-  const onTerminate = (signal) => {
-    terminatingSignal = signal;
-    try { child.kill(signal === 'SIGTERM' ? 'SIGHUP' : signal); } catch {}
-    forceKillTimer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch {}
-    }, 1200);
-    forceKillTimer.unref?.();
-  };
-  const onSigint = () => onTerminate('SIGINT');
-  const onSigterm = () => onTerminate('SIGTERM');
-  process.once('SIGINT', onSigint);
-  process.once('SIGTERM', onSigterm);
-
   // Write metadata so hcc web can discover this session
   writeExternalMeta(cols, rows);
-
-  // Open output file for append
-  let outFd = fs.openSync(outFile, 'w');
-
-  child.onData((data) => {
-    // Forward to local terminal
-    process.stdout.write(data);
-    // Append to shared buffer
-    try { fs.write(outFd, data, () => {}); } catch {}
-  });
 
   // Poll for browser input (written to .in file by hcc web)
   let inOffset = 0;
@@ -6227,15 +6306,11 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     process.stdin.on('data', (data) => child.write(data));
   }
 
-  const exitCode = await new Promise((resolve) => {
-    child.onExit((event) => resolve(event));
-  });
+  const exitCode = await childExit.promise;
 
   clearInterval(inputPoller);
   clearInterval(resizePoller);
-  if (forceKillTimer) clearTimeout(forceKillTimer);
-  process.off('SIGINT', onSigint);
-  process.off('SIGTERM', onSigterm);
+  wrapperTermination.dispose();
   process.stdout.off('resize', onStdoutResize);
   if (process.stdin.isTTY) {
     try { process.stdin.setRawMode(false); } catch {}
@@ -6259,7 +6334,7 @@ async function cmdRunWebManaged(ctx, { id, kind, role, cwd, command, commandArgs
     db2.close();
   }
 
-  const signal = exitCode.signal || terminatingSignal;
+  const signal = ptyTerminationSignal(wrapperTermination.signal, exitCode.signal);
   if (signal) {
     process.kill(process.pid, signal);
   } else {

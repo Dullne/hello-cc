@@ -7,7 +7,8 @@ import {
   compareProcessIdentity,
   inspectProcessIdentity,
   parseLinuxStatStartTicks,
-  parsePsStartIdentity
+  parsePsStartIdentity,
+  waitForLiveProcessIdentity
 } from '../lib/process/identity.mjs';
 
 function linuxStatRow(pid, command, startTicks, state = 'S') {
@@ -206,10 +207,105 @@ test('treats a partial stored fingerprint as unknown', () => {
   assert.equal(compareProcessIdentity(stored, current), 'unknown');
 });
 
-test('rejects a changed valid command hash', () => {
+test('keeps the same process instance live when exec changes its command hash', () => {
   const stored = { pid: 42, startToken: 'boot-a:100', commandHash: 'a'.repeat(64) };
   const current = { pid: 42, startToken: 'boot-a:100', commandHash: 'b'.repeat(64) };
-  assert.equal(compareProcessIdentity(stored, current), 'dead');
+  assert.equal(compareProcessIdentity(stored, current), 'live');
+});
+
+test('waits through unknown observations until a complete process identity is live', async () => {
+  const complete = {
+    pid: 42,
+    startToken: 'boot-a:100',
+    commandHash: 'a'.repeat(64)
+  };
+  const observations = [
+    { state: 'unknown', identity: null },
+    { state: 'unknown', identity: null },
+    { state: 'live', identity: complete }
+  ];
+  const sleeps = [];
+  let monotonicMs = 0;
+
+  const result = await waitForLiveProcessIdentity(42, {
+    timeoutMs: 20,
+    intervalMs: 5,
+    inspect: () => observations.shift(),
+    monotonicNow: () => monotonicMs,
+    sleep: async (delayMs) => {
+      sleeps.push(delayMs);
+      monotonicMs += delayMs;
+    }
+  });
+
+  assert.deepEqual(result, { state: 'live', identity: complete });
+  assert.deepEqual(sleeps, [5, 5]);
+});
+
+test('stops waiting immediately when the child is dead', async () => {
+  let slept = false;
+  const result = await waitForLiveProcessIdentity(42, {
+    timeoutMs: 20,
+    inspect: () => ({ state: 'dead', identity: null }),
+    monotonicNow: () => 0,
+    sleep: async () => { slept = true; }
+  });
+
+  assert.deepEqual(result, { state: 'dead', identity: null });
+  assert.equal(slept, false);
+});
+
+test('returns unknown at the monotonic identity deadline', async () => {
+  let monotonicMs = 100;
+  let inspections = 0;
+  const result = await waitForLiveProcessIdentity(42, {
+    timeoutMs: 10,
+    intervalMs: 6,
+    inspect: () => {
+      inspections += 1;
+      return { state: 'unknown', identity: null };
+    },
+    monotonicNow: () => monotonicMs,
+    sleep: async (delayMs) => { monotonicMs += delayMs; }
+  });
+
+  assert.deepEqual(result, { state: 'unknown', identity: null });
+  assert.equal(monotonicMs, 110);
+  assert.equal(inspections, 3);
+});
+
+test('captures a complete real PTY identity that remains live across delayed exec', async (t) => {
+  if (!['linux', 'darwin'].includes(process.platform)) {
+    t.skip('process identity is supported on Linux and macOS');
+    return;
+  }
+  const ptyModule = await import('node-pty');
+  const pty = ptyModule.default || ptyModule;
+  const child = pty.spawn('/bin/bash', [
+    '--noprofile', '--norc', '-c',
+    'trap "" HUP; sleep 0.1; exec sleep 30'
+  ], {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 40,
+    cwd: process.cwd(),
+    env: { ...process.env, TERM: 'xterm-256color' }
+  });
+
+  try {
+    const captured = await waitForLiveProcessIdentity(child.pid, { timeoutMs: 1000 });
+    assert.equal(captured.state, 'live');
+    assert.equal(captured.identity?.pid, child.pid);
+    assert.ok(captured.identity?.startToken);
+    assert.match(captured.identity?.commandHash || '', /^[a-f0-9]{64}$/);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const afterExec = inspectProcessIdentity(child.pid);
+    assert.equal(afterExec.state, 'live');
+    assert.equal(compareProcessIdentity(captured.identity, afterExec.identity), 'live');
+  } finally {
+    try { child.kill('SIGKILL'); } catch {}
+  }
 });
 
 test('rejects malformed Linux and macOS identity rows', () => {

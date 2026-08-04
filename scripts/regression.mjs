@@ -8398,14 +8398,95 @@ async function processEvidenceWorkflow() {
     cleanupBindingPeers(rootPeer);
   }
 
-  const externalId = `evidence-external-${testId}`;
   const externalDir = path.join(root, '.hello-cc', 'bufs');
+  const shortExternalId = `evidence-external-short-${testId}`;
+  const shortProducer = spawn(process.execPath, [
+    hccBin,
+    '--root', root,
+    'run', '--peer', shortExternalId, '--kind', 'shell', '--',
+    '/bin/true'
+  ], {
+    cwd: root,
+    env: { ...env, HCC_INTERNAL_WEB_MANAGED_RUN: '1' },
+    stdio: 'ignore'
+  });
+  await Promise.race([
+    new Promise((resolve, reject) => {
+      shortProducer.once('error', reject);
+      shortProducer.once('close', resolve);
+    }),
+    sleep(5000).then(() => { throw new Error('short external producer did not exit'); })
+  ]);
+  const shortFiles = ['out', 'in', 'resize', 'meta']
+    .map((suffix) => path.join(externalDir, `${shortExternalId}.${suffix}`));
+  const shortState = withMeshDb((db) => ({
+    peer: db.prepare('SELECT status FROM peers WHERE id = ?').get(shortExternalId),
+    event: db.prepare(`
+      SELECT id FROM events WHERE type = 'run.session.exited' AND actor = ? ORDER BY id DESC LIMIT 1
+    `).get(shortExternalId)
+  }));
+  if (shortFiles.some((file) => fs.existsSync(file)) ||
+      shortState.peer?.status !== 'exited' || !shortState.event?.id) {
+    fail(`short external PTY did not complete and clean up: ${JSON.stringify(shortState)}`);
+  }
+
+  const signaledExternalId = `evidence-external-signaled-${testId}`;
+  const signaledChildPidFile = path.join(root, '.hello-cc', `${signaledExternalId}.pid`);
+  const signaledProducer = spawn(process.execPath, [
+    hccBin,
+    '--root', root,
+    'run', '--peer', signaledExternalId, '--kind', 'shell', '--',
+    '/bin/bash', '--noprofile', '--norc', '-c',
+    'trap "" HUP; printf "%s" "$$" > "$HCC_SIGNAL_TEST_PID_FILE"; sleep 30'
+  ], {
+    cwd: root,
+    env: {
+      ...env,
+      HCC_INTERNAL_WEB_MANAGED_RUN: '1',
+      HCC_SIGNAL_TEST_PID_FILE: signaledChildPidFile
+    },
+    stdio: 'ignore'
+  });
+  await waitFor(() => fs.existsSync(signaledChildPidFile), 'signaled external child PID', 5000);
+  const signaledChildPid = Number(fs.readFileSync(signaledChildPidFile, 'utf8'));
+  const signaledClose = new Promise((resolve, reject) => {
+    signaledProducer.once('error', reject);
+    signaledProducer.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  signaledProducer.kill('SIGTERM');
+  const signaledExit = await Promise.race([
+    signaledClose,
+    sleep(5000).then(() => { throw new Error('signaled external producer did not exit'); })
+  ]);
+  if (signaledExit.signal !== 'SIGTERM') {
+    fail(`signaled external producer did not preserve SIGTERM: ${JSON.stringify(signaledExit)}`);
+  }
+  await waitFor(
+    () => inspectProcessIdentity(signaledChildPid).state === 'dead',
+    'signaled external child exit',
+    5000
+  );
+  const signaledFiles = ['out', 'in', 'resize', 'meta']
+    .map((suffix) => path.join(externalDir, `${signaledExternalId}.${suffix}`));
+  const signaledState = withMeshDb((db) => ({
+    peer: db.prepare('SELECT status FROM peers WHERE id = ?').get(signaledExternalId),
+    event: db.prepare(`
+      SELECT id FROM events WHERE type = 'run.session.exited' AND actor = ? ORDER BY id DESC LIMIT 1
+    `).get(signaledExternalId)
+  }));
+  fs.rmSync(signaledChildPidFile, { force: true });
+  if (signaledFiles.some((file) => fs.existsSync(file)) ||
+      signaledState.peer?.status !== 'exited' || !signaledState.event?.id) {
+    fail(`signaled external PTY did not terminate and clean up: ${JSON.stringify(signaledState)}`);
+  }
+
+  const externalId = `evidence-external-${testId}`;
   const externalMetaFile = path.join(externalDir, `${externalId}.meta`);
   const producer = spawn(process.execPath, [
     hccBin,
     '--root', root,
     'run', '--peer', externalId, '--kind', 'shell', '--',
-    '/bin/bash', '--noprofile', '--norc', '-c', 'trap "" HUP; exec sleep 30'
+    '/bin/bash', '--noprofile', '--norc', '-c', 'trap "" HUP; sleep 0.1; exec sleep 30'
   ], {
     cwd: root,
     env: { ...env, HCC_INTERNAL_WEB_MANAGED_RUN: '1' },
@@ -8430,7 +8511,10 @@ async function processEvidenceWorkflow() {
   producer.kill('SIGKILL');
   await waitForProcessExit(producer.pid, 'external wrapper SIGKILL');
   await sleep(2500);
-  if (inspectProcessIdentity(externalMeta.pid).state !== 'live' || !fs.existsSync(externalMetaFile)) {
+  const externalChildAfterExec = inspectProcessIdentity(externalMeta.pid);
+  if (externalChildAfterExec.state !== 'live' ||
+      externalChildAfterExec.identity?.startToken !== externalMeta.child_identity.startToken ||
+      !fs.existsSync(externalMetaFile)) {
     fail('live external child did not preserve session after wrapper death');
   }
   process.kill(externalMeta.pid, 'SIGKILL');
