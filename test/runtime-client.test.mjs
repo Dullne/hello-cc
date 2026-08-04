@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { runtimeRequest } from '../lib/runtime/client.mjs';
+import { normalizeRequestBody } from '../lib/web/runtime.mjs';
 
 async function stalledRuntime(t, phase) {
   const server = http.createServer((_req, res) => {
@@ -47,6 +48,17 @@ test('runtime request deadline covers waiting for response headers', async (t) =
 
 test('runtime request deadline covers waiting for the complete response body', async (t) => {
   await expectRuntimeDeadline(t, 'body');
+});
+
+test('request body normalization keeps the http and https transports consistent', () => {
+  // Both branches must serialize identically: fetch rejects object bodies while
+  // https.request needs a string, so a caller passing an object must not see
+  // transport-dependent behavior.
+  assert.equal(normalizeRequestBody(null), null);
+  assert.equal(normalizeRequestBody(undefined), null);
+  assert.equal(normalizeRequestBody('already-a-string'), 'already-a-string');
+  assert.equal(normalizeRequestBody({ a: 1 }), '{"a":1}');
+  assert.equal(normalizeRequestBody(42), '42');
 });
 
 test('runtime request composes an external abort signal with its deadline', async (t) => {

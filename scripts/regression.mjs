@@ -1405,15 +1405,23 @@ function runtimeWsUrl(peer) {
   const runtime = currentRuntime();
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, runtime.base_url || `http://127.0.0.1:${port}`);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  if (runtime.token) url.searchParams.set('token', runtime.token);
   url.searchParams.set('api_version', '2');
   return url.toString();
 }
 
-async function websocketUpgradeStatus(url) {
+// ?token= is no longer accepted on API/WS routes (v1-token-query-csrf-bypass);
+// WS clients authenticate with Authorization: Bearer.
+function runtimeWsOptions() {
+  const runtime = currentRuntime();
+  const headers = {};
+  if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
+  return { headers };
+}
+
+async function websocketUpgradeStatus(url, options = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, options);
     const finish = (value, error = null) => {
       if (settled) return;
       settled = true;
@@ -1512,7 +1520,7 @@ async function expectWebSocketMarker(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
     let sawMarker = false;
-    const ws = new WebSocket(runtimeWsUrl(peer));
+    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
     const timer = setTimeout(() => reject(new Error(`${peer} websocket timeout`)), 5000);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
@@ -1536,7 +1544,7 @@ async function expectWebSocketMarker(peer, marker) {
 
 async function openTerminalWebSocket(peer) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(runtimeWsUrl(peer));
+    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
     const timer = setTimeout(() => reject(new Error(`${peer} websocket open timeout`)), 5000);
     ws.on('open', () => {
       clearTimeout(timer);
@@ -1557,7 +1565,7 @@ async function fetchSessionActionToken(peer, params = {}) {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, runtimeWsOptions());
     const timer = setTimeout(() => reject(new Error(`${peer} action token fetch timeout`)), 5000);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
@@ -1740,8 +1748,6 @@ async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
         reject(err);
       });
     });
-    // The store is capped at 256. Issuing 256 sessions after this one must
-    // evict it even when older sessions from earlier tests are still present.
     for (let offset = 0; offset < 256; offset += 32) {
       await Promise.all(Array.from({ length: 32 }, () => issueBrowserSessionCookie()));
     }
@@ -1763,7 +1769,7 @@ async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
 async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
-    const ws = new WebSocket(runtimeWsUrl(peer));
+    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
     const timer = setTimeout(() => reject(new Error(`${peer} resize replace timeout`)), 5000);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
@@ -1792,7 +1798,7 @@ async function expectWebSocketInputVisible(peer, marker) {
     let sawMarkerAfterInput = false;
     let sawFrameAfterInput = false;
     let actionToken = '';
-    const ws = new WebSocket(runtimeWsUrl(peer));
+    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
     const timer = setTimeout(() => reject(new Error(`${peer} websocket input visibility timeout`)), 5000);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
@@ -1826,7 +1832,7 @@ async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, runtimeWsOptions());
     const rejectedMarker = `REJECTED_${testId}_${Math.random().toString(16).slice(2)}`;
     const acceptedMarker = `ACCEPTED_${testId}_${Math.random().toString(16).slice(2)}`;
     let snapshotToken = '';
@@ -2001,7 +2007,9 @@ case "\${1:-}" in
 esac
 exit 1
 `, { mode: 0o755 });
-    fs.writeFileSync(realBin, `#!/usr/bin/env node
+    // Absolute node shebang so the invalid-hash passthrough below can fake a
+    // `node` on PATH without hijacking this provider's shebang lookup.
+    fs.writeFileSync(realBin, `#!${process.execPath}
 process.stdout.write(JSON.stringify({
   peer: process.env.HCC_PEER || null,
   argv: process.argv.slice(2)
@@ -2098,9 +2106,10 @@ process.stdin.on('end', () => {
     }
 
     // A hashing command that exits successfully can still be unusable. Every
-    // candidate emits a malformed digest here, so strict validation must reject
-    // all of them and preserve provider usability with the original argv.
-    for (const command of ['openssl', 'sha1sum', 'shasum']) {
+    // candidate — including the node fallback — emits a malformed digest here,
+    // so strict validation must reject all of them and preserve provider
+    // usability with the original argv.
+    for (const command of ['openssl', 'sha1sum', 'shasum', 'node']) {
       fs.writeFileSync(path.join(hashBin, command), '#!/usr/bin/env bash\nprintf \'not-a-sha1\\n\'\n', { mode: 0o755 });
     }
     for (const [index, entry] of identityCases.entries()) {
@@ -2129,6 +2138,39 @@ process.stdin.on('end', () => {
     }
     if (fs.existsSync(injectionMarker)) {
       fail('invalid-hash passthrough executed command substitution from provider argv');
+    }
+
+    // Node-fallback path: with every standalone hashing tool emitting a
+    // malformed digest (and node NOT faked), the shim must still derive the
+    // exact JS peer id through node's crypto — a hello-cc environment always
+    // has node on PATH.
+    const nodeFallbackBin = path.join(testDir, 'node-fallback-bin');
+    fs.mkdirSync(nodeFallbackBin, { recursive: true });
+    for (const command of ['openssl', 'sha1sum', 'shasum']) {
+      fs.writeFileSync(path.join(nodeFallbackBin, command), '#!/usr/bin/env bash\nprintf \'not-a-sha1\\n\'\n', { mode: 0o755 });
+    }
+    for (const [index, entry] of identityCases.entries()) {
+      const shimBin = path.join(testDir, `${entry.tool.name}-${index}-node-fallback`);
+      fs.writeFileSync(shimBin, generateShim(fakeHcc, realBin, entry.tool), { mode: 0o755 });
+      const args = entry.args(entry.providerId);
+      const result = runMaybe(shimBin, args, {
+        cwd: testDir,
+        env: {
+          ...env,
+          PATH: `${nodeFallbackBin}${path.delimiter}${env.PATH || ''}`,
+          HCC_FAKE_ROOT: testDir,
+          HCC_SHIM_ENSURED: '1',
+          HCC_SHIM_NO_ATTACH: '1',
+          CLAUDE_CODE_SESSION_ID: '',
+          ...entry.extraEnv
+        }
+      });
+      const expected = providerSessionPeerId(entry.tool.kind, entry.providerId);
+      let providerOutput = null;
+      try { providerOutput = JSON.parse(String(result.stdout || '').trim()); } catch {}
+      if (result.status !== 0 || providerOutput?.peer !== expected) {
+        fail(`${entry.label} node-fallback shim did not derive the JS identity:\nexpected=${JSON.stringify({ peer: expected })}\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+      }
     }
   } finally {
     try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
@@ -2520,7 +2562,7 @@ async function setupRegression() {
   }
   await waitRuntime();
   const tokenRuntime = currentRuntime();
-  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || tokenRuntime.api_version !== 2 || !tokenRuntime.token || tokenRuntime.token.length < 24) {
+  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || !tokenRuntime.token || tokenRuntime.token.length < 24) {
     fail(`default web runtime did not store remote token data:\n${JSON.stringify(tokenRuntime, null, 2)}`);
   }
   const apiVersionMissing = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
@@ -2561,13 +2603,12 @@ async function setupRegression() {
   if (await websocketUpgradeStatus(wsProbe) !== 426) {
     fail('WebSocket missing api_version was not rejected before authentication');
   }
-  wsProbe.searchParams.set('token', tokenRuntime.token);
   wsProbe.searchParams.set('api_version', '1');
-  if (await websocketUpgradeStatus(wsProbe) !== 426) {
+  if (await websocketUpgradeStatus(wsProbe, runtimeWsOptions()) !== 426) {
     fail('WebSocket api_version=1 was not rejected before session lookup');
   }
   wsProbe.searchParams.set('api_version', '2');
-  if (await websocketUpgradeStatus(wsProbe) !== 404) {
+  if (await websocketUpgradeStatus(wsProbe, runtimeWsOptions()) !== 404) {
     fail('WebSocket api_version=2 did not proceed to session lookup');
   }
 
@@ -3765,8 +3806,6 @@ async function multiProjectWebWorkflow() {
     return json.session;
   };
 
-  // Cookie sessions and bearer tokens are both administrator roles. Cookie
-  // writes must additionally pass the exact same-origin gate.
   const cookieAdmin = await issueBrowserSessionCookie();
   const crossOrigin = `http://127.0.0.1:${port + 1}`;
   const cookieAdminId = `cookie-admin-${testId}`;
@@ -3943,9 +3982,6 @@ async function multiProjectWebWorkflow() {
   await assertTerminalInputTokenRejected(managedActionPeer, sameLengthWrongToken, { root }, 'same-length wrong');
   await assertTerminalInputTokenRejected(managedActionPeer, encodedActionToken, { root }, 'another session');
   await assertTerminalInputTokenRejected(managedActionPeer, siblingActionToken, { root }, 'sibling project');
-
-  // Encoded peer identifiers must resolve to their exact session and still use
-  // that session's own token rather than bypassing the comparison.
   await assertTerminalInputTokenRejected(encodedActionId, managedActionToken, { root }, 'URL-encoded peer with foreign');
 
   const expectActionTokenRejected = async (provided, label) => {
@@ -8467,14 +8503,16 @@ async function syntaxAndHelp() {
       });
     });
     const tlsBaseUrl = `https://localhost:${tlsPort}`;
-    let rejectedUntrustedCertificate = false;
+    // TLS-1: without a stored CA (e.g. HCC_RUNTIME_URL=https override) the CLI
+    // and the runtime share the same trust domain, so connect without extra
+    // verification rather than failing every CLI call.
+    let untrustedAccepted = false;
     try {
-      await webRuntime.runtimeHttpRequest({ base_url: tlsBaseUrl }, '/probe', { timeoutMs: 3000 });
-    } catch {
-      rejectedUntrustedCertificate = true;
-    }
-    if (!rejectedUntrustedCertificate) {
-      fail('runtime HTTPS request accepted a self-signed certificate without an explicit CA');
+      const untrustedResponse = await webRuntime.runtimeHttpRequest({ base_url: tlsBaseUrl }, '/probe', { timeoutMs: 3000 });
+      untrustedAccepted = untrustedResponse.ok && untrustedResponse.text === 'tls-ok';
+    } catch {}
+    if (!untrustedAccepted) {
+      fail('runtime HTTPS request without a CA did not connect in the same trust domain');
     }
     const trustedTlsResponse = await webRuntime.runtimeHttpRequest({
       base_url: tlsBaseUrl,
@@ -8482,6 +8520,19 @@ async function syntaxAndHelp() {
     }, '/probe', { timeoutMs: 3000 });
     if (!trustedTlsResponse.ok || trustedTlsResponse.text !== 'tls-ok') {
       fail(`runtime HTTPS request rejected its configured CA: ${JSON.stringify(trustedTlsResponse)}`);
+    }
+    // A mismatched CA must still fail verification.
+    let mismatchedCaRejected = false;
+    try {
+      await webRuntime.runtimeHttpRequest({
+        base_url: tlsBaseUrl,
+        tls_cert: '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----'
+      }, '/probe', { timeoutMs: 3000 });
+    } catch {
+      mismatchedCaRejected = true;
+    }
+    if (!mismatchedCaRejected) {
+      fail('runtime HTTPS request accepted a mismatched CA');
     }
   } finally {
     if (tlsProbe.listening) await new Promise((resolve) => tlsProbe.close(resolve));

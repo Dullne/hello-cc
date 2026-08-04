@@ -182,6 +182,7 @@ import {
   inferPeerKind
 } from '../lib/integrations/providers.mjs';
 import {
+  migrateLegacyProviderPeerIds,
   providerSessionParts,
   providerSessionPeerId
 } from '../lib/core/peers/session.mjs';
@@ -786,6 +787,12 @@ function connect(ctx, options = {}) {
       ensureMigrationBackup(db, ctx.dbPath, fromVersion, toVersion),
     beforePostMigrationIndexes: dedupePeerBindings
   });
+  // sess-04: rename legacy first-8-chars peer records to their hashed id so
+  // pre-upgrade sessions stay reachable. Idempotent and cheap when nothing
+  // matches (a single scan of peer_bindings).
+  try {
+    migrateLegacyProviderPeerIds(db, { addEvent });
+  } catch {}
   if (options.migrateRegistered !== false) migrateRegisteredProjectDbs(ctx);
   return db;
 }
@@ -2658,6 +2665,18 @@ async function startWebBackground(ctx, args) {
         global_runtime: true
       });
       return printWebRuntime(ctx, existing, { already: true, logFile: webLogPath(ctx), setup });
+    }
+    // TLS-2: an idempotent `hcc web` must not silently stop a TLS runtime and
+    // downgrade to plaintext (or vice versa) when only --tls/--trust-proxy
+    // differ. Refuse loudly instead; host/port/token mismatches below still
+    // take the normal stop-and-restart path (legitimate reconfiguration).
+    const runtimeTls = existing.tls === undefined
+      ? /^https:/i.test(String(existing.base_url || ''))
+      : Boolean(existing.tls);
+    if (runtimeTls !== Boolean(opts.tls) || Boolean(existing.trust_proxy) !== Boolean(opts['trust-proxy'])) {
+      throw new CliError('RUNTIME_CONFIG_CONFLICT',
+        `A ${runtimeTls ? 'TLS' : 'plaintext'} web runtime is already running${existing.trust_proxy ? ' with --trust-proxy' : ''} on port ${existing.port}. ` +
+        `Run ${CLI_NAME} down first, or re-run with matching flags (${opts.tls ? '--tls' : 'no --tls'}${opts['trust-proxy'] ? ', --trust-proxy' : ''}).`);
     }
     try { await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, existing); } catch {}
     await sleep(250);
@@ -5365,7 +5384,14 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       const safeMethod = ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '');
-      if (authMode === 'cookie' && !safeMethod && !requestOriginMatches(req, { trustProxy })) {
+      // CSRF gate (v1-csrf-tokenless + v1-token-query-csrf-bypass): any
+      // browser-initiated write that is authenticated by a session cookie — or
+      // runs on a tokenless (loopback) runtime — must be same-origin. Requests
+      // without an Origin header (CLI/curl/ws clients) are not browser-initiated
+      // and pass. A valid ?token= in the URL does NOT exempt a cookie-bearing
+      // request from this check.
+      const csrfScope = authMode === 'cookie' || cookieSessionOk(req) || !token;
+      if (csrfScope && !safeMethod && req.headers.origin && !requestOriginMatches(req, { trustProxy })) {
         sendJson(res, 403, { ok: false, error: { code: 'CSRF_ORIGIN', message: 'Cookie-authenticated writes require a same-origin request' } });
         return;
       }

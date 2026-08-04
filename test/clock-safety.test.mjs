@@ -602,3 +602,47 @@ test('backward pending gap renews a verified-live expired lock once and remains 
   assert.equal(pendingGap(db), null);
   db.close();
 });
+
+// CS-01: ordinary forward progress must not create or extend a gap. A
+// jump-induced gap is finite; after it is consumed by grace, steady-state
+// observations converge (no new gap, no spurious grace), so age-based GC is
+// not deferred forever.
+test('steady state converges: small forward steps create no gap and no grace', () => {
+  const db = sequenceDb();
+  // Jump: a 900s forward step from the seeded baseline (100) creates a gap.
+  const jump = observeClockSafety(db, { operation: 'gc', nowSec: 1000 });
+  assert.deepEqual(pendingGap(db), { from: 100, to: 1000, backward: false, first: false });
+  assert.equal(jump.decision.enterGrace, false);
+
+  // Ordinary 30s ticks: no gap growth, no new grace. GC cutoffs in the
+  // normal range (far outside the recent jump window) must not defer.
+  for (let tick = 1030; tick <= 1150; tick += 30) {
+    const obs = observeClockSafety(db, { operation: 'gc', nowSec: tick, gcCutoffs: [50] });
+    assert.equal(obs.decision.enterGrace, false);
+  }
+  // The persisted gap is unchanged (not extended by ordinary ticks).
+  assert.deepEqual(pendingGap(db), { from: 100, to: 1000, backward: false, first: false });
+
+  // Consume it with an unknown candidate inside the window → grace, gap cleared.
+  const unknown = observeClockSafety(db, {
+    operation: 'ownership',
+    nowSec: 1151,
+    candidates: [{ boundary: 500, evidence: 'unknown' }]
+  });
+  assert.equal(unknown.decision.enterGrace, true);
+  assert.equal(pendingGap(db), null);
+
+  // After the grace window, ordinary GC observations no longer defer.
+  const afterGrace = observeClockSafety(db, { operation: 'gc', nowSec: 1260, gcCutoffs: [50] });
+  assert.equal(afterGrace.decision.enterGrace, false);
+  assert.equal(pendingGap(db), null);
+  db.close();
+});
+
+test('small forward steps below the gap threshold never create a gap', () => {
+  const db = sequenceDb();
+  const obs = observeClockSafety(db, { operation: 'ownership', nowSec: 130 });
+  assert.equal(obs.graceUntil, 0);
+  assert.equal(pendingGap(db), null);
+  db.close();
+});

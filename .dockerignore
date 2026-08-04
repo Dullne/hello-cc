@@ -1,0 +1,11 @@
+# Keep the build context small and avoid leaking host state into the image.
+# NOTE: .github is included — the regression suite reads the release workflow.
+node_modules
+.git
+**/.hello-cc
+**/mesh.db*
+**/runtime.json
+**/web.log
+docs/defect-review-2026-07.md
+npm-debug.log*
+.DS_Store

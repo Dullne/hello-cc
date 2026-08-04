@@ -26,6 +26,53 @@ hello-cc 的**协调内核是扎实的**:任务认领、`claimNext`、takeover�
 
 ---
 
+## 1.5 修复状态总览(2026-08-03)
+
+> 自评审以来共完成 **10 轮加固**(P0–P3 已提交为 `9df2262`;第四~十轮在分支 `fix/p0-hardening` 工作区)。除标注外,修复均经**本机 + 容器(Node 24 / Linux)双环境回归 13/13** 验证。
+
+| 状态 | finding | 说明 | 轮次 |
+|---|---|---|---|
+| ✅ | bg-01 | `readRuntime` 校验 pid 存活,死指针跳过 | P1 |
+| ✅ | bg-02 / rob-01 | `uncaughtException`/`unhandledRejection` 兜底 + auto-attach `connect()` 移入 try | P0 |
+| ✅ | bg-03 | WS upgrade 整体 try/catch | P0 |
+| 🕐 | bg-04 | 轮询器仍硬编码主项目 ctx(多项目 watch 延后) | — |
+| ✅ | bg-05 | web.log 启动时 >5MB 轮换(保留 .1) | 9 |
+| ✅ | bg-06 | 原子写 + 每项目 ≥60s 写节流 | P0/9 |
+| ✅ | bg-07 / rob-02 / rob-05 | 原子写 + 读者不删文件 + clearRuntime 不盲删 | P0 |
+| ✅ | hb-01 | 死亡路径不前推 `last_seen_at`;`exited/detached` 立即非活 | P0 |
+| ✅ | hb-02 / hb-03 | 存活 reaper(30s,死 pid+沉寂才收割)+ external exit 写库 | P1 |
+| ✅ | hb-04 | 终端 I/O 节流刷新(3 输出路径 + input,30s) | 9 |
+| ✅ | hb-05 | 时钟跳变 grace 窗口(`classifyClockJump` 纯函数单测) | 8 |
+| ✅ | hb-06 | hook 心跳续锁(保留原始 TTL,上限 1h) | 9 |
+| ✅ | hb-07 / conc-04 | 默认 takeover `blocked-or-stale` + `--force` | P1 |
+| ✅ | hb-08 | upsertPeer 保留 exited/detached(status CASE) | 9 |
+| ✅ | net-01 | 非 loopback 无 token 拒绝启动 + 暴露告警(默认绑定按用户选择保持 0.0.0.0) | P0 |
+| ✅ | net-02 | TLS(`--tls` 自签)+ `web.log` 0600 + `Referrer-Policy` + **cookie 会话**(URL 令牌一次性交换) | P0/4/7 |
+| 🕐 | net-03 | 路径 allowlist 已做;per-project 令牌作用域延后 | P0(部分) |
+| ✅ | net-04 | WS Origin 校验 + `authOk` 空令牌仅限 loopback + `timingSafeEqual` | P0 |
+| 🕐 | net-05 | 令牌不再广播、WS input 强制;**`/input` HTTP 保留主令牌门控**(CLI inject 依赖) | 4(部分) |
+| ✅ | net-06 | 常量时间比较 | P0 |
+| ✅ | net-07 | DB 路径强制在 `<root>/.hello-cc/` 内 | P0 |
+| ✅ | sess-01 | restore 前面板归属校验(会话名 + HCC_ROOT) | P0 |
+| ✅ | sess-02 | shutdown 标记托管会话 detached + 清 `runtime_target` | P1 |
+| ✅ | sess-03 | exit poller 仅"确定性死亡"计数 | 9 |
+| ✅ | sess-04 | 全 id sha1 哈希(JS+shim 一致;⚠️ pre-1.0 identity 方案变更) | 9 |
+| ✅ | sess-05 | `externalSessionDead` pid 存活门已在 `adoptExternalSession` 创建前拦截幽灵会话(本批确认,无需改码) | 9 |
+| ✅ | sess-06 | park-then-swap(旧会话在新会话成功后拆除) | 9 |
+| ✅ | conc-01 | 已迁移 DB `connect()` 免写短路 | P1 |
+| ✅ | conc-02 / rob-03 | 跨项目迁移故障隔离(坏 DB 跳过) | P0 |
+| 🕐 | conc-03 | 短路已降写竞争;`Atomics.wait` 忙重试仍在(worker 化延后) | P1(部分) |
+| ✅ | conc-05 | `wal_autocheckpoint` + 自动 gc + `wal_checkpoint(TRUNCATE)` + `hcc gc` | 5 |
+| ✅ | conc-06 | `readTx` 单快照 + 单条 COUNT | 5 |
+| ✅ | rob-06 | `fs.watch` error 监听 + shutdown 关闭 | P0 |
+| ✅ | rob-07 | shutdown 清理所有注册项目指针 | P1 |
+| ✅ | (新增) | `hcc doctor`(`integrity_check`/schema/大小/行数) | 5 |
+| ✅ | (新增) | tmux 3.3a/Linux 兼容:`\t` 分隔符→`|` + path 重拼(容器暴露的既有缺陷) | 6 |
+
+**计数**:36 项 finding 中 **34 项已修复**,3 项部分修复(net-03/net-05/conc-03),1 项延后(bg-04:多项目轮询器 watch,需运行时多项目架构改造)。
+
+---
+
 ## 2. 严重问题排行(Top Risks)
 
 下表按后果严重度排序,合并了跨维度的重复项(同一根因在不同领域各记一次的,归并到一行并标注全部 id)。除特别标注外均为 **CONFIRMED**。
@@ -254,3 +301,76 @@ hello-cc 的**协调内核是扎实的**:任务认领、`claimNext`、takeover�
 28. **DB 文件/目录属主专属权限(0600/0700);断言 WAL 切换生效。** (hcom 加固,防多用户主机泄露 token/messages)
 
 > **落地次序建议:** P0-1/2 与 P0-3…6 可并行(前者堵崩溃,后者堵网络暴露),二者共同构成"可安全在局域网/长跑使用"的最小门槛;P0-7/8/9 紧随以消除数据串接与发现层丢失。P1 后再引入 P2-23 的 fencing 架构改造,使正确性不再依赖时钟正确。
+---
+
+## 6. 十轮加固总结(2026-08-03)
+
+> 分支 `fix/p0-hardening`;P0–P3 已提交(`9df2262`),第四~十轮在工作区(未提交)。当前工作区在本机(macOS / Node 24 / tmux 3.7b)与容器(Linux / Node 24 / tmux 3.3a)双环境通过完整回归 13/13。
+
+### 第一轮(P0 核心批)—— 崩溃安全 + 网络暴露 + 恢复 + 存活
+- 进程级 `uncaughtException`/`unhandledRejection` 兜底;所有轮询器/upgrade `connect()` 移入 try;`fs.watch` error 监听 + shutdown 关闭。
+- 非 loopback 无 token **拒绝启动** + 暴露告警;`authOk` 常量时间比较 + 空令牌仅限 loopback;WS upgrade **Origin 校验**;`?project/db` **路径 allowlist**。
+- 运行时/注册表**原子写**(`writeJsonSafe`)、读者不再遇解析失败即删;restore 前**面板归属校验**;死亡路径不前推 `last_seen_at`、`exited/detached` 立即非活。
+- 安全头(`Referrer-Policy`/`nosniff`)、`web.log` 0600;跨项目迁移**故障隔离**。
+- 解决:bg-02/03/06/07, rob-01/02/03/05/06, net-01/03/04/06/07, sess-01, hb-01, conc-02, hb-07(部分)。
+
+### 第二轮(P1 后端稳定批)—— 连接免写 + 安全接管 + 生命周期 + reaper
+- `connect()` **已迁移即短路**(纯读命令免写锁/WAL 帧);`synchronous=NORMAL`。
+- 默认 takeover 策略 **`blocked-or-stale`** + `--force`(=any)。
+- `readRuntime` 校验 pid 存活;shutdown **清所有项目指针 + 标 detached**;存活 **reaper**(死 pid + 沉寂才收割);external exit 写库。
+- 解决:conc-01/03(部分), hb-07, bg-01, rob-07, sess-02, hb-02/03。
+
+### 第三轮(已并入 `9df2262`)
+(与第一、二轮同批提交;含 tmux 恢复、存活语义等细化。)
+
+### 第四轮 —— TLS + net-05
+- `--tls` **自动自签证书**(`lib/web/tls.mjs`,持久化复用,SAN 含 LAN IP);`https` server + WS 自动 wss。
+- CLI↔runtime HTTPS 信任(`runtimeHttpRequest` + CA agent)。
+- `action_token` 不再经列表广播;经 **WS snapshot 帧** 只投递给控制方;WS input 帧强制令牌;`/input` HTTP 保留主令牌门控(CLI inject 依赖,已注释)。
+- 解决:net-02(TLS), net-05(部分)。
+
+### 第五轮 —— P2 后端批 + 容器基建
+- events/WAL 治理:`wal_autocheckpoint`、`runGc(scope full/auto)`、gc 末尾 `wal_checkpoint(TRUNCATE)`、Web 启动 + 每 6h 自动 gc(仅 events/锁/bufs)。
+- 快照一致性:`readTx` 单快照 + 单条 COUNT。
+- 新 `hcc doctor`(`integrity_check`/schema/大小/行数,失败 exit 1)。
+- 新 `Dockerfile`(node:24 + tmux)+ `.dockerignore` → **容器验证体系**。
+- 解决:conc-05, conc-06;新增 doctor。
+
+### 第六轮 —— tmux Linux 兼容(容器暴露的既有缺陷)
+- 根因:tmux < 3.4 把 `-F`/`display-message` 输出中的制表符替换为 `_`,`\t` 分隔解析失效 → `capture-pane -t ____`。
+- 修复:`|` 分隔符 + path 字段末尾重拼(两处格式串);容器全套回归从卡死 → **13/13**。
+
+### 第七轮 —— cookie 会话
+- 浏览器首访 `?token` **一次性交换**为 `HttpOnly; SameSite=Lax; Secure` cookie 并重定向裸 URL(地址栏/历史/Referer 不再含令牌)。
+- 浏览器导航(`Accept: text/html`)才触发交换,API fetch 不受影响;`POST /login` + 登录页兜底;CLI/测试仍用 `?token`/Bearer(叠加)。
+- 解决:net-02 的 URL 令牌泄露根因。
+
+### 第八轮 —— 时钟跳变保护(hb-05)
+- 运行时 30s 探测墙钟跳变(`classifyClockJump` 纯函数);跳变 → 写 `meta['clock_grace_until']`(120s grace)。
+- grace 内:takeover 永不判 stale、reaper 跳过收割、过期锁仍视为被持有(全进程一致,CLI 同享)。
+- 容器 `date -s` 无法传递给运行中进程(Docker 时间命名空间产物),检测器逻辑经纯函数单测;保护行为经 meta 注入全链路实测。
+
+### 第九轮 —— 延后的低优先级批(hb-08/hb-04/hb-06/bg-05/bg-06/sess-03/04/06)
+- hb-08:`upsertPeer` 保留 `exited/detached`(仅默认 `idle` 的无意 upsert 不复活;显式 status 仍覆盖)。
+- hb-04:终端真实 I/O 节流刷新 `last_seen_at`(3 输出路径 + input,30s)——活但安静(无 hook)的 peer 不再被判 stale/被接管。
+- hb-06:hook 心跳续该 peer 未过期锁(保留原始 TTL,上限 1h)——持续工作的 peer 锁不再静默过期。
+- bg-05:web.log 启动时 >5MB 轮换(保留 `.1` 共 2 份)。
+- bg-06:`projects.json` 每项目 ≥60s 写节流(原子写已在前几轮)。
+- sess-03:tmux exit poller 仅"确定性死亡"(`can't find pane/session`/`no server running`)计数,瞬时 tmux 故障不再误 detach 活会话。
+- sess-04:peer id 改为**全 id sha1 哈希**(JS `shortHash` + shim `peer_hash()`,两侧逐字节一致)——name-based 前缀碰撞(`feature-login`/`feature-logout` 曾同为 `codex-feature`)消除。⚠️ **pre-1.0 有意的 identity 方案变更**:旧 name-based peer id 升级后不再映射。
+- sess-06:restart 改 **park-then-swap**——旧内存会话在新 tmux 会话成功后才拆除,失败时旧会话(流/轮询/客户端)完好,无需重建。
+- sess-05:确认**已修复**(`externalSessionDead` pid 存活门早已在 `adoptExternalSession` 创建前拦截幽灵会话),仅文档标注。
+- 途中修复两个真 bug:`//` 注释误入 SQL 模板(`near "/"`)、`LEAST()` 在该 Node 捆绑 SQLite 中不存在(改用 `MIN(COALESCE(…),…)`)。
+
+### 第十轮 —— 终审边界修复(TTL/时钟/tmux/代理/cookie/TLS)
+- 锁 TTL 写入 schema v6 的 `ttl_sec`,CLI/Web 心跳默认按持久 TTL 续期;hook 续期上限 1h,时钟 grace 内可恢复因跳变而表面过期的锁。
+- 时钟 reaper 与自动 GC 覆盖仍有效的注册项目,隔离单项目 DB 故障且不重建已删除项目;跨项目 buffer 清理按真实目录保护。
+- tmux replacement 增加 capture-poll 输出兜底;失败时隔离未能 kill 的候选、恢复 parked 旧会话,恢复失败显式返回 `TMUX_RESTART_ROLLBACK_FAILED`。
+- 新增 `--trust-proxy`,仅接受 loopback 代理的 forwarded host/proto;cookie 会话增加 30 天服务端过期、数量上限、logout 撤销及 cookie-auth WebSocket 入站/出站即时阻断。
+- TLS 证书校验有效期、SAN 与密钥配对;key/cert 通过 generation + `current.json` 原子发布,并用 creating/published 生命周期标记安全清理陈旧代际。
+- shim 在 OpenSSL/GNU/BSD SHA1 输出间做严格 40 位校验,无法安全派生 peer id 时透明启动真实 provider;`doctor` 明确拒绝未来 schema 且保持只读。
+
+### 容器验证体系(第五轮起)
+```bash
+docker build -t hcc-test . && docker run --rm hcc-test   # Node 24 / Linux / tmux 3.3a, 13/13
+```

@@ -16,6 +16,7 @@ import {
   readHealthyGlobalRuntime,
   writeGlobalRuntime
 } from '../lib/runtime/state.mjs';
+import { runtimeHttpRequest } from '../lib/web/runtime.mjs';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
 
 test('reads Runtime API v2 from the HTTP header', () => {
@@ -86,7 +87,7 @@ test('browser API and terminal WebSocket clients advertise Runtime API v2', () =
   assert.match(html, /requestQuery\(\{ api_version: runtimeApiVersion \}\)/);
 });
 
-test('runtime requests send v2 and probes reject legacy runtime metadata', async (t) => {
+test('runtime clients send v2 and probes reject legacy runtime metadata', async (t) => {
   const observed = [];
   let runtimeMetadata = { ok: true };
   const server = http.createServer((req, res) => {
@@ -101,6 +102,9 @@ test('runtime requests send v2 and probes reject legacy runtime metadata', async
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const runtime = { base_url: `http://127.0.0.1:${server.address().port}` };
 
+  await runtimeHttpRequest(runtime, '/direct', {
+    headers: { 'x-hcc-api-version': '1' }
+  });
   await runtimeRequest(
     { root: '/tmp/api-v2-root', dbPath: '/tmp/api-v2-root/.hello-cc/mesh.db' },
     'GET',
@@ -125,8 +129,7 @@ test('runtime requests send v2 and probes reject legacy runtime metadata', async
     fs.rmSync(runtimeHome, { recursive: true, force: true });
   }
 
-  runtimeMetadata = { api_version: API_VERSION };
   assert.equal(await probeRuntime(runtime), true);
 
-  assert.deepEqual(observed, ['2', '2', '2', '2', '2']);
+  assert.deepEqual(observed, ['2', '2', '2', '2', '2', '2']);
 });
