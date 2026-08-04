@@ -5,7 +5,7 @@ import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
 import process from 'node:process';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -162,7 +162,8 @@ import {
   readJsonRequest,
   sendFile,
   sendHttp,
-  sendJson
+  sendJson,
+  tokenMatches
 } from '../lib/web/http.mjs';
 import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
 import {
@@ -676,15 +677,6 @@ function now() {
 function iso(ts) {
   if (!ts) return '';
   return new Date(ts * 1000).toISOString();
-}
-
-function tokenMatches(provided, expected) {
-  if (!provided || !expected || provided.length !== expected.length) return false;
-  try {
-    return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
-  } catch {
-    return false;
-  }
 }
 
 function isLoopbackRemote(req) {
@@ -3020,7 +3012,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     const expected = session.actionToken || '';
     const provided = readActionToken(input, req);
-    if (!expected || provided !== expected) {
+    if (!expected || !tokenMatches(provided, expected)) {
       throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action for ${peer} requires the managed session action token`, { peer });
     }
     return actorPeer;
@@ -5865,7 +5857,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           if (msg.type === 'input' && session.status === 'running') {
             // Require the per-session action token on terminal input (the RCE
             // path). The controlling client received it in the snapshot frame.
-            if (session.actionToken && msg.action_token !== session.actionToken) return;
+            if (session.actionToken && !tokenMatches(msg.action_token, session.actionToken)) return;
             const data = String(msg.data || '');
             writeSessionInput(session, data);
           } else if (msg.type === 'resize' && session.status === 'running') {

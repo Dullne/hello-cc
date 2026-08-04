@@ -1551,9 +1551,13 @@ async function openTerminalWebSocket(peer) {
 
 // The per-session action token is delivered only via the terminal WS snapshot
 // frame (net-05), not the session list. Fetch it by opening the socket.
-async function fetchSessionActionToken(peer) {
+async function fetchSessionActionToken(peer, params = {}) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(runtimeWsUrl(peer));
+    const url = new URL(runtimeWsUrl(peer));
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    const ws = new WebSocket(url);
     const timer = setTimeout(() => reject(new Error(`${peer} action token fetch timeout`)), 5000);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
@@ -1564,6 +1568,59 @@ async function fetchSessionActionToken(peer) {
       }
     });
     ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+async function issueBrowserSessionCookie() {
+  const runtime = currentRuntime();
+  const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
+  const response = await fetch(new URL('/login', baseUrl), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: runtime.token || '' }),
+    redirect: 'manual'
+  });
+  const setCookie = response.headers.get('set-cookie') || '';
+  const sid = setCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+  if (response.status !== 302 || !sid) {
+    fail(`browser session login failed: status=${response.status} cookie=${setCookie}`);
+  }
+  return { baseUrl, origin: new URL(baseUrl).origin, sid };
+}
+
+async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
+  const url = new URL(route, auth.baseUrl);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return fetch(url, {
+    ...options,
+    headers: {
+      Cookie: `hcc_sid=${auth.sid}`,
+      Origin: auth.origin,
+      'X-HCC-API-Version': '2',
+      ...(options.headers || {})
+    }
+  });
+}
+
+async function expectSocketMarkerAfter(ws, marker, action) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`terminal websocket did not show ${marker}`)), 5000);
+    const onMessage = (raw) => {
+      let message;
+      try { message = JSON.parse(String(raw)); } catch { return; }
+      if (!['data', 'replace'].includes(message.type) || !String(message.data || '').includes(marker)) return;
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      resolve();
+    };
+    ws.on('message', onMessage);
+    Promise.resolve().then(action).catch((err) => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      reject(err);
+    });
   });
 }
 
@@ -1602,6 +1659,7 @@ async function openCookieTerminalWebSocket(peer, sid, params = {}) {
       if (message.type !== 'snapshot' || settled) return;
       settled = true;
       clearTimeout(timer);
+      ws.hccActionToken = message.action_token || '';
       resolve(ws);
     });
     ws.on('error', rejectBeforeSnapshot);
@@ -1667,6 +1725,41 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
   }
 }
 
+async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
+  const auth = await issueBrowserSessionCookie();
+  const ws = await openCookieTerminalWebSocket(peer, auth.sid, params);
+  try {
+    const closed = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${peer} cookie websocket eviction close timeout`)), 10000);
+      ws.once('close', (code, reason) => {
+        clearTimeout(timer);
+        resolve({ code, reason: String(reason || '') });
+      });
+      ws.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    // The store is capped at 256. Issuing 256 sessions after this one must
+    // evict it even when older sessions from earlier tests are still present.
+    for (let offset = 0; offset < 256; offset += 32) {
+      await Promise.all(Array.from({ length: 32 }, () => issueBrowserSessionCookie()));
+    }
+    const closeResult = await closed;
+    if (closeResult.code !== 4001 || !closeResult.reason.includes('session limit reached')) {
+      fail(`cookie websocket eviction did not close with 4001:\n${JSON.stringify(closeResult, null, 2)}`);
+    }
+    const revoked = await fetch(new URL('/api/runtime', auth.baseUrl), {
+      headers: { Cookie: `hcc_sid=${auth.sid}`, 'X-HCC-API-Version': '2' }
+    });
+    if (revoked.status !== 401) fail(`evicted cookie remained authorized: ${revoked.status}`);
+  } finally {
+    if (ws.readyState !== WebSocket.CLOSED) {
+      try { ws.terminate(); } catch {}
+    }
+  }
+}
+
 async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
@@ -1724,6 +1817,61 @@ async function expectWebSocketInputVisible(peer, marker) {
       }
     });
     ws.on('error', reject);
+  });
+}
+
+async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}, label = 'invalid token') {
+  return new Promise((resolve, reject) => {
+    const url = new URL(runtimeWsUrl(peer));
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    const ws = new WebSocket(url);
+    const rejectedMarker = `REJECTED_${testId}_${Math.random().toString(16).slice(2)}`;
+    const acceptedMarker = `ACCEPTED_${testId}_${Math.random().toString(16).slice(2)}`;
+    let snapshotToken = '';
+    let output = '';
+    let checkedRejected = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} ${label} input rejection timeout`));
+    }, 6000);
+    const finish = (err = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve();
+    };
+    ws.on('message', (raw) => {
+      let message;
+      try { message = JSON.parse(String(raw)); } catch { return; }
+      output += String(message.data || '');
+      if (message.type === 'snapshot' && !snapshotToken) {
+        snapshotToken = message.action_token || '';
+        const frame = { type: 'input', data: `echo ${rejectedMarker}\r` };
+        if (suppliedToken !== undefined) frame.action_token = suppliedToken;
+        ws.send(JSON.stringify(frame));
+        setTimeout(() => {
+          if (output.includes(rejectedMarker)) {
+            finish(new Error(`${peer} accepted ${label} action token`));
+            return;
+          }
+          checkedRejected = true;
+          ws.send(JSON.stringify({
+            type: 'input',
+            data: `echo ${acceptedMarker}\r`,
+            action_token: snapshotToken
+          }));
+        }, 350);
+      }
+      if (checkedRejected && output.includes(acceptedMarker)) finish();
+    });
+    ws.on('error', (err) => finish(err));
   });
 }
 
@@ -3549,7 +3697,7 @@ async function multiProjectWebWorkflow() {
   }
   for (const expected of [
     'term.onData((data) => {',
-    "ws.send(JSON.stringify({ type: 'input', data, action_token: sessionActionTokens[active] || '' }))"
+    "ws.send(JSON.stringify({ type: 'input', data, action_token: sessionActionTokens.get(active) || '' }))"
   ]) {
     if (!html.includes(expected)) fail(`web terminal input forwarding missing: ${expected}`);
   }
@@ -3570,6 +3718,9 @@ async function multiProjectWebWorkflow() {
 
   const rootSessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
   const otherSessions = await (await runtimeFetch('/api/sessions', {}, { root: otherRoot })).json();
+  if (JSON.stringify(rootSessions).includes('action_token') || JSON.stringify(otherSessions).includes('action_token')) {
+    fail(`GET /api/sessions leaked a session action token:\n${JSON.stringify({ rootSessions, otherSessions }, null, 2)}`);
+  }
   if ((rootSessions.sessions || []).some((s) => s.id === 'other-shell')) {
     fail(`root API saw second project session:\n${JSON.stringify(rootSessions)}`);
   }
@@ -3582,7 +3733,7 @@ async function multiProjectWebWorkflow() {
     fail(`sessions API did not expose unknown provider binding without marking it shared/known:\n${JSON.stringify(otherShellSession, null, 2)}`);
   }
 
-  const startProvider = async (payload) => {
+  const startProvider = async (payload, projectRoot = root) => {
     const response = await runtimeFetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3595,12 +3746,12 @@ async function multiProjectWebWorkflow() {
         },
         ...payload
       })
-    }, { root });
+    }, { root: projectRoot });
     const json = await response.json();
     if (!response.ok) fail(`web provider session start failed: ${JSON.stringify(json)}`);
     return json.session;
   };
-  const stopSession = async (id, payload = null) => {
+  const stopSession = async (id, payload = null, projectRoot = root) => {
     const options = payload
       ? {
           method: 'POST',
@@ -3608,11 +3759,84 @@ async function multiProjectWebWorkflow() {
           body: JSON.stringify(payload)
         }
       : { method: 'POST' };
-    const response = await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, options, { root });
+    const response = await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, options, { root: projectRoot });
     const json = await response.json();
     if (!response.ok) fail(`web provider session stop failed: ${JSON.stringify(json)}`);
     return json.session;
   };
+
+  // Cookie sessions and bearer tokens are both administrator roles. Cookie
+  // writes must additionally pass the exact same-origin gate.
+  const cookieAdmin = await issueBrowserSessionCookie();
+  const crossOrigin = `http://127.0.0.1:${port + 1}`;
+  const cookieAdminId = `cookie-admin-${testId}`;
+  const cookieAdminBody = JSON.stringify({
+    id: cookieAdminId,
+    kind: 'shell',
+    command: 'bash --noprofile --norc',
+    env: {
+      HOME: home,
+      PATH: env.PATH,
+      SHELL: process.env.SHELL || 'bash'
+    }
+  });
+  const crossCreate = await cookieRuntimeFetch('/api/sessions', cookieAdmin, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: crossOrigin },
+    body: cookieAdminBody
+  }, { root });
+  if (crossCreate.status !== 403) fail(`cross-origin cookie administrator create returned ${crossCreate.status}`);
+
+  const cookieCreate = await cookieRuntimeFetch('/api/sessions', cookieAdmin, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: cookieAdminBody
+  }, { root });
+  const cookieCreated = await cookieCreate.json();
+  if (!cookieCreate.ok || cookieCreated.session?.id !== cookieAdminId || cookieCreated.session?.action_token) {
+    fail(`same-origin cookie administrator create failed or leaked its action token:\n${JSON.stringify(cookieCreated, null, 2)}`);
+  }
+
+  const cookieAdminWs = await openCookieTerminalWebSocket(cookieAdminId, cookieAdmin.sid, { root });
+  try {
+    if (!cookieAdminWs.hccActionToken) fail('cookie administrator terminal snapshot omitted its action token');
+    const inputRoute = `/api/sessions/${encodeURIComponent(cookieAdminId)}/input`;
+    const stopRoute = `/api/sessions/${encodeURIComponent(cookieAdminId)}/stop`;
+    const crossInput = await cookieRuntimeFetch(inputRoute, cookieAdmin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: crossOrigin },
+      body: JSON.stringify({ data: 'echo should-not-run\r' })
+    }, { root });
+    if (crossInput.status !== 403) fail(`cross-origin cookie administrator input returned ${crossInput.status}`);
+
+    const marker = `COOKIE_ADMIN_INPUT_${testId}`;
+    await expectSocketMarkerAfter(cookieAdminWs, marker, async () => {
+      const inputResponse = await cookieRuntimeFetch(inputRoute, cookieAdmin, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: `echo ${marker}\r` })
+      }, { root });
+      if (!inputResponse.ok) fail(`same-origin cookie administrator input returned ${inputResponse.status}`);
+    });
+
+    const crossStop = await cookieRuntimeFetch(stopRoute, cookieAdmin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: crossOrigin },
+      body: '{}'
+    }, { root });
+    if (crossStop.status !== 403) fail(`cross-origin cookie administrator stop returned ${crossStop.status}`);
+
+    const cookieStop = await cookieRuntimeFetch(stopRoute, cookieAdmin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }, { root });
+    if (!cookieStop.ok) fail(`same-origin cookie administrator stop returned ${cookieStop.status}`);
+  } finally {
+    if (cookieAdminWs.readyState !== WebSocket.CLOSED) {
+      try { cookieAdminWs.terminate(); } catch {}
+    }
+  }
 
   const auditSpoofSession = await startProvider({
     kind: 'shell',
@@ -3691,6 +3915,62 @@ async function multiProjectWebWorkflow() {
   if (managedActionToken === runtimeActionToken || managedActionToken.length < 32) {
     fail(`managed web session action token is not an independent session token:\n${JSON.stringify({ runtimeActionToken, managedActionToken }, null, 2)}`);
   }
+  if (managedActionSession.action_token || JSON.stringify(managedActionSession).includes('action_token')) {
+    fail(`session create response leaked its action token:\n${JSON.stringify(managedActionSession, null, 2)}`);
+  }
+
+  const encodedActionId = `web action encoded/${testId}`;
+  const encodedActionSession = await startProvider({
+    id: encodedActionId,
+    kind: 'shell',
+    command: 'bash --noprofile --norc'
+  });
+  const encodedActionToken = await fetchSessionActionToken(encodedActionId, { root });
+  const siblingActionId = `web-action-sibling-${testId}`;
+  const siblingActionSession = await startProvider({
+    id: siblingActionId,
+    kind: 'shell',
+    command: 'bash --noprofile --norc'
+  }, otherRoot);
+  const siblingActionToken = await fetchSessionActionToken(siblingActionId, { root: otherRoot });
+  if (!encodedActionToken || !siblingActionToken) {
+    fail(`alternate sessions did not deliver action tokens:\n${JSON.stringify({ encodedActionSession, siblingActionSession }, null, 2)}`);
+  }
+
+  const sameLengthWrongToken = managedActionToken.slice(0, -1) +
+    (managedActionToken.endsWith('A') ? 'B' : 'A');
+  await assertTerminalInputTokenRejected(managedActionPeer, undefined, { root }, 'missing');
+  await assertTerminalInputTokenRejected(managedActionPeer, sameLengthWrongToken, { root }, 'same-length wrong');
+  await assertTerminalInputTokenRejected(managedActionPeer, encodedActionToken, { root }, 'another session');
+  await assertTerminalInputTokenRejected(managedActionPeer, siblingActionToken, { root }, 'sibling project');
+
+  // Encoded peer identifiers must resolve to their exact session and still use
+  // that session's own token rather than bypassing the comparison.
+  await assertTerminalInputTokenRejected(encodedActionId, managedActionToken, { root }, 'URL-encoded peer with foreign');
+
+  const expectActionTokenRejected = async (provided, label) => {
+    const response = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action_token: provided, resource: `rejected/${label}/${testId}`, ttl: 60 })
+    }, { root });
+    const body = await response.json();
+    if (response.ok || body.error?.code !== 'PEER_IDENTITY_REQUIRED') {
+      fail(`web action accepted ${label} token:\n${JSON.stringify(body, null, 2)}`);
+    }
+  };
+  await expectActionTokenRejected(sameLengthWrongToken, 'same-length-wrong');
+  await expectActionTokenRejected(encodedActionToken, 'other-session');
+  await expectActionTokenRejected(siblingActionToken, 'sibling-project');
+  const encodedPeerAction = await runtimeFetch(`/api/peers/${encodeURIComponent(encodedActionId)}/actions/heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action_token: encodedActionToken, renew_locks: false })
+  }, { root });
+  if (!encodedPeerAction.ok) {
+    fail(`URL-encoded peer action rejected its own token:\n${await encodedPeerAction.text()}`);
+  }
+
   const actionNext = await (await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/task-next`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3699,9 +3979,12 @@ async function multiProjectWebWorkflow() {
   if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
     fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
   }
+  await stopSession(encodedActionSession.id);
+  await stopSession(siblingActionSession.id, null, otherRoot);
   // Cookie-authenticated terminal sockets are tied to the opaque browser
   // session and must be revoked immediately on logout.
   await assertLogoutClosesCookieWebSocket(managedActionPeer, { root });
+  await assertEvictionClosesCookieWebSocket(managedActionPeer, { root });
   // The web heartbeat path is independent from the CLI command. Verify it also
   // renews from ttl_sec without compounding, including an explicit override.
   const webTtlResource = 'web/persisted-ttl-lock';
@@ -5553,6 +5836,36 @@ async function syntaxAndHelp() {
     "addEvent(db, 'tmux.session.gc'"
   ]) {
     if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
+  }
+  const actionResolverSource = hccSource.slice(
+    hccSource.indexOf('function resolveWebActionSession('),
+    hccSource.indexOf('function knownPeerIds(')
+  );
+  if (!actionResolverSource.includes('tokenMatches(provided, expected)') ||
+      actionResolverSource.includes('provided !== expected')) {
+    fail('resolveWebActionSession must use the shared constant-time token comparator');
+  }
+  const websocketInputSource = hccSource.slice(
+    hccSource.indexOf("ws.on('message', (raw) => {"),
+    hccSource.indexOf("ws.on('close', () => {", hccSource.indexOf("ws.on('message', (raw) => {"))
+  );
+  if (!websocketInputSource.includes('tokenMatches(msg.action_token, session.actionToken)') ||
+      websocketInputSource.includes('msg.action_token !== session.actionToken')) {
+    fail('terminal WebSocket input must use the shared constant-time token comparator');
+  }
+  const webSessionLifecycleSource = hccSource.slice(
+    hccSource.indexOf('function closeWebSession('),
+    hccSource.indexOf('const webSessionPruner = setInterval(')
+  );
+  for (const expected of [
+    'ws.close(4001, reason)',
+    "session.expiresAt <= t) closeWebSession(sid, 'session expired')",
+    'while (webSessions.size >= MAX_WEB_SESSIONS)',
+    "closeWebSession(oldest, 'session limit reached')"
+  ]) {
+    if (!webSessionLifecycleSource.includes(expected)) {
+      fail(`browser session lifecycle no longer closes sockets: ${expected}`);
+    }
   }
   for (const helper of [
     'function webPeerRegister(',
