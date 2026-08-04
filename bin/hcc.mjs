@@ -165,6 +165,12 @@ import {
   sendJson
 } from '../lib/web/http.mjs';
 import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
+import {
+  API_VERSION,
+  apiVersionUnsupportedBody,
+  readHttpApiVersion,
+  readWebSocketApiVersion
+} from '../lib/web/api-version.mjs';
 import { ensureSelfSignedCert } from '../lib/web/tls.mjs';
 import * as webUiTemplate from '../lib/web/ui-template.mjs';
 import {
@@ -2651,7 +2657,14 @@ async function startWebBackground(ctx, args) {
       try {
         await runtimeRequest(ctx, 'POST', '/api/projects', { root: ctx.root, db: ctx.dbPath }, existing);
       } catch {}
-      writeRuntime(ctx, { ...existing, root: ctx.root, db: ctx.dbPath, project_root: ctx.root, global_runtime: true });
+      writeRuntime(ctx, {
+        ...existing,
+        api_version: API_VERSION,
+        root: ctx.root,
+        db: ctx.dbPath,
+        project_root: ctx.root,
+        global_runtime: true
+      });
       return printWebRuntime(ctx, existing, { already: true, logFile: webLogPath(ctx), setup });
     }
     try { await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, existing); } catch {}
@@ -5350,6 +5363,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         res.end();
         return;
       }
+      if (url.pathname.startsWith('/api/') && !readHttpApiVersion(req).ok) {
+        sendJson(res, 426, apiVersionUnsupportedBody());
+        return;
+      }
       const authMode = webAuthMode(url, req);
       if (!authMode) {
         sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Missing or invalid token' } });
@@ -5386,6 +5403,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         writeRuntime(projectCtx, {
           product: PRODUCT_NAME,
           version: VERSION,
+          api_version: API_VERSION,
           pid: process.pid,
           root: projectCtx.root,
           db: projectCtx.dbPath,
@@ -5512,6 +5530,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         sendJson(res, 200, {
           product: PRODUCT_NAME,
           version: VERSION,
+          api_version: API_VERSION,
           pid: process.pid,
           root: reqCtx.root,
           db: reqCtx.dbPath,
@@ -5778,6 +5797,18 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   server.on('upgrade', (req, socket, head) => {
     try {
     const url = requestUrl(req);
+    if (!readWebSocketApiVersion(url).ok) {
+      const body = JSON.stringify(apiVersionUnsupportedBody());
+      socket.end([
+        'HTTP/1.1 426 Upgrade Required',
+        'Content-Type: application/json; charset=utf-8',
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        'Connection: close',
+        '',
+        body
+      ].join('\r\n'));
+      return;
+    }
     const upgradeAuthMode = webAuthMode(url, req);
     if (!upgradeAuthMode) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -5972,6 +6003,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const runtime = {
     product: PRODUCT_NAME,
     version: VERSION,
+    api_version: API_VERSION,
     pid: process.pid,
     root: ctx.root,
     db: ctx.dbPath,

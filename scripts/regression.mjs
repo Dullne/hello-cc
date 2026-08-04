@@ -1396,7 +1396,7 @@ function currentRuntimeUrl(route, params = {}) {
 
 function runtimeFetch(route, options = {}, params = {}) {
   const runtime = currentRuntime();
-  const headers = { ...(options.headers || {}) };
+  const headers = { ...(options.headers || {}), 'X-HCC-API-Version': '2' };
   if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
   return fetch(runtimeUrl(runtime, route, params), { ...options, headers });
 }
@@ -1406,7 +1406,35 @@ function runtimeWsUrl(peer) {
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, runtime.base_url || `http://127.0.0.1:${port}`);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   if (runtime.token) url.searchParams.set('token', runtime.token);
+  url.searchParams.set('api_version', '2');
   return url.toString();
+}
+
+async function websocketUpgradeStatus(url) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(url);
+    const finish = (value, error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.terminate(); } catch {}
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => finish(null, new Error(`websocket upgrade timeout: ${url}`)), 5000);
+    ws.once('open', () => finish(101));
+    ws.once('unexpected-response', (_req, res) => {
+      const status = res.statusCode;
+      res.resume();
+      finish(status);
+    });
+    ws.once('error', (error) => {
+      const status = Number(String(error?.message || '').match(/response:\s*(\d+)/i)?.[1]);
+      if (status) finish(status);
+      else finish(null, error);
+    });
+  });
 }
 
 async function waitFor(check, label, timeoutMs = 10000) {
@@ -1544,6 +1572,7 @@ async function openCookieTerminalWebSocket(peer, sid, params = {}) {
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('api_version', '2');
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
   }
@@ -1626,7 +1655,7 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
       fail(`cookie websocket logout did not close the established socket with 4001:\n${JSON.stringify({ closeResult, readyState: ws.readyState }, null, 2)}`);
     }
     const revoked = await fetch(new URL('/api/runtime', baseUrl), {
-      headers: { Cookie: `hcc_sid=${sid}` }
+      headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' }
     });
     if (revoked.status !== 401) {
       fail(`cookie websocket logout left the old cookie authorized: ${revoked.status}`);
@@ -2343,10 +2372,60 @@ async function setupRegression() {
   }
   await waitRuntime();
   const tokenRuntime = currentRuntime();
-  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || !tokenRuntime.token || tokenRuntime.token.length < 24) {
+  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || tokenRuntime.api_version !== 2 || !tokenRuntime.token || tokenRuntime.token.length < 24) {
     fail(`default web runtime did not store remote token data:\n${JSON.stringify(tokenRuntime, null, 2)}`);
   }
-  const unauthorizedResponse = await fetch(`${tokenRuntime.base_url}/api/runtime`);
+  const apiVersionMissing = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
+    headers: { Authorization: `Bearer ${tokenRuntime.token}` }
+  });
+  const apiVersionMissingBody = await apiVersionMissing.json();
+  if (apiVersionMissing.status !== 426 ||
+      apiVersionMissingBody?.error?.code !== 'API_VERSION_UNSUPPORTED' ||
+      apiVersionMissingBody?.error?.supported_version !== 2) {
+    fail(`protected API did not reject a missing Runtime API version:\n${JSON.stringify({ status: apiVersionMissing.status, body: apiVersionMissingBody }, null, 2)}`);
+  }
+  const apiVersionOld = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
+    headers: {
+      Authorization: `Bearer ${tokenRuntime.token}`,
+      'X-HCC-API-Version': '1'
+    }
+  });
+  const apiVersionOldBody = await apiVersionOld.json();
+  if (apiVersionOld.status !== 426 || apiVersionOldBody?.error?.code !== 'API_VERSION_UNSUPPORTED') {
+    fail(`protected API did not reject Runtime API v1:\n${JSON.stringify({ status: apiVersionOld.status, body: apiVersionOldBody }, null, 2)}`);
+  }
+  const apiVersionCurrent = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
+    headers: {
+      Authorization: `Bearer ${tokenRuntime.token}`,
+      'X-HCC-API-Version': '2'
+    }
+  });
+  const apiVersionCurrentBody = await apiVersionCurrent.json();
+  if (!apiVersionCurrent.ok || apiVersionCurrentBody.api_version !== 2) {
+    fail(`protected API did not accept or advertise Runtime API v2:\n${JSON.stringify({ status: apiVersionCurrent.status, body: apiVersionCurrentBody }, null, 2)}`);
+  }
+  for (const publicPath of ['/', '/login', '/assets/xterm.css']) {
+    const publicResponse = await fetch(new URL(publicPath, tokenRuntime.base_url));
+    if (publicResponse.status === 426) fail(`public route unexpectedly required Runtime API v2: ${publicPath}`);
+  }
+  const wsProbe = new URL('/ws/terminal/api-version-probe', tokenRuntime.base_url);
+  wsProbe.protocol = wsProbe.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (await websocketUpgradeStatus(wsProbe) !== 426) {
+    fail('WebSocket missing api_version was not rejected before authentication');
+  }
+  wsProbe.searchParams.set('token', tokenRuntime.token);
+  wsProbe.searchParams.set('api_version', '1');
+  if (await websocketUpgradeStatus(wsProbe) !== 426) {
+    fail('WebSocket api_version=1 was not rejected before session lookup');
+  }
+  wsProbe.searchParams.set('api_version', '2');
+  if (await websocketUpgradeStatus(wsProbe) !== 404) {
+    fail('WebSocket api_version=2 did not proceed to session lookup');
+  }
+
+  const unauthorizedResponse = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
+    headers: { 'X-HCC-API-Version': '2' }
+  });
   if (unauthorizedResponse.status !== 401) fail(`default web API allowed missing token: ${unauthorizedResponse.status}`);
   const tokenResponse = await runtimeFetch('/api/runtime');
   if (!tokenResponse.ok) fail(`default web API rejected runtime token: ${tokenResponse.status}`);
@@ -2369,10 +2448,10 @@ async function setupRegression() {
   if (!sidMatch) fail(`exchange did not return a session id: ${setCookie}`);
   const sid = sidMatch[1];
   // (b) API with the session cookie → 200
-  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}` } });
+  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' } });
   if (!withCookie.ok) fail(`API with session cookie required auth: ${withCookie.status}`);
   // (c) API with a bogus session cookie → 401
-  const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: 'hcc_sid=bogus' } });
+  const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: 'hcc_sid=bogus', 'X-HCC-API-Version': '2' } });
   if (bogusCookie.status !== 401) fail(`API with bogus session cookie did not 401: ${bogusCookie.status}`);
   // (d) cookie-authenticated writes require an exact same-origin Origin header.
   const crossOriginCookieWrite = await fetch(`${baseUrl}/api/csrf-probe`, {
@@ -2380,6 +2459,7 @@ async function setupRegression() {
     headers: {
       Cookie: `hcc_sid=${sid}`,
       Origin: `http://127.0.0.1:${port + 1}`,
+      'X-HCC-API-Version': '2',
       'Content-Type': 'application/json'
     },
     body: '{}'
@@ -2396,6 +2476,7 @@ async function setupRegression() {
     headers: {
       Cookie: `hcc_sid=${sid}`,
       Origin: new URL(baseUrl).origin,
+      'X-HCC-API-Version': '2',
       'Content-Type': 'application/json'
     },
     body: '{}'
@@ -2436,7 +2517,7 @@ async function setupRegression() {
   if (logout.status !== 204 || !logoutCookie.includes('hcc_sid=') || !logoutCookie.includes('Max-Age=0')) {
     fail(`logout did not revoke and expire the session cookie: status=${logout.status} cookie=${logoutCookie}`);
   }
-  const revokedCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}` } });
+  const revokedCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' } });
   if (revokedCookie.status !== 401) fail(`logout left the old session cookie authorized: ${revokedCookie.status}`);
 
   // (i) trusted loopback reverse-proxy headers mark issued and expired cookies
@@ -2469,7 +2550,7 @@ async function setupRegression() {
   if (proxyLogout.status !== 204 || !proxyLogoutCookie.includes('Max-Age=0') || !proxyLogoutCookie.includes('Secure')) {
     fail(`trusted proxy logout did not expire a Secure cookie: status=${proxyLogout.status} cookie=${proxyLogoutCookie}`);
   }
-  const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}` } });
+  const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}`, 'X-HCC-API-Version': '2' } });
   if (revokedProxyCookie.status !== 401) fail(`trusted proxy logout left the old cookie authorized: ${revokedProxyCookie.status}`);
 
   const badJsonResponse = await runtimeFetch('/api/projects', {
@@ -2542,7 +2623,7 @@ async function setupRegression() {
   await waitRuntime();
   const noTokenRuntime = currentRuntime();
   if (noTokenRuntime.token) fail(`explicit no-token runtime stored token:\n${JSON.stringify(noTokenRuntime, null, 2)}`);
-  const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`);
+  const noTokenResponse = await fetch(`${noTokenRuntime.base_url}/api/runtime`, { headers: { 'X-HCC-API-Version': '2' } });
   if (!noTokenResponse.ok) fail(`explicit no-token web API required token: ${noTokenResponse.status}`);
   await stopRuntime();
 
@@ -4157,7 +4238,7 @@ async function bufferGcArbitrationWorkflow() {
   const runtime = currentRuntime();
   const unauthorized = await fetch(new URL('/api/runtime/gc-buffers', runtime.base_url), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-HCC-API-Version': '2' },
     body: JSON.stringify({ cutoffMs: Date.now(), dryRun: true })
   });
   if (unauthorized.status !== 401) fail(`buffer GC endpoint allowed missing auth: ${unauthorized.status}`);
