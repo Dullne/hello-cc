@@ -97,11 +97,11 @@ function sanitizePeerPart(value, fallback = 'peer') {
 }
 
 function tmuxManagedSession(projectRoot, peer) {
-  return `hcc-${shortHash(projectRoot)}-${sanitizePeerPart(peer, 'peer')}`.slice(0, 80);
+  return `hcc-${shortHash(canonicalPath(projectRoot))}-${sanitizePeerPart(peer, 'peer')}`.slice(0, 80);
 }
 
 function tmuxManagedSessionPrefix(projectRoot) {
-  return `hcc-${shortHash(projectRoot)}-`;
+  return `hcc-${shortHash(canonicalPath(projectRoot))}-`;
 }
 
 function run(command, args, options = {}) {
@@ -1269,8 +1269,7 @@ function assertHccManagedTmuxEnv(pane, expectedRoot = root) {
   const hccRoot = tmuxEnvironmentValue(session, 'HCC_ROOT');
   const hccDb = tmuxEnvironmentValue(session, 'HCC_DB');
   const expectedDb = path.join(expectedRoot, '.hello-cc', 'mesh.db');
-  if (path.resolve(hccRoot || '') !== path.resolve(expectedRoot) ||
-      path.resolve(hccDb || '') !== path.resolve(expectedDb)) {
+  if (!samePath(hccRoot, expectedRoot) || !samePath(hccDb, expectedDb)) {
     fail(`hcc-managed tmux session missing root/db markers: ${session} HCC_ROOT=${hccRoot} HCC_DB=${hccDb}`);
   }
   return session;
@@ -3814,6 +3813,218 @@ async function multiProjectWebWorkflow() {
     fail(`projects API did not include both roots:\n${JSON.stringify(projects, null, 2)}`);
   }
 
+  const pathFixture = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-project-path-${testId}-`));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-project-outside-${testId}-`));
+  try {
+    const arbitraryRoot = path.join(pathFixture, 'arbitrary-project');
+    fs.mkdirSync(arbitraryRoot);
+    const arbitraryResponse = await runtimeFetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: arbitraryRoot })
+    });
+    const arbitraryBody = await arbitraryResponse.json();
+    if (!arbitraryResponse.ok || !samePath(arbitraryBody?.project?.root, fs.realpathSync(arbitraryRoot))) {
+      fail(`authenticated arbitrary project root was rejected:\n${JSON.stringify(arbitraryBody, null, 2)}`);
+    }
+    const arbitraryDb = path.join(arbitraryRoot, '.hello-cc', 'mesh.db');
+    if (!fs.lstatSync(arbitraryDb).isFile()) fail('arbitrary project did not create a regular mesh database');
+
+    const assertRejected = async (label, input) => {
+      const response = await runtimeFetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input)
+      });
+      const body = await response.json();
+      if (response.status !== 403 || body?.error?.code !== 'PROJECT_PATH_FORBIDDEN') {
+        fail(`${label} returned ${response.status} instead of PROJECT_PATH_FORBIDDEN:\n${JSON.stringify(body, null, 2)}`);
+      }
+    };
+
+    const outsideBeforeCreateRoot = path.join(pathFixture, 'outside-before-create-project');
+    fs.mkdirSync(outsideBeforeCreateRoot);
+    await assertRejected('outside database before state creation', {
+      root: outsideBeforeCreateRoot,
+      db: path.join(outside, 'outside-before-create.sqlite')
+    });
+    if (fs.existsSync(path.join(outsideBeforeCreateRoot, '.hello-cc'))) {
+      fail('outside database request created the project state directory before rejection');
+    }
+
+    const stateLinkRoot = path.join(pathFixture, 'state-link-project');
+    const stateLinkOutside = path.join(outside, 'state-link-target');
+    fs.mkdirSync(stateLinkRoot);
+    fs.mkdirSync(stateLinkOutside);
+    fs.symlinkSync(stateLinkOutside, path.join(stateLinkRoot, '.hello-cc'), 'dir');
+    await assertRejected('state directory symlink escape', { root: stateLinkRoot });
+    if (fs.existsSync(path.join(stateLinkOutside, 'mesh.db'))) {
+      fail('state directory symlink escape created an outside database');
+    }
+
+    const parentLinkRoot = path.join(pathFixture, 'parent-link-project');
+    const parentLinkState = path.join(parentLinkRoot, '.hello-cc');
+    const parentLinkOutside = path.join(outside, 'parent-link-target');
+    fs.mkdirSync(parentLinkState, { recursive: true });
+    fs.mkdirSync(parentLinkOutside);
+    fs.symlinkSync(parentLinkOutside, path.join(parentLinkState, 'nested'), 'dir');
+    await assertRejected('nested database parent symlink escape', {
+      root: parentLinkRoot,
+      db: path.join(parentLinkState, 'nested', 'escape.sqlite')
+    });
+    if (fs.existsSync(path.join(parentLinkOutside, 'escape.sqlite'))) {
+      fail('nested parent symlink escape created an outside database');
+    }
+
+    const fileLinkRoot = path.join(pathFixture, 'file-link-project');
+    const fileLinkState = path.join(fileLinkRoot, '.hello-cc');
+    const outsideDb = path.join(outside, 'outside.sqlite');
+    fs.mkdirSync(fileLinkState, { recursive: true });
+    fs.writeFileSync(outsideDb, 'outside-sentinel');
+    fs.symlinkSync(outsideDb, path.join(fileLinkState, 'mesh.db'), 'file');
+    await assertRejected('database file symlink escape', { root: fileLinkRoot });
+    if (fs.readFileSync(outsideDb, 'utf8') !== 'outside-sentinel') {
+      fail('database file symlink escape modified the outside target');
+    }
+
+    const reboundRoot = path.join(pathFixture, 'body-rebind-project');
+    const reboundState = path.join(reboundRoot, '.hello-cc');
+    const reboundStateBefore = path.join(reboundRoot, '.hello-cc-before-rebind');
+    const reboundOutside = path.join(outside, 'body-rebind-target');
+    fs.mkdirSync(reboundRoot);
+    fs.mkdirSync(reboundOutside);
+    const reboundCreate = await runtimeFetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: reboundRoot })
+    });
+    if (!reboundCreate.ok) fail(`cannot create body-rebind project: ${await reboundCreate.text()}`);
+
+    const reboundBody = JSON.stringify({ body: 'must not reach rebound database' });
+    const reboundRuntime = currentRuntime();
+    const reboundUrl = runtimeUrl(
+      reboundRuntime,
+      '/api/detected/body-rebind-peer/msg',
+      { root: reboundRoot }
+    );
+    let reboundRequest;
+    const reboundResponse = new Promise((resolve, reject) => {
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(reboundBody),
+        'X-HCC-API-Version': '2'
+      };
+      if (reboundRuntime.token) headers.Authorization = `Bearer ${reboundRuntime.token}`;
+      reboundRequest = http.request(reboundUrl, { method: 'POST', headers }, (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { text += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, text }));
+      });
+      reboundRequest.on('error', reject);
+    });
+    const splitAt = Math.max(1, Math.floor(reboundBody.length / 2));
+    reboundRequest.write(reboundBody.slice(0, splitAt));
+    await sleep(250);
+    fs.renameSync(reboundState, reboundStateBefore);
+    fs.symlinkSync(reboundOutside, reboundState, 'dir');
+    reboundRequest.end(reboundBody.slice(splitAt));
+    const reboundResult = await reboundResponse;
+    let reboundPayload = null;
+    try { reboundPayload = JSON.parse(reboundResult.text); } catch {}
+    if (reboundResult.status !== 403 || reboundPayload?.error?.code !== 'PROJECT_PATH_FORBIDDEN') {
+      fail(`body-time state rebind returned ${reboundResult.status} instead of PROJECT_PATH_FORBIDDEN:\n${reboundResult.text}`);
+    }
+    if (fs.existsSync(path.join(reboundOutside, 'mesh.db'))) {
+      fail('body-time state rebind opened a database outside the project');
+    }
+    fs.unlinkSync(reboundState);
+    fs.renameSync(reboundStateBefore, reboundState);
+
+    const migrationBusyRoot = path.join(pathFixture, 'migration-busy-project');
+    const migrationTargetRoot = path.join(pathFixture, 'migration-target-project');
+    const migrationTargetState = path.join(migrationTargetRoot, '.hello-cc');
+    const migrationTargetStateBefore = path.join(migrationTargetRoot, '.hello-cc-before-rebind');
+    const migrationOutside = path.join(outside, 'migration-target');
+    const migrationBusyDb = path.join(migrationBusyRoot, '.hello-cc', 'mesh.db');
+    const migrationTargetDb = path.join(migrationTargetState, 'mesh.db');
+    const migrationOutsideDb = path.join(migrationOutside, 'mesh.db');
+    const migrationRegistry = path.join(home, '.hello-cc', 'projects.json');
+    const migrationReady = path.join(outDir, 'migration-busy-ready');
+    const migrationRelease = path.join(outDir, 'migration-busy-release');
+    createLegacySchemaDb(migrationBusyDb, 6);
+    createLegacySchemaDb(migrationTargetDb, 6);
+    fs.mkdirSync(migrationOutside);
+    const registryBeforeMigrationRace = fs.readFileSync(migrationRegistry, 'utf8');
+    const migrationHolderSource = String.raw`
+      import fs from 'node:fs';
+      import { DatabaseSync } from 'node:sqlite';
+      const [dbPath, ready, release] = process.argv.slice(1);
+      const db = new DatabaseSync(dbPath, { timeout: 5000 });
+      db.exec('BEGIN EXCLUSIVE');
+      fs.writeFileSync(ready, 'ready');
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (!fs.existsSync(release)) Atomics.wait(wait, 0, 0, 10);
+      db.exec('ROLLBACK');
+      db.close();
+    `;
+    const migrationHolder = spawn(process.execPath, [
+      '--input-type=module',
+      '-e',
+      migrationHolderSource,
+      migrationBusyDb,
+      migrationReady,
+      migrationRelease
+    ], {
+      cwd: repoRoot,
+      env,
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    await waitForFile(migrationReady, 'ready', 'registered migration busy holder');
+    try {
+      const registryPayload = JSON.parse(registryBeforeMigrationRace);
+      const t = Math.floor(Date.now() / 1000);
+      registryPayload.projects = [
+        { root: migrationBusyRoot, db: migrationBusyDb, name: 'migration-busy', last_seen_at: t + 2 },
+        { root: migrationTargetRoot, db: migrationTargetDb, name: 'migration-target', last_seen_at: t + 1 },
+        ...(registryPayload.projects || []).filter((project) =>
+          !samePath(project.root, migrationBusyRoot) && !samePath(project.root, migrationTargetRoot))
+      ];
+      fs.writeFileSync(migrationRegistry, JSON.stringify(registryPayload, null, 2));
+
+      const migrationRequest = runtimeFetch('/api/sessions', {}, { root });
+      await sleep(750);
+      fs.renameSync(migrationTargetState, migrationTargetStateBefore);
+      fs.symlinkSync(migrationOutside, migrationTargetState, 'dir');
+      fs.writeFileSync(migrationRelease, 'go');
+      await waitForProcessExit(migrationHolder.pid, 'registered migration busy holder exit');
+      const migrationResponse = await migrationRequest;
+      if (!migrationResponse.ok) {
+        fail(`registered migration race request returned ${migrationResponse.status}: ${await migrationResponse.text()}`);
+      }
+      // A periodic scan may own that fan-out instead of this request.
+      await sleep(1000);
+      if (fs.existsSync(migrationOutsideDb)) {
+        fail('registered project migration followed a rebound state directory outside the project');
+      }
+    } finally {
+      if (!fs.existsSync(migrationRelease)) fs.writeFileSync(migrationRelease, 'go');
+      await waitForProcessExit(migrationHolder.pid, 'registered migration busy holder exit');
+      fs.writeFileSync(migrationRegistry, registryBeforeMigrationRace);
+      if (fs.lstatSync(migrationTargetState).isSymbolicLink()) fs.unlinkSync(migrationTargetState);
+      if (fs.existsSync(migrationTargetStateBefore)) {
+        fs.renameSync(migrationTargetStateBefore, migrationTargetState);
+      }
+    }
+
+    if (process.platform === 'linux') {
+      await assertRejected('proc pseudo-file target', { root: '/', db: '/proc/self/status' });
+    }
+  } finally {
+    fs.rmSync(pathFixture, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+
   const activityLockReady = path.join(outDir, 'web-activity-lock-ready');
   const activityLockRelease = path.join(outDir, 'web-activity-lock-release');
   const registryPath = path.join(home, '.hello-cc', 'projects.json');
@@ -4056,6 +4267,85 @@ async function multiProjectWebWorkflow() {
     if (!response.ok) fail(`web provider session stop failed: ${JSON.stringify(json)}`);
     return json.session;
   };
+
+  const canonicalRegressionRoot = fs.realpathSync(root);
+  if (canonicalRegressionRoot !== root) {
+    const legacyAliasPeer = 'legacy-alias-restart';
+    const legacyAliasSession = `hcc-${shortHash(root)}-${legacyAliasPeer}`;
+    const canonicalAliasSession = tmuxManagedSession(root, legacyAliasPeer);
+    if (legacyAliasSession === canonicalAliasSession) {
+      fail('legacy alias session fixture did not produce a distinct pre-upgrade name');
+    }
+    managedTmuxSessions.add(legacyAliasSession);
+    run('tmux', [
+      'new-session', '-d', '-s', legacyAliasSession,
+      '-e', `HCC_ROOT=${root}`, '-c', root,
+      'bash', '--noprofile', '--norc'
+    ]);
+    const legacyAliasPane = run('tmux', [
+      'display-message', '-p', '-t', `${legacyAliasSession}:0.0`, '#{pane_id}'
+    ]).trim();
+    const legacyAliasPid = Number(run('tmux', [
+      'display-message', '-p', '-t', legacyAliasPane, '#{pane_pid}'
+    ]).trim());
+    const legacyAliasIdentity = inspectProcessIdentity(legacyAliasPid).identity;
+    if (!legacyAliasIdentity) fail('cannot inspect legacy alias pane identity');
+    withMeshDb((db) => {
+      const t = Math.floor(Date.now() / 1000);
+      const staleLastSeenAt = t - 3600;
+      db.prepare(`
+        INSERT INTO peers(id, kind, role, worktree, pid, pid_start_token, pid_command_hash,
+                          status, capabilities, created_at, last_seen_at)
+        VALUES (?, 'shell', 'peer', ?, ?, ?, ?, 'working', 'tmux', ?, ?)
+        ON CONFLICT(id) DO UPDATE SET worktree = excluded.worktree, pid = excluded.pid,
+          pid_start_token = excluded.pid_start_token, pid_command_hash = excluded.pid_command_hash,
+          status = excluded.status, capabilities = excluded.capabilities, last_seen_at = excluded.last_seen_at
+      `).run(legacyAliasPeer, root, legacyAliasPid, legacyAliasIdentity.startToken,
+        legacyAliasIdentity.commandHash, t, staleLastSeenAt);
+      db.prepare(`
+        INSERT INTO peer_bindings(peer, provider, resume_mode, command, transport,
+                                  runtime_session_id, runtime_target, created_at, updated_at)
+        VALUES (?, 'shell', 'attached', 'bash --noprofile --norc', 'tmux', ?, NULL, ?, ?)
+        ON CONFLICT(peer) DO UPDATE SET transport = 'tmux', runtime_session_id = excluded.runtime_session_id,
+          runtime_target = NULL, updated_at = excluded.updated_at
+      `).run(legacyAliasPeer, legacyAliasPeer, t, t);
+      const initialBinding = db.prepare(`
+        SELECT runtime_target FROM peer_bindings WHERE peer = ?
+      `).get(legacyAliasPeer);
+      if (!initialBinding || initialBinding.runtime_target !== null) {
+        fail(`legacy alias fixture did not start detached:\n${JSON.stringify(initialBinding, null, 2)}`);
+      }
+    });
+    let observedSessions = [];
+    let observedBinding = null;
+    try {
+      await waitFor(async () => {
+        const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+        observedSessions = data.sessions || [];
+        withMeshDb((db) => {
+          observedBinding = db.prepare(`
+            SELECT transport, runtime_session_id, runtime_target
+            FROM peer_bindings WHERE peer = ?
+          `).get(legacyAliasPeer) || null;
+        });
+        return observedSessions.some((session) =>
+          session.id === legacyAliasPeer && session.pane === legacyAliasPane) &&
+          observedBinding?.runtime_target === legacyAliasPane;
+      }, 'legacy alias detached tmux re-adoption', 12000);
+    } catch (error) {
+      fail(`legacy alias detached tmux was not re-adopted: ${error.message}\n${JSON.stringify({
+        legacyAliasSession,
+        canonicalAliasSession,
+        legacyAliasPane,
+        session_visible: observedSessions.some((session) => session.id === legacyAliasPeer),
+        binding: observedBinding
+      }, null, 2)}`);
+    }
+    await stopSession(legacyAliasPeer, { kill_tmux: true });
+    if (runMaybe('tmux', ['has-session', '-t', legacyAliasSession]).status === 0) {
+      fail('legacy alias detached tmux session survived DB-proven kill');
+    }
+  }
 
   const cookieAdmin = await issueBrowserSessionCookie();
   const crossOrigin = `http://127.0.0.1:${port + 1}`;
@@ -5921,6 +6211,43 @@ async function syntaxAndHelp() {
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
+  const cmdWebSource = hccSource.slice(
+    hccSource.indexOf('async function cmdWeb('),
+    hccSource.indexOf('async function cmdRun(', hccSource.indexOf('async function cmdWeb('))
+  );
+  for (const expected of [
+    'statusSnapshot: webStatusSnapshot',
+    'statusSummary: webStatusSummary',
+    'webPeerAction: webPeerActionForProject',
+    'connect: connectWebProject',
+    'statusSnapshot: webStatusSnapshot',
+    'statusSummary: webStatusSummary',
+    'webStatusSnapshot(reqCtx',
+    'webPeerActionForProject(reqCtx'
+  ]) {
+    if (!cmdWebSource.includes(expected)) {
+      fail(`cmdWeb project-safe coordination factory wiring missing: ${expected}`);
+    }
+  }
+  const migrationFanoutSource = hccSource.slice(
+    hccSource.indexOf('function migrateRegisteredProjectDbs('),
+    hccSource.indexOf('function addEvent(', hccSource.indexOf('function migrateRegisteredProjectDbs('))
+  );
+  for (const expected of [
+    'resolved = resolveProjectDatabase({',
+    'root: project.root',
+    'createStateDir: false',
+    'const dbPath = resolved.db',
+    'db = new DatabaseSync(dbPath'
+  ]) {
+    if (!migrationFanoutSource.includes(expected)) {
+      fail(`registered migration project-path recheck missing: ${expected}`);
+    }
+  }
+  if (migrationFanoutSource.indexOf('resolved = resolveProjectDatabase({') >
+      migrationFanoutSource.indexOf('db = new DatabaseSync(dbPath')) {
+    fail('registered migration opens a sibling database before its project-path recheck');
+  }
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
     "runTmux(['pipe-pane', '-t', session.pane]);",

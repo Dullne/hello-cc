@@ -34,6 +34,7 @@ import {
   tx
 } from '../lib/db/schema.mjs';
 import { ensureMigrationBackup } from '../lib/db/migration-backup.mjs';
+import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import {
   intOpt,
   parseOpts,
@@ -205,6 +206,8 @@ import {
   tmuxLaunchFingerprint,
   tmuxListSessionNames,
   tmuxManagedSessionName,
+  tmuxManagedSessionNameMatches,
+  tmuxManagedSessionPrefixMatches,
   tmuxPaneInfo,
   tmuxProviderState,
   tmuxSendLiteral,
@@ -311,8 +314,8 @@ const {
   npmPackageName: NPM_PACKAGE_NAME
 });
 
-function isProjectManagedTmuxSession(projectCtx, sessionName) {
-  return Boolean(sessionName) && sessionName.startsWith(`hcc-${shortHash(projectCtx.root)}-`);
+function isProjectManagedTmuxSession(projectCtx, sessionName, sessionRoot = null) {
+  return tmuxManagedSessionPrefixMatches(projectCtx, sessionName, sessionRoot);
 }
 
 function liveProcessIdentity(pid) {
@@ -425,6 +428,14 @@ function observePeerEvidence(projectCtx, row, binding = null) {
   const actualRoot = target.session.actual
     ? tmuxSessionEnvironmentValue(target.session.actual, 'HCC_ROOT')
     : null;
+  if (target.session.actual && tmuxManagedSessionNameMatches(
+    projectCtx,
+    target.session.actual,
+    row.id,
+    actualRoot
+  )) {
+    target.session.expected = target.session.actual;
+  }
   return resolvePeerEvidence({
     peer: row,
     tmux: {
@@ -824,8 +835,19 @@ function migrateRegisteredProjectDbs(ctx) {
     const currentDb = path.resolve(ctx.dbPath);
     const seen = new Set([currentDb]);
     for (const project of readProjectRegistry()) {
-      const root = path.resolve(project.root);
-      const dbPath = path.resolve(project.db || path.join(root, '.hello-cc', 'mesh.db'));
+      let resolved;
+      try {
+        resolved = resolveProjectDatabase({
+          root: project.root,
+          db: project.db || path.join(project.root, '.hello-cc', 'mesh.db'),
+          createStateDir: false
+        });
+      } catch (err) {
+        console.error(redactedLogText(`[${new Date().toISOString()}] skipping registered project DB migration for ${project.db || project.root}: ${err?.message || err}`));
+        continue;
+      }
+      const root = resolved.root;
+      const dbPath = resolved.db;
       if (seen.has(dbPath)) continue;
       seen.add(dbPath);
       const cacheKey = `${dbPath}:${DB_SCHEMA_VERSION}`;
@@ -2972,35 +2994,79 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return rows;
   }
 
-  function assertDbUnderRoot(root, db) {
-    const stateDir = path.join(path.resolve(root), '.hello-cc');
-    const resolvedDb = path.resolve(db);
-    if (resolvedDb !== path.join(stateDir, 'mesh.db') && !resolvedDb.startsWith(stateDir + path.sep)) {
-      throw new CliError('PROJECT_PATH_FORBIDDEN', `Database path must live under ${stateDir}`);
-    }
+  function resolveWebProjectContext(root, db) {
+    const first = resolveProjectDatabase({ root, db, createStateDir: true });
+    // Re-read every filesystem identity immediately before the returned
+    // context can reach connect(). A path rebound after the first pass fails
+    // closed instead of carrying a stale lexical decision into SQLite.
+    const final = resolveProjectDatabase({
+      root: first.root,
+      db: first.db,
+      createStateDir: true
+    });
+    return contextForProject(final.root, final.db, { cwd: final.root, json: ctx.json });
   }
 
+  function connectWebProject(projectCtx, options = {}) {
+    const final = resolveProjectDatabase({
+      root: projectCtx.root,
+      db: projectCtx.dbPath,
+      createStateDir: options.create !== false
+    });
+    return connect(contextForProject(final.root, final.db, {
+      cwd: final.root,
+      json: projectCtx.json
+    }), options);
+  }
+
+  const {
+    statusSnapshot: webStatusSnapshot,
+    statusSummary: webStatusSummary
+  } = createCoordinationState({
+    activePeerTtl: ACTIVE_PEER_TTL,
+    cliName: CLI_NAME,
+    connect: connectWebProject,
+    defaultLockTtl: DEFAULT_LOCK_TTL,
+    now,
+    queryInbox,
+    queryOpenTasks,
+    queryTimelineMessages,
+    observePeerEvidence
+  });
+  const {
+    webPeerAction: webPeerActionForProject
+  } = createWebPeerActions({
+    activePeerTtl: ACTIVE_PEER_TTL,
+    addEvent,
+    assertTaskOwnerForMutation,
+    claimNextTasksForPeer,
+    connect: connectWebProject,
+    defaultLockTtl: DEFAULT_LOCK_TTL,
+    detectBranch,
+    now,
+    observeClockSafetyInTransaction,
+    observePeerEvidence,
+    positiveIntOpt,
+    peerEvidenceFromDb,
+    queryInbox,
+    statusSnapshot: webStatusSnapshot,
+    statusSummary: webStatusSummary,
+    takeOverTaskForPeer,
+    touchPeer,
+    tx,
+    upsertPeer
+  });
+
   function projectFromRequest(req, url) {
-    const root = url.searchParams.get('root') ||
+    const requestedRoot = url.searchParams.get('root') ||
       url.searchParams.get('project') ||
       req.headers['x-hcc-root'] ||
       ctx.root;
-    const resolvedRoot = path.resolve(root);
-    // A bearer token must not open or create a SQLite DB at an arbitrary path
-    // (net-07) or read pseudo-files (?db=/proc/...). Require a real directory and
-    // keep the DB under its own .hello-cc/. This preserves multi-project switching
-    // (point the console at any real project dir) without granting an
-    // arbitrary-filesystem-write primitive.
-    if (resolvedRoot !== path.resolve(ctx.root) &&
-        (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory())) {
-      throw new CliError('PROJECT_NOT_REGISTERED', `Project root does not exist: ${resolvedRoot}`);
-    }
-    const db = url.searchParams.get('db') ||
+    const requestedDb = url.searchParams.get('db') ||
       req.headers['x-hcc-db'] ||
-      path.join(resolvedRoot, '.hello-cc', 'mesh.db');
-    assertDbUnderRoot(resolvedRoot, db);
+      path.join(requestedRoot, '.hello-cc', 'mesh.db');
     return rememberProject(
-      contextForProject(resolvedRoot, db, { cwd: resolvedRoot, json: ctx.json }),
+      resolveWebProjectContext(requestedRoot, requestedDb),
       { activity: true }
     );
   }
@@ -3033,7 +3099,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function resolveWebActionSession(projectCtx, peer, input, req) {
-    const db = connect(projectCtx);
+    const db = connectWebProject(projectCtx);
     let session;
     try {
       session = getSession(projectCtx, peer, db);
@@ -3060,7 +3126,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function knownPeerIds(projectCtx) {
-    const db = connect(projectCtx);
+    const db = connectWebProject(projectCtx);
     try {
       return db.prepare('SELECT id FROM peers').all().map((row) => row.id);
     } finally {
@@ -3207,7 +3273,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           // hb-03: persist the exit in the peers table so hcc peers/status no
           // longer shows this session as active once its .out vanished.
           try {
-            const exitDb = connect(session.ctx || ctx);
+            const exitDb = connectWebProject(session.ctx || ctx);
             try {
               const exitPeerId = session.peerId || session.id;
               exitDb.prepare('UPDATE peers SET status = ? WHERE id = ?').run('exited', exitPeerId);
@@ -3296,7 +3362,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function reconcileRunningBindings(projectCtx = ctx, panes = null) {
-    const db = connect(projectCtx);
+    const db = connectWebProject(projectCtx);
     try {
       const tmuxPanes = Array.isArray(panes) ? panes : listTmuxPanesOnce();
       return reconcileRunningPeerBindings(db, projectCtx, {
@@ -3320,7 +3386,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     autoAttachScanInFlight = true;
     let db = null;
     try {
-      db = connect(ctx);
+      db = connectWebProject(ctx);
 
       // Always-on, TTL-independent hygiene: recover managed tmux sessions left
       // alive (default Stop = detach-without-kill, or across a restart) and reap
@@ -3463,7 +3529,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       for (const projectCtx of runtimeProjectContexts()) {
         let db = null;
         try {
-          db = connect(projectCtx, { migrateRegistered: false, create: false });
+          db = connectWebProject(projectCtx, { migrateRegistered: false, create: false });
           const t = now();
           const managedPeerIds = new Set();
           for (const session of sessionsForProject(projectCtx)) {
@@ -3585,7 +3651,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     });
     let db = null;
     try {
-      db = connect(projectCtx);
+      db = connectWebProject(projectCtx);
       return applyClockSafeBufferPlan({
         db,
         plan: prepared.plan,
@@ -3618,7 +3684,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       for (const projectCtx of runtimeProjectContexts()) {
         let db = null;
         try {
-          db = connect(projectCtx, { migrateRegistered: false, create: false });
+          db = connectWebProject(projectCtx, { migrateRegistered: false, create: false });
           const result = runGc(projectCtx, db, {
             olderThanDays: 14,
             dryRun: false,
@@ -3827,7 +3893,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     broadcast(session, { type: 'exit', event: { reason: status } });
     const pctx = session.ctx || contextForProject(session.root || ctx.root, null, { json: ctx.json });
     sessions.delete(sessionKey(pctx, session.id));
-    const db = connect(pctx);
+    const db = connectWebProject(pctx);
     try {
       const t = now();
       const peerId = resolveSessionPeerId(db, session) || session.id;
@@ -4129,7 +4195,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function oldTmuxRebindTarget(projectCtx, oldTarget, newTarget) {
     if (!oldTarget || oldTarget === newTarget) return false;
     const oldSessionName = tmuxSessionNameForPane(oldTarget);
-    if (!isProjectManagedTmuxSession(projectCtx, oldSessionName)) return false;
+    const oldSessionRoot = tmuxSessionEnvironmentValue(oldSessionName, 'HCC_ROOT');
+    if (!isProjectManagedTmuxSession(projectCtx, oldSessionName, oldSessionRoot)) return false;
     const newSessionName = tmuxSessionNameForPane(newTarget);
     if (oldSessionName === newSessionName) return false;
     return { oldSessionName, newSessionName };
@@ -4169,7 +4236,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
 
     const expectedSession = tmuxManagedSessionName(projectCtx, peerId);
-    if (actualSession !== expectedSession) {
+    const sessionRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');
+    if (!tmuxManagedSessionNameMatches(projectCtx, actualSession, peerId, sessionRoot)) {
       throw new CliError('TMUX_KILL_NOT_HCC_MANAGED', `Refusing to kill non-managed tmux session ${actualSession}`, {
         peer: peerId,
         expected_session: expectedSession,
@@ -4238,7 +4306,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     const expectedSession = tmuxManagedSessionName(projectCtx, oldPeer);
     const allowedSession = opts.allowedSessionName || null;
-    if (oldSessionName !== expectedSession && oldSessionName !== allowedSession) {
+    const oldSessionRoot = tmuxSessionEnvironmentValue(oldSessionName, 'HCC_ROOT');
+    if (!tmuxManagedSessionNameMatches(projectCtx, oldSessionName, oldPeer, oldSessionRoot) &&
+        oldSessionName !== allowedSession) {
       addRebindCleanupFailedEvent(projectCtx, db, actor, {
         reason: 'not_hcc_managed_peer_session',
         old_peer: oldPeer,
@@ -4536,7 +4606,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
     let db = null;
     try {
-      db = connect(pctx);
+      db = connectWebProject(pctx);
       if (input.rebindOldTmux && !input.skipProviderRebindCleanup &&
           (nextBinding.provider_session_id || nextBinding.provider_session_name)) {
         const existingPeerBinding = db.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get(id);
@@ -4606,7 +4676,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     if (rebindOldTarget) {
       try {
-        const eventDb = connect(pctx);
+        const eventDb = connectWebProject(pctx);
         try {
           killOldTmuxForRebind(pctx, rebindOldPlan, session.peerId || id, eventDb);
           if (rebindOldPeer && rebindOldPeer !== id) {
@@ -4647,7 +4717,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       session.lastIoRefreshAt = t;
       const peerId = session.peerId || session.id;
       if (!peerId) return;
-      const ioDb = connect(session.ctx || ctx);
+      const ioDb = connectWebProject(session.ctx || ctx);
       try {
         ioDb.prepare('UPDATE peers SET last_seen_at = ? WHERE id = ?').run(t, peerId);
       } finally {
@@ -4843,7 +4913,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
       pane = tmuxPaneInfo(paneTarget).pane;
       for (const oldInfo of oldTmuxTargetsForRebind) {
-        const eventDb = connect(pctx);
+        const eventDb = connectWebProject(pctx);
         try {
           oldInfo.plan = assertOldTmuxCanRebind(pctx, oldInfo.oldPeer, oldInfo.oldTarget, pane, id, eventDb, {
             force: Boolean(input.providerForce),
@@ -4888,7 +4958,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       if (pendingRestartAudit) {
         try {
-          const eventDb = connect(pctx);
+          const eventDb = connectWebProject(pctx);
           try {
             addEvent(eventDb, 'tmux.session.restart_failed', actorPeer, null, auditPayload({
               actor: actorPeer,
@@ -4920,7 +4990,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     if (pendingRestartAudit) {
       try {
-        const eventDb = connect(pctx);
+        const eventDb = connectWebProject(pctx);
         try {
           addEvent(eventDb, 'tmux.session.restarted', actorPeer, null, auditPayload({
             actor: actorPeer,
@@ -4946,7 +5016,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     for (const oldInfo of oldTmuxTargetsForRebind) {
       try {
-        const eventDb = connect(pctx);
+        const eventDb = connectWebProject(pctx);
         try {
           killOldTmuxForRebind(pctx, oldInfo.plan, actorPeer, eventDb);
         } finally {
@@ -4965,7 +5035,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function restoreTmuxManagedSessions(projectCtx = ctx) {
-    const db = connect(projectCtx);
+    const db = connectWebProject(projectCtx);
     let rows = [];
     try {
       rows = db.prepare(`
@@ -4995,7 +5065,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         // intact. Only jointly confirmed dead tmux/process evidence is stale.
         if (evidence.state !== 'dead') continue;
         try {
-          const db2 = connect(projectCtx);
+          const db2 = connectWebProject(projectCtx);
           try {
             db2.prepare('UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer = ?').run(now(), row.id);
           } finally { db2.close(); }
@@ -5043,18 +5113,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const live = new Set();
     let names;
     try {
-      names = tmuxListSessionNames().filter((name) => isProjectManagedTmuxSession(projectCtx, name));
+      names = tmuxListSessionNames().filter((name) => isProjectManagedTmuxSession(
+        projectCtx,
+        name,
+        tmuxSessionEnvironmentValue(name, 'HCC_ROOT')
+      ));
     } catch {
       return live;
     }
     if (!names.length) return live;
 
-    // Map each known peer's expected managed session name back to its id, and
-    // capture its binding so the re-adopted session stays resumable.
-    const nameToPeer = new Map();
+    // Capture known peers and their stored process evidence so a detached
+    // session is only re-adopted after root, exact name, and identity agree.
     const bindingByPeer = new Map();
     try {
-      const db = connect(projectCtx);
+      const db = connectWebProject(projectCtx);
       try {
         for (const row of db.prepare(`
           SELECT p.id, p.status, p.pid, p.pid_start_token, p.pid_command_hash,
@@ -5063,7 +5136,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           FROM peers p
           LEFT JOIN peer_bindings b ON b.peer = p.id
         `).all()) {
-          nameToPeer.set(tmuxManagedSessionName(projectCtx, row.id), row.id);
           bindingByPeer.set(row.id, row);
         }
       } finally {
@@ -5080,8 +5152,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     );
 
     for (const name of names) {
-      const peerId = nameToPeer.get(name);
-      if (!peerId) continue;
       // Ownership: the session's HCC_ROOT env must match this project root.
       const hccRoot = tmuxSessionEnvironmentValue(name, 'HCC_ROOT');
       if (rootEvidence(projectCtx.root, hccRoot).state !== 'match') continue;
@@ -5090,12 +5160,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try { info = tmuxPaneInfo(`${name}:0.0`); } catch { continue; }
       if (!info || info.dead) continue;
 
-      const b = bindingByPeer.get(peerId) || null;
-      const evidence = observePeerEvidence(projectCtx, b, {
-        transport: 'tmux',
-        runtime_target: info.pane
+      const candidates = [...bindingByPeer.entries()].filter(([peerId, binding]) => {
+        if (!tmuxManagedSessionNameMatches(projectCtx, name, peerId, hccRoot)) return false;
+        return observePeerEvidence(projectCtx, binding, {
+          transport: 'tmux',
+          runtime_target: info.pane
+        }).state === 'live';
       });
-      if (evidence.state !== 'live') continue;
+      if (candidates.length !== 1) continue;
+      const [[peerId, b]] = candidates;
       live.add(peerId);
       if (tracked.has(peerId)) continue;
       const binding = b ? {
@@ -5215,7 +5288,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       clients: new Set()
     };
     sessions.set(key, session);
-    const db = connect(pctx);
+    const db = connectWebProject(pctx);
     try {
       upsertPeer(db, {
         id,
@@ -5261,7 +5334,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     child.onExit((event) => {
       session.status = 'exited';
       session.exitedAt = now();
-      const db = connect(pctx);
+      const db = connectWebProject(pctx);
       try {
         db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('exited', now(), id);
         addEvent(db, 'web.session.exited', session.actorPeer || id, null, auditPayload({
@@ -5430,14 +5503,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/projects') {
         const input = await readJsonRequest(req);
-        const requestedRoot = path.resolve(input.root || reqCtx.root);
-        if (!fs.existsSync(requestedRoot) || !fs.statSync(requestedRoot).isDirectory()) {
-          throw new CliError('BAD_REQUEST', `Project root does not exist: ${requestedRoot}`);
-        }
-        const requestedDb = input.db ? path.resolve(input.db) : path.join(requestedRoot, '.hello-cc', 'mesh.db');
-        assertDbUnderRoot(requestedRoot, requestedDb);
-        const projectCtx = rememberProject(contextForProject(requestedRoot, requestedDb, { json: ctx.json }));
-        const db = connect(projectCtx);
+        const requestedRoot = input.root || reqCtx.root;
+        const projectCtx = rememberProject(resolveWebProjectContext(
+          requestedRoot,
+          input.db || path.join(requestedRoot, '.hello-cc', 'mesh.db')
+        ));
+        const db = connectWebProject(projectCtx);
         db.close();
         writeRuntime(projectCtx, {
           product: PRODUCT_NAME,
@@ -5464,7 +5535,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           ...url.searchParams.getAll('resource'),
           url.searchParams.get('resources') || ''
         ]);
-        sendJson(res, 200, statusSnapshot(reqCtx, url.searchParams.get('peer'), {
+        sendJson(res, 200, webStatusSnapshot(reqCtx, url.searchParams.get('peer'), {
           resources,
           intent: url.searchParams.get('intent') || null,
           scope: url.searchParams.get('scope') || null
@@ -5493,12 +5564,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const actionInput = readOnly
           ? input
           : { ...input, actorPeer: resolveWebActionSession(reqCtx, peer, input, req) };
-        sendJson(res, 200, webPeerAction(reqCtx, peer, action, actionInput));
+        sendJson(res, 200, webPeerActionForProject(reqCtx, peer, action, actionInput));
         return;
       }
       // Detected sessions: peers registered via hooks/watcher but without PTY
       if (req.method === 'GET' && url.pathname === '/api/detected') {
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         let detected = [];
         const managedIds = new Set();
         const t = now();
@@ -5530,7 +5601,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       if (req.method === 'GET' && url.pathname === '/api/resumable') {
         // Provider sessions hcc has seen (via hooks/detection) that carry a real
         // provider session id or resumable provider session name.
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         let rows = [];
         try {
           rows = db.prepare(`
@@ -5616,7 +5687,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/sessions') {
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         try {
           sendJson(res, 200, {
             sessions: sessionsForProject(reqCtx).map((session) => serializeSession(session, db))
@@ -5646,7 +5717,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         // action token — the browser types via the WebSocket input frame
         // (which DOES require it), and the CLI cannot obtain the action token.
         const id = decodeURIComponent(inputMatch[1]);
-        const lookupDb = connect(reqCtx);
+        const lookupDb = connectWebProject(reqCtx);
         let session;
         try {
           session = getSession(reqCtx, id, lookupDb);
@@ -5665,7 +5736,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const text = String(input.text ?? input.data ?? '');
         const data = input.data !== undefined ? String(input.data) : `${text}${input.enter === false ? '' : '\r'}`;
         writeSessionInput(session, data);
-        const db = connect(session.ctx || reqCtx);
+        const db = connectWebProject(session.ctx || reqCtx);
         try {
           addEvent(db, 'web.session.input', 'web', null, auditPayload({
             actor: 'web',
@@ -5688,7 +5759,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const id = decodeURIComponent(stopMatch[1]);
         let stopInput = {};
         try { stopInput = await readJsonRequest(req); } catch {}
-        const lookupDb = connect(reqCtx);
+        const lookupDb = connectWebProject(reqCtx);
         let session;
         try {
           session = getSession(reqCtx, id, lookupDb);
@@ -5707,7 +5778,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             if (session.pid && session.pid !== session.wrapperPid) { try { process.kill(session.pid, 'SIGTERM'); } catch {} }
           } else if (session.type === 'tmux') {
             let killPlan = null;
-            const stopDb = connect(reqCtx);
+            const stopDb = connectWebProject(reqCtx);
             try {
               const peerId = resolveSessionPeerId(stopDb, session) || session.peerId || session.id;
               if (stopInput.kill_tmux) {
@@ -5722,7 +5793,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
             session.pty.kill();
           }
         }
-        const eventDb = connect(reqCtx);
+        const eventDb = connectWebProject(reqCtx);
         try {
           const peerId = resolveSessionPeerId(eventDb, session) || session.peerId || id;
           addEvent(eventDb, 'web.session.stop_requested', 'web', null, auditPayload({
@@ -5749,7 +5820,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const sender = 'web';
         const taskId = input.task ? Number(input.task) : null;
         if (!body) { sendJson(res, 400, { ok: false, error: { code: 'BAD_REQUEST', message: 'body required' } }); return; }
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         let msgId;
         try {
           msgId = sendMessage(db, sender, peerId, taskId, 'note', body);
@@ -5764,7 +5835,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const peerId = decodeURIComponent(detectedStopMatch[1]);
         let input = {};
         try { input = await readJsonRequest(req); } catch {}
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         try {
           const now_ = now();
           let killPlan = null;
@@ -5794,7 +5865,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       const detectedRestartMatch = url.pathname.match(/^\/api\/detected\/([^/]+)\/restart$/);
       if (req.method === 'POST' && detectedRestartMatch) {
         const peerId = decodeURIComponent(detectedRestartMatch[1]);
-        const db = connect(reqCtx);
+        const db = connectWebProject(reqCtx);
         try {
           const now_ = now();
           db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('running', now_, peerId);
@@ -5873,7 +5944,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
     const reqCtx = projectFromRequest(req, url);
     const id = decodeURIComponent(match[1]);
-    const lookupDb = connect(reqCtx);
+    const lookupDb = connectWebProject(reqCtx);
     let session;
     try {
       session = getSession(reqCtx, id, lookupDb);
@@ -5959,7 +6030,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const peerIds = [...idSet];
         if (!peerIds.length) continue;
         const placeholders = peerIds.map(() => '?').join(',');
-        const cleanupDb = connect(contextForProject(root, null, { json: ctx.json }));
+        const cleanupDb = connectWebProject(contextForProject(root, null, { json: ctx.json }));
         try {
           cleanupDb.prepare(`UPDATE peers SET status = 'detached' WHERE id IN (${placeholders}) AND status IN ('running','working','busy')`).run(...peerIds);
           cleanupDb.prepare(`UPDATE peer_bindings SET runtime_target = NULL, updated_at = ? WHERE peer IN (${placeholders})`).run(detachedAt, ...peerIds);
@@ -6058,7 +6129,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const runtimeFile = writeRuntime(ctx, runtime);
   writeGlobalRuntime(runtime);
   registerProject(ctx);
-  const db = connect(ctx);
+  const db = connectWebProject(ctx);
   try {
     addEvent(db, startMeta.eventType || 'web.started', 'human', null, auditPayload({
       actor: 'human',
@@ -7428,12 +7499,12 @@ async function planTmuxGc(ctx, opts) {
       skip('old_runtime_target_changed', { actual_session: actualSession });
       continue;
     }
-    if (!isProjectManagedTmuxSession(ctx, expectedSession)) {
+    const hccRoot = tmuxSessionEnvironmentValue(expectedSession, 'HCC_ROOT');
+    if (!isProjectManagedTmuxSession(ctx, expectedSession, hccRoot)) {
       skip('not_hcc_managed_name');
       continue;
     }
-    const hccRoot = tmuxSessionEnvironmentValue(expectedSession, 'HCC_ROOT');
-    if (hccRoot && path.resolve(hccRoot) !== path.resolve(ctx.root)) {
+    if (rootEvidence(ctx.root, hccRoot).state !== 'match') {
       skip('hcc_root_mismatch', { hcc_root: hccRoot });
       continue;
     }
@@ -7475,8 +7546,8 @@ function validateTmuxGcCandidate(ctx, candidate, runtimeSessions = [], options =
   if (candidate.source !== 'binding' && candidate.old_pane !== actualPane) {
     return skip('tmux_pane_changed', { pane: actualPane });
   }
-  if (!isProjectManagedTmuxSession(ctx, actualSession)) return skip('not_hcc_managed_name');
   const hccRoot = tmuxSessionEnvironmentValue(actualSession, 'HCC_ROOT');
+  if (!isProjectManagedTmuxSession(ctx, actualSession, hccRoot)) return skip('not_hcc_managed_name');
   if (rootEvidence(ctx.root, hccRoot).state !== 'match') {
     return skip('hcc_root_mismatch', { hcc_root: hccRoot });
   }
