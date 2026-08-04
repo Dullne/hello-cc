@@ -8,6 +8,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { providerSessionPeerId } from '../lib/core/peers/session.mjs';
+import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -148,6 +149,64 @@ function identityGraph(db, peerId) {
   };
 }
 
+function createBindingBoundary() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`
+    CREATE TABLE peers (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE TABLE peer_bindings (
+      peer TEXT PRIMARY KEY, provider TEXT NOT NULL, provider_session_id TEXT,
+      provider_session_name TEXT, resume_mode TEXT NOT NULL DEFAULT 'new',
+      resume_arg TEXT, command TEXT, transport TEXT NOT NULL,
+      runtime_session_id TEXT, runtime_target TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX provider_session_id_unique
+      ON peer_bindings(provider, provider_session_id)
+      WHERE provider_session_id IS NOT NULL;
+    CREATE UNIQUE INDEX provider_session_name_unique
+      ON peer_bindings(provider, provider_session_name)
+      WHERE provider_session_name IS NOT NULL;
+    CREATE TABLE tasks (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+  `);
+  const providerSession = 'feature-login';
+  const legacyId = 'codex-feature';
+  const newId = providerSessionPeerId('codex', providerSession);
+  db.prepare("INSERT INTO peers(id, kind, created_at) VALUES (?, 'codex', 1000)").run(legacyId);
+  db.prepare("INSERT INTO peers(id, kind, created_at) VALUES (?, 'codex', 2000)").run(newId);
+  db.prepare(`
+    INSERT INTO peer_bindings(
+      peer, provider, provider_session_id, provider_session_name, resume_mode,
+      resume_arg, command, transport, runtime_session_id, runtime_target,
+      created_at, updated_at
+    ) VALUES (?, 'codex', NULL, ?, 'resume', ?, ?, 'detected', ?, NULL, 1000, 1000)
+  `).run(legacyId, providerSession, providerSession, `codex resume ${providerSession}`, legacyId);
+  db.prepare('INSERT INTO tasks(id, owner) VALUES (1, ?)').run(legacyId);
+  return {
+    db,
+    store: createPeerBindingStore({ now: () => 2000 }),
+    legacyId,
+    newId,
+    providerSession
+  };
+}
+
+function incomingBinding({ newId, providerSession }, transport, runtimeTarget = null) {
+  return {
+    peer: newId,
+    provider: 'codex',
+    provider_session_id: null,
+    provider_session_name: providerSession,
+    resume_mode: transport === 'hook' || transport === 'detected' ? 'detected' : 'resume',
+    resume_arg: transport === 'hook' || transport === 'detected' ? null : providerSession,
+    command: null,
+    transport,
+    runtime_session_id: newId,
+    runtime_target: runtimeTarget
+  };
+}
+
 test('provider peer IDs hash the complete provider value under the v1 contract', () => {
   for (const [kind, providerId] of [
     ['claude', '123e4567-e89b-12d3-a456-426614174000'],
@@ -217,4 +276,161 @@ test('provider session module and connect contain no pre-v1 provider ID migratio
   const cliSource = fs.readFileSync(hccBin, 'utf8');
   assert.doesNotMatch(sessionSource, /legacyProviderSessionPeerId|migrateLegacyProviderPeerIds/);
   assert.doesNotMatch(cliSource, /legacyProviderSessionPeerId|migrateLegacyProviderPeerIds/);
+});
+
+for (const transport of ['hook', 'detected']) {
+  test(`${transport} binding keeps the v1 peer independent from a pre-v1 provider binding`, () => {
+    const boundary = createBindingBoundary();
+    const { db, store, legacyId, newId, providerSession } = boundary;
+    try {
+      const result = store.upsertCanonicalPeerBinding(
+        db,
+        incomingBinding(boundary, transport),
+        true
+      );
+
+      assert.equal(result.peer, newId);
+      assert.equal(result.merged_from, null);
+      assert.equal(result.binding.provider_session_id, null);
+      assert.equal(result.binding.provider_session_name, null);
+      assert.equal(result.binding.resume_mode, 'unknown');
+      assert.equal(result.binding.resume_arg, null);
+      assert.deepEqual({ ...db.prepare(`
+        SELECT peer, provider_session_name, runtime_session_id, transport
+        FROM peer_bindings WHERE peer = ?
+      `).get(legacyId) }, {
+        peer: legacyId,
+        provider_session_name: providerSession,
+        runtime_session_id: legacyId,
+        transport: 'detected'
+      });
+      assert.deepEqual({ ...db.prepare(`
+        SELECT peer, provider_session_id, provider_session_name, resume_mode, resume_arg,
+               runtime_session_id, transport
+        FROM peer_bindings WHERE peer = ?
+      `).get(newId) }, {
+        peer: newId,
+        provider_session_id: null,
+        provider_session_name: null,
+        resume_mode: 'unknown',
+        resume_arg: null,
+        runtime_session_id: newId,
+        transport
+      });
+      assert.equal(db.prepare('SELECT owner FROM tasks WHERE id = 1').get().owner, legacyId);
+    } finally {
+      db.close();
+    }
+  });
+}
+
+test('tmux-backed detected observation stays independent from a pre-v1 provider binding', () => {
+  const boundary = createBindingBoundary();
+  const { db, store, legacyId, newId } = boundary;
+  const binding = incomingBinding(boundary, 'tmux', '%detected-pane');
+  binding.resume_mode = 'detected';
+  binding.resume_arg = null;
+  try {
+    const result = store.upsertCanonicalPeerBinding(db, binding, true);
+
+    assert.equal(result.peer, newId);
+    assert.equal(result.merged_from, null);
+    assert.equal(result.binding.provider_session_name, null);
+    assert.equal(result.binding.resume_mode, 'unknown');
+    assert.ok(db.prepare('SELECT peer FROM peer_bindings WHERE peer = ?').get(legacyId));
+    assert.equal(
+      db.prepare('SELECT provider_session_name FROM peer_bindings WHERE peer = ?').get(newId)?.provider_session_name,
+      null
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('runtime binding without explicit force cannot claim a pre-v1 provider session', () => {
+  const boundary = createBindingBoundary();
+  const { db, store, legacyId, newId, providerSession } = boundary;
+  try {
+    let failure = null;
+    try {
+      store.upsertCanonicalPeerBinding(
+        db,
+        incomingBinding(boundary, 'tmux', '%new-pane'),
+        false
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, 'PROVIDER_SESSION_IN_USE');
+    assert.deepEqual({ ...db.prepare(`
+      SELECT peer, provider_session_name, runtime_session_id, transport, runtime_target
+      FROM peer_bindings WHERE peer = ?
+    `).get(legacyId) }, {
+      peer: legacyId,
+      provider_session_name: providerSession,
+      runtime_session_id: legacyId,
+      transport: 'detected',
+      runtime_target: null
+    });
+    assert.equal(db.prepare('SELECT peer FROM peer_bindings WHERE peer = ?').get(newId), undefined);
+    assert.equal(db.prepare('SELECT owner FROM tasks WHERE id = 1').get().owner, legacyId);
+  } finally {
+    db.close();
+  }
+});
+
+test('internal force does not authorize a runtime to claim a pre-v1 provider session', () => {
+  const boundary = createBindingBoundary();
+  const { db, store, legacyId, newId } = boundary;
+  try {
+    let failure = null;
+    try {
+      store.upsertCanonicalPeerBinding(
+        db,
+        incomingBinding(boundary, 'tmux', '%new-pane'),
+        true
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, 'PROVIDER_SESSION_IN_USE');
+    assert.ok(db.prepare('SELECT peer FROM peer_bindings WHERE peer = ?').get(legacyId));
+    assert.equal(db.prepare('SELECT peer FROM peer_bindings WHERE peer = ?').get(newId), undefined);
+    assert.equal(db.prepare('SELECT owner FROM tasks WHERE id = 1').get().owner, legacyId);
+  } finally {
+    db.close();
+  }
+});
+
+test('explicit override keeps the auditable rebind result without rewriting the legacy graph', () => {
+  const boundary = createBindingBoundary();
+  const { db, store, legacyId, newId, providerSession } = boundary;
+  try {
+    const result = store.upsertCanonicalPeerBinding(
+      db,
+      incomingBinding(boundary, 'tmux', '%new-pane'),
+      true,
+      { override: true }
+    );
+
+    assert.equal(result.peer, newId);
+    assert.equal(result.merged_from, legacyId);
+    assert.ok(db.prepare('SELECT id FROM peers WHERE id = ?').get(legacyId));
+    assert.equal(db.prepare('SELECT owner FROM tasks WHERE id = 1').get().owner, legacyId);
+    assert.equal(db.prepare('SELECT peer FROM peer_bindings WHERE peer = ?').get(legacyId), undefined);
+    assert.deepEqual({ ...db.prepare(`
+      SELECT peer, provider_session_name, runtime_session_id, transport, runtime_target
+      FROM peer_bindings WHERE peer = ?
+    `).get(newId) }, {
+      peer: newId,
+      provider_session_name: providerSession,
+      runtime_session_id: newId,
+      transport: 'tmux',
+      runtime_target: '%new-pane'
+    });
+  } finally {
+    db.close();
+  }
 });
