@@ -80,6 +80,7 @@ import {
   writeGlobalRuntime,
   writeRuntime
 } from '../lib/runtime/state.mjs';
+import { createFatalShutdownController } from '../lib/runtime/fatal-shutdown.mjs';
 import { runtimeBufferGcUnavailable, runtimeRequest } from '../lib/runtime/client.mjs';
 import {
   applyBufferPlan,
@@ -6019,10 +6020,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
   });
 
-  let shuttingDown = false;
-  function shutdown() {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  let cleanupPromise = null;
+  let shutdownExitCode = 0;
+  async function performRuntimeCleanup() {
     clearRuntime(ctx);
     // rob-07: clear this runtime's per-project pointers for every registered
     // project, not just the primary ctx, so sibling projects don't keep
@@ -6080,27 +6080,45 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
     }
     try { wss.close(); } catch {}
-    const terminateClients = setTimeout(() => {
-      for (const session of sessions.values()) {
-        for (const client of [...(session.clients || [])]) {
-          try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
+    await new Promise((resolve) => {
+      const terminateClients = setTimeout(() => {
+        for (const session of sessions.values()) {
+          for (const client of [...(session.clients || [])]) {
+            try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
+          }
         }
-      }
-      try { server.closeAllConnections?.(); } catch {}
-    }, 250);
-    const forceExit = setTimeout(() => process.exit(0), 1500);
-    try {
-      server.close(() => {
+        try { server.closeAllConnections?.(); } catch {}
+      }, 250);
+      const forceClose = setTimeout(() => {
+        try { server.closeAllConnections?.(); } catch {}
+        resolve();
+      }, 1500);
+      try {
+        server.close(() => {
+          clearTimeout(terminateClients);
+          clearTimeout(forceClose);
+          resolve();
+        });
+        try { server.closeIdleConnections?.(); } catch {}
+      } catch {
         clearTimeout(terminateClients);
-        clearTimeout(forceExit);
-        process.exit(0);
-      });
-      try { server.closeIdleConnections?.(); } catch {}
-    } catch {
-      clearTimeout(terminateClients);
-      clearTimeout(forceExit);
-      process.exit(0);
-    }
+        clearTimeout(forceClose);
+        resolve();
+      }
+    });
+  }
+  function cleanupRuntime() {
+    if (!cleanupPromise) cleanupPromise = performRuntimeCleanup();
+    return cleanupPromise;
+  }
+  function shutdown() {
+    void cleanupRuntime().then(
+      () => process.exit(shutdownExitCode),
+      (error) => {
+        console.error(redactedLogText(`[${new Date().toISOString()}] runtime cleanup failed: ${error?.stack || error}`));
+        process.exit(1);
+      }
+    );
   }
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
@@ -6116,17 +6134,23 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
   });
 
-  // Keep the shared runtime alive across unexpected errors thrown from pollers,
-  // the WS upgrade path, connect(), fs watchers, or request handlers. A single
-  // bad request or a corrupt sibling project DB must not take down the runtime
-  // that serves every project. Fatal signals still route through shutdown().
+  const fatalController = createFatalShutdownController({
+    cleanup: (reason) => {
+      shutdownExitCode = 1;
+      return cleanupRuntime(reason);
+    },
+    exit: (code) => process.exit(code),
+    forceExit: (code) => process.exit(code),
+    log: (entry) => console.error(redactedLogText({
+      timestamp: new Date().toISOString(),
+      ...entry
+    }))
+  });
   process.on('uncaughtException', (err) => {
-    if (shuttingDown) return;
-    console.error(redactedLogText(`[${new Date().toISOString()}] uncaughtException in web runtime (kept alive): ${err?.stack || err}`));
+    void fatalController.fatal(err);
   });
   process.on('unhandledRejection', (reason) => {
-    if (shuttingDown) return;
-    console.error(redactedLogText(`[${new Date().toISOString()}] unhandledRejection in web runtime (kept alive): ${reason?.stack || reason}`));
+    void fatalController.fatal(reason);
   });
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
