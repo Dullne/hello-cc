@@ -1579,6 +1579,25 @@ async function fetchSessionActionToken(peer, params = {}) {
   });
 }
 
+async function fetchTerminalSnapshot(peer, params = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(runtimeWsUrl(peer));
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    const ws = new WebSocket(url, runtimeWsOptions());
+    const timer = setTimeout(() => reject(new Error(`${peer} terminal snapshot timeout`)), 5000);
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw));
+      if (msg.type !== 'snapshot') return;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve(String(msg.data || ''));
+    });
+    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
 async function issueBrowserSessionCookie() {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
@@ -1606,6 +1625,21 @@ async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
     headers: {
       Cookie: `hcc_sid=${auth.sid}`,
       Origin: auth.origin,
+      'X-HCC-API-Version': '2',
+      ...(options.headers || {})
+    }
+  });
+}
+
+async function cookieRuntimeFetchWithoutOrigin(route, auth, options = {}, params = {}) {
+  const url = new URL(route, auth.baseUrl);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return fetch(url, {
+    ...options,
+    headers: {
+      Cookie: `hcc_sid=${auth.sid}`,
       'X-HCC-API-Version': '2',
       ...(options.headers || {})
     }
@@ -2324,6 +2358,85 @@ function startRuntime(options = {}) {
   if (!match) fail(`hcc web did not print background pid:\n${output}`);
   runtimePid = Number.parseInt(match[1], 10);
   if (!output.includes('web started in background')) fail(`hcc web did not report background start:\n${output}`);
+}
+
+async function cookieSessionExpiryWorkflow() {
+  const expirySessionId = `cookie-expiry-${testId}`;
+  const marker = `EXPIRED_COOKIE_INPUT_${testId}`;
+  let ws = null;
+
+  startRuntime({
+    env: {
+      ...env,
+      HCC_REGRESSION_TEST: '1',
+      HCC_REGRESSION_WEB_SESSION_TTL_SEC: '1'
+    }
+  });
+  try {
+    await waitRuntime();
+    const create = await runtimeFetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: expirySessionId,
+        kind: 'shell',
+        backend: 'pty',
+        command: 'bash --noprofile --norc',
+        env: {
+          HOME: home,
+          PATH: env.PATH,
+          SHELL: '/bin/bash'
+        }
+      })
+    }, { root });
+    const created = await create.json();
+    if (!create.ok || created.session?.id !== expirySessionId) {
+      fail(`short-TTL cookie test could not create its PTY session:\n${JSON.stringify(created, null, 2)}`);
+    }
+
+    const auth = await issueBrowserSessionCookie();
+    ws = await openCookieTerminalWebSocket(expirySessionId, auth.sid, { root });
+    if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
+    const closed = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), 5000);
+      ws.once('close', (code, reason) => {
+        clearTimeout(timer);
+        resolve({ code, reason: String(reason || '') });
+      });
+      ws.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    await sleep(1200);
+    ws.send(JSON.stringify({
+      type: 'input',
+      data: `echo ${marker}\r`,
+      action_token: ws.hccActionToken
+    }));
+    const closeResult = await closed;
+    if (closeResult.code !== 4001 || !closeResult.reason.includes('session expired')) {
+      fail(`expired cookie websocket did not close with 4001/session expired:\n${JSON.stringify(closeResult, null, 2)}`);
+    }
+
+    const expiredHttp = await cookieRuntimeFetch('/api/runtime', auth);
+    if (expiredHttp.status !== 401) {
+      fail(`expired browser cookie remained authorized over HTTP: ${expiredHttp.status}`);
+    }
+    const snapshot = await fetchTerminalSnapshot(expirySessionId, { root });
+    if (snapshot.includes(marker)) {
+      fail(`expired browser cookie executed terminal input after expiry:\n${snapshot}`);
+    }
+  } finally {
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+      try { ws.terminate(); } catch {}
+    }
+    try {
+      await runtimeFetch(`/api/sessions/${encodeURIComponent(expirySessionId)}/stop`, { method: 'POST' }, { root });
+    } catch {}
+    await stopRuntime();
+  }
 }
 
 async function assertWebWrapperParentSurvives() {
@@ -3825,6 +3938,14 @@ async function multiProjectWebWorkflow() {
     body: cookieAdminBody
   }, { root });
   if (crossCreate.status !== 403) fail(`cross-origin cookie administrator create returned ${crossCreate.status}`);
+  const missingOriginCreate = await cookieRuntimeFetchWithoutOrigin('/api/sessions', cookieAdmin, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: cookieAdminBody
+  }, { root });
+  if (missingOriginCreate.status !== 403) {
+    fail(`missing-Origin cookie administrator create returned ${missingOriginCreate.status}`);
+  }
 
   const cookieCreate = await cookieRuntimeFetch('/api/sessions', cookieAdmin, {
     method: 'POST',
@@ -3847,6 +3968,14 @@ async function multiProjectWebWorkflow() {
       body: JSON.stringify({ data: 'echo should-not-run\r' })
     }, { root });
     if (crossInput.status !== 403) fail(`cross-origin cookie administrator input returned ${crossInput.status}`);
+    const missingOriginInput = await cookieRuntimeFetchWithoutOrigin(inputRoute, cookieAdmin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: 'echo should-not-run\r' })
+    }, { root });
+    if (missingOriginInput.status !== 403) {
+      fail(`missing-Origin cookie administrator input returned ${missingOriginInput.status}`);
+    }
 
     const marker = `COOKIE_ADMIN_INPUT_${testId}`;
     await expectSocketMarkerAfter(cookieAdminWs, marker, async () => {
@@ -3864,6 +3993,14 @@ async function multiProjectWebWorkflow() {
       body: '{}'
     }, { root });
     if (crossStop.status !== 403) fail(`cross-origin cookie administrator stop returned ${crossStop.status}`);
+    const missingOriginStop = await cookieRuntimeFetchWithoutOrigin(stopRoute, cookieAdmin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }, { root });
+    if (missingOriginStop.status !== 403) {
+      fail(`missing-Origin cookie administrator stop returned ${missingOriginStop.status}`);
+    }
 
     const cookieStop = await cookieRuntimeFetch(stopRoute, cookieAdmin, {
       method: 'POST',
@@ -9936,6 +10073,7 @@ async function main() {
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
 
   await setupRegression();
+  await cookieSessionExpiryWorkflow();
   log('[2/13] runtime');
   startRuntime();
   await waitRuntime();

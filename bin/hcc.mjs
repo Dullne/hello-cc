@@ -2836,7 +2836,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   // HttpOnly cookie so the token stops travelling in every fetch/WS URL
   // (net-02). The cookie carries an opaque session id (not the token); it is
   // meaningless outside this runtime and is lost on restart.
-  const WEB_SESSION_TTL_SEC = 30 * 24 * 60 * 60;
+  const DEFAULT_WEB_SESSION_TTL_SEC = 30 * 24 * 60 * 60;
+  const regressionWebSessionTtlRaw = process.env.HCC_REGRESSION_WEB_SESSION_TTL_SEC || '';
+  const regressionWebSessionTtl = /^\d+$/.test(regressionWebSessionTtlRaw)
+    ? Number.parseInt(regressionWebSessionTtlRaw, 10)
+    : 0;
+  const WEB_SESSION_TTL_SEC = process.env.HCC_REGRESSION_TEST === '1' &&
+    regressionWebSessionTtl >= 1 && regressionWebSessionTtl <= 60
+    ? regressionWebSessionTtl
+    : DEFAULT_WEB_SESSION_TTL_SEC;
   const MAX_WEB_SESSIONS = 256;
   const webSessions = new Map();
   const bufferGcPlanStore = createBufferGcPlanStore();
@@ -5384,14 +5392,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         return;
       }
       const safeMethod = ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '');
-      // CSRF gate (v1-csrf-tokenless + v1-token-query-csrf-bypass): any
-      // browser-initiated write that is authenticated by a session cookie — or
-      // runs on a tokenless (loopback) runtime — must be same-origin. Requests
-      // without an Origin header (CLI/curl/ws clients) are not browser-initiated
-      // and pass. A valid ?token= in the URL does NOT exempt a cookie-bearing
-      // request from this check.
-      const csrfScope = authMode === 'cookie' || cookieSessionOk(req) || !token;
-      if (csrfScope && !safeMethod && req.headers.origin && !requestOriginMatches(req, { trustProxy })) {
+      // Cookie-authenticated writes require affirmative same-origin evidence;
+      // a missing Origin is not sufficient. Token-authenticated CLI requests
+      // without cookies remain origin-free, as do tokenless loopback CLI
+      // requests; a supplied Origin on the tokenless runtime must still match.
+      const cookieAuthenticated = authMode === 'cookie' || cookieSessionOk(req);
+      const originRequired = cookieAuthenticated || (!token && Boolean(req.headers.origin));
+      if (!safeMethod && originRequired && !requestOriginMatches(req, { trustProxy })) {
         sendJson(res, 403, { ok: false, error: { code: 'CSRF_ORIGIN', message: 'Cookie-authenticated writes require a same-origin request' } });
         return;
       }
