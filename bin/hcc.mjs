@@ -185,7 +185,6 @@ import {
   inferPeerKind
 } from '../lib/integrations/providers.mjs';
 import {
-  migrateLegacyProviderPeerIds,
   providerSessionParts,
   providerSessionPeerId
 } from '../lib/core/peers/session.mjs';
@@ -832,12 +831,6 @@ function connect(ctx, options = {}) {
       ensureMigrationBackup(db, ctx.dbPath, fromVersion, toVersion),
     beforePostMigrationIndexes: dedupePeerBindings
   });
-  // sess-04: rename legacy first-8-chars peer records to their hashed id so
-  // pre-upgrade sessions stay reachable. Idempotent and cheap when nothing
-  // matches (a single scan of peer_bindings).
-  try {
-    migrateLegacyProviderPeerIds(db, { addEvent });
-  } catch {}
   if (options.migrateRegistered !== false) migrateRegisteredProjectDbs(ctx);
   return db;
 }
