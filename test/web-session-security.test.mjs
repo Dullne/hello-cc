@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { requestOriginMatches } from '../lib/web/http.mjs';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -59,4 +60,32 @@ test('expired and evicted browser sessions close their attached sockets', () => 
   assert.match(lifecycle, /session\.expiresAt <= t\) closeWebSession\(sid, 'session expired'\)/);
   assert.match(lifecycle, /while \(webSessions\.size >= MAX_WEB_SESSIONS\)/);
   assert.match(lifecycle, /closeWebSession\(oldest, 'session limit reached'\)/);
+});
+
+test('origin matching normalizes only default ports on the selected authority', () => {
+  const proxied = (origin, forwardedHost, forwardedProto = 'https', remoteAddress = '127.0.0.1') => ({
+    headers: {
+      origin,
+      host: '127.0.0.1:8787',
+      'x-forwarded-host': forwardedHost,
+      'x-forwarded-proto': forwardedProto
+    },
+    socket: { encrypted: false, remoteAddress }
+  });
+
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'public.example.test:443'), { trustProxy: true }), true);
+  assert.equal(requestOriginMatches(proxied('http://public.example.test', 'public.example.test:80', 'http'), { trustProxy: true }), true);
+  assert.equal(requestOriginMatches({
+    headers: { origin: 'https://public.example.test', host: 'public.example.test:443' },
+    socket: { encrypted: true, remoteAddress: '203.0.113.9' }
+  }), true);
+
+  assert.equal(requestOriginMatches(proxied('https://public.example.test:444', 'public.example.test:443'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://other.example.test', 'public.example.test:443'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'public.example.test:443', 'http'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'attacker@public.example.test:443'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'public.example.test:443/path'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', '[::1'), { trustProxy: true }), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'public.example.test:443')), false);
+  assert.equal(requestOriginMatches(proxied('https://public.example.test', 'public.example.test:443', 'https', '203.0.113.9'), { trustProxy: true }), false);
 });

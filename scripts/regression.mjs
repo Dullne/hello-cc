@@ -1400,6 +1400,40 @@ function runtimeFetch(route, options = {}, params = {}) {
   return fetch(runtimeUrl(runtime, route, params), { ...options, headers });
 }
 
+function directTlsRequest(runtime, route, options = {}) {
+  const url = new URL(route, runtime.base_url);
+  const body = options.body === undefined || options.body === null ? null : String(options.body);
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      method: options.method || 'GET',
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: `${url.pathname}${url.search}`,
+      headers: options.headers || {},
+      ca: runtime.tls_cert,
+      rejectUnauthorized: true
+    }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text }));
+    });
+    req.once('error', reject);
+    req.setTimeout(5000, () => req.destroy(new Error('direct TLS regression request timeout')));
+    if (body !== null) req.write(body);
+    req.end();
+  });
+}
+
+function nonLoopbackIpv4() {
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const address of addresses || []) {
+      if (address.family === 'IPv4' && !address.internal) return address.address;
+    }
+  }
+  return null;
+}
+
 function runtimeWsUrl(peer) {
   const runtime = currentRuntime();
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, runtime.base_url || `http://127.0.0.1:${port}`);
@@ -2782,6 +2816,58 @@ async function setupRegression() {
     fail(`shim ensure preserved stale real binary instead of rediscovering PATH binary:\n${rediscoveredShim}`);
   }
   await stopRuntime();
+
+  const directTlsOutput = hcc(['web', '--local', '--tls', '--port', String(port), '--no-discover', '--no-guidance']);
+  const directTlsMatch = directTlsOutput.match(/^pid:\s*(\d+)/m);
+  if (!directTlsMatch) fail(`direct TLS web did not print background pid:\n${directTlsOutput}`);
+  runtimePid = Number.parseInt(directTlsMatch[1], 10);
+  await waitFor(async () => {
+    const runtimeFile = path.join(root, '.hello-cc', 'runtime.json');
+    if (!fs.existsSync(runtimeFile)) return false;
+    try {
+      const runtime = currentRuntime();
+      const response = await directTlsRequest(runtime, '/api/runtime', {
+        headers: {
+          Authorization: `Bearer ${runtime.token}`,
+          'X-HCC-API-Version': '2'
+        }
+      });
+      return response.status === 200;
+    } catch {
+      return false;
+    }
+  }, 'direct TLS runtime');
+  const directTlsRuntime = currentRuntime();
+  if (directTlsRuntime.tls !== true ||
+      !String(directTlsRuntime.base_url || '').startsWith('https://') ||
+      !String(directTlsRuntime.tls_cert || '').includes('BEGIN CERTIFICATE')) {
+    fail(`direct TLS runtime metadata was incomplete:\n${JSON.stringify(directTlsRuntime, null, 2)}`);
+  }
+  const directTlsExchange = await directTlsRequest(
+    directTlsRuntime,
+    `/?token=${encodeURIComponent(directTlsRuntime.token)}`,
+    { headers: { Accept: 'text/html' } }
+  );
+  const directTlsSetCookie = String(directTlsExchange.headers['set-cookie']?.[0] || '');
+  const directTlsSid = directTlsSetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+  if (directTlsExchange.status !== 302 || !directTlsSid || !directTlsSetCookie.includes('Secure')) {
+    fail(`direct TLS login did not issue a Secure cookie: status=${directTlsExchange.status} cookie=${directTlsSetCookie}`);
+  }
+  const directTlsLogout = await directTlsRequest(directTlsRuntime, '/logout', {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${directTlsSid}`,
+      Origin: new URL(directTlsRuntime.base_url).origin
+    }
+  });
+  const directTlsLogoutCookie = String(directTlsLogout.headers['set-cookie']?.[0] || '');
+  if (directTlsLogout.status !== 204 ||
+      !directTlsLogoutCookie.includes('Max-Age=0') ||
+      !directTlsLogoutCookie.includes('Secure')) {
+    fail(`direct TLS logout did not expire a Secure cookie: status=${directTlsLogout.status} cookie=${directTlsLogoutCookie}`);
+  }
+  await stopRuntime();
+
   await assertWebWrapperParentSurvives();
   assertPeerBindingUniqueConstraints();
   assertLegacySchemaMigration();
@@ -2883,6 +2969,7 @@ async function setupRegression() {
   if (!setCookie.includes('hcc_sid=') || !setCookie.includes('HttpOnly') || !setCookie.includes('SameSite=Lax')) {
     fail(`exchange did not set an HttpOnly SameSite cookie: ${setCookie}`);
   }
+  if (setCookie.includes('Secure')) fail(`plaintext LAN exchange issued a Secure cookie: ${setCookie}`);
   const sidMatch = setCookie.match(/hcc_sid=([^;]+)/);
   if (!sidMatch) fail(`exchange did not return a session id: ${setCookie}`);
   const sid = sidMatch[1];
@@ -2991,6 +3078,71 @@ async function setupRegression() {
   }
   const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}`, 'X-HCC-API-Version': '2' } });
   if (revokedProxyCookie.status !== 401) fail(`trusted proxy logout left the old cookie authorized: ${revokedProxyCookie.status}`);
+
+  // A reverse proxy may retain the HTTPS default port in X-Forwarded-Host
+  // while browsers normalize it out of Origin. These are the same origin and
+  // must pass the cookie-authenticated CSRF gate.
+  const defaultPortProxyHeaders = {
+    Accept: 'text/html',
+    'X-Forwarded-Host': 'public.example.test:443',
+    'X-Forwarded-Proto': 'https'
+  };
+  const defaultPortProxyExchange = await fetch(`${baseUrl}/?token=${encodeURIComponent(cookieToken)}`, {
+    headers: defaultPortProxyHeaders,
+    redirect: 'manual'
+  });
+  const defaultPortProxySetCookie = defaultPortProxyExchange.headers.get('set-cookie') || '';
+  const defaultPortProxySid = defaultPortProxySetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+  if (defaultPortProxyExchange.status !== 302 || !defaultPortProxySid || !defaultPortProxySetCookie.includes('Secure')) {
+    fail(`default-port trusted proxy login did not issue a Secure cookie: status=${defaultPortProxyExchange.status} cookie=${defaultPortProxySetCookie}`);
+  }
+  const defaultPortProxyLogout = await fetch(`${baseUrl}/logout`, {
+    method: 'POST',
+    headers: {
+      Cookie: `hcc_sid=${defaultPortProxySid}`,
+      Origin: 'https://public.example.test',
+      'X-Forwarded-Host': 'public.example.test:443',
+      'X-Forwarded-Proto': 'https'
+    }
+  });
+  const defaultPortProxyLogoutCookie = defaultPortProxyLogout.headers.get('set-cookie') || '';
+  if (defaultPortProxyLogout.status !== 204 ||
+      !defaultPortProxyLogoutCookie.includes('Max-Age=0') ||
+      !defaultPortProxyLogoutCookie.includes('Secure')) {
+    fail(`same-origin default-port proxy logout was rejected: status=${defaultPortProxyLogout.status} cookie=${defaultPortProxyLogoutCookie}`);
+  }
+
+  const lanAddress = nonLoopbackIpv4();
+  if (lanAddress) {
+    const lanBaseUrl = `http://${lanAddress}:${port}`;
+    const spoofedLanExchange = await fetch(`${lanBaseUrl}/?token=${encodeURIComponent(cookieToken)}`, {
+      headers: {
+        Accept: 'text/html',
+        'X-Forwarded-Host': 'spoofed.example.test',
+        'X-Forwarded-Proto': 'https'
+      },
+      redirect: 'manual'
+    });
+    const spoofedLanCookie = spoofedLanExchange.headers.get('set-cookie') || '';
+    const spoofedLanSid = spoofedLanCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
+    if (spoofedLanExchange.status !== 302 || !spoofedLanSid || spoofedLanCookie.includes('Secure')) {
+      fail(`non-loopback forwarded spoof influenced plaintext cookie security: status=${spoofedLanExchange.status} cookie=${spoofedLanCookie}`);
+    }
+    const spoofedLanLogout = await fetch(`${lanBaseUrl}/logout`, {
+      method: 'POST',
+      headers: {
+        Cookie: `hcc_sid=${spoofedLanSid}`,
+        Origin: 'https://spoofed.example.test',
+        'X-Forwarded-Host': 'spoofed.example.test',
+        'X-Forwarded-Proto': 'https'
+      }
+    });
+    if (spoofedLanLogout.status !== 403) {
+      fail(`non-loopback forwarded spoof passed the CSRF gate: ${spoofedLanLogout.status}`);
+    }
+  } else {
+    log('non-loopback forwarded spoof: no non-loopback IPv4 interface; focused boundary coverage retained');
+  }
 
   const badJsonResponse = await runtimeFetch('/api/projects', {
     method: 'POST',

@@ -718,6 +718,17 @@ function requestIsSecure(req, options = {}) {
   return Boolean(req?.socket?.encrypted);
 }
 
+function normalizedOriginAuthority(hostValue, protocol) {
+  const raw = String(hostValue || '');
+  if (!raw || raw !== raw.trim()) return null;
+  const parsed = new URL(`${protocol}//${raw}`);
+  if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+  return {
+    hostname: parsed.hostname.toLowerCase(),
+    port: parsed.port || (protocol === 'https:' ? '443' : '80')
+  };
+}
+
 function requestOriginMatches(req, options = {}) {
   const trustProxy = options === true || options?.trustProxy === true;
   const useForwardedHeaders = trustProxy && isLoopbackRemote(req);
@@ -736,7 +747,16 @@ function requestOriginMatches(req, options = {}) {
     const expectedProtocol = forwardedProto
       ? `${forwardedProto}:`
       : (req?.socket?.encrypted ? 'https:' : 'http:');
-    return parsed.protocol === expectedProtocol && parsed.host.toLowerCase() === host.toLowerCase();
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
+    const originAuthority = {
+      hostname: parsed.hostname.toLowerCase(),
+      port: parsed.port || (expectedProtocol === 'https:' ? '443' : '80')
+    };
+    const hostAuthority = normalizedOriginAuthority(host, expectedProtocol);
+    return parsed.protocol === expectedProtocol &&
+      hostAuthority !== null &&
+      originAuthority.hostname === hostAuthority.hostname &&
+      originAuthority.port === hostAuthority.port;
   } catch {
     return false;
   }
