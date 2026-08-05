@@ -6260,6 +6260,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       socket.destroy();
       return;
     }
+    // ws-5: cap concurrent WS clients per session so the action_token (delivered
+    // via the snapshot frame) cannot be harvested by unlimited connections.
+    if (session.clients.size >= 4) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       const connectionActionToken = newSessionActionToken();
       ws.hccCookieAuth = cookieAuth;
@@ -8215,6 +8222,7 @@ function observeGcClockSafety(ctx, db, {
 }) {
   try {
     return runOptimisticEvidenceMutation(db, {
+      attempts: 5,
       capture: (subjectDb) => captureGcClockSubject(subjectDb, {
         bufferGcCutoffs,
         olderThanDays,
