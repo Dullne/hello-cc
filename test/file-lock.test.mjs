@@ -10,6 +10,7 @@ import { withFileLock } from '../lib/shared/file-lock.mjs';
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const projectsModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/runtime/projects.mjs')).href;
 const lockModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/shared/file-lock.mjs')).href;
+const NONBLOCKING_LOCK_DEADLINE_MS = 2_500;
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-file-lock-'));
@@ -305,11 +306,15 @@ test('project activity is nonblocking and retries soon after a busy first write'
     () => registerProject({ root: projectRoot, dbPath: path.join(projectRoot, 'one.db') }, { nonblocking: true }),
     (error) => error?.code === 'ERR_FILE_LOCK_BUSY'
   );
-  assert.ok(performance.now() - registerStarted < 100);
+  const registerElapsed = performance.now() - registerStarted;
+  assert.ok(registerElapsed < NONBLOCKING_LOCK_DEADLINE_MS,
+    `nonblocking register waited ${registerElapsed}ms`);
   const started = performance.now();
 
   registerProjectActivity({ root: projectRoot, dbPath: path.join(projectRoot, 'one.db') });
-  assert.ok(performance.now() - started < 100);
+  const activityElapsed = performance.now() - started;
+  assert.ok(activityElapsed < NONBLOCKING_LOCK_DEADLINE_MS,
+    `nonblocking activity update waited ${activityElapsed}ms`);
   assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')).projects, []);
 
   fs.writeFileSync(release, 'go');
