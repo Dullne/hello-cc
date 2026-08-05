@@ -6,6 +6,19 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('web runtime verifies a complete process identity before opening its listener', () => {
+  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+  const command = source.indexOf('async function cmdWeb(ctx, args, startMeta = {})');
+  const identityWait = source.indexOf('await waitForLiveProcessIdentity(process.pid', command);
+  const identityFailure = source.indexOf("'RUNTIME_IDENTITY_UNAVAILABLE'", identityWait);
+  const server = source.indexOf('const server = useTls', command);
+
+  assert.ok(command >= 0 && identityWait > command && identityFailure > identityWait,
+    'web startup must fail closed when its complete process identity is unavailable');
+  assert.ok(identityFailure < server,
+    'web startup must verify its process identity before opening the listener');
+});
+
 test('startup auto-GC runs only after all tmux sessions are restored', () => {
   const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
   const restoreLoop = source.indexOf('const restoredTmuxDbs = new Set();');

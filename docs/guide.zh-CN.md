@@ -3,6 +3,37 @@
 这份文档说明安装、启动和日常使用流程。紧凑命令清单见
 [命令参考](commands.zh-CN.md)。
 
+## v1 升级契约
+
+1.0.0 会在生成并校验迁移前备份后升级到 schema v7，且不支持降级。provider
+peer ID 已变更，不会映射旧 ID；受保护接口要求 Runtime API v2。存活判断以进程
+证据为先，只有 unknown 证据获得 120 秒宽限。历史 GC 必须显式使用
+`--history`。需要加密时使用 `--tls`，或
+`--trust-proxy --proxy-origin ORIGIN`。可信内网明文模式和已认证浏览器选择任意
+已存在服务器目录，仍是明确接受的风险。
+
+### 从迁移前备份恢复
+
+hello-cc 为每个数据库最多保留 5 份经校验的迁移备份。如果必须回退一次 v1
+迁移，先停止 Web runtime，以及所有仍可能访问该项目的 hello-cc/provider 进程。
+校验选定备份，把失败数据库及其 WAL/SHM 文件改名保留，再发布备份的私有副本：
+
+```bash
+db=/path/to/project/.hello-cc/mesh.db
+backup=/path/to/project/.hello-cc/mesh.db.pre-v6-to-v7.<timestamp>.<suffix>.bak
+sqlite3 "$backup" 'PRAGMA quick_check;'
+cp -p "$backup" "$db.restore"
+chmod 600 "$db.restore"
+mv "$db" "$db.failed-v7.<recovery-id>"
+test ! -e "$db-wal" || mv "$db-wal" "$db-wal.failed-v7.<recovery-id>"
+test ! -e "$db-shm" || mv "$db-shm" "$db-shm.failed-v7.<recovery-id>"
+mv "$db.restore" "$db"
+```
+
+校验结果必须是 `ok`。确认恢复后的项目正常前，不要删除这些改名文件。再次启动
+v1 会把恢复的数据库重新迁移到 schema v7；用旧版本 hello-cc 打开恢复出的 pre-v1
+数据库不属于受支持的降级路径。
+
 ## 安装、更新和卸载
 
 全局安装 hello-cc：
@@ -210,7 +241,7 @@ debug 日志里应该出现 `Hook UserPromptSubmit ... provided additionalContex
 hcc web
 ```
 
-裸 `hcc web` 会保存自动生成的 token，并在重启后复用。需要替换保存值时可显式设置：
+裸 `hcc web` 会为本次 runtime 自动生成 token。需要稳定的运维 token 时可显式设置：
 
 ```bash
 HCC_WEB_TOKEN='choose-a-long-token' hcc web --port 8787
@@ -331,7 +362,8 @@ hcc lock release --resource vllm/router
 | `HCC_PEER` | 默认 peer 身份 |
 | `HCC_ROOT` | 覆盖项目根目录 |
 | `HCC_DB` | 覆盖数据库路径 |
-| `HCC_WEB_TOKEN` | 替换并保存固定 Web 访问令牌 |
+| `HCC_WEB_TOKEN` | 设置显式 Web 访问令牌 |
+| `HCC_RUNTIME_CA` | `HCC_RUNTIME_URL=https` 端点的 CA 文件 |
 | `HCC_RUNTIME_URL` | 直接指定 runtime URL |
 | `HCC_NO_AUTO_INSTALL_TMUX=1` | 禁用 tmux 自动安装，主要用于测试 |
 

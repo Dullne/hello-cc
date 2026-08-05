@@ -13,7 +13,7 @@ WORKDIR /app
 
 # Install deps first for better layer caching.
 COPY package.json package-lock.json ./
-RUN npm install --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 
 # Copy the rest of the source.
 COPY . .
@@ -27,4 +27,4 @@ RUN git init \
  && git commit -q -m "test snapshot" || true
 
 # Smoke that the CLI loads, then run the regression suite.
-CMD ["sh", "-c", "node ./bin/hcc.mjs --help >/dev/null && node ./scripts/regression.mjs"]
+CMD ["sh", "-c", "node --version && tmux -V && node ./bin/hcc.mjs --help >/dev/null && node ./scripts/regression.mjs"]

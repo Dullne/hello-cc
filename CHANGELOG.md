@@ -16,6 +16,65 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.0.0
+
+### Summary
+
+hello-cc 1.0.0 is a breaking data, identity, and Runtime API release. It makes
+process identity the authority for session liveness, bounds unknown evidence,
+and hardens browser terminal control and technical-state cleanup.
+
+### Highlights
+
+- Process identity now controls live/dead decisions across tmux and ordinary
+  child processes, including sleep, detach, PID reuse, and stale status rows.
+- Browser credentials, trusted proxy headers, Runtime API TLS, and buffer GC
+  all have narrower, tested authority boundaries.
+
+### Breaking Changes
+
+- Databases upgrade to schema v7. Downgrading a migrated database is not
+  supported. Before migration, hello-cc creates a verified
+  `<db>.pre-v<from>-to-v7.<timestamp>.<suffix>.bak` snapshot; stop all hello-cc
+  processes and validate the backup with SQLite `quick_check` before any manual
+  recovery. At most five strictly named backups are retained per database; the
+  recovery procedure is documented in the user guide.
+- Provider peer IDs now hash the complete provider session value. Existing
+  pre-v1 provider IDs and bindings are left unchanged: there is no automatic
+  alias, graph rewrite, or migration to the new ID.
+- Protected HTTP and WebSocket operations require Runtime API v2. Browser
+  terminal write tokens are issued per WebSocket connection and revoked when
+  that connection closes.
+
+### Security And Reliability
+
+- Live tmux and non-tmux sessions are decided from immutable process evidence;
+  sleep and tmux detachment do not mark a live process dead. Unknown evidence
+  receives at most 120 seconds of grace, while confirmed dead owners expire.
+- Generated Web access tokens are scoped to one runtime and are not persisted.
+  HTTPS runtime overrides use normal certificate verification; set
+  `HCC_RUNTIME_CA` to a CA file for a private or self-signed endpoint.
+- `--trust-proxy` now requires `--proxy-origin https://host[:port]`; forwarded
+  scheme and host must match that fixed origin and arrive from loopback.
+- Garbage collection keeps task/message/event/handoff history unless
+  `hcc gc --history --yes` is explicitly requested. Buffer deletion rechecks
+  producer evidence and leases immediately before each bounded batch.
+
+### Accepted Risks
+
+- The default Web listener remains `0.0.0.0` over plaintext HTTP for trusted
+  LAN use. The token controls access but does not provide transport encryption;
+  use `--tls` or a pinned TLS reverse proxy when the network is not trusted.
+- An authenticated browser may select any existing server directory as a
+  project root. This is intentional for the operator console and is not a
+  project-root sandbox or tenant boundary.
+
+### Validation
+
+The release gate requires Node 24 unit and full regression tests, package import
+closure checks, a fresh Docker build, and three consecutive container runs that
+end with `FULL_REGRESSION_OK`.
+
 ## 0.1.9
 
 ### Summary

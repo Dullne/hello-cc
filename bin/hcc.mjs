@@ -29,11 +29,10 @@ import {
 import {
   DB_SCHEMA_VERSION,
   execWithBusyRetry,
-  initSchema,
   readSchemaVersion,
   tx
 } from '../lib/db/schema.mjs';
-import { ensureMigrationBackup } from '../lib/db/migration-backup.mjs';
+import { initSchemaWithBackup } from '../lib/db/migration-backup.mjs';
 import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import {
   intOpt,
@@ -101,6 +100,7 @@ import {
   collectBufferEvidence,
   externalBufferEvidence,
   externalBufferOwnerKey,
+  externalBufferSessionIds,
   readExternalBufferMetadata
 } from '../lib/runtime/buffer-evidence.mjs';
 import { withBufferDirectoryLease } from '../lib/runtime/buffer-directory-lease.mjs';
@@ -134,12 +134,15 @@ import {
   conditionalTmuxKill,
   conditionalTmuxRename,
   finalizeTmuxGcBindingMutation,
+  prepareTmuxRestartBinding,
+  rollbackTmuxRestartBinding,
   validateTmuxDestructiveEvidence,
   validateTmuxGcBindingEvidence,
   validateTmuxGcDeadProcessEvidence
 } from '../lib/core/peers/tmux-safety.mjs';
 import {
-  inspectProcessIdentity
+  inspectProcessIdentity,
+  waitForLiveProcessIdentity
 } from '../lib/process/identity.mjs';
 import {
   capturePtyStartupEvidence,
@@ -180,7 +183,11 @@ import {
 } from '../lib/web/runtime.mjs';
 import {
   authOk,
+  isLoopbackRemote,
   readJsonRequest,
+  requestIsSecure,
+  requestMatchesProxyOrigin,
+  requestOriginMatches,
   sendFile,
   sendHttp,
   sendJson,
@@ -735,69 +742,6 @@ function redactedLogText(value) {
   return serialized === undefined ? String(redacted) : serialized;
 }
 
-function isLoopbackRemote(req) {
-  const address = req?.socket?.remoteAddress || '';
-  return address === '::1' || address.startsWith('127.') || address.startsWith('::ffff:127.');
-}
-
-function firstForwardedValue(value) {
-  const raw = Array.isArray(value) ? value[0] : value;
-  return String(raw || '').split(',')[0].trim();
-}
-
-function requestIsSecure(req, options = {}) {
-  const trustProxy = options === true || options?.trustProxy === true;
-  if (trustProxy && isLoopbackRemote(req)) {
-    const forwardedProto = firstForwardedValue(req?.headers?.['x-forwarded-proto']).toLowerCase();
-    if (forwardedProto) return forwardedProto === 'https';
-  }
-  return Boolean(req?.socket?.encrypted);
-}
-
-function normalizedOriginAuthority(hostValue, protocol) {
-  const raw = String(hostValue || '');
-  if (!raw || raw !== raw.trim()) return null;
-  const parsed = new URL(`${protocol}//${raw}`);
-  if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
-  return {
-    hostname: parsed.hostname.toLowerCase(),
-    port: parsed.port || (protocol === 'https:' ? '443' : '80')
-  };
-}
-
-function requestOriginMatches(req, options = {}) {
-  const trustProxy = options === true || options?.trustProxy === true;
-  const useForwardedHeaders = trustProxy && isLoopbackRemote(req);
-  const origin = req?.headers?.origin || '';
-  const forwardedHost = useForwardedHeaders
-    ? firstForwardedValue(req?.headers?.['x-forwarded-host'])
-    : '';
-  const forwardedProto = useForwardedHeaders
-    ? firstForwardedValue(req?.headers?.['x-forwarded-proto']).toLowerCase()
-    : '';
-  const host = forwardedHost || req?.headers?.host || '';
-  if (!origin || !host) return false;
-  try {
-    const parsed = new URL(origin);
-    if (forwardedProto && !['http', 'https'].includes(forwardedProto)) return false;
-    const expectedProtocol = forwardedProto
-      ? `${forwardedProto}:`
-      : (req?.socket?.encrypted ? 'https:' : 'http:');
-    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
-    const originAuthority = {
-      hostname: parsed.hostname.toLowerCase(),
-      port: parsed.port || (expectedProtocol === 'https:' ? '443' : '80')
-    };
-    const hostAuthority = normalizedOriginAuthority(host, expectedProtocol);
-    return parsed.protocol === expectedProtocol &&
-      hostAuthority !== null &&
-      originAuthority.hostname === hostAuthority.hostname &&
-      originAuthority.port === hostAuthority.port;
-  } catch {
-    return false;
-  }
-}
-
 function renderWebIndex(nonce) {
   return webUiTemplate.webIndexHtml({ nonce });
 }
@@ -818,6 +762,7 @@ function sendWebHtml(res, render) {
 
 function webErrorStatus(err) {
   if (!(err instanceof CliError)) return 500;
+  if (err.code === 'REGISTRY_BUSY') return 503;
   if (['BAD_ARGS', 'BAD_REQUEST', 'PEER_IDENTITY_REQUIRED', 'REQUEST_TOO_LARGE'].includes(err.code)) return 400;
   if (['PEER_IDENTITY_MISMATCH', 'TASK_OWNED', 'LOCK_OWNED', 'PROJECT_NOT_REGISTERED', 'PROJECT_PATH_FORBIDDEN'].includes(err.code)) return 403;
   if (['NOT_FOUND'].includes(err.code)) return 404;
@@ -850,6 +795,8 @@ function resolveTargetPeer(ctx, opts = {}, key = 'peer', kindHint = 'shell') {
 
 let projectMigrationFanoutDepth = 0;
 const migratedRegisteredProjectDbs = new Set();
+// xx-05: cooldown before retrying a sibling project DB whose migration failed.
+const MIGRATION_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 
 function connect(ctx, options = {}) {
   if (options.create === false && !fs.existsSync(ctx.dbPath)) {
@@ -862,9 +809,7 @@ function connect(ctx, options = {}) {
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA wal_autocheckpoint = 1000;');
   db.exec('PRAGMA foreign_keys = ON;');
-  initSchema(db, {
-    beforeMigration: ({ fromVersion, toVersion }) =>
-      ensureMigrationBackup(db, ctx.dbPath, fromVersion, toVersion),
+  initSchemaWithBackup(db, ctx.dbPath, {
     beforePostMigrationIndexes: dedupePeerBindings
   });
   if (options.migrateRegistered !== false) migrateRegisteredProjectDbs(ctx);
@@ -903,6 +848,14 @@ function migrateRegisteredProjectDbs(ctx) {
       const cacheKey = `${dbPath}:${DB_SCHEMA_VERSION}`;
       if (migratedRegisteredProjectDbs.has(cacheKey)) continue;
       if (!fs.existsSync(root) || !fs.existsSync(dbPath)) continue;
+      // xx-05: a persistently failing sibling (corrupt, read-only, or a slow
+      // network FS) must not re-pay the full multi-second failure attempt on
+      // every connect. A sidecar marker records the last failure; skip the DB
+      // for a cooldown window instead of retrying on every command/request.
+      const failedMarker = `${dbPath}.migration-failed`;
+      try {
+        if (Date.now() - fs.statSync(failedMarker).mtimeMs < MIGRATION_FAILURE_COOLDOWN_MS) continue;
+      } catch {}
       let db = null;
       try {
         db = new DatabaseSync(dbPath, { timeout: 5000 });
@@ -910,16 +863,16 @@ function migrateRegisteredProjectDbs(ctx) {
         execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
         db.exec('PRAGMA synchronous = NORMAL;');
         db.exec('PRAGMA foreign_keys = ON;');
-        initSchema(db, {
-          beforeMigration: ({ fromVersion, toVersion }) =>
-            ensureMigrationBackup(db, dbPath, fromVersion, toVersion),
+        initSchemaWithBackup(db, dbPath, {
           beforePostMigrationIndexes: dedupePeerBindings
         });
         migratedRegisteredProjectDbs.add(cacheKey);
+        try { fs.rmSync(failedMarker, { force: true }); } catch {}
       } catch (err) {
         // A corrupt or busy sibling project DB must not fail commands or crash
         // the shared runtime for unrelated projects. Skip it and keep going.
         console.error(redactedLogText(`[${new Date().toISOString()}] skipping registered project DB migration for ${dbPath}: ${err?.message || err}`));
+        try { fs.writeFileSync(failedMarker, String(now())); } catch {}
         continue;
       } finally {
         try { db?.close(); } catch {}
@@ -2294,10 +2247,14 @@ async function lockAcquire(ctx, args) {
         if (!task) throw new CliError('NOT_FOUND', `Task #${taskId} does not exist`);
         assertTaskOwnerForMutation(db, peer, task, 'lock-acquire');
       }
-      // During clock grace, every retained lock row still conflicts. A fixed
-      // look-back cannot protect locks across an arbitrarily long sleep.
-      const activeLocks = clockGraceSuppressed(t, clockObservation.graceUntil)
-        ? subject.locks
+      // During clock grace, retained lock rows still conflict — but NOT
+      // EXPIRED locks of verified-dead owners (CS-04): a dead owner's expired
+      // lock must not block acquisition while the GC that would delete the row
+      // is itself deferred by the same grace window.
+      const graceActive = clockGraceSuppressed(t, clockObservation.graceUntil);
+      const activeLocks = graceActive
+        ? subject.locks.filter((row) =>
+            !(Number(row.expires_at) <= t && evidenceByOwner.get(row.owner)?.state === 'dead'))
         : subject.locks.filter((row) =>
             Number(row.expires_at) > t ||
             evidenceByOwner.get(row.owner)?.state === 'live'
@@ -2728,15 +2685,33 @@ function webExposureWarning(host, port) {
 // cross-site WebSocket hijack (CSWSH) is rejected. Non-browser clients (the CLI,
 // the `ws` library, regression tests) send no Origin and are allowed through to
 // the token gate.
-function webSocketOriginAllowed(req, trustProxy = false) {
+function webSocketOriginAllowed(req, options = {}) {
   const origin = req.headers.origin;
   if (!origin) return true;
-  return requestOriginMatches(req, { trustProxy });
+  return requestOriginMatches(req, options);
+}
+
+function proxyOriginForOpts(opts) {
+  const trustProxy = Boolean(opts['trust-proxy']);
+  const value = String(opts['proxy-origin'] || '');
+  if (!trustProxy && value) throw new CliError('BAD_ARGS', '--proxy-origin requires --trust-proxy');
+  if (!trustProxy) return '';
+  if (!value) throw new CliError('BAD_ARGS', '--trust-proxy requires --proxy-origin');
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+        parsed.pathname !== '/' || parsed.search || parsed.hash) throw new Error('invalid origin');
+    return parsed.origin;
+  } catch {
+    throw new CliError('BAD_ARGS', '--proxy-origin must be an http(s) origin without a path, query, or credentials');
+  }
 }
 
 async function startWebBackground(ctx, args) {
   const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy']);
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy', 'proxy-origin']);
+  const requestedProxyOrigin = proxyOriginForOpts(opts);
+  if (requestedProxyOrigin) opts['proxy-origin'] = requestedProxyOrigin;
   validateWebTokenOpts(opts);
   const requestedHost = expectedWebHost(opts);
   assertWebTokenForHost(requestedHost, !opts['no-token']);
@@ -2773,7 +2748,9 @@ async function startWebBackground(ctx, args) {
     const runtimeTls = existing.tls === undefined
       ? /^https:/i.test(String(existing.base_url || ''))
       : Boolean(existing.tls);
-    if (runtimeTls !== Boolean(opts.tls) || Boolean(existing.trust_proxy) !== Boolean(opts['trust-proxy'])) {
+    if (runtimeTls !== Boolean(opts.tls) ||
+        Boolean(existing.trust_proxy) !== Boolean(opts['trust-proxy']) ||
+        (existing.proxy_origin || '') !== (opts['proxy-origin'] || '')) {
       throw new CliError('RUNTIME_CONFIG_CONFLICT',
         `A ${runtimeTls ? 'TLS' : 'plaintext'} web runtime is already running${existing.trust_proxy ? ' with --trust-proxy' : ''} on port ${existing.port}. ` +
         `Run ${CLI_NAME} down first, or re-run with matching flags (${opts.tls ? '--tls' : 'no --tls'}${opts['trust-proxy'] ? ', --trust-proxy' : ''}).`);
@@ -2909,12 +2886,30 @@ function printWebRuntime(ctx, runtime, opts = {}) {
 
 async function cmdDown(ctx, args) {
   if (args[0] === '--help' || args[0] === '-h') return helpDown();
-  const runtime = readRuntime(ctx);
+  const pointerFiles = [runtimePath(ctx), globalRuntimePath()];
+  let runtime;
+  try {
+    runtime = readRuntime(ctx);
+  } catch (err) {
+    if (!(err instanceof CliError && err.code === 'RUNTIME_NOT_RUNNING') || process.env.HCC_RUNTIME_URL) throw err;
+    const cleanup = reclaimRuntimePointerFiles(pointerFiles, { reclaimUnknown: false });
+    if (cleanup.reclaimed < 1 || cleanup.blocked) throw err;
+    printResult(ctx, { pointers: cleanup.reclaimed }, (result) =>
+      `${PRODUCT_NAME} stale runtime pointer removed${result.pointers === 1 ? '' : 's'}`);
+    return;
+  }
   try {
     await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, runtime);
   } catch (err) {
     if (!(err instanceof CliError && err.code === 'RUNTIME_UNREACHABLE')) throw err;
-    try { fs.rmSync(runtimePath(ctx), { force: true }); } catch {}
+    if (runtime.source === 'env') throw err;
+    const source = path.resolve(String(runtime.source || ''));
+    const localSource = pointerFiles.find((file) => path.resolve(file) === source);
+    if (!localSource) throw err;
+    const cleanup = reclaimRuntimePointerFiles([localSource], { reclaimUnknown: false });
+    if (cleanup.reclaimed !== 1 || cleanup.blocked) throw err;
+    printResult(ctx, { runtime: localSource }, () => `${PRODUCT_NAME} stale runtime pointer removed`);
+    return;
   }
   printResult(ctx, { runtime: runtime.source || runtime.base_url }, () => `${PRODUCT_NAME} runtime stopped`);
 }
@@ -2922,8 +2917,16 @@ async function cmdDown(ctx, args) {
 async function cmdWeb(ctx, args, startMeta = {}) {
   if (args[0] === '--help' || args[0] === '-h') return helpWeb();
   if (process.env[WEB_CHILD_ENV] !== '1') return startWebBackground(ctx, args);
+  const runtimeIdentity = await waitForLiveProcessIdentity(process.pid, { timeoutMs: 1_000 });
+  if (runtimeIdentity.state !== 'live' || !runtimeIdentity.identity) {
+    throw new CliError(
+      'RUNTIME_IDENTITY_UNAVAILABLE',
+      'Unable to verify the web runtime process identity; no runtime pointer was published.'
+    );
+  }
+  const processIdentity = runtimeIdentity.identity;
   const opts = parseOpts(args, { booleans: ['local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy'] });
-  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy']);
+  validateOpts('web', opts, ['host', 'port', 'token', 'local', 'no-token', 'no-guidance', 'no-discover', 'tls', 'trust-proxy', 'proxy-origin']);
   validateWebTokenOpts(opts);
   const host = expectedWebHost(opts);
   const port = intOpt(opts, 'port', 8787);
@@ -2932,6 +2935,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   if (!isLoopbackHost(host)) console.error(redactedLogText(webExposureWarning(host, port) + (opts.tls ? '' : ' Consider --tls to encrypt this connection.')));
   const useTls = Boolean(opts.tls);
   const trustProxy = Boolean(opts['trust-proxy']);
+  const proxyOrigin = proxyOriginForOpts(opts);
   const tlsCredentials = useTls ? ensureSelfSignedCert([host]) : null;
   // Browser sessions: a token printed in the URL is exchanged once for an
   // HttpOnly cookie so the token stops travelling in every fetch/WS URL
@@ -2956,7 +2960,11 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     for (const part of header.split(';')) {
       const [k, ...rest] = part.trim().split('=');
       if (k === 'hcc_sid') {
-        try { return decodeURIComponent(rest.join('=')); } catch { return ''; }
+        // xx-07: bound the value length so an attacker-controlled cookie cannot
+        // cause unbounded decode/lookup work.
+        const raw = rest.join('=');
+        if (raw.length > 128) return '';
+        try { return decodeURIComponent(raw); } catch { return ''; }
       }
     }
     return '';
@@ -2987,12 +2995,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
   function sessionCookieHeader(sid, req) {
     const parts = [`hcc_sid=${sid}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${WEB_SESSION_TTL_SEC}`];
-    if (requestIsSecure(req, { trustProxy })) parts.push('Secure');
+    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
     return parts.join('; ');
   }
   function expiredSessionCookieHeader(req) {
     const parts = ['hcc_sid=', 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
-    if (requestIsSecure(req, { trustProxy })) parts.push('Secure');
+    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
     return parts.join('; ');
   }
   function cookieSessionRecord(req) {
@@ -3041,11 +3049,24 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     return randomBytes(32).toString('base64url');
   }
 
-  function rememberProject(projectCtx, { activity = false } = {}) {
+  function rememberProject(projectCtx, { activity = false, register = false, nonblocking = false } = {}) {
     const normalized = contextForProject(projectCtx.root, projectCtx.dbPath, { cwd: projectCtx.cwd, json: ctx.json });
-    projectContexts.set(normalized.root, normalized);
+    const isNew = !projectContexts.has(normalized.root);
+    // Activity refresh is already nonblocking and throttled before it tries the
+    // registry lock. Calling it on each request keeps last_seen_at current
+    // without putting the synchronous lock back on the HTTP hot path.
     if (activity) registerProjectActivity(normalized);
-    else registerProject(normalized);
+    else if (isNew || register) {
+      try {
+        registerProject(normalized, { nonblocking });
+      } catch (error) {
+        if (nonblocking && ['ERR_FILE_LOCK_BUSY', 'ERR_FILE_LOCK_TIMEOUT'].includes(error?.code)) {
+          throw new CliError('REGISTRY_BUSY', 'Project registry is busy; retry the request');
+        }
+        throw error;
+      }
+    }
+    projectContexts.set(normalized.root, normalized);
     return normalized;
   }
 
@@ -3183,9 +3204,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         session_id: session.id
       });
     }
-    const expected = session.actionToken || '';
     const provided = readActionToken(input, req);
-    if (!expected || !tokenMatches(provided, expected)) {
+    const authorized = Boolean(provided) && [...(session.actionTokens || [])]
+      .some((candidate) => tokenMatches(provided, candidate));
+    if (!authorized) {
       throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action for ${peer} requires the managed session action token`, { peer });
     }
     return actorPeer;
@@ -3263,7 +3285,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     const session = {
       id,
       peerId: id,
-      actionToken: newSessionActionToken(),
+      actionTokens: new Set(),
       root: pctx.root,
       ctx: pctx,
       kind: meta.kind || 'external',
@@ -3401,14 +3423,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function scanExternalSessions() {
     for (const projectCtx of runtimeProjectContexts()) {
       const directory = bufferDirectory(projectCtx);
-      try {
-        fs.mkdirSync(directory, { recursive: true });
-        for (const f of fs.readdirSync(directory)) {
-          if (f.endsWith('.out')) {
-            adoptExternalSession(path.basename(f, '.out'), projectCtx, directory);
-          }
-        }
-      } catch {}
+      for (const id of externalBufferSessionIds(directory)) {
+        adoptExternalSession(id, projectCtx, directory);
+      }
     }
   }
 
@@ -3436,12 +3453,15 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function listTmuxPanesOnce() {
     // Use '|' not '\t' as the field separator: older tmux (3.3a) replaces
     // whitespace in -F output with '_'. Path is last and rejoined so a '|'
-    // inside a path is safe.
+    // inside a path is safe. tmux-8: session_name is NOT included here — a
+    // user-created session name could contain '|', corrupting the parse. Callers
+    // that need the session name use tmuxSessionNameForPane(pane.pane) which
+    // queries a single field with no separator issue.
     const result = runTmux([
       'list-panes',
       '-a',
       '-F',
-      '#{pane_id}|#{pane_pid}|#{pane_current_command}|#{session_name}|#{pane_current_path}'
+      '#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}'
     ]);
     return result.trim().split('\n')
       .filter(Boolean)
@@ -3451,8 +3471,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           pane: parts[0],
           pid: Number.parseInt(parts[1] || '0', 10) || null,
           command: parts[2] || '',
-          sessionName: parts[3] || '',
-          cwd: parts.slice(4).join('|') || ''
+          sessionName: '',
+          cwd: parts.slice(3).join('|') || ''
         };
       })
       .filter((pane) => pane.pane && pane.pid);
@@ -4022,7 +4042,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function closeSessionClients(session) {
-    if (!session?.clients?.size) return;
+    if (!session) return;
+    session.actionTokens?.clear();
+    if (!session.clients?.size) return;
     for (const client of [...session.clients]) {
       try {
         if (client.readyState === client.OPEN || client.readyState === 1) client.close(1001, 'runtime stopping');
@@ -4040,6 +4062,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     session.status = status;
     session.exitedAt = now();
     broadcast(session, { type: 'exit', event: { reason: status } });
+    closeSessionClients(session);
     const pctx = session.ctx || contextForProject(session.root || ctx.root, null, { json: ctx.json });
     sessions.delete(sessionKey(pctx, session.id));
     const db = connectWebProject(pctx);
@@ -4702,7 +4725,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       peerId: id,
       actorPeer,
       auditSource,
-      actionToken: newSessionActionToken(),
+      actionTokens: new Set(),
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -5023,6 +5046,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       }
       const authorityDb = connectWebProject(pctx);
       let storedAuthority;
+      let bindingPreparation;
       try {
         storedAuthority = tmuxAttachmentEvidence(authorityDb, id, oldTarget);
         assertTmuxDestructiveEvidence(
@@ -5030,6 +5054,23 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           observeTmuxDestructiveEvidence(pctx, oldTarget),
           { peer: id, tmux_session: sessionName, reason }
         );
+        // The liveness reaper may have safely detached a dead provider while
+        // leaving its fallback tmux shell alive. Restore only that null binding
+        // after immutable tmux authority is verified so the rebind CAS can
+        // distinguish recovery from a foreign target change.
+        bindingPreparation = prepareTmuxRestartBinding(authorityDb, {
+          peer: id,
+          runtimeTarget: oldTarget,
+          nowSec: now()
+        });
+        if (!bindingPreparation.ok) {
+          throw new CliError('TMUX_REBIND_OLD_TARGET_CHANGED',
+            `tmux runtime target for ${id} changed before provider restart`, {
+              peer: id,
+              expected_runtime_target: oldTarget,
+              reason: bindingPreparation.reason
+            });
+        }
       } finally {
         authorityDb.close();
       }
@@ -5037,11 +5078,21 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       try {
         conditionalTmuxRename(runTmux, storedAuthority, parkedName);
       } catch (err) {
-        if (err instanceof CliError && err.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH') throw err;
+        let bindingRolledBack = true;
+        if (bindingPreparation?.restored) {
+          const rollbackDb = connectWebProject(pctx);
+          try {
+            bindingRolledBack = rollbackTmuxRestartBinding(rollbackDb, bindingPreparation);
+          } finally {
+            rollbackDb.close();
+          }
+        }
+        if (err instanceof CliError && err.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH' && bindingRolledBack) throw err;
         throw new CliError('TMUX_REBIND_PREPARE_FAILED', `Could not park old tmux session ${sessionName} before rebind: ${err.message}`, {
           peer: id,
           tmux_session: sessionName,
-          reason
+          reason,
+          binding_rollback_failed: !bindingRolledBack
         });
       }
       parkedOldTmuxSessions.push({ oldTarget, originalName: sessionName, parkedName });
@@ -5065,6 +5116,12 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     }
 
     if (hasSession && relaunchableProvider) {
+      // G4a: HCC_PROVIDER_STATE is a tmux-env hint that can be forged from
+      // inside the session. Before a destructive park-and-replace, require
+      // process evidence that the provider is really gone: the pane process
+      // must be dead, or have no live non-shell child (the provider wrapper
+      // leaves the pane as a bare shell after the provider exits). A session
+      // with a live provider child is never torn down.
       const providerState = tmuxProviderState(sessionName);
       const info = tmuxPaneInfo(paneTarget);
       const ownerDb = connectWebProject(pctx);
@@ -5498,7 +5555,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       peerId: id,
       actorPeer,
       auditSource,
-      actionToken: newSessionActionToken(),
+      actionTokens: new Set(),
       root: pctx.root,
       ctx: pctx,
       kind,
@@ -5573,6 +5630,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         db.close();
       }
       broadcast(session, { type: 'exit', event });
+      closeSessionClients(session);
     });
     return session;
   }
@@ -5656,6 +5714,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         // address bar). API-style fetches (Accept: */*) still get the HTML
         // directly so existing CLI/test callers are unaffected.
         if (isBrowserNav && queryToken && token && tokenMatches(queryToken, token)) {
+          if (trustProxy && !requestMatchesProxyOrigin(req, { trustProxy, proxyOrigin })) {
+            sendJson(res, 403, { ok: false, error: { code: 'PROXY_ORIGIN_MISMATCH', message: 'Trusted proxy headers do not match --proxy-origin' } });
+            return;
+          }
           const sid = issueSession();
           const params = new URLSearchParams();
           for (const key of ['project', 'root']) {
@@ -5691,6 +5753,10 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Invalid token' } });
           return;
         }
+        if (trustProxy && !requestMatchesProxyOrigin(req, { trustProxy, proxyOrigin })) {
+          sendJson(res, 403, { ok: false, error: { code: 'PROXY_ORIGIN_MISMATCH', message: 'Trusted proxy headers do not match --proxy-origin' } });
+          return;
+        }
         const sid = issueSession();
         res.writeHead(302, { Location: '/', 'Set-Cookie': sessionCookieHeader(sid, req) });
         res.end();
@@ -5712,7 +5778,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       // requests; a supplied Origin on the tokenless runtime must still match.
       const cookieAuthenticated = authMode === 'cookie' || cookieSessionOk(req);
       const originRequired = cookieAuthenticated || (!token && Boolean(req.headers.origin));
-      if (!safeMethod && originRequired && !requestOriginMatches(req, { trustProxy })) {
+      if (!safeMethod && originRequired && !requestOriginMatches(req, { trustProxy, proxyOrigin })) {
         sendJson(res, 403, { ok: false, error: { code: 'CSRF_ORIGIN', message: 'Cookie-authenticated writes require a same-origin request' } });
         return;
       }
@@ -5734,7 +5800,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const projectCtx = rememberProject(resolveWebProjectContext(
           requestedRoot,
           input.db || path.join(requestedRoot, '.hello-cc', 'mesh.db')
-        ));
+        ), { register: true, nonblocking: true });
         const db = connectWebProject(projectCtx);
         db.close();
         writeRuntime(projectCtx, {
@@ -5751,6 +5817,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
           token,
           tls: useTls,
           trust_proxy: trustProxy,
+          proxy_origin: proxyOrigin,
           tls_cert: useTls ? tlsCredentials.cert : undefined,
           global_runtime: true,
           started_at: now()
@@ -6096,8 +6163,16 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         const peerId = decodeURIComponent(detectedRestartMatch[1]);
         const db = connectWebProject(reqCtx);
         try {
-          const now_ = now();
-          db.prepare('UPDATE peers SET status = ?, last_seen_at = ? WHERE id = ?').run('running', now_, peerId);
+          // v1-detected-restart: only flip a real detected peer that has a live
+          // process or is not explicitly exited. Do not bump last_seen_at
+          // (the peer did not actually heartbeat) so the reaper's age filter
+          // still applies and a phantom cannot persist indefinitely.
+          const peer = db.prepare('SELECT id, pid, status FROM peers WHERE id = ?').get(peerId);
+          if (!peer || peer.status === 'exited') {
+            sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: `No live detected peer for ${peerId}` } });
+            return;
+          }
+          db.prepare('UPDATE peers SET status = ? WHERE id = ?').run('running', peerId);
           addEvent(db, 'peer.restarted', 'web', null, auditPayload({
             actor: 'web',
             target: peerId,
@@ -6160,7 +6235,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       socket.destroy();
       return;
     }
-    if (!webSocketOriginAllowed(req, trustProxy)) {
+    if (!webSocketOriginAllowed(req, { trustProxy, proxyOrigin })) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
@@ -6186,6 +6261,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      const connectionActionToken = newSessionActionToken();
       ws.hccCookieAuth = cookieAuth;
       session.clients.add(ws);
       if (cookieAuth) cookieAuth.session.sockets.add(ws);
@@ -6193,21 +6269,19 @@ async function cmdWeb(ctx, args, startMeta = {}) {
         session.clients.delete(ws);
         return;
       }
-      // Deliver the per-session action token only to the client that completed
-      // the upgrade for THIS session's terminal socket (net-05): it is not in
-      // the public session list.
-      ws.send(JSON.stringify({ type: 'snapshot', data: refreshTmuxSnapshot(session), action_token: session.actionToken || null }));
+      session.actionTokens ||= new Set();
+      session.actionTokens.add(connectionActionToken);
+      ws.send(JSON.stringify({ type: 'snapshot', data: refreshTmuxSnapshot(session), action_token: connectionActionToken }));
       ws.on('message', (raw) => {
         try {
           if (!cookieSocketValid(ws)) return;
           const msg = JSON.parse(String(raw));
           if (msg.type === 'input' && session.status === 'running') {
-            // Require the per-session action token on terminal input (the RCE
-            // path). The controlling client received it in the snapshot frame.
-            if (session.actionToken && !tokenMatches(msg.action_token, session.actionToken)) return;
+            if (!tokenMatches(msg.action_token, connectionActionToken)) return;
             const data = String(msg.data || '');
             writeSessionInput(session, data);
           } else if (msg.type === 'resize' && session.status === 'running') {
+            if (!tokenMatches(msg.action_token, connectionActionToken)) return;
             const cols = Math.max(20, Number.parseInt(msg.cols || 100, 10));
             const rows = Math.max(8, Number.parseInt(msg.rows || 30, 10));
             resizeSession(session, cols, rows);
@@ -6219,6 +6293,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       });
       ws.on('close', () => {
         session.clients.delete(ws);
+        session.actionTokens.delete(connectionActionToken);
         if (cookieAuth) cookieAuth.session.sockets.delete(ws);
       });
     });
@@ -6343,9 +6418,9 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   });
 
   const fatalController = createFatalShutdownController({
-    cleanup: (reason) => {
+    cleanup: () => {
       shutdownExitCode = 1;
-      return cleanupRuntime(reason);
+      return cleanupRuntime();
     },
     exit: (code) => process.exit(code),
     forceExit: (code) => process.exit(code),
@@ -6362,7 +6437,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   });
 
   const actualPort = await listenServer(server, host, port, opts.port === undefined);
-  const processIdentity = runtimeProcessIdentity();
   const runtime = {
     product: PRODUCT_NAME,
     version: VERSION,
@@ -6377,6 +6451,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     token,
     tls: useTls,
     trust_proxy: trustProxy,
+    proxy_origin: proxyOrigin,
     tls_cert: useTls ? tlsCredentials.cert : undefined,
     started_at: now()
   };
@@ -8860,6 +8935,11 @@ async function cmdGc(ctx, args) {
         !r.protected_old_events && !r.protected_old_tasks && !r.protected_old_messages &&
         !r.protected_old_handoffs && !r.deferred_age_based) {
       lines.push('  nothing to clean');
+    }
+    // v1-06: warn when history tables are retained so the user knows to add
+    // --history for events/tasks/messages/handoffs pruning.
+    if (!dryRun && opts.history !== true) {
+      lines.push('  (history tables retained; add --history to prune events/tasks/messages/handoffs)');
     }
     return lines.join('\n');
   });

@@ -1564,7 +1564,10 @@ function assertHtmlCsp(response, html, label) {
 function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
+    // Linux keeps an exited child addressable until PID 1 reaps its zombie.
+    // Product liveness treats that state as dead, and the regression wait must
+    // use the same semantic boundary instead of waiting forever on kill(0).
+    return process.platform !== 'linux' || inspectProcessIdentity(pid).state !== 'dead';
   } catch {
     return false;
   }
@@ -1615,9 +1618,9 @@ async function openTerminalWebSocket(peer) {
   });
 }
 
-// The per-session action token is delivered only via the terminal WS snapshot
-// frame (net-05), not the session list. Fetch it by opening the socket.
-async function fetchSessionActionToken(peer, params = {}) {
+// Each terminal connection receives its own action token. Keep the connection
+// open while HTTP peer actions use that token; closing it revokes the token.
+async function openSessionActionChannel(peer, params = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(runtimeWsUrl(peer));
     for (const [key, value] of Object.entries(params)) {
@@ -1629,11 +1632,32 @@ async function fetchSessionActionToken(peer, params = {}) {
       const msg = JSON.parse(String(raw));
       if (msg.type === 'snapshot') {
         clearTimeout(timer);
-        try { ws.close(); } catch {}
-        resolve(msg.action_token || '');
+        resolve({ token: msg.action_token || '', ws });
       }
     });
     ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+async function fetchSessionActionToken(peer, params = {}) {
+  return (await openSessionActionChannel(peer, params)).token;
+}
+
+async function closeTerminalWebSocket(ws) {
+  if (!ws || ws.readyState === WebSocket.CLOSED) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      resolve();
+    }, 2000);
+    ws.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    try { ws.close(); } catch {
+      clearTimeout(timer);
+      resolve();
+    }
   });
 }
 
@@ -2879,7 +2903,7 @@ async function setupRegression() {
   assertFutureSchemaMigrationHistoryRejected();
   assertLegacyBindingRepair();
 
-  const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--trust-proxy', '--no-discover', '--no-guidance']);
+  const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   const tokenMatch = tokenOutput.match(/^pid:\s*(\d+)/m);
   if (!tokenMatch) fail(`token web did not print background pid:\n${tokenOutput}`);
   runtimePid = Number.parseInt(tokenMatch[1], 10);
@@ -2888,7 +2912,7 @@ async function setupRegression() {
   }
   await waitRuntime();
   const tokenRuntime = currentRuntime();
-  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy !== true || !tokenRuntime.token || tokenRuntime.token.length < 24) {
+  if (tokenRuntime.host !== '0.0.0.0' || tokenRuntime.trust_proxy === true || !tokenRuntime.token || tokenRuntime.token.length < 24) {
     fail(`default web runtime did not store remote token data:\n${JSON.stringify(tokenRuntime, null, 2)}`);
   }
   const apiVersionMissing = await fetch(`${tokenRuntime.base_url}/api/runtime`, {
@@ -3059,6 +3083,19 @@ async function setupRegression() {
   // (i) trusted loopback reverse-proxy headers mark issued and expired cookies
   // Secure. The same headers are ignored unless --trust-proxy was explicit.
   const proxyOrigin = 'https://public.example.test:9443';
+  await stopRuntime();
+  const proxyOutput = hcc([
+    'web', '--host', '0.0.0.0', '--port', String(port), '--token', cookieToken,
+    '--trust-proxy', '--proxy-origin', proxyOrigin, '--no-discover', '--no-guidance'
+  ]);
+  const proxyPidMatch = proxyOutput.match(/^pid:\s*(\d+)/m);
+  if (!proxyPidMatch) fail(`trusted-proxy web did not print background pid:\n${proxyOutput}`);
+  runtimePid = Number.parseInt(proxyPidMatch[1], 10);
+  await waitRuntime();
+  const proxyRuntime = currentRuntime();
+  if (proxyRuntime.proxy_origin !== proxyOrigin || proxyRuntime.trust_proxy !== true) {
+    fail(`trusted-proxy runtime did not pin its public origin:\n${JSON.stringify(proxyRuntime, null, 2)}`);
+  }
   const proxyHeaders = {
     Accept: 'text/html',
     'X-Forwarded-Host': 'public.example.test:9443',
@@ -3089,9 +3126,7 @@ async function setupRegression() {
   const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}`, 'X-HCC-API-Version': '2' } });
   if (revokedProxyCookie.status !== 401) fail(`trusted proxy logout left the old cookie authorized: ${revokedProxyCookie.status}`);
 
-  // A reverse proxy may retain the HTTPS default port in X-Forwarded-Host
-  // while browsers normalize it out of Origin. These are the same origin and
-  // must pass the cookie-authenticated CSRF gate.
+  // A forwarded authority other than the pinned public origin is untrusted.
   const defaultPortProxyHeaders = {
     Accept: 'text/html',
     'X-Forwarded-Host': 'public.example.test:443',
@@ -3102,24 +3137,17 @@ async function setupRegression() {
     redirect: 'manual'
   });
   const defaultPortProxySetCookie = defaultPortProxyExchange.headers.get('set-cookie') || '';
-  const defaultPortProxySid = defaultPortProxySetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-  if (defaultPortProxyExchange.status !== 302 || !defaultPortProxySid || !defaultPortProxySetCookie.includes('Secure')) {
-    fail(`default-port trusted proxy login did not issue a Secure cookie: status=${defaultPortProxyExchange.status} cookie=${defaultPortProxySetCookie}`);
+  if (defaultPortProxyExchange.status !== 403 || defaultPortProxySetCookie) {
+    fail(`unpinned proxy authority received a session: status=${defaultPortProxyExchange.status} cookie=${defaultPortProxySetCookie}`);
   }
-  const defaultPortProxyLogout = await fetch(`${baseUrl}/logout`, {
+  const unpinnedProxyLogin = await fetch(`${baseUrl}/login`, {
     method: 'POST',
-    headers: {
-      Cookie: `hcc_sid=${defaultPortProxySid}`,
-      Origin: 'https://public.example.test',
-      'X-Forwarded-Host': 'public.example.test:443',
-      'X-Forwarded-Proto': 'https'
-    }
+    headers: { ...defaultPortProxyHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: cookieToken }),
+    redirect: 'manual'
   });
-  const defaultPortProxyLogoutCookie = defaultPortProxyLogout.headers.get('set-cookie') || '';
-  if (defaultPortProxyLogout.status !== 204 ||
-      !defaultPortProxyLogoutCookie.includes('Max-Age=0') ||
-      !defaultPortProxyLogoutCookie.includes('Secure')) {
-    fail(`same-origin default-port proxy logout was rejected: status=${defaultPortProxyLogout.status} cookie=${defaultPortProxyLogoutCookie}`);
+  if (unpinnedProxyLogin.status !== 403 || unpinnedProxyLogin.headers.get('set-cookie')) {
+    fail(`unpinned proxy POST /login received a session: status=${unpinnedProxyLogin.status}`);
   }
 
   const lanAddress = nonLoopbackIpv4();
@@ -3134,25 +3162,22 @@ async function setupRegression() {
       redirect: 'manual'
     });
     const spoofedLanCookie = spoofedLanExchange.headers.get('set-cookie') || '';
-    const spoofedLanSid = spoofedLanCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-    if (spoofedLanExchange.status !== 302 || !spoofedLanSid || spoofedLanCookie.includes('Secure')) {
-      fail(`non-loopback forwarded spoof influenced plaintext cookie security: status=${spoofedLanExchange.status} cookie=${spoofedLanCookie}`);
-    }
-    const spoofedLanLogout = await fetch(`${lanBaseUrl}/logout`, {
-      method: 'POST',
-      headers: {
-        Cookie: `hcc_sid=${spoofedLanSid}`,
-        Origin: 'https://spoofed.example.test',
-        'X-Forwarded-Host': 'spoofed.example.test',
-        'X-Forwarded-Proto': 'https'
-      }
-    });
-    if (spoofedLanLogout.status !== 403) {
-      fail(`non-loopback forwarded spoof passed the CSRF gate: ${spoofedLanLogout.status}`);
+    if (spoofedLanExchange.status !== 403 || spoofedLanCookie) {
+      fail(`non-loopback forwarded spoof received a session: status=${spoofedLanExchange.status} cookie=${spoofedLanCookie}`);
     }
   } else {
     log('non-loopback forwarded spoof: no non-loopback IPv4 interface; focused boundary coverage retained');
   }
+
+  await stopRuntime();
+  const restoredOutput = hcc([
+    'web', '--host', '0.0.0.0', '--port', String(port), '--token', cookieToken,
+    '--no-discover', '--no-guidance'
+  ]);
+  const restoredPidMatch = restoredOutput.match(/^pid:\s*(\d+)/m);
+  if (!restoredPidMatch) fail(`post-proxy web did not print background pid:\n${restoredOutput}`);
+  runtimePid = Number.parseInt(restoredPidMatch[1], 10);
+  await waitRuntime();
 
   const badJsonResponse = await runtimeFetch('/api/projects', {
     method: 'POST',
@@ -3167,13 +3192,12 @@ async function setupRegression() {
     fail(`bad JSON request did not return BAD_REQUEST:\n${JSON.stringify(badJsonBody, null, 2)}`);
   }
   const tokenFile = path.join(home, '.hello-cc', 'web-token');
-  ensureFile(tokenFile, tokenRuntime.token);
-  fs.rmSync(tokenFile, { force: true });
-  const existingTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--trust-proxy', '--no-discover', '--no-guidance']);
+  if (fs.existsSync(tokenFile)) fail('generated web token was persisted outside the runtime pointer');
+  const existingTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   if (!existingTokenOutput.includes('web already running in background')) {
     fail(`web did not reuse existing token runtime:\n${existingTokenOutput}`);
   }
-  ensureFile(tokenFile, tokenRuntime.token);
+  if (fs.existsSync(tokenFile)) fail('reusing a live runtime persisted its generated token');
   await stopRuntime();
 
   const stableTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
@@ -3182,8 +3206,8 @@ async function setupRegression() {
   runtimePid = Number.parseInt(stableTokenMatch[1], 10);
   await waitRuntime();
   const stableTokenRuntime = currentRuntime();
-  if (stableTokenRuntime.token !== tokenRuntime.token) {
-    fail(`default web token changed across restart:\nfirst=${tokenRuntime.token}\nsecond=${stableTokenRuntime.token}`);
+  if (stableTokenRuntime.token === tokenRuntime.token) {
+    fail(`default web token was reused across runtime restart:\nfirst=${tokenRuntime.token}\nsecond=${stableTokenRuntime.token}`);
   }
   await stopRuntime();
 
@@ -3201,14 +3225,14 @@ async function setupRegression() {
   }
   await stopRuntime();
 
-  const persistedFixedOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
-  const persistedFixedMatch = persistedFixedOutput.match(/^pid:\s*(\d+)/m);
-  if (!persistedFixedMatch) fail(`persisted fixed-token web did not print background pid:\n${persistedFixedOutput}`);
-  runtimePid = Number.parseInt(persistedFixedMatch[1], 10);
+  const postFixedOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
+  const postFixedMatch = postFixedOutput.match(/^pid:\s*(\d+)/m);
+  if (!postFixedMatch) fail(`post-fixed-token web did not print background pid:\n${postFixedOutput}`);
+  runtimePid = Number.parseInt(postFixedMatch[1], 10);
   await waitRuntime();
-  const persistedFixedRuntime = currentRuntime();
-  if (persistedFixedRuntime.token !== fixedToken) {
-    fail(`explicit stable token was not persisted:\n${JSON.stringify(persistedFixedRuntime, null, 2)}`);
+  const postFixedRuntime = currentRuntime();
+  if (postFixedRuntime.token === fixedToken || fs.existsSync(tokenFile)) {
+    fail(`explicit token leaked into a later runtime:\n${JSON.stringify(postFixedRuntime, null, 2)}`);
   }
   await stopRuntime();
 
@@ -4007,6 +4031,11 @@ async function multiProjectWebWorkflow() {
         !arbitraryRuntime.process_identity?.commandHash) {
       fail(`project API runtime pointer omitted the shared runtime fingerprint:\n${JSON.stringify(arbitraryRuntime, null, 2)}`);
     }
+    fs.rmSync(path.join(arbitraryRoot, '.hello-cc'), { recursive: true, force: true });
+    await sleep(1250);
+    if (fs.existsSync(path.join(arbitraryRoot, '.hello-cc'))) {
+      fail('background external-session scan recreated a deleted project state directory');
+    }
 
     const assertRejected = async (label, input) => {
       const response = await runtimeFetch('/api/projects', {
@@ -4205,6 +4234,8 @@ async function multiProjectWebWorkflow() {
 
   const activityLockReady = path.join(outDir, 'web-activity-lock-ready');
   const activityLockRelease = path.join(outDir, 'web-activity-lock-release');
+  const busyRegistrationRoot = path.join(outDir, 'web-busy-registration-project');
+  fs.mkdirSync(busyRegistrationRoot, { recursive: true });
   const registryPath = path.join(home, '.hello-cc', 'projects.json');
   const lockModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/shared/file-lock.mjs')).href;
   const activityHolderSource = String.raw`
@@ -4245,9 +4276,26 @@ async function multiProjectWebWorkflow() {
     if (activityElapsed >= 750) {
       fail(`busy registry delayed repeated Web activity requests by ${activityElapsed}ms`);
     }
+    const registrationStarted = Date.now();
+    const busyRegistration = await runtimeFetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: busyRegistrationRoot })
+    });
+    if (busyRegistration.status !== 503 || Date.now() - registrationStarted >= 750) {
+      fail(`busy registry did not fail Web registration quickly: ${busyRegistration.status}`);
+    }
   } finally {
     fs.writeFileSync(activityLockRelease, 'go');
     await waitForProcessExit(activityHolder.pid, 'web activity lock holder exit');
+  }
+  const retriedRegistration = await runtimeFetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ root: busyRegistrationRoot })
+  });
+  if (!retriedRegistration.ok) {
+    fail(`Web registration did not recover after registry contention: ${await retriedRegistration.text()}`);
   }
 
   const detectedResponse = await runtimeFetch('/api/detected', {}, { root });
@@ -4378,7 +4426,9 @@ async function multiProjectWebWorkflow() {
   }
   for (const expected of [
     'term.onData((data) => {',
-    "ws.send(JSON.stringify({ type: 'input', data, action_token: sessionActionTokens.get(active) || '' }))"
+    'sendTerminalInput(data);',
+    'function flushPendingTerminalInput(id, socket)',
+    "socket.send(JSON.stringify({ type: 'input', data, action_token: actionToken }))"
   ]) {
     if (!html.includes(expected)) fail(`web terminal input forwarding missing: ${expected}`);
   }
@@ -4689,7 +4739,8 @@ async function multiProjectWebWorkflow() {
   const managedActionPeer = managedActionSession.peer_id || managedActionSession.id;
   // net-05: the action token is no longer in the session response; fetch it
   // from the terminal WS snapshot frame.
-  const managedActionToken = await fetchSessionActionToken(managedActionPeer);
+  const managedActionChannel = await openSessionActionChannel(managedActionPeer);
+  const managedActionToken = managedActionChannel.token;
   if (!managedActionToken) {
     fail(`managed web session did not deliver an action token over the WS snapshot:\n${JSON.stringify(managedActionSession, null, 2)}`);
   }
@@ -4741,6 +4792,12 @@ async function multiProjectWebWorkflow() {
   await expectActionTokenRejected(sameLengthWrongToken, 'same-length-wrong');
   await expectActionTokenRejected(encodedActionToken, 'other-session');
   await expectActionTokenRejected(siblingActionToken, 'sibling-project');
+  const secondManagedChannel = await openSessionActionChannel(managedActionPeer, { root });
+  if (!secondManagedChannel.token || secondManagedChannel.token === managedActionToken) {
+    fail('two terminal connections shared an action token');
+  }
+  await closeTerminalWebSocket(secondManagedChannel.ws);
+  await expectActionTokenRejected(secondManagedChannel.token, 'closed-connection');
   const encodedPeerAction = await runtimeFetch(`/api/peers/${encodeURIComponent(encodedActionId)}/actions/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -4888,10 +4945,16 @@ async function multiProjectWebWorkflow() {
   const recentEvidenceAt = Math.floor(Date.now() / 1000);
   withMeshDb((db) => db.prepare(`
     UPDATE peers
-    SET pid = ?, pid_start_token = 'reused:web-owner', pid_command_hash = ?,
+    SET pid = ?, pid_start_token = ?, pid_command_hash = ?,
         status = 'working', last_seen_at = ?
     WHERE id = ?
-  `).run(evidenceOwnerPid, 'a'.repeat(64), recentEvidenceAt, evidenceOwner));
+  `).run(
+    evidenceOwnerPid,
+    evidenceOwnerIdentity.startToken,
+    evidenceOwnerIdentity.commandHash,
+    recentEvidenceAt,
+    evidenceOwner
+  ));
   const evidenceOwnerBeforeReads = withMeshDb((db) => db.prepare(`
     SELECT pid, pid_start_token, pid_command_hash, status, last_seen_at
     FROM peers WHERE id = ?
@@ -4906,6 +4969,12 @@ async function multiProjectWebWorkflow() {
   if (JSON.stringify(evidenceOwnerAfterReads) !== JSON.stringify(evidenceOwnerBeforeReads)) {
     fail(`status/state/lock-list mutated peer evidence:\n${JSON.stringify({ evidenceOwnerBeforeReads, evidenceOwnerAfterReads }, null, 2)}`);
   }
+  withMeshDb((db) => db.prepare(`
+    UPDATE peers
+    SET pid_start_token = 'reused:web-owner', pid_command_hash = ?,
+        status = 'working', last_seen_at = ?
+    WHERE id = ?
+  `).run('a'.repeat(64), recentEvidenceAt, evidenceOwner));
 
   const reusedOwnerState = await (await runtimeFetch('/api/peers/web-action-peer/actions/state', {}, { root })).json();
   const reusedOwnerTask = (reusedOwnerState.data?.tasks || []).find((task) => Number(task.id) === evidenceTaskId);
@@ -5054,6 +5123,7 @@ async function multiProjectWebWorkflow() {
   hcc(['task', 'done', '--peer', 'web-lock-owner', '--id', ownerTaskMatch[1], '--summary', 'web lock owner cleanup'], {
     env: { ...env, HCC_PEER: 'web-lock-owner' }
   });
+  await closeTerminalWebSocket(managedActionChannel.ws);
   await stopSession(managedActionSession.id);
 
   hcc(['register', '--peer', 'detected-msg-peer', '--kind', 'codex', '--role', 'peer']);
@@ -6711,7 +6781,9 @@ async function syntaxAndHelp() {
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
     'resolveWebActionSession(reqCtx, peer, input, req)',
-    'action_token: session.actionToken || null',
+    'action_token: connectionActionToken',
+    'session.actionTokens.add(connectionActionToken)',
+    'session.actionTokens.delete(connectionActionToken)',
     "const sender = 'web';",
     'function auditPayload({ actor = null, target = null, source = ',
     'payload.actor_peer = actor',
@@ -6730,7 +6802,8 @@ async function syntaxAndHelp() {
     hccSource.indexOf('function resolveWebActionSession('),
     hccSource.indexOf('function knownPeerIds(')
   );
-  if (!actionResolverSource.includes('tokenMatches(provided, expected)') ||
+  if (!actionResolverSource.includes('tokenMatches(provided, candidate)') ||
+      !actionResolverSource.includes('session.actionTokens') ||
       actionResolverSource.includes('provided !== expected')) {
     fail('resolveWebActionSession must use the shared constant-time token comparator');
   }
@@ -6738,8 +6811,8 @@ async function syntaxAndHelp() {
     hccSource.indexOf("ws.on('message', (raw) => {"),
     hccSource.indexOf("ws.on('close', () => {", hccSource.indexOf("ws.on('message', (raw) => {"))
   );
-  if (!websocketInputSource.includes('tokenMatches(msg.action_token, session.actionToken)') ||
-      websocketInputSource.includes('msg.action_token !== session.actionToken')) {
+  if (!websocketInputSource.includes('tokenMatches(msg.action_token, connectionActionToken)') ||
+      websocketInputSource.includes('session.actionToken')) {
     fail('terminal WebSocket input must use the shared constant-time token comparator');
   }
   const webSessionLifecycleSource = hccSource.slice(
@@ -7315,18 +7388,39 @@ async function syntaxAndHelp() {
     runtimeState.clearRuntime(runtimeCtx, 999999);
     if (fs.existsSync(globalRuntimeFile)) fail('runtime state clearRuntime did not remove the dead-pid global pointer');
 
-    runtimeState.writeGlobalRuntime({
+    const deterministicRuntimeIdentity = {
+      pid: process.pid,
+      startToken: 'regression:current-process',
+      commandHash: 'c'.repeat(64)
+    };
+    const deterministicRuntimeInspect = () => ({
+      state: 'live',
+      identity: deterministicRuntimeIdentity
+    });
+    const deterministicGlobalRuntime = {
       base_url: 'http://127.0.0.1:14',
       token: 'reused-pid-token',
       pid: process.pid,
+      process_identity: deterministicRuntimeIdentity
+    };
+    runtimeState.writeGlobalRuntime(deterministicGlobalRuntime);
+    const verifiedGlobalRuntime = runtimeState.readRuntime(runtimeCtx, {
+      inspectProcessIdentity: deterministicRuntimeInspect
+    });
+    if (verifiedGlobalRuntime.base_url !== 'http://127.0.0.1:14') {
+      fail('runtime state readRuntime rejected a matching global process identity');
+    }
+    runtimeState.writeGlobalRuntime({
+      ...deterministicGlobalRuntime,
       process_identity: {
-        pid: process.pid,
-        startToken: 'definitely-not-the-current-process',
-        commandHash: 'c'.repeat(64)
+        ...deterministicRuntimeIdentity,
+        startToken: 'regression:reused-process'
       }
     });
     try {
-      runtimeState.readRuntime(runtimeCtx);
+      runtimeState.readRuntime(runtimeCtx, {
+        inspectProcessIdentity: deterministicRuntimeInspect
+      });
       fail('runtime state readRuntime returned a reused-pid global pointer');
     } catch (err) {
       if (err?.code !== 'RUNTIME_NOT_RUNNING') throw err;
@@ -9221,17 +9315,20 @@ async function syntaxAndHelp() {
     },
     socket: { encrypted: false, remoteAddress: '::ffff:127.0.0.1' }
   };
-  if (!webHttp.requestOriginMatches(trustedProxyOriginRequest, { trustProxy: true }) ||
+  const trustedProxyOptions = { trustProxy: true, proxyOrigin: 'https://public.example.test:9443' };
+  if (!webHttp.requestOriginMatches(trustedProxyOriginRequest, trustedProxyOptions) ||
+      webHttp.requestOriginMatches(trustedProxyOriginRequest, { trustProxy: true }) ||
       webHttp.requestOriginMatches(trustedProxyOriginRequest) ||
-      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, { trustProxy: true }) ||
-      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-host': 'other.example.test:9443' } }, { trustProxy: true }) ||
-      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'http' } }, { trustProxy: true }) ||
-      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'file' } }, { trustProxy: true })) {
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, trustedProxyOptions) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-host': 'other.example.test:9443' } }, trustedProxyOptions) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'http' } }, trustedProxyOptions) ||
+      webHttp.requestOriginMatches({ ...trustedProxyOriginRequest, headers: { ...trustedProxyOriginRequest.headers, 'x-forwarded-proto': 'file' } }, trustedProxyOptions)) {
     fail('web HTTP helper trusted-proxy forwarded origin checks failed');
   }
-  if (!webHttp.requestIsSecure(trustedProxyOriginRequest, { trustProxy: true }) ||
+  if (!webHttp.requestIsSecure(trustedProxyOriginRequest, trustedProxyOptions) ||
+      webHttp.requestIsSecure(trustedProxyOriginRequest, { trustProxy: true }) ||
       webHttp.requestIsSecure(trustedProxyOriginRequest) ||
-      webHttp.requestIsSecure({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, { trustProxy: true }) ||
+      webHttp.requestIsSecure({ ...trustedProxyOriginRequest, socket: { encrypted: false, remoteAddress: '203.0.113.9' } }, trustedProxyOptions) ||
       !webHttp.requestIsSecure({ headers: {}, socket: { encrypted: true, remoteAddress: '203.0.113.9' } })) {
     fail('web HTTP helper trusted-proxy secure-request checks failed');
   }
@@ -9377,20 +9474,20 @@ async function syntaxAndHelp() {
       });
     });
     const tlsBaseUrl = `https://localhost:${tlsPort}`;
-    // TLS-1: without a stored CA (e.g. HCC_RUNTIME_URL=https override) the CLI
-    // and the runtime share the same trust domain, so connect without extra
-    // verification rather than failing every CLI call.
-    let untrustedAccepted = false;
+    // TLS-1: an HTTPS environment override without a CA must use normal PKI
+    // verification and reject this private self-signed endpoint.
+    let untrustedRejected = false;
     try {
-      const untrustedResponse = await webRuntime.runtimeHttpRequest({ base_url: tlsBaseUrl }, '/probe', { timeoutMs: 3000 });
-      untrustedAccepted = untrustedResponse.ok && untrustedResponse.text === 'tls-ok';
-    } catch {}
-    if (!untrustedAccepted) {
-      fail('runtime HTTPS request without a CA did not connect in the same trust domain');
+      await webRuntime.runtimeHttpRequest({ base_url: tlsBaseUrl }, '/probe', { timeoutMs: 3000 });
+    } catch {
+      untrustedRejected = true;
+    }
+    if (!untrustedRejected) {
+      fail('runtime HTTPS request accepted a private endpoint without an explicit CA');
     }
     const trustedTlsResponse = await webRuntime.runtimeHttpRequest({
       base_url: tlsBaseUrl,
-      tls_cert: tlsCredentials.cert
+      tls_ca: tlsCredentials.cert
     }, '/probe', { timeoutMs: 3000 });
     if (!trustedTlsResponse.ok || trustedTlsResponse.text !== 'tls-ok') {
       fail(`runtime HTTPS request rejected its configured CA: ${JSON.stringify(trustedTlsResponse)}`);
@@ -9930,7 +10027,11 @@ async function processEvidenceWorkflow() {
   }, 'legacy external adoption', 10000);
   legacyProcess.kill('SIGKILL');
   await waitForProcessExit(legacyProcess.pid, 'legacy external process exit');
-  await waitFor(() => !fs.existsSync(legacyFiles[3]), 'legacy external cleanup', 10000);
+  await waitFor(async () => {
+    if (fs.existsSync(legacyFiles[3])) return false;
+    const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+    return !(data.sessions || []).some((session) => session.id === legacyExternalId);
+  }, 'legacy external cleanup', 10000);
   const legacySessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
   if (fs.existsSync(legacyFiles[3]) ||
       (legacySessions.sessions || []).some((session) => session.id === legacyExternalId)) {
@@ -10059,7 +10160,12 @@ function cliOnlyClockSafetyWorkflow() {
     if (unavailableAttempt.status === 0 || !String(unavailableAttempt.stderr).includes('CLOCK_SAFETY_UNAVAILABLE')) {
       fail(`clock safety persistence failure did not fail closed:\n${unavailableAttempt.stdout}\n${unavailableAttempt.stderr}`);
     }
-    const unavailablePublicText = String(unavailableAttempt.stderr).split(/\n\(node:/, 1)[0].trim();
+    const unavailableStderr = String(unavailableAttempt.stderr);
+    const publicStart = unavailableStderr.indexOf('{');
+    const publicEnd = unavailableStderr.lastIndexOf('}');
+    const unavailablePublicText = publicStart >= 0 && publicEnd >= publicStart
+      ? unavailableStderr.slice(publicStart, publicEnd + 1)
+      : '';
     const unavailablePublicError = JSON.parse(unavailablePublicText);
     if (JSON.stringify(unavailablePublicError) !== JSON.stringify({
       ok: false,

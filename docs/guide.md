@@ -3,6 +3,41 @@
 This guide covers the practical workflow for installing, starting, and using
 hello-cc. For a compact command list, use the [Command Reference](commands.md).
 
+## v1 Upgrade Contract
+
+Version 1.0.0 upgrades to schema v7 after a verified pre-migration backup and
+does not support downgrade. Provider peer IDs changed without legacy remapping;
+protected routes require Runtime API v2. Liveness is process-evidence-first and
+only unknown evidence receives 120 seconds of grace. History GC requires
+`--history`. Use `--tls`, or `--trust-proxy --proxy-origin ORIGIN`, when
+encryption is required. Plaintext trusted-LAN mode and authenticated selection
+of any existing server directory remain accepted risks.
+
+### Restoring a pre-migration backup
+
+hello-cc keeps at most five verified migration backups per database. If a v1
+migration must be rolled back, first stop the Web runtime and every hello-cc or
+provider process that can still access that project. Validate the selected
+backup, preserve the failed database and its WAL/SHM files under new names, then
+publish a private copy of the backup:
+
+```bash
+db=/path/to/project/.hello-cc/mesh.db
+backup=/path/to/project/.hello-cc/mesh.db.pre-v6-to-v7.<timestamp>.<suffix>.bak
+sqlite3 "$backup" 'PRAGMA quick_check;'
+cp -p "$backup" "$db.restore"
+chmod 600 "$db.restore"
+mv "$db" "$db.failed-v7.<recovery-id>"
+test ! -e "$db-wal" || mv "$db-wal" "$db-wal.failed-v7.<recovery-id>"
+test ! -e "$db-shm" || mv "$db-shm" "$db-shm.failed-v7.<recovery-id>"
+mv "$db.restore" "$db"
+```
+
+The check must print `ok`. Keep the renamed files until the restored project has
+been verified. Starting v1 again will migrate the restored database to schema
+v7; using the restored pre-v1 database with an older hello-cc release is outside
+the supported downgrade contract.
+
 ## Install, Update, And Uninstall
 
 Install hello-cc globally:
@@ -241,8 +276,8 @@ Start local and LAN-visible control with token authentication:
 hcc web
 ```
 
-Bare `hcc web` stores its generated token and reuses it across restarts. Set a
-token explicitly when you want to replace the saved value:
+Bare `hcc web` generates a new token for that runtime and does not persist it.
+Set a token explicitly when you need a stable operator-managed value:
 
 ```bash
 HCC_WEB_TOKEN='choose-a-long-token' hcc web --port 8787
@@ -370,7 +405,8 @@ hcc lock release --resource vllm/router
 | `HCC_PEER` | default peer identity |
 | `HCC_ROOT` | override project root |
 | `HCC_DB` | override database path |
-| `HCC_WEB_TOKEN` | replace and save the stable web access token |
+| `HCC_WEB_TOKEN` | set an explicit web access token |
+| `HCC_RUNTIME_CA` | CA file for an `HCC_RUNTIME_URL=https` endpoint |
 | `HCC_RUNTIME_URL` | direct runtime URL |
 | `HCC_NO_AUTO_INSTALL_TMUX=1` | disable tmux auto-install, mainly for tests |
 

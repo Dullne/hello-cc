@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createPublicKey, X509Certificate } from 'node:crypto';
 import * as webTls from '../lib/web/tls.mjs';
+import { readRuntime } from '../lib/runtime/state.mjs';
+import { runtimeHttpRequest } from '../lib/web/runtime.mjs';
 
 function currentGeneration(home) {
   return JSON.parse(fs.readFileSync(path.join(home, '.hello-cc', 'tls', 'current.json'), 'utf8')).generation;
@@ -126,4 +128,51 @@ test('ensureSelfSignedCert rotates SAN and key mismatches into usable generation
   const privateKeyPublic = createPublicKey(keyRotated.key).export({ format: 'der', type: 'spki' });
   assert.deepEqual(certificateKey, privateKeyPublic);
   await assertCredentialsStartTls(keyRotated);
+});
+
+test('runtime HTTPS requires normal PKI trust or an explicit CA', async (t) => {
+  const originalHome = process.env.HOME;
+  const originalRuntimeUrl = process.env.HCC_RUNTIME_URL;
+  const originalRuntimeToken = process.env.HCC_RUNTIME_TOKEN;
+  const originalRuntimeCa = process.env.HCC_RUNTIME_CA;
+  const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-ca-'));
+  t.after(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalRuntimeUrl === undefined) delete process.env.HCC_RUNTIME_URL;
+    else process.env.HCC_RUNTIME_URL = originalRuntimeUrl;
+    if (originalRuntimeToken === undefined) delete process.env.HCC_RUNTIME_TOKEN;
+    else process.env.HCC_RUNTIME_TOKEN = originalRuntimeToken;
+    if (originalRuntimeCa === undefined) delete process.env.HCC_RUNTIME_CA;
+    else process.env.HCC_RUNTIME_CA = originalRuntimeCa;
+    fs.rmSync(runtimeHome, { recursive: true, force: true });
+  });
+
+  process.env.HOME = runtimeHome;
+  const credentials = webTls.ensureSelfSignedCert();
+  const server = https.createServer({ key: credentials.key, cert: credentials.cert }, (_req, res) => res.end('tls-ok'));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const runtime = { base_url: `https://localhost:${server.address().port}` };
+
+  await assert.rejects(
+    runtimeHttpRequest(runtime, '/probe', { timeoutMs: 3000 }),
+    /self-signed certificate|unable to verify/i
+  );
+  const trusted = await runtimeHttpRequest({ ...runtime, tls_ca: credentials.cert }, '/probe', { timeoutMs: 3000 });
+  assert.equal(trusted.ok, true);
+  assert.equal(trusted.text, 'tls-ok');
+
+  const caFile = path.join(runtimeHome, 'runtime-ca.pem');
+  fs.writeFileSync(caFile, credentials.cert, { mode: 0o600 });
+  process.env.HCC_RUNTIME_URL = runtime.base_url;
+  process.env.HCC_RUNTIME_TOKEN = 'runtime-token';
+  process.env.HCC_RUNTIME_CA = caFile;
+  const fromEnvironment = readRuntime({ root: runtimeHome });
+  const fileTrusted = await runtimeHttpRequest(fromEnvironment, '/probe', { timeoutMs: 3000 });
+  assert.equal(fileTrusted.ok, true);
+  assert.equal(fileTrusted.text, 'tls-ok');
 });

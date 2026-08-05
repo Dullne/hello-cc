@@ -388,7 +388,23 @@ test('different noncolliding targets can be held at the same time', (t) => {
     withFileLock(second, () => 'nested', { nonblocking: true })), 'nested');
 });
 
-test('an unrelated listener on the fixed port fails closed', async (t) => {
+test('different targets with the same primary port keep independent lock domains', (t) => {
+  const root = sandbox(t);
+  const byPort = new Map();
+  let pair = null;
+  for (let index = 0; index < 2000 && !pair; index += 1) {
+    const target = path.join(root, `collision-${index}.json`);
+    const { port } = lockModule.fileLockEndpoint(target);
+    const previous = byPort.get(port);
+    if (previous) pair = [previous, target];
+    else byPort.set(port, target);
+  }
+  assert.ok(pair, 'expected a primary-port collision in 2000 deterministic targets');
+  assert.equal(withFileLock(pair[0], () =>
+    withFileLock(pair[1], () => 'independent', { nonblocking: true })), 'independent');
+});
+
+test('an unrelated listener on the primary port does not impersonate the file lock', async (t) => {
   const root = sandbox(t);
   const target = path.join(root, 'registry.json');
   const ready = path.join(root, 'port-ready');
@@ -411,9 +427,15 @@ test('an unrelated listener on the fixed port fails closed', async (t) => {
     try { child.kill('SIGKILL'); } catch {}
   });
   await waitForPath(ready);
-  assert.throws(
-    () => withFileLock(target, () => {}, { nonblocking: true }),
-    (error) => error?.code === 'ERR_FILE_LOCK_BUSY'
+  assert.equal(
+    withFileLock(target, () => {
+      assert.throws(
+        () => withFileLock(target, () => {}, { nonblocking: true }),
+        (error) => error?.code === 'ERR_FILE_LOCK_BUSY'
+      );
+      return 'acquired';
+    }, { nonblocking: true }),
+    'acquired'
   );
   const exited = waitForExit(child, { allowSignal: true });
   child.kill('SIGKILL');

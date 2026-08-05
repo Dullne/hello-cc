@@ -190,4 +190,8 @@ test('runtime probe binds fingerprinted pointers to the responding process ident
     process_identity: storedIdentity
   };
   assert.equal(await probeRuntime(runtime), true);
+  assert.equal(await probeRuntime({
+    ...runtime,
+    process_identity: { pid: storedIdentity.pid }
+  }), false);
 });

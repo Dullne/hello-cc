@@ -3,6 +3,14 @@
 Start with the [project README](../README.md) when you only need the project
 summary and first command. Use these docs when you need more detail.
 
+The 1.0.0 contract is breaking: schema v7 has no downgrade path, migrations
+create a verified backup, provider peer IDs changed without legacy remapping,
+and protected routes use Runtime API v2. Process evidence controls liveness and
+only unknown evidence gets 120 seconds of grace; `gc --history` is opt-in.
+Use `--tls` directly, or `--trust-proxy` with a fixed `--proxy-origin`.
+Plaintext LAN operation and
+authenticated selection of any existing server directory are accepted risks.
+
 ## User Docs
 
 - [User Guide](guide.md): install, start, Web console, coordination semantics,

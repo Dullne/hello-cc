@@ -8,6 +8,7 @@ import test from 'node:test';
 import { decideClockSafety } from '../lib/core/coordination/clock-safety.mjs';
 import {
   collectBufferEvidence,
+  externalBufferSessionIds,
   externalBufferOwnerKey
 } from '../lib/runtime/buffer-evidence.mjs';
 
@@ -22,6 +23,20 @@ const identity = {
   startToken: 'boot:started',
   commandHash: 'a'.repeat(64)
 };
+
+test('external buffer discovery is read-only when a project directory disappears', (t) => {
+  const root = tempRoot(t);
+  const missing = path.join(root, 'deleted-project', '.hello-cc', 'bufs');
+  assert.deepEqual(externalBufferSessionIds(missing), []);
+  assert.equal(fs.existsSync(missing), false);
+
+  const existing = path.join(root, 'existing');
+  fs.mkdirSync(existing);
+  fs.writeFileSync(path.join(existing, 'two.out'), '');
+  fs.writeFileSync(path.join(existing, 'one.out'), '');
+  fs.writeFileSync(path.join(existing, 'ignored.meta'), '');
+  assert.deepEqual(externalBufferSessionIds(existing), ['one', 'two']);
+});
 
 test('collects live external metadata evidence from every project directory', (t) => {
   const root = tempRoot(t);

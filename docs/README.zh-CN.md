@@ -3,6 +3,12 @@
 只需要项目简介和第一条命令时，先看[仓库 README](../README.zh-CN.md)。
 需要更多细节时，再看下面的文档。
 
+1.0.0 是 breaking release：schema v7 不支持降级，迁移前会生成并校验备份；
+provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime API v2。存活由
+进程证据决定，只有 unknown 证据获得 120 秒宽限；`gc --history` 必须显式启用。
+可以直接使用 `--tls`，或让 `--trust-proxy` 固定 `--proxy-origin`。默认可信内网明文监听，以及已认证
+浏览器可选择服务器上任意已存在目录，是明确接受的风险。
+
 ## 用户文档
 
 - [用户指南](guide.zh-CN.md)：安装、启动、Web 控制台、协作语义、工作流、稳定

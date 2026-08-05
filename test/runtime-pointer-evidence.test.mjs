@@ -56,6 +56,17 @@ test('alive and recent unknown runtime pointers fail closed, while unknown is bo
   }), { state: 'dead', reclaimable: true });
 });
 
+test('ambiguous duplicate runtime identity fields are unknown to destructive cleanup', () => {
+  assert.deepEqual(classifyRuntimePointer({
+    pid: stored.pid,
+    process_identity: stored,
+    processIdentity: { ...stored, startToken: 'boot:other' }
+  }, {
+    inspect: () => ({ state: 'dead', identity: null }),
+    ageMs: RUNTIME_POINTER_UNKNOWN_GRACE_MS - 1
+  }), { state: 'unknown', reclaimable: false });
+});
+
 test('runtime process identity is published only when it is complete and live', () => {
   assert.deepEqual(runtimeProcessIdentity({
     inspect: () => ({ state: 'live', identity: stored })
@@ -69,18 +80,49 @@ test('readRuntime rejects a reused pid when the stored process identity is compl
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-read-identity-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const ctx = { root };
+  const currentIdentity = {
+    pid: process.pid,
+    startToken: 'boot:current-process',
+    commandHash: 'c'.repeat(64)
+  };
+  const inspectProcessIdentity = () => ({ state: 'live', identity: currentIdentity });
   writeRuntime(ctx, {
     pid: process.pid,
-    process_identity: {
-      pid: process.pid,
-      startToken: 'definitely-not-the-current-process',
-      commandHash: 'c'.repeat(64)
-    },
+    process_identity: currentIdentity,
+    base_url: 'http://127.0.0.1:1'
+  });
+  assert.equal(readRuntime(ctx, {
+    localOnly: true,
+    inspectProcessIdentity
+  }).base_url, 'http://127.0.0.1:1');
+
+  writeRuntime(ctx, {
+    pid: process.pid,
+    process_identity: { ...currentIdentity, startToken: 'boot:reused-process' },
     base_url: 'http://127.0.0.1:1'
   });
 
   assert.throws(
-    () => readRuntime(ctx, { localOnly: true }),
+    () => readRuntime(ctx, { localOnly: true, inspectProcessIdentity }),
+    (error) => error?.code === 'RUNTIME_NOT_RUNNING'
+  );
+});
+
+test('readRuntime rejects a present but malformed process identity', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-read-malformed-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const ctx = { root };
+  writeRuntime(ctx, {
+    pid: process.pid,
+    process_identity: { pid: process.pid },
+    base_url: 'http://127.0.0.1:1'
+  });
+
+  assert.throws(
+    () => readRuntime(ctx, {
+      localOnly: true,
+      inspectProcessIdentity: () => ({ state: 'live', identity: stored })
+    }),
     (error) => error?.code === 'RUNTIME_NOT_RUNNING'
   );
 });

@@ -27,13 +27,13 @@ function withPlatform(platform, callback) {
   }
 }
 
-function inspectMockLinuxProcess(t, { command, firstStartTicks, secondStartTicks }) {
+function inspectMockLinuxProcess(t, { command, firstStartTicks, secondStartTicks, state = 'S' }) {
   t.mock.method(process, 'kill', () => {});
   let statReads = 0;
   t.mock.method(fs, 'readFileSync', (path) => {
     if (path === '/proc/42/stat') {
       const startTicks = statReads++ === 0 ? firstStartTicks : secondStartTicks;
-      return linuxStatRow(42, 'worker', startTicks);
+      return linuxStatRow(42, 'worker', startTicks, state);
     }
     if (path === '/proc/sys/kernel/random/boot_id') return 'boot-a\n';
     if (path === '/proc/42/cmdline') return command;
@@ -85,6 +85,16 @@ test('returns unknown when Linux cmdline is empty', (t) => {
     secondStartTicks: 100
   });
   assert.deepEqual(result, { state: 'unknown', identity: null });
+});
+
+test('reports a Linux zombie as dead while its pid still exists', (t) => {
+  const result = inspectMockLinuxProcess(t, {
+    command: '\0',
+    firstStartTicks: 100,
+    secondStartTicks: 100,
+    state: 'Z'
+  });
+  assert.deepEqual(result, { state: 'dead', identity: null });
 });
 
 test('returns unknown when macOS start identity changes during inspection', (t) => {

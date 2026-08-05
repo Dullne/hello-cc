@@ -4,6 +4,12 @@ Use `hcc --help` for the current top-level command list. Most subcommands also
 accept `--help`, for example `hcc update --help`, `hcc peer --help`, and
 `hcc task --help`.
 
+Version 1.0.0 uses schema v7 (no downgrade), verified pre-migration backups,
+new full-session provider peer IDs without old-ID remapping, and Runtime API v2.
+Process evidence controls liveness with 120 seconds only for unknown evidence;
+history cleanup requires `gc --history`. The default plaintext LAN listener and
+authenticated access to any existing server directory are accepted risks.
+
 ## Install Maintenance
 
 ```text
@@ -18,16 +24,16 @@ current project's `.hello-cc` data and guidance blocks.
 ## Start And Stop
 
 ```text
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
+hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--tls] [--trust-proxy --proxy-origin ORIGIN] [--no-token] [--no-discover] [--no-guidance]
 hcc down
 hcc up [--no-discover] [--no-guidance]
 ```
 
 `hcc web` is the default entry. It initializes coordination, installs hooks and
 shims, starts or reuses the Web console, and returns the terminal to you. Bare
-`hcc web` listens on `0.0.0.0` and uses a saved URL token, generating one on
-first use. Use `--local` to bind only `127.0.0.1`, `--token` or `HCC_WEB_TOKEN`
-to replace the saved token, and
+`hcc web` listens on `0.0.0.0` and generates a URL token for that runtime.
+Use `--local` to bind only `127.0.0.1`, `--token` or `HCC_WEB_TOKEN` to set an
+explicit token, `HCC_RUNTIME_CA` to trust a private HTTPS Runtime API CA, and
 `--no-token` only in trusted local/test environments. Use `hcc up` only when you
 want coordination without the Web console or shims. Provider shims only join
 projects with a local `.hello-cc/runtime.json` from `hcc web`; they do not use a

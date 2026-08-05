@@ -77,9 +77,11 @@ Direct `--tls` mode validates certificate dates, SAN coverage, key pairing, file
 permissions, and generation publication before listening. CLI requests trust
 only the runtime's stored self-signed certificate.
 
-`--local --trust-proxy` accepts forwarded host/proto only from a loopback peer.
-Forwarded headers from any non-loopback peer are ignored. Cookie `Secure` state
-and origin checks consume the same trusted-proxy decision.
+`--trust-proxy --proxy-origin https://host[:port]` accepts forwarded host/proto
+only from a loopback peer and only when both exactly match the pinned public
+origin. Either option without the other is rejected. Forwarded headers from any
+non-loopback peer are ignored. Cookie `Secure` state and origin checks consume
+the same trusted-proxy decision.
 
 ## Secret Redaction
 

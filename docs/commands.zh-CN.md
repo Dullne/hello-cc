@@ -3,6 +3,11 @@
 使用 `hcc --help` 查看当前顶层命令列表。大多数子命令也支持 `--help`，
 例如 `hcc update --help`、`hcc peer --help` 和 `hcc task --help`。
 
+1.0.0 使用 schema v7（不支持降级）、经校验的迁移前备份、不会映射旧 ID 的
+完整 session provider peer ID，以及 Runtime API v2。进程证据决定存活，只有
+unknown 证据获得 120 秒宽限；历史清理必须显式使用 `gc --history`。默认可信
+内网明文监听和已认证浏览器访问任意已存在服务器目录，是明确接受的风险。
+
 ## 安装维护
 
 ```text
@@ -17,15 +22,16 @@ hcc uninstall [--purge --yes]
 ## 启动和停止
 
 ```text
-hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--no-token] [--no-discover] [--no-guidance]
+hcc web [--host HOST] [--port N] [--token TEXT] [--local] [--tls] [--trust-proxy --proxy-origin ORIGIN] [--no-token] [--no-discover] [--no-guidance]
 hcc down
 hcc up [--no-discover] [--no-guidance]
 ```
 
 `hcc web` 是默认入口。它会初始化协作状态，安装 hooks 和 shims，启动或复用
-Web 控制台，然后把终端还给你。裸 `hcc web` 会监听 `0.0.0.0` 并使用固定
-URL token；首次使用时自动生成并保存。用 `--local` 可只绑定 `127.0.0.1`，
-用 `--token` 或 `HCC_WEB_TOKEN` 可替换保存的 token，只有在可信本地/测试环境才使用 `--no-token`。
+Web 控制台，然后把终端还给你。裸 `hcc web` 会监听 `0.0.0.0`，并为本次
+runtime 生成 URL token。用 `--local` 可只绑定 `127.0.0.1`，用 `--token` 或
+`HCC_WEB_TOKEN` 可设置显式 token；私有 HTTPS Runtime API CA 用
+`HCC_RUNTIME_CA` 指定。只有在可信本地/测试环境才使用 `--no-token`。
 只想使用本地协作、不需要 Web 或 shims 时，再使用 `hcc up`。provider shim 只会加入
 已经由 `hcc web` 生成本地 `.hello-cc/runtime.json` 的项目，不会使用全局 runtime
 去管理任意目录。

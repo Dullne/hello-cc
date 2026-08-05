@@ -25,6 +25,19 @@
 
 它适合在同一个仓库里同时运行多个 AI 编程 agent 的场景：让它们知道彼此在做什么，而不是各自猜测。
 
+## v1 兼容性与信任边界
+
+1.0.0 会在生成并校验升级前备份后，把项目数据库升级到 schema v7；升级后的
+数据库不支持降级。provider peer ID 改为对完整 provider session 值做哈希，旧 ID
+不会自动映射或迁移。受保护的接口使用 Runtime API v2，终端 action token 按
+WebSocket 连接签发和撤销。
+
+存活判断以 tmux/非 tmux 进程证据为准：休眠或 detach 不会把活进程判死，只有
+unknown 证据获得最长 120 秒宽限。`hcc gc` 默认保留历史，必须显式使用
+`--history`。`--tls` 提供传输加密；`--trust-proxy` 必须固定
+`--proxy-origin`。两项风险是有意保留的：默认在可信内网以明文 HTTP 监听
+`0.0.0.0`，且已认证浏览器可以选择服务器上任意已存在目录。
+
 ## 特色
 
 - **项目本地共享状态**：peers、tasks、messages、locks、handoffs 和 events 写入 `<project>/.hello-cc/mesh.db`。
@@ -82,13 +95,13 @@ hcc web
 ```
 
 然后打开命令输出里的 URL。默认情况下，`hcc web` 会监听内网地址，请求
-`0.0.0.0:8787`，并在 URL 里附带首次自动生成并保存的稳定 token。如果 8787
+`0.0.0.0:8787`，并在 URL 里附带为本次 runtime 自动生成的 token。如果 8787
 端口已被占用，且你没有显式传 `--port`，它会自动尝试后续可用端口。启动时会同时
 打印内网登录地址和本机 loopback 地址：
 
 ```text
-open: http://<machine-ip>:8787/?token=<saved-token>&project=/path/to/project
-local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
+open: http://<machine-ip>:8787/?token=<runtime-token>&project=/path/to/project
+local: http://127.0.0.1:8787/?token=<runtime-token>&project=/path/to/project
 ```
 
 使用 `--local` 可以只绑定 `127.0.0.1`，使用 `--port N` 可以指定请求端口。

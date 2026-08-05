@@ -280,7 +280,7 @@ test('project activity is nonblocking and retries soon after a busy first write'
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
   });
-  const { registerProjectActivity } = await import(`${projectsModuleUrl}?activity-busy=${Date.now()}`);
+  const { registerProject, registerProjectActivity } = await import(`${projectsModuleUrl}?activity-busy=${Date.now()}`);
   const holderSource = String.raw`
     import fs from 'node:fs';
     const [moduleUrl, target, ready, release] = process.argv.slice(1);
@@ -300,6 +300,12 @@ test('project activity is nonblocking and retries soon after a busy first write'
     try { holder.kill('SIGKILL'); } catch {}
   });
   await waitForPath(ready);
+  const registerStarted = performance.now();
+  assert.throws(
+    () => registerProject({ root: projectRoot, dbPath: path.join(projectRoot, 'one.db') }, { nonblocking: true }),
+    (error) => error?.code === 'ERR_FILE_LOCK_BUSY'
+  );
+  assert.ok(performance.now() - registerStarted < 100);
   const started = performance.now();
 
   registerProjectActivity({ root: projectRoot, dbPath: path.join(projectRoot, 'one.db') });

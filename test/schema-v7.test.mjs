@@ -3,9 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { ensureMigrationBackup } from '../lib/db/migration-backup.mjs';
-import { initSchema } from '../lib/db/schema.mjs';
+import { pathToFileURL } from 'node:url';
+import {
+  ensureMigrationBackup,
+  initSchemaWithBackup
+} from '../lib/db/migration-backup.mjs';
+import { initSchema, readSchemaVersion } from '../lib/db/schema.mjs';
 
 const FIXED_TIMESTAMP = '20260803T120000000Z';
 
@@ -129,6 +134,56 @@ test('same-timestamp backups are distinct and never overwrite an existing backup
   assert.deepEqual(fs.readFileSync(first), firstBytes);
   readBackup(first, 5);
   readBackup(second, 5);
+});
+
+test('rotation is deterministic at equal mtimes and never deletes the published backup', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-schema-rotation-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const dbPath = path.join(tempDir, 'mesh.db');
+  const db = createLegacyDb(dbPath, 5);
+  t.after(() => db.close());
+  const existing = [
+    '20260801T120000000Z.00000001',
+    '20260801T120000000Z.00000002',
+    '20260802T120000000Z.00000003',
+    '20260802T120000000Z.00000004',
+    '20260803T120000000Z.ffffffff'
+  ].map((stamp) => `mesh.db.pre-v5-to-v7.${stamp}.bak`);
+  const publishedName = 'mesh.db.pre-v5-to-v7.20260701T120000000Z.00000000.bak';
+  for (const name of existing) fs.copyFileSync(dbPath, path.join(tempDir, name));
+  fs.writeFileSync(path.join(tempDir, 'mesh.db.pre-v-not-a-backup.bak'), 'unrelated');
+
+  const realReadDirSync = fs.readdirSync.bind(fs);
+  const realStatSync = fs.statSync.bind(fs);
+  t.mock.method(fs, 'readdirSync', (target, ...args) => {
+    if (path.resolve(String(target)) === path.resolve(tempDir)) {
+      return [...existing, publishedName, 'mesh.db.pre-v-not-a-backup.bak'];
+    }
+    return realReadDirSync(target, ...args);
+  });
+  t.mock.method(fs, 'statSync', (target, ...args) => {
+    const result = realStatSync(target, ...args);
+    if (String(target).endsWith('.bak')) {
+      return new Proxy(result, {
+        get(object, property) {
+          if (property === 'mtimeMs') return 1;
+          const value = Reflect.get(object, property, object);
+          return typeof value === 'function' ? value.bind(object) : value;
+        }
+      });
+    }
+    return result;
+  });
+
+  const published = ensureMigrationBackup(db, dbPath, 5, 7, {
+    timestamp: () => '20260701T120000000Z',
+    suffix: () => '00000000'
+  });
+
+  assert.equal(fs.existsSync(published), true);
+  assert.equal(fs.existsSync(path.join(tempDir, existing[0])), false);
+  assert.equal(fs.existsSync(path.join(tempDir, existing[4])), true);
+  assert.equal(fs.readFileSync(path.join(tempDir, 'mesh.db.pre-v-not-a-backup.bak'), 'utf8'), 'unrelated');
 });
 
 test('exclusive publication preserves an empty file and dangling symlink collision', (t) => {
@@ -381,4 +436,71 @@ test('a brand-new empty database migrates without requesting a backup', (t) => {
 
   assert.equal(backupCalls, 0);
   assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 7);
+});
+
+test('migration lock rechecks the schema before backup after a competing migration', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-schema-lock-recheck-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const dbPath = path.join(tempDir, 'mesh.db');
+  const db = createLegacyDb(dbPath, 6);
+  t.after(() => db.close());
+  let backupCalls = 0;
+
+  initSchemaWithBackup(db, dbPath, {
+    withLock(_target, migrate) {
+      db.exec(`
+        UPDATE meta SET value = '7' WHERE key = 'schema_version';
+        PRAGMA user_version = 7;
+      `);
+      return migrate();
+    },
+    ensureBackup() {
+      backupCalls += 1;
+    }
+  });
+
+  assert.equal(backupCalls, 0);
+  assert.equal(readSchemaVersion(db), 7);
+});
+
+test('concurrent migrations publish one correctly labelled pre-v7 backup', async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-schema-lock-processes-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const dbPath = path.join(tempDir, 'mesh.db');
+  createLegacyDb(dbPath, 6).close();
+  const moduleUrl = pathToFileURL(path.join(import.meta.dirname, '..', 'lib', 'db', 'migration-backup.mjs')).href;
+  const childSource = `
+    import { DatabaseSync } from 'node:sqlite';
+    const [moduleUrl, dbPath] = process.argv.slice(1);
+    const { initSchemaWithBackup } = await import(moduleUrl);
+    const db = new DatabaseSync(dbPath, { timeout: 5000 });
+    db.exec('PRAGMA busy_timeout = 5000;');
+    try { initSchemaWithBackup(db, dbPath); } finally { db.close(); }
+  `;
+  const migrate = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      '--input-type=module', '-e', childSource, moduleUrl, dbPath
+    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`migration child exited ${code ?? signal}: ${stderr}`));
+    });
+  });
+
+  await Promise.all([migrate(), migrate(), migrate(), migrate()]);
+
+  const backups = fs.readdirSync(tempDir)
+    .filter((name) => /^mesh\.db\.pre-v6-to-v7\..+\.bak$/.test(name));
+  assert.equal(backups.length, 1);
+  readBackup(path.join(tempDir, backups[0]), 6);
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    assert.equal(readSchemaVersion(migrated), 7);
+  } finally {
+    migrated.close();
+  }
 });

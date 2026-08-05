@@ -30,6 +30,20 @@ It is built for developers who run multiple AI coding agents in the same repo
 and need them to coordinate instead of guessing what the other sessions are
 doing.
 
+## v1 Compatibility And Trust Model
+
+Version 1.0.0 upgrades project databases to schema v7 after creating a verified
+pre-migration backup; downgrading that database is unsupported. Provider peer
+IDs now hash the full provider session value and old IDs are not remapped.
+Runtime API v2 and per-connection terminal action tokens are required.
+
+Liveness follows tmux/non-tmux process evidence: sleep or detachment does not
+kill a live session, and only unknown evidence receives the bounded 120-second
+grace. `hcc gc` retains history unless `--history` is explicit. `--tls` encrypts
+the console; `--trust-proxy` requires a fixed `--proxy-origin`. Two risks remain
+intentional: the default listener is plaintext HTTP on `0.0.0.0` for trusted
+LANs, and an authenticated browser may select any existing server directory.
+
 ## Highlights
 
 - **Shared project memory**: peers, tasks, messages, locks, handoffs, and
@@ -94,14 +108,14 @@ hcc web
 ```
 
 Then open the printed URL. By default, `hcc web` listens on LAN interfaces and
-requests `0.0.0.0:8787`, using a saved URL token generated on first use. If
+requests `0.0.0.0:8787`, using a token generated for that runtime. If
 port 8787 is already busy and you did not pass `--port`, it automatically tries
 the next available port. The command prints both the LAN login URL and the local
 loopback URL:
 
 ```text
-open: http://<machine-ip>:8787/?token=<saved-token>&project=/path/to/project
-local: http://127.0.0.1:8787/?token=<saved-token>&project=/path/to/project
+open: http://<machine-ip>:8787/?token=<runtime-token>&project=/path/to/project
+local: http://127.0.0.1:8787/?token=<runtime-token>&project=/path/to/project
 ```
 
 Use `--local` to bind only to `127.0.0.1`, or `--port N` to request a specific

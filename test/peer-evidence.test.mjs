@@ -16,11 +16,59 @@ import {
   sameLockAcquireSubject
 } from '../lib/core/coordination/lock-evidence.mjs';
 import { scopedLockResource } from '../lib/core/coordination/locks.mjs';
+import {
+  prepareTmuxRestartBinding,
+  rollbackTmuxRestartBinding
+} from '../lib/core/peers/tmux-safety.mjs';
 
 const { resolvePeerEvidence } = peerEvidence;
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
+
+test('provider restart may restore only a detached tmux binding with a CAS rollback token', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`
+    CREATE TABLE peer_bindings (
+      peer TEXT PRIMARY KEY,
+      transport TEXT NOT NULL,
+      runtime_target TEXT,
+      updated_at INTEGER
+    );
+  `);
+  try {
+    db.prepare('INSERT INTO peer_bindings VALUES (?, ?, ?, ?)')
+      .run('peer-a', 'tmux', null, 100);
+    const prepared = prepareTmuxRestartBinding(db, {
+      peer: 'peer-a',
+      runtimeTarget: '%7',
+      nowSec: 100
+    });
+    assert.deepEqual(prepared, {
+      ok: true,
+      restored: true,
+      peer: 'peer-a',
+      runtimeTarget: '%7',
+      previousUpdatedAt: 100,
+      preparedUpdatedAt: 101
+    });
+    assert.deepEqual({ ...db.prepare('SELECT runtime_target, updated_at FROM peer_bindings WHERE peer = ?')
+      .get('peer-a') }, { runtime_target: '%7', updated_at: 101 });
+    assert.equal(rollbackTmuxRestartBinding(db, prepared), true);
+    assert.deepEqual({ ...db.prepare('SELECT runtime_target, updated_at FROM peer_bindings WHERE peer = ?')
+      .get('peer-a') }, { runtime_target: null, updated_at: 100 });
+
+    db.prepare('UPDATE peer_bindings SET runtime_target = ?, updated_at = ? WHERE peer = ?')
+      .run('%8', 102, 'peer-a');
+    assert.deepEqual(prepareTmuxRestartBinding(db, {
+      peer: 'peer-a', runtimeTarget: '%7', nowSec: 103
+    }), { ok: false, reason: 'tmux_binding_target_changed' });
+    assert.equal(db.prepare('SELECT runtime_target FROM peer_bindings WHERE peer = ?')
+      .get('peer-a').runtime_target, '%8');
+  } finally {
+    db.close();
+  }
+});
 
 function identity(pid, startToken = `boot:${pid}`, commandHash = HASH_A) {
   return { pid, startToken, commandHash };
