@@ -33,6 +33,7 @@ import {
   tx
 } from '../lib/db/schema.mjs';
 import { initSchemaWithBackup } from '../lib/db/migration-backup.mjs';
+import { createEventHelpers } from '../lib/db/events.mjs';
 import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import {
   intOpt,
@@ -660,6 +661,8 @@ function sameResolvedPath(a, b) {
   return key(a) === key(b);
 }
 
+const { addEvent, auditPayload, requestActorPeer, requestSource } = createEventHelpers({ now });
+
 const {
   ackMessage,
   getMessage,
@@ -881,29 +884,6 @@ function migrateRegisteredProjectDbs(ctx) {
   } finally {
     projectMigrationFanoutDepth -= 1;
   }
-}
-
-function addEvent(db, type, actor, taskId, payload) {
-  db.prepare(`
-    INSERT INTO events(type, actor, task_id, payload, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(type, actor || null, taskId || null, JSON.stringify(payload || {}), now());
-}
-
-function auditPayload({ actor = null, target = null, source = 'cli', admin = false, ...extra } = {}) {
-  const payload = { ...extra, source };
-  if (actor) payload.actor_peer = actor;
-  if (target) payload.target_peer = target;
-  if (admin) payload.admin = true;
-  return payload;
-}
-
-function requestActorPeer(input = {}, fallback = 'web') {
-  return String(input.auditActorPeer || fallback || 'web').trim() || 'web';
-}
-
-function requestSource(input = {}, fallback = 'web') {
-  return String(input.auditSource || fallback || 'web').trim() || fallback;
 }
 
 function latestHookProviderSession(db, peer) {
