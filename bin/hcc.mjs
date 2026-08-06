@@ -3433,21 +3433,30 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   const externalScanPoller = setInterval(scanExternalSessions, 1000);
 
-  // Watch for new external sessions appearing
-  let bufsWatcher = null;
-  try {
-    bufsWatcher = fs.watch(bufsDir, { persistent: false }, (event, filename) => {
-      if (filename?.endsWith('.out')) {
-        setTimeout(() => adoptExternalSession(path.basename(filename, '.out'), ctx, bufsDir), 300);
-      }
-    });
-    // An FSWatcher with no 'error' listener re-throws async errors as an
-    // uncaught exception (e.g. inotify limits, bufsDir removed) — keep it
-    // contained so the shared runtime survives.
-    bufsWatcher.on('error', (err) => {
-      console.error(redactedLogText(`[${new Date().toISOString()}] bufs watcher error: ${err?.message || err}`));
-    });
-  } catch {}
+  // bg-04: watch for new external sessions appearing in EVERY registered
+  // project's bufsDir, not just the primary. New projects discovered by
+  // scanExternalSessions get their own watcher on the next scan tick.
+  const bufsWatchers = new Map();
+  function ensureBufsWatchers() {
+    for (const projectCtx of runtimeProjectContexts()) {
+      const root = path.resolve(projectCtx.root);
+      if (bufsWatchers.has(root)) continue;
+      const directory = bufferDirectory(projectCtx);
+      try {
+        const watcher = fs.watch(directory, { persistent: false }, (event, filename) => {
+          if (filename?.endsWith('.out')) {
+            setTimeout(() => adoptExternalSession(path.basename(filename, '.out'), projectCtx, directory), 300);
+          }
+        });
+        watcher.on('error', (err) => {
+          console.error(redactedLogText(`[${new Date().toISOString()}] bufs watcher error for ${root}: ${err?.message || err}`));
+        });
+        bufsWatchers.set(root, watcher);
+      } catch {}
+    }
+  }
+  ensureBufsWatchers();
+  const bufsWatcherSyncPoller = setInterval(ensureBufsWatchers, 5000);
 
   // ── Auto-attach detected peers that are in tmux panes ─────────────────────
   function listTmuxPanesOnce() {
@@ -6354,7 +6363,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     clearInterval(reaperPoller);
     clearInterval(gcPoller);
     clearInterval(webSessionPruner);
-    try { bufsWatcher?.close(); } catch {}
+    try { for (const w of bufsWatchers.values()) w.close(); } catch {}
+    clearInterval(bufsWatcherSyncPoller);
     for (const session of sessions.values()) {
       closeSessionClients(session);
       if (session.status !== 'running') continue;
