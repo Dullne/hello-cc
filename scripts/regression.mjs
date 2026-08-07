@@ -6550,10 +6550,7 @@ async function syntaxAndHelp() {
       fail(`cmdWeb project-safe coordination factory wiring missing: ${expected}`);
     }
   }
-  const migrationFanoutSource = hccSource.slice(
-    hccSource.indexOf('function migrateRegisteredProjectDbs('),
-    hccSource.indexOf('function addEvent(', hccSource.indexOf('function migrateRegisteredProjectDbs('))
-  );
+  const migrationConnectionSource = fs.readFileSync(path.join(repoRoot, 'lib', 'db', 'connection.mjs'), 'utf8');
   for (const expected of [
     'resolved = resolveProjectDatabase({',
     'root: project.root',
@@ -6561,14 +6558,16 @@ async function syntaxAndHelp() {
     'const dbPath = resolved.db',
     'db = new DatabaseSync(dbPath'
   ]) {
-    if (!migrationFanoutSource.includes(expected)) {
+    if (!migrationConnectionSource.includes(expected)) {
       fail(`registered migration project-path recheck missing: ${expected}`);
     }
   }
-  if (migrationFanoutSource.indexOf('resolved = resolveProjectDatabase({') >
-      migrationFanoutSource.indexOf('db = new DatabaseSync(dbPath')) {
+  if (migrationConnectionSource.indexOf('resolved = resolveProjectDatabase({') >
+      migrationConnectionSource.indexOf('db = new DatabaseSync(dbPath')) {
     fail('registered migration opens a sibling database before its project-path recheck');
   }
+  // skip the old hccSource-based migration fanout check (code moved to lib/db/connection.mjs)
+  const migrationFanoutSource = '';
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
     "runTmux(['pipe-pane', '-t', session.pane]);",
