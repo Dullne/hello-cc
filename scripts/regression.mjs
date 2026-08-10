@@ -9549,6 +9549,7 @@ async function syntaxAndHelp() {
       !taskHelp.includes('task update --status STATUS')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
+  const taskModuleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'task.mjs'), 'utf8');
   for (const expected of [
     "if (sub === 'dispatch') return taskDispatch",
     'async function taskDispatch(ctx, args)',
@@ -9556,7 +9557,7 @@ async function syntaxAndHelp() {
     'function sessionLooksProviderInteractive(session)',
     '!customMessage && !sessionLooksProviderInteractive(session)'
   ]) {
-    if (!hccSource.includes(expected)) fail(`task dispatch source guard missing: ${expected}`);
+    if (!taskModuleSource.includes(expected)) fail(`task dispatch source guard missing: ${expected}`);
   }
   const teamHelp = run(process.execPath, [hccBin, 'team', '--help']);
   if (!teamHelp.includes('hcc team') || !teamHelp.includes('team plan') || !teamHelp.includes('team start') || !teamHelp.includes('team status')) {
