@@ -14,6 +14,7 @@ import { webIndexHtml } from '../lib/web/ui-template.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccSource = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+const cookieAuthSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
 
 function sourceBetween(start, end) {
   const startIndex = hccSource.indexOf(start);
@@ -75,14 +76,11 @@ test('browser logout revokes the cookie session', () => {
 });
 
 test('expired and evicted browser sessions close their attached sockets', () => {
-  const lifecycle = sourceBetween(
-    'function closeWebSession(',
-    'const webSessionPruner = setInterval('
-  );
-  assert.match(lifecycle, /ws\.close\(4001, reason\)/);
-  assert.match(lifecycle, /session\.expiresAt <= t\) closeWebSession\(sid, 'session expired'\)/);
-  assert.match(lifecycle, /while \(webSessions\.size >= MAX_WEB_SESSIONS\)/);
-  assert.match(lifecycle, /closeWebSession\(oldest, 'session limit reached'\)/);
+  // Code moved to lib/web/cookie-auth.mjs — check that module instead.
+  assert.match(cookieAuthSource, /ws\.close\(4001, reason\)/);
+  assert.match(cookieAuthSource, /session\.expiresAt <= t\) closeWebSession\(sid, 'session expired'\)/);
+  assert.match(cookieAuthSource, /webSessions\.size >= maxSessions/);
+  assert.match(cookieAuthSource, /closeWebSession\(oldest, 'session limit reached'\)/);
 });
 
 test('origin matching normalizes only default ports on the selected authority', () => {

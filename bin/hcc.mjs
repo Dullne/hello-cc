@@ -36,6 +36,7 @@ import { initSchemaWithBackup } from '../lib/db/migration-backup.mjs';
 import { createEventHelpers } from '../lib/db/events.mjs';
 import { createConnectionHelpers } from '../lib/db/connection.mjs';
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
+import { createCookieAuth } from '../lib/web/cookie-auth.mjs';
 import { createMsgCommands } from '../lib/cli/commands/msg.mjs';
 import { createCoordinationCommands } from '../lib/cli/commands/coordination.mjs';
 import { createLockCommands } from '../lib/cli/commands/lock.mjs';
@@ -1865,92 +1866,20 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     ? regressionWebSessionTtl
     : DEFAULT_WEB_SESSION_TTL_SEC;
   const MAX_WEB_SESSIONS = 256;
-  const webSessions = new Map();
   const bufferGcPlanStore = createBufferGcPlanStore();
   const bufferUnknownTracker = new Map();
   const bufferDirectoriesByProject = new Map();
-  function parseCookieSid(req) {
-    const header = req.headers.cookie || '';
-    for (const part of header.split(';')) {
-      const [k, ...rest] = part.trim().split('=');
-      if (k === 'hcc_sid') {
-        // xx-07: bound the value length so an attacker-controlled cookie cannot
-        // cause unbounded decode/lookup work.
-        const raw = rest.join('=');
-        if (raw.length > 128) return '';
-        try { return decodeURIComponent(raw); } catch { return ''; }
-      }
-    }
-    return '';
-  }
-  function closeWebSession(sid, reason = 'session revoked') {
-    const session = webSessions.get(sid);
-    webSessions.delete(sid);
-    for (const ws of session?.sockets || []) {
-      try { ws.close(4001, reason); } catch {}
-    }
-    session?.sockets?.clear();
-  }
-  function pruneWebSessions(t = now()) {
-    for (const [sid, session] of webSessions) {
-      if (session.expiresAt <= t) closeWebSession(sid, 'session expired');
-    }
-  }
-  function issueSession() {
-    pruneWebSessions();
-    while (webSessions.size >= MAX_WEB_SESSIONS) {
-      const oldest = webSessions.keys().next().value;
-      if (!oldest) break;
-      closeWebSession(oldest, 'session limit reached');
-    }
-    const sid = randomBytes(24).toString('base64url');
-    webSessions.set(sid, { expiresAt: now() + WEB_SESSION_TTL_SEC, sockets: new Set() });
-    return sid;
-  }
-  function sessionCookieHeader(sid, req) {
-    const parts = [`hcc_sid=${sid}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${WEB_SESSION_TTL_SEC}`];
-    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
-    return parts.join('; ');
-  }
-  function expiredSessionCookieHeader(req) {
-    const parts = ['hcc_sid=', 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
-    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
-    return parts.join('; ');
-  }
-  function cookieSessionRecord(req) {
-    const sid = parseCookieSid(req);
-    if (!sid) return null;
-    const session = webSessions.get(sid);
-    if (!session || session.expiresAt <= now()) {
-      if (session) closeWebSession(sid, 'session expired');
-      return null;
-    }
-    return { sid, session };
-  }
-  function cookieSessionOk(req) {
-    return Boolean(cookieSessionRecord(req));
-  }
-  function cookieSocketValid(ws) {
-    const auth = ws?.hccCookieAuth;
-    if (!auth) return true;
-    const current = webSessions.get(auth.sid);
-    if (current === auth.session && current.expiresAt > now()) return true;
-
-    const reason = current === auth.session ? 'session expired' : 'session revoked';
-    if (current === auth.session) {
-      closeWebSession(auth.sid, reason);
-    } else {
-      auth.session.sockets.delete(ws);
-      try { ws.close(4001, reason); } catch {}
-    }
-    return false;
-  }
+  const {
+    webSessions,
+    parseCookieSid, closeWebSession, pruneWebSessions,
+    issueSession, sessionCookieHeader, expiredSessionCookieHeader,
+    cookieSessionRecord, cookieSessionOk, cookieSocketValid, webAuthMode
+  } = createCookieAuth({
+    now, ttlSec: WEB_SESSION_TTL_SEC, maxSessions: MAX_WEB_SESSIONS,
+    requestIsSecure, trustProxy, proxyOrigin, authOk, token
+  });
   const webSessionPruner = setInterval(pruneWebSessions, 60000);
   webSessionPruner.unref?.();
-  function webAuthMode(url, req) {
-    if (authOk(url, req, token)) return 'token';
-    return cookieSessionOk(req) ? 'cookie' : null;
-  }
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');

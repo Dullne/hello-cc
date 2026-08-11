@@ -6811,14 +6811,11 @@ async function syntaxAndHelp() {
       websocketInputSource.includes('session.actionToken')) {
     fail('terminal WebSocket input must use the shared constant-time token comparator');
   }
-  const webSessionLifecycleSource = hccSource.slice(
-    hccSource.indexOf('function closeWebSession('),
-    hccSource.indexOf('const webSessionPruner = setInterval(')
-  );
+  const webSessionLifecycleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
   for (const expected of [
     'ws.close(4001, reason)',
     "session.expiresAt <= t) closeWebSession(sid, 'session expired')",
-    'while (webSessions.size >= MAX_WEB_SESSIONS)',
+    'webSessions.size >= maxSessions',
     "closeWebSession(oldest, 'session limit reached')"
   ]) {
     if (!webSessionLifecycleSource.includes(expected)) {
