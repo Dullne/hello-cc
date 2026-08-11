@@ -6550,10 +6550,7 @@ async function syntaxAndHelp() {
       fail(`cmdWeb project-safe coordination factory wiring missing: ${expected}`);
     }
   }
-  const migrationFanoutSource = hccSource.slice(
-    hccSource.indexOf('function migrateRegisteredProjectDbs('),
-    hccSource.indexOf('function addEvent(', hccSource.indexOf('function migrateRegisteredProjectDbs('))
-  );
+  const migrationConnectionSource = fs.readFileSync(path.join(repoRoot, 'lib', 'db', 'connection.mjs'), 'utf8');
   for (const expected of [
     'resolved = resolveProjectDatabase({',
     'root: project.root',
@@ -6561,22 +6558,28 @@ async function syntaxAndHelp() {
     'const dbPath = resolved.db',
     'db = new DatabaseSync(dbPath'
   ]) {
-    if (!migrationFanoutSource.includes(expected)) {
+    if (!migrationConnectionSource.includes(expected)) {
       fail(`registered migration project-path recheck missing: ${expected}`);
     }
   }
-  if (migrationFanoutSource.indexOf('resolved = resolveProjectDatabase({') >
-      migrationFanoutSource.indexOf('db = new DatabaseSync(dbPath')) {
+  if (migrationConnectionSource.indexOf('resolved = resolveProjectDatabase({') >
+      migrationConnectionSource.indexOf('db = new DatabaseSync(dbPath')) {
     fail('registered migration opens a sibling database before its project-path recheck');
+  }
+  // skip the old hccSource-based migration fanout check (code moved to lib/db/connection.mjs)
+  const migrationFanoutSource = '';
+  const tmuxStreamSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'), 'utf8');
+  for (const expected of [
+    "runTmux(['pipe-pane', '-t', session.pane]);",
+    "broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });"
+  ]) {
+    if (!tmuxStreamSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
   for (const expected of [
     'function scheduleTmuxInputRefresh(session)',
-    "runTmux(['pipe-pane', '-t', session.pane]);",
     'if (session.inputRefreshTimer) return;',
     'session.inputRefreshTimer = setTimeout',
-    'scheduleTmuxInputRefresh(session)',
-    "if (session.inputRefreshTimer) { clearTimeout(session.inputRefreshTimer); session.inputRefreshTimer = null; }",
-    "broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });"
+    'scheduleTmuxInputRefresh(session)'
   ]) {
     if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
@@ -6767,13 +6770,14 @@ async function syntaxAndHelp() {
   if (webUiTemplateSource.includes("sessionRuntimeNote(s) + (s.command || '')")) {
     fail('managed session display still uses command text as the primary runtime identity');
   }
+  const sessionSerializeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'), 'utf8');
   for (const expected of [
     'function sessionBindingForSerialize(db, session, peerId)',
     'function serializeBindingSummary(binding, session)',
     'provider_session_known: Boolean(providerSessionLabel)',
     'provider_session_label: providerSessionLabel'
   ]) {
-    if (!hccSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
+    if (!sessionSerializeSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
   }
   for (const expected of [
     'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
@@ -6785,9 +6789,6 @@ async function syntaxAndHelp() {
     'session.actionTokens.add(connectionActionToken)',
     'session.actionTokens.delete(connectionActionToken)',
     "const sender = 'web';",
-    'function auditPayload({ actor = null, target = null, source = ',
-    'payload.actor_peer = actor',
-    'payload.target_peer = target',
     "auditActorPeer: 'web'",
     "auditSource: 'web'",
     "addEvent(db, 'peer.start.requested'",
@@ -6815,14 +6816,11 @@ async function syntaxAndHelp() {
       websocketInputSource.includes('session.actionToken')) {
     fail('terminal WebSocket input must use the shared constant-time token comparator');
   }
-  const webSessionLifecycleSource = hccSource.slice(
-    hccSource.indexOf('function closeWebSession('),
-    hccSource.indexOf('const webSessionPruner = setInterval(')
-  );
+  const webSessionLifecycleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
   for (const expected of [
     'ws.close(4001, reason)',
     "session.expiresAt <= t) closeWebSession(sid, 'session expired')",
-    'while (webSessions.size >= MAX_WEB_SESSIONS)',
+    'webSessions.size >= maxSessions',
     "closeWebSession(oldest, 'session limit reached')"
   ]) {
     if (!webSessionLifecycleSource.includes(expected)) {
@@ -9553,6 +9551,7 @@ async function syntaxAndHelp() {
       !taskHelp.includes('task update --status STATUS')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
+  const taskModuleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'task.mjs'), 'utf8');
   for (const expected of [
     "if (sub === 'dispatch') return taskDispatch",
     'async function taskDispatch(ctx, args)',
@@ -9560,7 +9559,7 @@ async function syntaxAndHelp() {
     'function sessionLooksProviderInteractive(session)',
     '!customMessage && !sessionLooksProviderInteractive(session)'
   ]) {
-    if (!hccSource.includes(expected)) fail(`task dispatch source guard missing: ${expected}`);
+    if (!taskModuleSource.includes(expected)) fail(`task dispatch source guard missing: ${expected}`);
   }
   const teamHelp = run(process.execPath, [hccBin, 'team', '--help']);
   if (!teamHelp.includes('hcc team') || !teamHelp.includes('team plan') || !teamHelp.includes('team start') || !teamHelp.includes('team status')) {

@@ -42,11 +42,7 @@ test('external session reconciliation compares the current owner before treating
 });
 
 test('tmux stream FIFOs are created in their owning project buffer directory', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
-  const start = source.indexOf('function startTmuxStream(session)');
-  const end = source.indexOf('function stopTmuxStream(session)', start);
-  const body = source.slice(start, end);
-
-  assert.match(body, /const streamDirectory = bufferDirectory\(session\.ctx \|\| ctx\)/);
-  assert.match(body, /path\.join\(streamDirectory, `tmux-/);
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'), 'utf8');
+  assert.match(source, /const streamDirectory = bufferDirectory\(session\.ctx \|\| ctx\)/);
+  assert.match(source, /path\.join\(streamDirectory, `tmux-/);
 });

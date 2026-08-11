@@ -33,6 +33,17 @@ import {
   tx
 } from '../lib/db/schema.mjs';
 import { initSchemaWithBackup } from '../lib/db/migration-backup.mjs';
+import { createEventHelpers } from '../lib/db/events.mjs';
+import { createConnectionHelpers } from '../lib/db/connection.mjs';
+import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
+import { createCookieAuth } from '../lib/web/cookie-auth.mjs';
+import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
+import { createTmuxStream } from '../lib/web/tmux-stream.mjs';
+import { createMsgCommands } from '../lib/cli/commands/msg.mjs';
+import { createCoordinationCommands } from '../lib/cli/commands/coordination.mjs';
+import { createLockCommands } from '../lib/cli/commands/lock.mjs';
+import { createTaskCommands } from '../lib/cli/commands/task.mjs';
+import { createDoctorCommand } from '../lib/cli/commands/doctor.mjs';
 import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import {
   intOpt,
@@ -660,6 +671,18 @@ function sameResolvedPath(a, b) {
   return key(a) === key(b);
 }
 
+const { addEvent, auditPayload, requestActorPeer, requestSource } = createEventHelpers({ now });
+const {
+  dedupePeerBindings,
+  findProviderSessionBinding,
+  upsertCanonicalPeerBinding
+} = createPeerBindingStore({ now, addEvent });
+
+const { connect, connectReadOnly, migrateRegisteredProjectDbs } = createConnectionHelpers({ now, dedupePeerBindings, redactedLogText });
+const { upsertPeer, touchPeer, touchCurrentPeer } = createPeerHelpers({ now, addEvent, liveProcessIdentity, detectBranch, registerProjectActivity, upsertCanonicalPeerBinding, autoPeerKind, autoPeerSessionId, autoPeerResumeId, autoPeerDefaults, autoPeerBasis, providerSessionParts });
+
+
+
 const {
   ackMessage,
   getMessage,
@@ -668,6 +691,20 @@ const {
   queryTimelineMessages,
   sendMessage
 } = createMessageStore({ now, addEvent });
+const { cmdMsg } = createMsgCommands({
+  connect, now, iso, touchCurrentPeer, resolveCurrentPeer, registerProjectActivity,
+  parseOpts, intOpt, required, wantsHelp, helpMsg, printResult, table, sleep, CliError,
+  ackMessage, getMessage, queryInbox, queryMessageThread, sendMessage
+});
+const { cmdHandoff, cmdEvent, cmdHeartbeat, cmdAsk, cmdBroadcast, cmdInject, injectPeer } = createCoordinationCommands({
+  connect, now, iso, tx, addEvent, auditPayload, touchCurrentPeer, resolveCurrentPeer, registerProjectActivity,
+  parseOpts, intOpt, required, positiveSafeIntOpt, wantsHelp,
+  helpHandoff, helpEvent, helpAsk, helpBroadcast, helpInject,
+  printResult, table, CliError, DEFAULT_LOCK_TTL, leaseDeadline,
+  sendMessage, readRuntime, runtimeRequest,
+  observeLockClockSafety, peerEvidenceFromDb, renewOwnedLocks,
+  normalizeListText, changedFiles
+});
 const {
   assertTaskOwnerForMutation,
   claimNextTasksForPeer,
@@ -683,6 +720,28 @@ const {
   now,
   observeClockSafety: observeTaskTakeoverClockSafety,
   sendMessage
+});
+const { cmdTask, notifyTaskOwnerConflict } = createTaskCommands({
+  connect, now, tx, addEvent, auditPayload, touchCurrentPeer, resolveCurrentPeer,
+  parseOpts, intOpt, required, positiveIntOpt, parseTaskIds, wantsHelp, helpTask,
+  printResult, table, CliError, ACTIVE_PEER_TTL,
+  sendMessage, readRuntime, runtimeRequest, injectPeer,
+  queryOpenTasks, claimNextTasksForPeer, claimTaskRowsForPeer,
+  takeOverTaskForPeer, assertTaskOwnerForMutation,
+  annotateTasksWithLiveness, taskOwnerStateText, taskRowsText,
+  observePeerEvidence, clockGraceSuppressed, readClockGraceUntil
+});
+const { cmdDoctor } = createDoctorCommand({ connectReadOnly, readSchemaVersion, DB_SCHEMA_VERSION, CLI_NAME });
+const { cmdLock } = createLockCommands({
+  connect, now, iso, tx, addEvent, touchCurrentPeer, resolveCurrentPeer,
+  parseOpts, intOpt, required, positiveSafeIntOpt, wantsHelp, helpLock,
+  printResult, table, CliError, DEFAULT_LOCK_TTL, leaseDeadline,
+  scopedLockResource, lockLabel, lockScope, lockBaseResource, locksConflict,
+  clockGraceSuppressed, readClockGraceUntil, clockSafetyUnavailable,
+  captureLockAcquireSubject, sameLockAcquireSubject,
+  observeLockOwnerEvidence, observePeerEvidence,
+  prepareLockClockObservation, runOptimisticEvidenceMutation,
+  assertTaskOwnerForMutation, notifyTaskOwnerConflict
 });
 const {
   ackMessages,
@@ -793,118 +852,6 @@ function resolveTargetPeer(ctx, opts = {}, key = 'peer', kindHint = 'shell') {
   return resolveCurrentPeer(ctx, opts, key, kindHint);
 }
 
-let projectMigrationFanoutDepth = 0;
-const migratedRegisteredProjectDbs = new Set();
-// xx-05: cooldown before retrying a sibling project DB whose migration failed.
-const MIGRATION_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
-
-function connect(ctx, options = {}) {
-  if (options.create === false && !fs.existsSync(ctx.dbPath)) {
-    throw new CliError('NOT_FOUND', `Project database does not exist: ${ctx.dbPath}`);
-  }
-  if (options.create !== false) fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
-  const db = new DatabaseSync(ctx.dbPath, { timeout: 5000 });
-  db.exec('PRAGMA busy_timeout = 5000;');
-  execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
-  db.exec('PRAGMA synchronous = NORMAL;');
-  db.exec('PRAGMA wal_autocheckpoint = 1000;');
-  db.exec('PRAGMA foreign_keys = ON;');
-  initSchemaWithBackup(db, ctx.dbPath, {
-    beforePostMigrationIndexes: dedupePeerBindings
-  });
-  if (options.migrateRegistered !== false) migrateRegisteredProjectDbs(ctx);
-  return db;
-}
-
-function connectReadOnly(ctx) {
-  if (!fs.existsSync(ctx.dbPath) || !fs.statSync(ctx.dbPath).isFile()) {
-    throw new CliError('NOT_FOUND', `Project database does not exist: ${ctx.dbPath}`);
-  }
-  return new DatabaseSync(ctx.dbPath, { timeout: 5000, readOnly: true });
-}
-
-function migrateRegisteredProjectDbs(ctx) {
-  if (projectMigrationFanoutDepth > 0) return;
-  projectMigrationFanoutDepth += 1;
-  try {
-    const currentDb = path.resolve(ctx.dbPath);
-    const seen = new Set([currentDb]);
-    for (const project of readProjectRegistry()) {
-      let resolved;
-      try {
-        resolved = resolveProjectDatabase({
-          root: project.root,
-          db: project.db || path.join(project.root, '.hello-cc', 'mesh.db'),
-          createStateDir: false
-        });
-      } catch (err) {
-        console.error(redactedLogText(`[${new Date().toISOString()}] skipping registered project DB migration for ${project.db || project.root}: ${err?.message || err}`));
-        continue;
-      }
-      const root = resolved.root;
-      const dbPath = resolved.db;
-      if (seen.has(dbPath)) continue;
-      seen.add(dbPath);
-      const cacheKey = `${dbPath}:${DB_SCHEMA_VERSION}`;
-      if (migratedRegisteredProjectDbs.has(cacheKey)) continue;
-      if (!fs.existsSync(root) || !fs.existsSync(dbPath)) continue;
-      // xx-05: a persistently failing sibling (corrupt, read-only, or a slow
-      // network FS) must not re-pay the full multi-second failure attempt on
-      // every connect. A sidecar marker records the last failure; skip the DB
-      // for a cooldown window instead of retrying on every command/request.
-      const failedMarker = `${dbPath}.migration-failed`;
-      try {
-        if (Date.now() - fs.statSync(failedMarker).mtimeMs < MIGRATION_FAILURE_COOLDOWN_MS) continue;
-      } catch {}
-      let db = null;
-      try {
-        db = new DatabaseSync(dbPath, { timeout: 5000 });
-        db.exec('PRAGMA busy_timeout = 5000;');
-        execWithBusyRetry(db, 'PRAGMA journal_mode = WAL;', { ignoreBusy: true });
-        db.exec('PRAGMA synchronous = NORMAL;');
-        db.exec('PRAGMA foreign_keys = ON;');
-        initSchemaWithBackup(db, dbPath, {
-          beforePostMigrationIndexes: dedupePeerBindings
-        });
-        migratedRegisteredProjectDbs.add(cacheKey);
-        try { fs.rmSync(failedMarker, { force: true }); } catch {}
-      } catch (err) {
-        // A corrupt or busy sibling project DB must not fail commands or crash
-        // the shared runtime for unrelated projects. Skip it and keep going.
-        console.error(redactedLogText(`[${new Date().toISOString()}] skipping registered project DB migration for ${dbPath}: ${err?.message || err}`));
-        try { fs.writeFileSync(failedMarker, String(now())); } catch {}
-        continue;
-      } finally {
-        try { db?.close(); } catch {}
-      }
-    }
-  } finally {
-    projectMigrationFanoutDepth -= 1;
-  }
-}
-
-function addEvent(db, type, actor, taskId, payload) {
-  db.prepare(`
-    INSERT INTO events(type, actor, task_id, payload, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(type, actor || null, taskId || null, JSON.stringify(payload || {}), now());
-}
-
-function auditPayload({ actor = null, target = null, source = 'cli', admin = false, ...extra } = {}) {
-  const payload = { ...extra, source };
-  if (actor) payload.actor_peer = actor;
-  if (target) payload.target_peer = target;
-  if (admin) payload.admin = true;
-  return payload;
-}
-
-function requestActorPeer(input = {}, fallback = 'web') {
-  return String(input.auditActorPeer || fallback || 'web').trim() || 'web';
-}
-
-function requestSource(input = {}, fallback = 'web') {
-  return String(input.auditSource || fallback || 'web').trim() || fallback;
-}
 
 function latestHookProviderSession(db, peer) {
   if (!peer) return null;
@@ -926,114 +873,6 @@ function latestHookProviderSession(db, peer) {
   } catch {
     return null;
   }
-}
-
-const {
-  dedupePeerBindings,
-  findProviderSessionBinding,
-  upsertCanonicalPeerBinding
-} = createPeerBindingStore({ now, addEvent });
-
-function upsertPeer(db, peer) {
-  const t = now();
-  const identity = Object.hasOwn(peer, 'processIdentity')
-    ? peer.processIdentity
-    : liveProcessIdentity(peer.pid);
-  db.prepare(`
-    INSERT INTO peers(id, kind, role, worktree, branch, pid, pid_start_token, pid_command_hash, status, capabilities, created_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      kind = excluded.kind,
-      role = excluded.role,
-      worktree = excluded.worktree,
-      branch = excluded.branch,
-      pid = excluded.pid,
-      pid_start_token = excluded.pid_start_token,
-      pid_command_hash = excluded.pid_command_hash,
-      -- hb-08: an incidental upsert with the default 'idle' status must not
-      -- resurrect a peer that was explicitly marked exited/detached.
-      status = CASE WHEN excluded.status = 'idle' AND peers.status IN ('exited', 'detached')
-                    THEN peers.status ELSE excluded.status END,
-      capabilities = excluded.capabilities,
-      last_seen_at = excluded.last_seen_at
-  `).run(
-    peer.id,
-    peer.kind || 'other',
-    peer.role || '',
-    peer.worktree || '',
-    peer.branch || '',
-    peer.pid || null,
-    identity?.startToken || null,
-    identity?.commandHash || null,
-    peer.status || 'idle',
-    peer.capabilities || '',
-    t,
-    t
-  );
-}
-
-function touchPeer(db, id, status = null) {
-  if (!id) return;
-  const existing = db.prepare('SELECT id FROM peers WHERE id = ?').get(id);
-  if (!existing) {
-    upsertPeer(db, {
-      id,
-      kind: 'other',
-      role: 'auto',
-      worktree: process.cwd(),
-      branch: detectBranch(process.cwd()),
-      pid: process.ppid,
-      status: status || 'idle',
-      capabilities: ''
-    });
-  } else {
-    db.prepare(`
-      UPDATE peers
-      SET last_seen_at = ?, status = COALESCE(?, status)
-      WHERE id = ?
-    `).run(now(), status, id);
-  }
-}
-
-function touchCurrentPeer(db, ctx, resolved, status = null, kindHint = 'shell') {
-  registerProjectActivity(ctx);
-  const identity = typeof resolved === 'string'
-    ? { id: resolved, auto: false }
-    : resolved;
-  if (!identity || !identity.id) return;
-  if (!identity.auto) {
-    touchPeer(db, identity.id, status);
-    return;
-  }
-
-  const existing = db.prepare('SELECT id FROM peers WHERE id = ?').get(identity.id);
-  if (existing) {
-    touchPeer(db, identity.id, status);
-    return;
-  }
-
-  const kind = autoPeerKind(kindHint);
-  const sessionId = autoPeerSessionId(kind);
-  const resumeId = autoPeerResumeId(kind);
-  upsertPeer(db, {
-    id: identity.id,
-    ...autoPeerDefaults(ctx, kindHint, status || 'idle')
-  });
-  upsertCanonicalPeerBinding(db, {
-    peer: identity.id,
-    provider: kind,
-    ...providerSessionParts(resumeId || sessionId),
-    resume_mode: resumeId ? 'resume' : (sessionId ? 'detected' : 'auto'),
-    resume_arg: resumeId || null,
-    command: null,
-    transport: process.env.TMUX_PANE ? 'auto-tmux' : 'auto-shell',
-    runtime_session_id: identity.id
-  }, true);
-  addEvent(db, 'peer.auto_joined', identity.id, null, {
-    root: ctx.root,
-    basis: autoPeerBasis(kind),
-    provider_session: resumeId || sessionId || null
-  });
 }
 
 function formatHookEventName(hookType) {
@@ -1145,43 +984,6 @@ async function cmdJoin(ctx, args) {
   printResult(ctx, { peer, env: values }, (data) => shellExports(data.env));
 }
 
-async function cmdHeartbeat(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['renew-locks'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const status = opts.status || null;
-  const ttlOverride = opts.ttl === undefined ? null : positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
-  const t = now();
-  if (ttlOverride !== null) leaseDeadline(t, ttlOverride);
-  const db = connect(ctx);
-  const clockObservation = opts['renew-locks']
-    ? observeLockClockSafety(db, ctx, { owner: peer, observedAt: t })
-    : null;
-  touchCurrentPeer(db, ctx, identity, status, 'shell');
-  let renewed = 0;
-  if (opts['renew-locks']) {
-    const evidenceLive = peerEvidenceFromDb(db, ctx, peer).state === 'live';
-    if (clockObservation?.renewed > 0 && ttlOverride === null) {
-      renewed = clockObservation.renewed;
-    } else if (ttlOverride !== null) {
-      renewed = renewOwnedLocks(db, {
-        owner: peer,
-        nowSec: t,
-        ttlOverride,
-        includeExpired: evidenceLive
-      });
-    } else {
-      renewed = renewOwnedLocks(db, {
-        owner: peer,
-        nowSec: t,
-        includeExpired: evidenceLive
-      });
-    }
-  }
-  addEvent(db, 'peer.heartbeat', peer, null, { status, renewed });
-  printResult(ctx, { peer, status, renewed }, (data) => `heartbeat ${data.peer}${data.renewed ? `, renewed locks: ${data.renewed}` : ''}`);
-}
-
 async function cmdPeers(ctx, args) {
   parseOpts(args);
   const db = connect(ctx);
@@ -1212,439 +1014,6 @@ async function cmdPeers(ctx, args) {
   ]));
 }
 
-const TASK_STATUS_SHORTCUTS = new Set(['running', 'review', 'blocked', 'abandoned']);
-
-async function cmdTask(ctx, args) {
-  const sub = args[0];
-  if (!sub || wantsHelp(args)) return helpTask();
-  if (sub === 'create') return taskCreate(ctx, args.slice(1));
-  if (sub === 'dispatch') return taskDispatch(ctx, args.slice(1));
-  if (sub === 'list') return taskList(ctx, args.slice(1));
-  if (sub === 'claim') return taskClaim(ctx, args.slice(1));
-  if (sub === 'takeover') return taskTakeover(ctx, args.slice(1));
-  if (sub === 'next') return taskNext(ctx, args.slice(1));
-  if (sub === 'update') return taskUpdate(ctx, args.slice(1));
-  if (sub === 'done') return taskDone(ctx, args.slice(1));
-  if (TASK_STATUS_SHORTCUTS.has(sub)) return taskStatusShortcut(ctx, sub, args.slice(1));
-  throw new CliError('BAD_ARGS', `Unknown task command: ${sub}`);
-}
-
-async function taskCreate(ctx, args) {
-  const opts = parseOpts(args);
-  const title = required(opts, 'title');
-  const body = opts.body || '';
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const createdBy = identity.id;
-  const assignee = opts.to || opts.assignee || null;
-  const priority = intOpt(opts, 'priority', 100);
-  const parentId = intOpt(opts, 'parent', null);
-  const teamRole = opts.role || opts['team-role'] || null;
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const t = now();
-  const id = tx(db, () => {
-    if (parentId && !db.prepare('SELECT id FROM tasks WHERE id = ?').get(parentId)) {
-      throw new CliError('NOT_FOUND', `Parent task #${parentId} does not exist`);
-    }
-    const info = db.prepare(`
-      INSERT INTO tasks(title, body, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
-      VALUES (?, ?, 'pending', ?, NULL, ?, ?, ?, ?, ?, ?)
-    `).run(title, body, assignee, parentId, teamRole, priority, createdBy, t, t);
-    const taskId = Number(info.lastInsertRowid);
-    addEvent(db, 'task.created', createdBy, taskId, { title, assignee, priority, parent_id: parentId, team_role: teamRole });
-    if (assignee) {
-      sendMessage(db, createdBy, assignee, taskId, 'task', `Task #${taskId} assigned: ${title}`);
-    }
-    return taskId;
-  });
-  printResult(ctx, { id, title, assignee, priority, parent_id: parentId, team_role: teamRole },
-    (data) => `created task #${data.id}: ${data.title}${data.assignee ? ` -> ${data.assignee}` : ''}${data.parent_id ? ` (child of #${data.parent_id})` : ''}`);
-}
-
-function dispatchPromptText(task, customMessage = null) {
-  if (customMessage) return customMessage;
-  return [
-    `Please pick up hello-cc task #${task.id}: ${task.title}.`,
-    `Run hcc task claim --id ${task.id}, then follow project coordination rules, create a handoff, and mark the task done when finished.`
-  ].join(' ');
-}
-
-function currentOwnedTaskForPeer(db, peer) {
-  return db.prepare(`
-    SELECT *
-    FROM tasks
-    WHERE owner = ?
-      AND status IN ('claimed', 'running', 'review', 'blocked')
-    ORDER BY
-      CASE status
-        WHEN 'running' THEN 0
-        WHEN 'claimed' THEN 1
-        WHEN 'review' THEN 2
-        WHEN 'blocked' THEN 3
-        ELSE 4
-      END,
-      priority ASC,
-      id ASC
-    LIMIT 1
-  `).get(peer);
-}
-
-function findRuntimeSessionForPeer(runtimeData, peer) {
-  return (runtimeData?.sessions || []).find((session) => {
-    const sessionPeer = session.peer_id || session.id;
-    return session.status === 'running' && (session.id === peer || sessionPeer === peer);
-  }) || null;
-}
-
-function sessionLooksProviderInteractive(session) {
-  if (!['claude', 'codex'].includes(session?.kind)) return false;
-  if (session.provider_session_known) return true;
-  const command = String(session.command || '');
-  if (/^tmux\s+%/.test(command)) return false;
-  return /\b(?:claude|codex)(?:\s|$)/.test(command);
-}
-
-async function taskDispatch(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force', 'no-inject'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const actor = identity.id;
-  const target = required(opts, 'to');
-  const requestedTaskId = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  const title = requestedTaskId ? (opts.title || null) : required(opts, 'title');
-  const body = opts.body || '';
-  const priority = intOpt(opts, 'priority', 100);
-  const customMessage = opts.message ? String(opts.message) : null;
-  const injectAllowed = !Boolean(opts['no-inject']);
-
-  let task = null;
-  let messageId = null;
-  let currentTask = null;
-  let previousAssignee = null;
-  const db = connect(ctx);
-  try {
-    touchCurrentPeer(db, ctx, identity, null, 'shell');
-    const t = now();
-    task = tx(db, () => {
-      if (requestedTaskId) {
-        const existing = db.prepare('SELECT * FROM tasks WHERE id = ?').get(requestedTaskId);
-        if (!existing) throw new CliError('NOT_FOUND', `Task #${requestedTaskId} does not exist`);
-        if (['done', 'abandoned'].includes(existing.status)) {
-          throw new CliError('BAD_STATE', `Task #${requestedTaskId} is ${existing.status}`);
-        }
-        if (existing.owner && existing.owner !== target) {
-          throw new CliError('TASK_OWNED', `Task #${requestedTaskId} is owned by ${existing.owner}`, {
-            owner: existing.owner,
-            task_id: requestedTaskId,
-            attempted_by: actor,
-            target
-          });
-        }
-        previousAssignee = existing.assignee || null;
-        db.prepare('UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?').run(target, t, requestedTaskId);
-        return db.prepare('SELECT * FROM tasks WHERE id = ?').get(requestedTaskId);
-      }
-      const info = db.prepare(`
-        INSERT INTO tasks(title, body, status, assignee, owner, parent_id, team_role, priority, created_by, created_at, updated_at)
-        VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, ?, ?, ?)
-      `).run(title, body, target, priority, actor, t, t);
-      const taskId = Number(info.lastInsertRowid);
-      addEvent(db, 'task.created', actor, taskId, { title, assignee: target, priority, parent_id: null, team_role: null });
-      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
-    });
-    const durableMessage = dispatchPromptText(task, customMessage);
-    messageId = sendMessage(db, actor, target, task.id, 'task', durableMessage);
-    currentTask = currentOwnedTaskForPeer(db, target);
-  } finally {
-    db.close();
-  }
-
-  const durableMessage = dispatchPromptText(task, customMessage);
-  let session = null;
-  let injected = false;
-  let injectionReason = injectAllowed ? 'runtime_unavailable' : 'no_inject';
-  const busyTask = currentTask && Number(currentTask.id) !== Number(task.id) ? currentTask : null;
-  if (injectAllowed) {
-    let runtime = null;
-    let runtimeData = null;
-    try {
-      runtime = readRuntime(ctx);
-      runtimeData = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
-    } catch (err) {
-      if (!(err instanceof CliError) || !['RUNTIME_NOT_RUNNING', 'RUNTIME_UNREACHABLE'].includes(err.code)) throw err;
-    }
-    session = runtimeData ? findRuntimeSessionForPeer(runtimeData, target) : null;
-    if (!session) {
-      injectionReason = runtimeData ? 'session_not_running' : 'runtime_unavailable';
-    } else if (!customMessage && !sessionLooksProviderInteractive(session)) {
-      injectionReason = 'unsupported_session_kind';
-    } else if (busyTask && !Boolean(opts.force)) {
-      injectionReason = 'target_busy';
-    } else {
-      try {
-        await injectPeer(ctx, target, durableMessage, true, runtime, actor);
-        injected = true;
-        injectionReason = 'injected';
-      } catch (err) {
-        if (!(err instanceof CliError)) throw err;
-        if (['RUNTIME_NOT_RUNNING', 'RUNTIME_UNREACHABLE'].includes(err.code)) {
-          injectionReason = 'runtime_unavailable';
-        } else if (['NOT_FOUND', 'SESSION_NOT_RUNNING'].includes(err.code)) {
-          injectionReason = 'session_not_running';
-        } else {
-          throw err;
-        }
-      }
-    }
-  }
-
-  const eventDb = connect(ctx);
-  try {
-    addEvent(eventDb, 'task.dispatched', actor, task.id, auditPayload({
-      actor,
-      target,
-      source: 'cli',
-      admin: actor !== target,
-      peer: target,
-      title: task.title,
-      message_id: messageId,
-      injected,
-      delivery: injected ? 'message+inject' : 'message-only',
-      injection_reason: injectionReason,
-      session_id: session?.id || null,
-      session_kind: session?.kind || null,
-      previous_assignee: previousAssignee,
-      blocked_by_task_id: busyTask?.id || null
-    }));
-  } finally {
-    eventDb.close();
-  }
-
-  const result = {
-    task,
-    target,
-    message_id: messageId,
-    message: durableMessage,
-    injected,
-    delivery: injected ? 'message+inject' : 'message-only',
-    injection_reason: injectionReason,
-    session: session ? {
-      id: session.id,
-      peer_id: session.peer_id || session.id,
-      kind: session.kind,
-      status: session.status
-    } : null,
-    previous_assignee: previousAssignee,
-    blocked_by_task: busyTask ? {
-      id: busyTask.id,
-      status: busyTask.status,
-      title: busyTask.title
-    } : null
-  };
-  printResult(ctx, result, (data) => {
-    const base = `dispatched task #${data.task.id} to ${data.target} with message #${data.message_id}`;
-    if (data.injected) return `${base} and injected live input`;
-    if (data.injection_reason === 'target_busy' && data.blocked_by_task) {
-      return `${base} (not injected: ${data.target} already owns task #${data.blocked_by_task.id})`;
-    }
-    if (data.injection_reason === 'unsupported_session_kind' && data.session) {
-      return `${base} (not injected: managed ${data.session.kind} session needs an explicit shell-safe message)`;
-    }
-    if (data.injection_reason === 'session_not_running') return `${base} (not injected: target is not a running managed session)`;
-    if (data.injection_reason === 'runtime_unavailable') return `${base} (not injected: web runtime is unavailable)`;
-    if (data.injection_reason === 'no_inject') return `${base} (message only)`;
-    return `${base} (not injected: ${data.injection_reason})`;
-  });
-}
-
-async function taskList(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['all'] });
-  const status = opts.status || null;
-  const peer = opts.peer || null;
-  const limit = intOpt(opts, 'limit', 50);
-  const db = connect(ctx);
-  let rows;
-  if (status && peer) {
-    rows = db.prepare(`
-      SELECT * FROM tasks
-      WHERE status = ? AND (owner = ? OR assignee = ?)
-      ORDER BY priority ASC, id ASC LIMIT ?
-    `).all(status, peer, peer, limit);
-  } else if (status) {
-    rows = db.prepare('SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, id ASC LIMIT ?').all(status, limit);
-  } else if (opts.all && peer) {
-    rows = db.prepare(`
-      SELECT * FROM tasks
-      WHERE owner = ? OR assignee = ?
-      ORDER BY status ASC, priority ASC, id ASC
-      LIMIT ?
-    `).all(peer, peer, limit);
-  } else if (opts.all) {
-    rows = db.prepare('SELECT * FROM tasks ORDER BY status ASC, priority ASC, id ASC LIMIT ?').all(limit);
-  } else if (peer) {
-    rows = queryOpenTasks(db, limit, peer);
-  } else {
-    rows = queryOpenTasks(db, limit);
-  }
-  const t = now();
-  const peers = db.prepare(`
-    SELECT id, status, pid, pid_start_token, pid_command_hash,
-           last_seen_at, (? - last_seen_at) AS age_sec
-    FROM peers
-  `).all(t);
-  for (const peerRow of peers) {
-    const binding = db.prepare(`
-      SELECT transport, runtime_target FROM peer_bindings WHERE peer = ?
-    `).get(peerRow.id) || null;
-    const evidence = observePeerEvidence(ctx, peerRow, binding);
-    peerRow.evidence_state = evidence.state;
-    peerRow.evidence_reason = evidence.reason;
-  }
-  const graceUntil = readClockGraceUntil(db);
-  const locks = clockGraceSuppressed(t, graceUntil)
-    ? db.prepare('SELECT * FROM locks').all()
-    : db.prepare('SELECT * FROM locks WHERE expires_at > ?').all(t);
-  rows = annotateTasksWithLiveness(rows, peers, locks, t, ACTIVE_PEER_TTL, graceUntil);
-  printResult(ctx, rows, (data) => table(data, [
-    { label: 'id', value: (r) => `#${r.id}` },
-    { label: 'status', value: (r) => r.status },
-    { label: 'prio', value: (r) => r.priority },
-    { label: 'assignee', value: (r) => r.assignee || '' },
-    { label: 'owner', value: (r) => r.owner || '' },
-    { label: 'owner_state', value: (r) => taskOwnerStateText(r) },
-    { label: 'parent', value: (r) => r.parent_id ? `#${r.parent_id}` : '' },
-    { label: 'role', value: (r) => r.team_role || '' },
-    { label: 'title', value: (r) => r.title }
-  ]));
-}
-
-async function taskClaim(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'], arrays: ['id', 'ids'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const ids = parseTaskIds(opts);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  let tasks;
-  try {
-    tasks = claimTaskRowsForPeer(db, peer, ids, { force: Boolean(opts.force) });
-  } catch (err) {
-    notifyTaskOwnerConflict(ctx, err);
-    throw err;
-  }
-  printResult(ctx, ids.length === 1 ? tasks[0] : tasks, (data) => taskRowsText(Array.isArray(data) ? data : [data], 'claimed'));
-}
-
-function notifyTaskOwnerConflict(ctx, err) {
-  if (err?.code !== 'TASK_OWNED' || !err.extra?.notify_owner) return;
-  const { owner, task_id: taskId, attempted_by: attemptedBy, action } = err.extra;
-  if (!owner || !attemptedBy || owner === attemptedBy) return;
-  let db = null;
-  try {
-    db = connect(ctx);
-    sendMessage(
-      db,
-      attemptedBy,
-      owner,
-      taskId || null,
-      'task.owner-conflict',
-      `Task #${taskId} is owned by ${owner}; ${attemptedBy} attempted ${action || 'modify'} and hello-cc left ownership unchanged.`
-    );
-    err.extra.notified = true;
-  } catch {
-    err.extra.notified = false;
-  } finally {
-    try { db?.close(); } catch {}
-  }
-}
-
-async function taskTakeover(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
-  const reason = required(opts, 'reason');
-  // Default to blocked-or-stale so an active owner's task is not silently
-  // taken over (hb-07/conc-04). --force restores the old unconditional 'any'
-  // behavior; --policy still wins when given explicitly.
-  const policy = opts.force ? 'any' : (opts.policy || 'blocked-or-stale');
-  const staleAfter = positiveIntOpt(opts, 'stale-after', ACTIVE_PEER_TTL, { max: 86400 * 30 });
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const task = takeOverTaskForPeer(db, peer, id, {
-    reason,
-    policy,
-    staleAfter,
-    ownerEvidenceFor: (_owner, _row, ownerRow, binding) => observePeerEvidence(ctx, ownerRow, binding)
-  });
-  printResult(ctx, task, (data) => `took over task #${data.id}: ${data.title}`);
-}
-
-async function taskNext(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const count = positiveIntOpt(opts, 'count', 1, { max: 50 });
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const result = claimNextTasksForPeer(db, peer, { force: Boolean(opts.force), count });
-  printResult(ctx, count === 1 ? (result.current || result.tasks[0] || null) : result, (data) => {
-    if (!data) return 'no pending task';
-    if (data.current === true) return `current task #${data.id}: ${data.title} (${data.status})`;
-    if (data.current) return `current task #${data.current.id}: ${data.current.title} (${data.current.status})`;
-    if (data.tasks) return data.tasks.length ? taskRowsText(data.tasks, 'claimed') : 'no pending task';
-    return `claimed task #${data.id}: ${data.title}`;
-  });
-}
-
-async function taskUpdate(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  const status = required(opts, 'status');
-  if (!['pending', 'claimed', 'running', 'review', 'blocked', 'done', 'abandoned'].includes(status)) {
-    throw new CliError('BAD_ARGS', `Unsupported status: ${status}`);
-  }
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, status === 'done' ? 'idle' : 'working', 'shell');
-  let task;
-  try {
-    task = tx(db, () => {
-      const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-      if (!row) throw new CliError('NOT_FOUND', `Task #${id} does not exist`);
-      assertTaskOwnerForMutation(db, peer, row, `update:${status}`);
-      const t = now();
-      const completedAt = status === 'done' ? t : row.completed_at;
-      db.prepare(`
-        UPDATE tasks
-        SET status = ?, completed_at = ?, updated_at = ?
-        WHERE id = ?
-      `).run(status, completedAt, t, id);
-      addEvent(db, `task.${status}`, peer, id, { summary: opts.summary || opts.reason || '' });
-      if (opts.body) {
-        sendMessage(db, peer, opts.to || 'all', id, 'task.update', opts.body);
-      }
-      return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-    });
-  } catch (err) {
-    notifyTaskOwnerConflict(ctx, err);
-    throw err;
-  }
-  printResult(ctx, task, (data) => `task #${data.id} -> ${data.status}`);
-}
-
-async function taskStatusShortcut(ctx, status, args) {
-  return taskUpdate(ctx, args.concat(['--status', status]));
-}
-
-async function taskDone(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
-  opts.status = 'done';
-  if (opts.summary && !opts.body) opts.body = opts.summary;
-  return taskUpdate(ctx, args.concat(['--status', 'done']));
-}
 
 async function cmdTeam(ctx, args) {
   const sub = args[0];
@@ -1761,224 +1130,6 @@ async function teamStatus(ctx, args) {
     }
     return lines.join('\n');
   });
-}
-
-async function cmdMsg(ctx, args) {
-  const sub = args[0];
-  if (!sub || wantsHelp(args)) return helpMsg();
-  if (sub === 'send') return msgSend(ctx, args.slice(1));
-  if (sub === 'inbox') return msgInbox(ctx, args.slice(1));
-  if (sub === 'ack') return msgAck(ctx, args.slice(1));
-  if (sub === 'reply') return msgReply(ctx, args.slice(1));
-  if (sub === 'thread') return msgThread(ctx, args.slice(1));
-  throw new CliError('BAD_ARGS', `Unknown msg command: ${sub}`);
-}
-
-async function msgSend(ctx, args) {
-  const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const sender = identity.id;
-  const recipient = opts.to || 'all';
-  const body = required(opts, 'body');
-  const taskId = intOpt(opts, 'task', null);
-  const kind = opts.kind || 'note';
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const id = sendMessage(db, sender, recipient, taskId, kind, body);
-  printResult(ctx, { id, sender, recipient, task_id: taskId, kind, body, reply_to: null, thread_id: id },
-    (data) => `sent message #${data.id} ${data.sender} -> ${data.recipient}`);
-}
-
-async function msgInbox(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['all'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const waitSec = intOpt(opts, 'wait', 0);
-  const limit = intOpt(opts, 'limit', 20);
-  const includeAll = Boolean(opts.all);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const deadline = Date.now() + waitSec * 1000;
-  let rows = queryInbox(db, peer, includeAll, limit);
-  while (!rows.length && waitSec > 0 && Date.now() < deadline) {
-    await sleep(1000);
-    rows = queryInbox(db, peer, includeAll, limit);
-  }
-  printResult(ctx, rows, (data) => table(data, [
-    { label: 'id', value: (r) => `#${r.id}` },
-    { label: 'from', value: (r) => r.sender },
-    { label: 'kind', value: (r) => r.kind },
-    { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-    { label: 'reply', value: (r) => r.reply_to ? `#${r.reply_to}` : '' },
-    { label: 'thread', value: (r) => r.thread_id ? `#${r.thread_id}` : '' },
-    { label: 'time', value: (r) => iso(r.created_at) },
-    { label: 'body', value: (r) => r.body }
-  ]));
-}
-
-async function msgAck(ctx, args) {
-  const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(id);
-  if (!message) throw new CliError('NOT_FOUND', `Message #${id} does not exist`);
-  ackMessage(db, peer, message);
-  printResult(ctx, { id, peer }, (data) => `acknowledged message #${data.id} for ${data.peer}`);
-}
-
-async function msgReply(ctx, args) {
-  const opts = parseOpts(args);
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
-  const body = required(opts, 'body');
-  const db = connect(ctx);
-  const original = getMessage(db, id);
-  if (!original) throw new CliError('NOT_FOUND', `Message #${id} does not exist`);
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const sender = identity.id;
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const recipient = opts.to || original.sender;
-  const taskId = intOpt(opts, 'task', original.task_id || null);
-  const kind = opts.kind || 'reply';
-  const threadId = original.thread_id || original.id;
-  const replyId = sendMessage(db, sender, recipient, taskId, kind, body, {
-    reply_to: original.id,
-    thread_id: threadId
-  });
-  ackMessage(db, sender, original);
-  printResult(ctx, {
-    id: replyId,
-    sender,
-    recipient,
-    task_id: taskId,
-    kind,
-    body,
-    reply_to: original.id,
-    thread_id: threadId
-  }, (data) => `sent reply #${data.id} to #${data.reply_to} ${data.sender} -> ${data.recipient}`);
-}
-
-async function msgThread(ctx, args) {
-  const opts = parseOpts(args);
-  const id = intOpt(opts, 'id', intOpt({ id: opts._[0] }, 'id'));
-  if (!id) throw new CliError('BAD_ARGS', 'Missing --id');
-  const limit = intOpt(opts, 'limit', 50);
-  const db = connect(ctx);
-  const data = queryMessageThread(db, id, limit);
-  printResult(ctx, data, (thread) => {
-    const lines = [`thread #${thread.thread_id} (${thread.messages.length} message${thread.messages.length === 1 ? '' : 's'})`];
-    for (const message of thread.messages) {
-      const parts = [
-        `#${message.id}`,
-        `${message.sender} -> ${message.recipient || 'all'}`,
-        message.task_id ? `task #${message.task_id}` : '',
-        message.reply_to ? `reply #${message.reply_to}` : '',
-        message.kind || 'note',
-        iso(message.created_at)
-      ].filter(Boolean).join(' ');
-      lines.push(`${parts}\n  ${message.body}`);
-    }
-    return lines.join('\n');
-  });
-}
-
-async function cmdAsk(ctx, args) {
-  if (args[0] === '--help' || args[0] === '-h') return helpAsk();
-  const opts = parseOpts(args, { booleans: ['inject', 'no-enter'] });
-  const recipient = opts.to || opts._[0];
-  if (!recipient) throw new CliError('BAD_ARGS', 'Missing peer');
-  const body = opts.body || opts._.slice(opts.to ? 0 : 1).join(' ');
-  if (!body) throw new CliError('BAD_ARGS', 'Missing message');
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const sender = identity.id;
-  const taskId = intOpt(opts, 'task', null);
-  const kind = opts.kind || 'ask';
-  const runtime = opts.inject ? readRuntime(ctx) : null;
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const id = sendMessage(db, sender, recipient, taskId, kind, body);
-  let injected = false;
-  if (opts.inject) {
-    await injectPeer(ctx, recipient, body, !opts['no-enter'], runtime, sender);
-    injected = true;
-  }
-  printResult(ctx, { id, sender, recipient, task_id: taskId, kind, body, injected }, (data) => `asked ${data.recipient} with message #${data.id}${data.injected ? ' and injected terminal input' : ''}`);
-}
-
-async function cmdBroadcast(ctx, args) {
-  if (args[0] === '--help' || args[0] === '-h') return helpBroadcast();
-  const opts = parseOpts(args, { booleans: ['inject', 'no-enter'] });
-  const body = opts.body || opts._.join(' ');
-  if (!body) throw new CliError('BAD_ARGS', 'Missing message');
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const sender = identity.id;
-  const taskId = intOpt(opts, 'task', null);
-  const kind = opts.kind || 'broadcast';
-  const runtime = opts.inject ? readRuntime(ctx) : null;
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const id = sendMessage(db, sender, 'all', taskId, kind, body);
-  let injected = 0;
-  let skipped = 0;
-  if (opts.inject) {
-    const sessions = await runtimeRequest(ctx, 'GET', '/api/sessions', null, runtime);
-    const running = (sessions.sessions || []).filter((session) => session.status === 'running');
-    for (const session of running) {
-      try {
-        await injectPeer(ctx, session.id, body, !opts['no-enter'], runtime, sender);
-        injected += 1;
-      } catch (err) {
-        if (err instanceof CliError && ['NOT_FOUND', 'SESSION_NOT_RUNNING', 'TMUX_ERROR'].includes(err.code)) {
-          skipped += 1;
-          continue;
-        }
-        throw err;
-      }
-    }
-  }
-  printResult(ctx, { id, sender, recipient: 'all', task_id: taskId, kind, body, injected, skipped }, (data) => {
-    const injectedText = data.injected ? ` and injected ${data.injected} terminal(s)` : '';
-    const skippedText = data.skipped ? `, skipped ${data.skipped} stale terminal(s)` : '';
-    return `broadcast message #${data.id}${injectedText}${skippedText}`;
-  });
-}
-
-async function injectPeer(ctx, peer, text, enter = true, runtime = null, auditActor = null) {
-  const actor = auditActor || resolveCurrentPeer(ctx, {}, 'peer', 'shell').id;
-  const db = connect(ctx);
-  try {
-    addEvent(db, 'web.session.input.requested', actor, null, auditPayload({
-      actor,
-      target: peer,
-      peer,
-      source: 'cli',
-      admin: actor !== peer,
-      bytes: text.length,
-      enter
-    }));
-  } finally {
-    db.close();
-  }
-  return runtimeRequest(ctx, 'POST', `/api/sessions/${encodeURIComponent(peer)}/input`, {
-    text,
-    enter
-  }, runtime);
-}
-
-async function cmdInject(ctx, args) {
-  if (args[0] === '--help' || args[0] === '-h') return helpInject();
-  const opts = parseOpts(args, { booleans: ['no-enter'] });
-  const peer = opts.peer || opts._[0];
-  if (!peer) throw new CliError('BAD_ARGS', 'Missing peer');
-  const text = opts.body || opts._.slice(opts.peer ? 0 : 1).join(' ');
-  if (!text) throw new CliError('BAD_ARGS', 'Missing text');
-  const enter = !opts['no-enter'];
-  const result = await injectPeer(ctx, peer, text, enter);
-  printResult(ctx, { peer, text, enter, result }, (data) => `injected ${data.peer}${data.enter ? ' and pressed Enter' : ''}`);
 }
 
 async function cmdPeer(ctx, args) {
@@ -2196,238 +1347,6 @@ async function peerStop(ctx, args) {
     throw err;
   }
   printResult(ctx, data.session, (session) => `stopped ${session.id}`);
-}
-
-async function cmdLock(ctx, args) {
-  const sub = args[0];
-  if (!sub || wantsHelp(args)) return helpLock();
-  if (sub === 'acquire') return lockAcquire(ctx, args.slice(1));
-  if (sub === 'release') return lockRelease(ctx, args.slice(1));
-  if (sub === 'renew') return lockRenew(ctx, args.slice(1));
-  if (sub === 'list') return lockList(ctx, args.slice(1));
-  throw new CliError('BAD_ARGS', `Unknown lock command: ${sub}`);
-}
-
-async function lockAcquire(ctx, args) {
-  const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
-  const taskId = intOpt(opts, 'task', null);
-  const ttl = positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
-  const reason = opts.reason || '';
-  const acquisitionNow = now();
-  leaseDeadline(acquisitionNow, ttl);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  let lock;
-  try {
-    const outcome = runOptimisticEvidenceMutation(db, {
-      capture: (subjectDb) => {
-        try {
-          return captureLockAcquireSubject(subjectDb, {
-            taskId,
-            requested,
-            now: acquisitionNow
-          });
-        } catch (err) {
-          throw clockSafetyUnavailable(err);
-        }
-      },
-      observe: (subject) => observeLockOwnerEvidence(subject, (row, binding) =>
-        observePeerEvidence(ctx, row, binding)),
-      same: sameLockAcquireSubject,
-      beforeMutate: (subject, evidenceByOwner) =>
-        prepareLockClockObservation(db, subject, evidenceByOwner),
-      changedMessage: `Lock subjects changed while acquiring ${lockLabel(requested)}; retry`,
-      mutate: (subject, evidenceByOwner, clockObservation) => {
-      const t = subject.observedAt;
-      if (taskId) {
-        const task = subject.task;
-        if (!task) throw new CliError('NOT_FOUND', `Task #${taskId} does not exist`);
-        assertTaskOwnerForMutation(db, peer, task, 'lock-acquire');
-      }
-      // During clock grace, retained lock rows still conflict — but NOT
-      // EXPIRED locks of verified-dead owners (CS-04): a dead owner's expired
-      // lock must not block acquisition while the GC that would delete the row
-      // is itself deferred by the same grace window.
-      const graceActive = clockGraceSuppressed(t, clockObservation.graceUntil);
-      const activeLocks = graceActive
-        ? subject.locks.filter((row) =>
-            !(Number(row.expires_at) <= t && evidenceByOwner.get(row.owner)?.state === 'dead'))
-        : subject.locks.filter((row) =>
-            Number(row.expires_at) > t ||
-            evidenceByOwner.get(row.owner)?.state === 'live'
-          );
-      const conflict = activeLocks.find((row) => locksConflict(row, requested) && row.owner !== peer);
-      if (conflict) {
-        return { error: new CliError('LOCK_HELD', `Resource ${lockLabel(requested)} conflicts with lock ${lockLabel(conflict)} held by ${conflict.owner}`, {
-          resource: requested.base_resource,
-          scope: requested.scope,
-          lock_resource: conflict.resource,
-          lock_scope: lockScope(conflict),
-          owner: conflict.owner,
-          expires_at: iso(conflict.expires_at)
-        }) };
-      }
-      const existing = subject.locks.find((row) => row.resource === requested.resource) || null;
-      const expiresAt = leaseDeadline(t, ttl);
-      db.prepare(`
-        INSERT INTO locks(resource, base_resource, scope, owner, task_id, reason, expires_at, created_at, ttl_sec)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(resource) DO UPDATE SET
-          base_resource = excluded.base_resource,
-          scope = excluded.scope,
-          owner = excluded.owner,
-          task_id = excluded.task_id,
-          reason = excluded.reason,
-          expires_at = excluded.expires_at,
-          created_at = excluded.created_at,
-          ttl_sec = excluded.ttl_sec
-      `).run(requested.resource, requested.base_resource, requested.scope, peer, taskId, reason, expiresAt, t, ttl);
-      addEvent(db, 'lock.acquired', peer, taskId, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl, previous_owner: existing ? existing.owner : null });
-      return { lock: db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource) };
-      }
-    });
-    if (outcome.error) throw outcome.error;
-    lock = outcome.lock;
-  } catch (err) {
-    notifyTaskOwnerConflict(ctx, err);
-    throw err;
-  }
-  printResult(ctx, lock, (data) => `locked ${lockLabel(data)} by ${data.owner} until ${iso(data.expires_at)}`);
-}
-
-async function lockRelease(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['force'] });
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, null, 'shell');
-  const result = tx(db, () => {
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
-    if (!existing) return { released: false, ...requested };
-    if (existing.owner !== peer && !opts.force) {
-      throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
-    }
-    db.prepare('DELETE FROM locks WHERE resource = ?').run(requested.resource);
-    addEvent(db, 'lock.released', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, force: Boolean(opts.force) });
-    return { released: true, ...requested };
-  });
-  printResult(ctx, result, (data) => data.released ? `released ${lockLabel(data)}` : `no lock for ${lockLabel(data)}`);
-}
-
-async function lockRenew(ctx, args) {
-  const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'peer', 'shell');
-  const peer = identity.id;
-  const requested = scopedLockResource(required(opts, 'resource'), opts.scope);
-  const ttl = positiveSafeIntOpt(opts, 'ttl', DEFAULT_LOCK_TTL);
-  const renewalNow = now();
-  const expiresAt = leaseDeadline(renewalNow, ttl);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'working', 'shell');
-  const lock = tx(db, () => {
-    const existing = db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
-    if (!existing) throw new CliError('NOT_FOUND', `No lock for ${lockLabel(requested)}`);
-    if (existing.owner !== peer) throw new CliError('LOCK_OWNED', `Lock is owned by ${existing.owner}`, { owner: existing.owner });
-    db.prepare('UPDATE locks SET expires_at = ?, ttl_sec = ? WHERE resource = ?').run(expiresAt, ttl, requested.resource);
-    addEvent(db, 'lock.renewed', peer, existing.task_id || null, { resource: requested.base_resource, lock_resource: requested.resource, scope: requested.scope, ttl });
-    return db.prepare('SELECT * FROM locks WHERE resource = ?').get(requested.resource);
-  });
-  printResult(ctx, lock, (data) => `renewed ${lockLabel(data)} until ${iso(data.expires_at)}`);
-}
-
-async function lockList(ctx, args) {
-  const opts = parseOpts(args, { booleans: ['all'] });
-  const db = connect(ctx);
-  const t = now();
-  const rows = opts.all || clockGraceSuppressed(t, readClockGraceUntil(db))
-    ? db.prepare('SELECT * FROM locks ORDER BY resource ASC').all()
-    : db.prepare('SELECT * FROM locks WHERE expires_at > ? ORDER BY resource ASC').all(t);
-  printResult(ctx, rows, (data) => table(data, [
-    { label: 'resource', value: (r) => lockBaseResource(r) },
-    { label: 'scope', value: (r) => lockScope(r) },
-    { label: 'owner', value: (r) => r.owner },
-    { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-    { label: 'expires', value: (r) => iso(r.expires_at) },
-    { label: 'reason', value: (r) => r.reason || '' }
-  ]));
-}
-
-async function cmdHandoff(ctx, args) {
-  const sub = args[0];
-  if (!sub || wantsHelp(args)) return helpHandoff();
-  if (sub === 'create') return handoffCreate(ctx, args.slice(1));
-  if (sub === 'list') return handoffList(ctx, args.slice(1));
-  throw new CliError('BAD_ARGS', `Unknown handoff command: ${sub}`);
-}
-
-async function handoffCreate(ctx, args) {
-  const opts = parseOpts(args);
-  const identity = resolveCurrentPeer(ctx, opts, 'from', 'shell');
-  const from = identity.id;
-  const taskId = intOpt(opts, 'task', null);
-  const to = opts.to || null;
-  const summary = required(opts, 'summary');
-  const files = opts['changed-files']
-    ? normalizeListText(opts['changed-files'])
-    : JSON.stringify(changedFiles(ctx.cwd));
-  const tests = normalizeListText(opts.tests, []);
-  const risks = normalizeListText(opts.risks, []);
-  const db = connect(ctx);
-  touchCurrentPeer(db, ctx, identity, 'idle', 'shell');
-  const id = tx(db, () => {
-    const info = db.prepare(`
-      INSERT INTO handoffs(task_id, from_peer, to_peer, summary, changed_files, tests, risks, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(taskId, from, to, summary, files, tests, risks, now());
-    const handoffId = Number(info.lastInsertRowid);
-    addEvent(db, 'handoff.created', from, taskId, { handoff_id: handoffId, to });
-    if (to) sendMessage(db, from, to, taskId, 'handoff', `Handoff #${handoffId}: ${summary}`);
-    return handoffId;
-  });
-  printResult(ctx, { id, task_id: taskId, from, to, summary, changed_files: files, tests, risks }, (data) => `created handoff #${data.id}${data.to ? ` -> ${data.to}` : ''}`);
-}
-
-async function handoffList(ctx, args) {
-  const opts = parseOpts(args);
-  const taskId = intOpt(opts, 'task', null);
-  const limit = intOpt(opts, 'limit', 20);
-  const db = connect(ctx);
-  const rows = taskId
-    ? db.prepare('SELECT * FROM handoffs WHERE task_id = ? ORDER BY id DESC LIMIT ?').all(taskId, limit)
-    : db.prepare('SELECT * FROM handoffs ORDER BY id DESC LIMIT ?').all(limit);
-  printResult(ctx, rows, (data) => table(data, [
-    { label: 'id', value: (r) => `#${r.id}` },
-    { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-    { label: 'from', value: (r) => r.from_peer },
-    { label: 'to', value: (r) => r.to_peer || '' },
-    { label: 'time', value: (r) => iso(r.created_at) },
-    { label: 'summary', value: (r) => r.summary }
-  ]));
-}
-
-async function cmdEvent(ctx, args) {
-  const sub = args[0];
-  if (!sub || wantsHelp(args)) return helpEvent();
-  if (sub === 'tail') return eventTail(ctx, args.slice(1));
-  throw new CliError('BAD_ARGS', `Unknown event command: ${sub}`);
-}
-
-async function eventTail(ctx, args) {
-  const opts = parseOpts(args);
-  const limit = intOpt(opts, 'limit', 30);
-  const db = connect(ctx);
-  const rows = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit).reverse();
-  printResult(ctx, rows, (data) => table(data, [
-    { label: 'id', value: (r) => `#${r.id}` },
-    { label: 'type', value: (r) => r.type },
-    { label: 'actor', value: (r) => r.actor || '' },
-    { label: 'task', value: (r) => r.task_id ? `#${r.task_id}` : '' },
-    { label: 'time', value: (r) => iso(r.created_at) }
-  ]));
 }
 
 async function cmdStatus(ctx, args) {
@@ -2951,97 +1870,33 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     ? regressionWebSessionTtl
     : DEFAULT_WEB_SESSION_TTL_SEC;
   const MAX_WEB_SESSIONS = 256;
-  const webSessions = new Map();
   const bufferGcPlanStore = createBufferGcPlanStore();
   const bufferUnknownTracker = new Map();
   const bufferDirectoriesByProject = new Map();
-  function parseCookieSid(req) {
-    const header = req.headers.cookie || '';
-    for (const part of header.split(';')) {
-      const [k, ...rest] = part.trim().split('=');
-      if (k === 'hcc_sid') {
-        // xx-07: bound the value length so an attacker-controlled cookie cannot
-        // cause unbounded decode/lookup work.
-        const raw = rest.join('=');
-        if (raw.length > 128) return '';
-        try { return decodeURIComponent(raw); } catch { return ''; }
-      }
-    }
-    return '';
-  }
-  function closeWebSession(sid, reason = 'session revoked') {
-    const session = webSessions.get(sid);
-    webSessions.delete(sid);
-    for (const ws of session?.sockets || []) {
-      try { ws.close(4001, reason); } catch {}
-    }
-    session?.sockets?.clear();
-  }
-  function pruneWebSessions(t = now()) {
-    for (const [sid, session] of webSessions) {
-      if (session.expiresAt <= t) closeWebSession(sid, 'session expired');
-    }
-  }
-  function issueSession() {
-    pruneWebSessions();
-    while (webSessions.size >= MAX_WEB_SESSIONS) {
-      const oldest = webSessions.keys().next().value;
-      if (!oldest) break;
-      closeWebSession(oldest, 'session limit reached');
-    }
-    const sid = randomBytes(24).toString('base64url');
-    webSessions.set(sid, { expiresAt: now() + WEB_SESSION_TTL_SEC, sockets: new Set() });
-    return sid;
-  }
-  function sessionCookieHeader(sid, req) {
-    const parts = [`hcc_sid=${sid}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${WEB_SESSION_TTL_SEC}`];
-    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
-    return parts.join('; ');
-  }
-  function expiredSessionCookieHeader(req) {
-    const parts = ['hcc_sid=', 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
-    if (requestIsSecure(req, { trustProxy, proxyOrigin })) parts.push('Secure');
-    return parts.join('; ');
-  }
-  function cookieSessionRecord(req) {
-    const sid = parseCookieSid(req);
-    if (!sid) return null;
-    const session = webSessions.get(sid);
-    if (!session || session.expiresAt <= now()) {
-      if (session) closeWebSession(sid, 'session expired');
-      return null;
-    }
-    return { sid, session };
-  }
-  function cookieSessionOk(req) {
-    return Boolean(cookieSessionRecord(req));
-  }
-  function cookieSocketValid(ws) {
-    const auth = ws?.hccCookieAuth;
-    if (!auth) return true;
-    const current = webSessions.get(auth.sid);
-    if (current === auth.session && current.expiresAt > now()) return true;
-
-    const reason = current === auth.session ? 'session expired' : 'session revoked';
-    if (current === auth.session) {
-      closeWebSession(auth.sid, reason);
-    } else {
-      auth.session.sockets.delete(ws);
-      try { ws.close(4001, reason); } catch {}
-    }
-    return false;
-  }
+  const {
+    webSessions,
+    parseCookieSid, closeWebSession, pruneWebSessions,
+    issueSession, sessionCookieHeader, expiredSessionCookieHeader,
+    cookieSessionRecord, cookieSessionOk, cookieSocketValid, webAuthMode
+  } = createCookieAuth({
+    now, ttlSec: WEB_SESSION_TTL_SEC, maxSessions: MAX_WEB_SESSIONS,
+    requestIsSecure, trustProxy, proxyOrigin, authOk, token
+  });
   const webSessionPruner = setInterval(pruneWebSessions, 60000);
   webSessionPruner.unref?.();
-  function webAuthMode(url, req) {
-    if (authOk(url, req, token)) return 'token';
-    return cookieSessionOk(req) ? 'cookie' : null;
-  }
   ensureTmuxAvailable({ autoInstall: false });
   const ptyModule = await import('node-pty');
   const { WebSocketServer } = await import('ws');
   const pty = ptyModule.default || ptyModule;
   const sessions = new Map();
+
+  const {
+    sessionKey, sessionsForProject,
+    resolveSessionPeerId, sessionBindingForSerialize,
+    serializeBindingSummary, serializeSession,
+    broadcast, hasOpenClients, closeSessionClients
+  } = createSessionSerialize({ sessions, cookieSocketValid, ctx, sameResolvedPath });
+  const { cursorEscape, tmuxSnapshot, refreshTmuxSnapshot, scheduleTmuxReplace, startTmuxReplacePoller, startTmuxStream, stopTmuxStream } = createTmuxStream({ broadcast, now, refreshPeerIoHeartbeat, bufferDirectory, withBufferDirectoryLease, shellQuoteArg, ctx });
   const projectContexts = new Map();
   const prepared = await prepareLocalBus(ctx, opts);
 
@@ -3158,13 +2013,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     );
   }
 
-  function sessionKey(projectCtx, id) {
-    return `${projectCtx.root}\u0000${id}`;
-  }
-
-  function sessionsForProject(projectCtx) {
-    return [...sessions.values()].filter((session) => sameResolvedPath(session.root, projectCtx.root));
-  }
 
   function getSession(projectCtx, id, db = null) {
     const direct = sessions.get(sessionKey(projectCtx, id));
@@ -3181,8 +2029,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function readActionToken(input, req) {
-    const headerToken = req.headers['x-hcc-session-token'];
-    return String(input.action_token || input.actionToken || headerToken || '').trim();
+    const headerToken = req.headers["x-hcc-session-token"];
+    return String(input.action_token || input.actionToken || headerToken || "").trim();
   }
 
   function resolveWebActionSession(projectCtx, peer, input, req) {
@@ -3193,22 +2041,20 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     } finally {
       db.close();
     }
-    if (!session || session.status !== 'running') {
-      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action requires a running managed session for ${peer}`, { peer });
+    if (!session || session.status !== "running") {
+      throw new CliError("PEER_IDENTITY_REQUIRED", "Web peer action requires a running managed session for " + peer, { peer });
     }
     const actorPeer = session.peerId || peer;
     if (actorPeer !== peer && session.id !== peer) {
-      throw new CliError('PEER_IDENTITY_MISMATCH', `Web peer action target ${peer} does not match managed session ${actorPeer}`, {
-        peer,
-        actor_peer: actorPeer,
-        session_id: session.id
+      throw new CliError("PEER_IDENTITY_MISMATCH", "Web peer action target " + peer + " does not match managed session " + actorPeer, {
+        peer, actor_peer: actorPeer, session_id: session.id
       });
     }
     const provided = readActionToken(input, req);
     const authorized = Boolean(provided) && [...(session.actionTokens || [])]
       .some((candidate) => tokenMatches(provided, candidate));
     if (!authorized) {
-      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action for ${peer} requires the managed session action token`, { peer });
+      throw new CliError("PEER_IDENTITY_REQUIRED", "Web peer action for " + peer + " requires the managed session action token", { peer });
     }
     return actorPeer;
   }
@@ -3216,7 +2062,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function knownPeerIds(projectCtx) {
     const db = connectWebProject(projectCtx);
     try {
-      return db.prepare('SELECT id FROM peers').all().map((row) => row.id);
+      return db.prepare("SELECT id FROM peers").all().map((row) => row.id);
     } finally {
       db.close();
     }
@@ -3228,7 +2074,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       ...knownPeerIds(projectCtx)
     ], kind);
   }
-
   rememberProject(ctx);
   for (const project of readProjectRegistry()) {
     projectContexts.set(project.root, contextForProject(project.root, project.db, { json: ctx.json }));
@@ -3887,183 +2732,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const gcPoller = setInterval(runAutoGc, 6 * 60 * 60 * 1000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
-  function resolveSessionPeerId(db, session) {
-    if (!session) return null;
-    if (!db) return session.peerId || session.id || null;
-
-    if (session.type === 'tmux' && session.pane) {
-      const byTarget = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE runtime_target = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.pane);
-      if (byTarget?.peer) {
-        session.peerId = byTarget.peer;
-        return byTarget.peer;
-      }
-    }
-
-    if (session.id) {
-      const byRuntime = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE runtime_session_id = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.id);
-      if (byRuntime?.peer) {
-        session.peerId = byRuntime.peer;
-        return byRuntime.peer;
-      }
-
-      const byPeer = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE peer = ?
-        LIMIT 1
-      `).get(session.id);
-      if (byPeer?.peer) {
-        session.peerId = byPeer.peer;
-        return byPeer.peer;
-      }
-    }
-
-    session.peerId = session.peerId || session.id || null;
-    return session.peerId;
-  }
-
-  function sessionBindingForSerialize(db, session, peerId) {
-    if (!session) return null;
-    if (!db) return session.binding || null;
-
-    if (session.type === 'tmux' && session.pane) {
-      const byTarget = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE runtime_target = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.pane);
-      if (byTarget) return byTarget;
-    }
-
-    for (const peer of [peerId, session.peerId, session.id]) {
-      if (!peer) continue;
-      const byPeer = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE peer = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(peer);
-      if (byPeer) return byPeer;
-    }
-
-    if (session.id) {
-      const byRuntime = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE runtime_session_id = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.id);
-      if (byRuntime) return byRuntime;
-    }
-
-    return session.binding || null;
-  }
-
-  function serializeBindingSummary(binding, session) {
-    if (!binding) return null;
-    return {
-      peer: binding.peer || session?.peerId || session?.id || null,
-      provider: binding.provider || session?.kind || 'other',
-      provider_session_id: binding.provider_session_id || null,
-      provider_session_name: binding.provider_session_name || null,
-      resume_mode: binding.resume_mode || null,
-      resume_arg: binding.resume_arg || null,
-      command: binding.command || null,
-      transport: binding.transport || session?.type || null,
-      runtime_session_id: binding.runtime_session_id || session?.id || null,
-      runtime_target: binding.runtime_target || session?.pane || null,
-      created_at: binding.created_at || null,
-      updated_at: binding.updated_at || null
-    };
-  }
-
-  function serializeSession(session, db = null) {
-    const peerId = resolveSessionPeerId(db, session);
-    const binding = serializeBindingSummary(sessionBindingForSerialize(db, session, peerId), session);
-    const providerSessionLabel = binding?.provider_session_id || binding?.provider_session_name || null;
-    return {
-      id: session.id,
-      peer_id: peerId,
-      kind: session.kind,
-      role: session.role,
-      command: session.command,
-      cwd: session.cwd,
-      pid: session.pid,
-      pane: session.pane || null,
-      root: session.root || session.ctx?.root || ctx.root,
-      status: session.status,
-      type: session.type || 'pty',
-      created_at: session.createdAt,
-      exited_at: session.exitedAt || null,
-      binding,
-      provider_session_known: Boolean(providerSessionLabel),
-      provider_session_label: providerSessionLabel,
-      // action_token is intentionally NOT serialized here: it used to be leaked
-      // to every client via GET /api/sessions. It is now delivered only to the
-      // client that opens the session's terminal WebSocket (see the snapshot
-      // frame), so only the controlling client can use it (net-05).
-      warning: session.warning || null
-    };
-  }
-
-  function broadcast(session, payload) {
-    const text = JSON.stringify(payload);
-    for (const client of [...session.clients]) {
-      if (!cookieSocketValid(client)) {
-        session.clients.delete(client);
-        continue;
-      }
-      if (client.readyState === client.OPEN) client.send(text);
-    }
-  }
-
-  function hasOpenClients(session) {
-    if (!session?.clients?.size) return false;
-    let open = false;
-    for (const client of [...session.clients]) {
-      if (!cookieSocketValid(client)) {
-        session.clients.delete(client);
-        continue;
-      }
-      if (client.readyState === client.OPEN || client.readyState === 1) {
-        open = true;
-      } else {
-        session.clients.delete(client);
-      }
-    }
-    return open;
-  }
-
-  function closeSessionClients(session) {
-    if (!session) return;
-    session.actionTokens?.clear();
-    if (!session.clients?.size) return;
-    for (const client of [...session.clients]) {
-      try {
-        if (client.readyState === client.OPEN || client.readyState === 1) client.close(1001, 'runtime stopping');
-        else if (typeof client.terminate === 'function') client.terminate();
-      } catch {
-        try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
-      }
-    }
-  }
-
   function detachTmuxSession(session, status = 'detached') {
     stopTmuxStream(session);
     if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }
@@ -4102,170 +2770,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
 
   // Build the escape that places + shows/hides the cursor at a viewport cell,
   // used only to seed the initial snapshot (live output carries its own cursor).
-  function cursorEscape(payload) {
-    if (!payload) return '';
-    return '[' + (payload.row + 1) + ';' + (payload.col + 1) + 'H' +
-      (payload.visible ? '[?25h' : '[?25l');
-  }
-
-  function tmuxSnapshot(session) {
-    const captured = tmuxCapturePane(session.pane);
-    return captured + cursorEscape(tmuxCursorPayload(captured, tmuxCursorInfo(session.pane)));
-  }
-
-  function refreshTmuxSnapshot(session) {
-    if (session.type !== 'tmux' || !session.pane) return session.buffer || '';
-    try {
-      session.buffer = tmuxSnapshot(session);
-    } catch {
-      // Keep the previous buffer if the pane disappears during capture.
-    }
-    return session.buffer || '';
-  }
-
-  function scheduleTmuxReplace(session) {
-    if (session.type !== 'tmux' || !session.pane) return;
-    if (session.replaceTimer) clearTimeout(session.replaceTimer);
-    session.replaceTimer = setTimeout(() => {
-      session.replaceTimer = null;
-      session.lastBroadcastTime = Date.now();
-      broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
-    }, 80);
-  }
-
-  // Stream the tmux pane's RAW output (escape sequences and all) into the
-  // browser via `tmux pipe-pane`, so xterm.js renders incrementally — no
-  // screenshot-poll, no full-screen reset, no flicker — and the program's own
-  // cursor sequences are mirrored verbatim (works for bash, codex, claude, vim).
-  function startTmuxReplacePoller(session, warning = null) {
-    if (session.replacePoller) clearInterval(session.replacePoller);
-    if (warning) {
-      session.warning = {
-        code: 'TMUX_STREAM_FALLBACK',
-        message: `Raw tmux streaming unavailable; using capture polling: ${warning}`
-      };
-    }
-    session.lastBroadcastTime = Date.now();
-    session.replacePoller = setInterval(() => {
-      if (session.status !== 'running') return;
-      if (Date.now() - (session.lastBroadcastTime || 0) > 4000) {
-        session.lastBroadcastTime = Date.now();
-        broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });
-      }
-    }, 1600);
-  }
-
-  function startTmuxStream(session) {
-    const safePane = String(session.pane).replace(/[^A-Za-z0-9_-]/g, '');
-    const safeId = String(session.id).replace(/[^A-Za-z0-9_.-]/g, '_');
-    const streamDirectory = bufferDirectory(session.ctx || ctx);
-    fs.mkdirSync(streamDirectory, { recursive: true });
-    const pipeFile = path.join(streamDirectory, `tmux-${safePane}-${safeId}.pipe`);
-    session.pipeFile = pipeFile;
-    // Restored panes may still have pipe-pane writers from a previous runtime.
-    // Disable first so tmux tears down the stale writer before this runtime
-    // installs its own FIFO reader.
-    try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
-    // Capture the existing screen once for the initial paint; pipe-pane only
-    // forwards output produced after it is enabled.
-    try {
-      session.buffer = tmuxSnapshot(session);
-    } catch {}
-
-    // Use a FIFO rather than an append-only regular file. The old file-backed
-    // implementation capped session.buffer but let .hello-cc/bufs grow forever
-    // for long-lived tmux panes.
-    try {
-      withBufferDirectoryLease(path.dirname(pipeFile), () => {
-        fs.rmSync(pipeFile, { force: true });
-        const mkfifo = spawnSync('mkfifo', [pipeFile], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe']
-        });
-        if (mkfifo.status !== 0) {
-          const message = (mkfifo.stderr || mkfifo.stdout || '').trim() || 'mkfifo failed';
-          throw new CliError('TMUX_STREAM_ERROR', message);
-        }
-        try { fs.chmodSync(pipeFile, 0o600); } catch {}
-        session.streamFd = fs.openSync(pipeFile, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-      });
-    } catch (err) {
-      const message = err?.message || String(err);
-      stopTmuxStream(session);
-      startTmuxReplacePoller(session, message);
-      return 'poll';
-    }
-
-    // Enable raw output piping after the read end is open. This avoids the
-    // old "enable pipe, then seek to EOF" window that could skip early output.
-    try {
-      runTmux(['pipe-pane', '-t', session.pane, `cat > ${shellQuoteArg(pipeFile)}`]);
-    } catch (err) {
-      stopTmuxStream(session);
-      startTmuxReplacePoller(session, err?.message || String(err));
-      return 'poll';
-    }
-    session.streamPoller = setInterval(() => {
-      try {
-        if (session.streamFd === null || session.streamFd === undefined) return;
-        const chunks = [];
-        for (;;) {
-          const buf = Buffer.alloc(65536);
-          let bytes = 0;
-          try {
-            bytes = fs.readSync(session.streamFd, buf, 0, buf.length, null);
-          } catch (err) {
-            if (['EAGAIN', 'EWOULDBLOCK'].includes(err?.code)) break;
-            throw err;
-          }
-          if (bytes <= 0) break;
-          chunks.push(buf.subarray(0, bytes));
-          if (bytes < buf.length) break;
-        }
-        if (!chunks.length) return;
-        const data = Buffer.concat(chunks).toString();
-        session.buffer += data;
-        if (session.buffer.length > 250000) session.buffer = session.buffer.slice(-200000);
-        session.lastBroadcastTime = Date.now();
-        broadcast(session, { type: 'data', data });
-        refreshPeerIoHeartbeat(session);
-      } catch {
-        if (session.streamFd !== null && session.streamFd !== undefined) {
-          try { fs.closeSync(session.streamFd); } catch {}
-          session.streamFd = null;
-        }
-      }
-    }, 40);
-
-    // Fallback replace poller: if the FIFO produces no data for N seconds
-    // (e.g. pipe-pane output is fully buffered), send a fresh capture-pane
-    // snapshot so the browser stays current. This also recovers from any
-    // silent FIFO-read failures on restored panes.
-    startTmuxReplacePoller(session);
-    return 'stream';
-  }
-
-  function stopTmuxStream(session) {
-    if (session.streamPoller) { clearInterval(session.streamPoller); session.streamPoller = null; }
-    if (session.replacePoller) { clearInterval(session.replacePoller); session.replacePoller = null; }
-    if (session.replaceTimer) { clearTimeout(session.replaceTimer); session.replaceTimer = null; }
-    if (session.inputRefreshTimer) { clearTimeout(session.inputRefreshTimer); session.inputRefreshTimer = null; }
-    // Turn piping back off for this pane (no command toggles it off).
-    try { runTmux(['pipe-pane', '-t', session.pane]); } catch {}
-    if (session.streamFd !== null && session.streamFd !== undefined) {
-      try { fs.closeSync(session.streamFd); } catch {}
-      session.streamFd = null;
-    }
-    if (session.pipeFile) {
-      try {
-        withBufferDirectoryLease(path.dirname(session.pipeFile), () => {
-          fs.unlinkSync(session.pipeFile);
-        });
-      } catch {}
-      session.pipeFile = null;
-    }
-  }
-
   function tmuxSessionNameForPane(pane) {
     if (!pane) return null;
     try {
@@ -8965,86 +7469,6 @@ async function cmdGc(ctx, args) {
 
 // ─── hcc doctor ─────────────────────────────────────────────────────────────
 // Health self-check: SQLite integrity, schema version, WAL/DB size, row counts.
-async function cmdDoctor(ctx, args) {
-  if (wantsHelp(args)) {
-    console.log(`${CLI_NAME} doctor [--json]
-
-Runs a read-only health check on the project database: PRAGMA integrity_check,
-schema compatibility, persistent journal mode, DB and WAL file sizes, and
-per-table row counts. Exits non-zero for corruption or an unsupported schema.
-`);
-    return;
-  }
-  const db = connectReadOnly(ctx);
-  let report;
-  try {
-    const integrity = db.prepare('PRAGMA integrity_check').get();
-    const quick = db.prepare('PRAGMA quick_check').get();
-    const schemaVersion = readSchemaVersion(db);
-    const journalMode = db.prepare('PRAGMA journal_mode').get();
-    const synchronous = db.prepare('PRAGMA synchronous').get();
-    const walAutocheckpoint = db.prepare('PRAGMA wal_autocheckpoint').get();
-    const userVersion = db.prepare('PRAGMA user_version').get();
-    const fk = db.prepare('PRAGMA foreign_keys').get();
-    const counts = {};
-    for (const table of ['peers', 'peer_bindings', 'tasks', 'messages', 'message_reads', 'locks', 'handoffs', 'events']) {
-      try { counts[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n; } catch { counts[table] = null; }
-    }
-    report = {
-      root: ctx.root,
-      db: ctx.dbPath,
-      integrity_check: integrity ? Object.values(integrity)[0] : null,
-      quick_check: quick ? Object.values(quick)[0] : null,
-      schema_version: schemaVersion,
-      supported_schema_version: DB_SCHEMA_VERSION,
-      schema_compatible: schemaVersion > 0 && schemaVersion <= DB_SCHEMA_VERSION,
-      migration_required: schemaVersion > 0 && schemaVersion < DB_SCHEMA_VERSION,
-      user_version: userVersion ? Object.values(userVersion)[0] : 0,
-      journal_mode: journalMode ? Object.values(journalMode)[0] : null,
-      diagnostic_connection: {
-        synchronous: synchronous ? Object.values(synchronous)[0] : null,
-        wal_autocheckpoint: walAutocheckpoint ? Object.values(walAutocheckpoint)[0] : null,
-        foreign_keys: fk ? Object.values(fk)[0] : null
-      },
-      runtime_connection_defaults: {
-        synchronous: 'NORMAL',
-        wal_autocheckpoint: 1000,
-        foreign_keys: true
-      },
-      row_counts: counts
-    };
-  } finally {
-    db.close();
-  }
-  // File sizes (best-effort).
-  try {
-    report.db_size_bytes = fs.statSync(ctx.dbPath).size;
-    const walPath = `${ctx.dbPath}-wal`;
-    report.wal_size_bytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
-  } catch {}
-
-  const healthy = report.integrity_check === 'ok' &&
-    report.quick_check === 'ok' &&
-    report.schema_compatible;
-  printResult(ctx, report, (r) => {
-    const lines = [
-      `doctor (${r.root}):`,
-      `  integrity_check: ${r.integrity_check}`,
-      `  quick_check:     ${r.quick_check}`,
-      `  schema:          ${r.schema_version} (supported ${r.supported_schema_version}; ${r.schema_compatible ? (r.migration_required ? 'migration available' : 'compatible') : 'unsupported'})`,
-      `  journal_mode:    ${r.journal_mode}`,
-      `  diagnostic connection: synchronous=${r.diagnostic_connection.synchronous}  wal_autocheckpoint=${r.diagnostic_connection.wal_autocheckpoint}  foreign_keys=${r.diagnostic_connection.foreign_keys}`,
-      `  db size:         ${r.db_size_bytes ?? '?'} bytes${r.wal_size_bytes ? `  (wal ${r.wal_size_bytes})` : ''}`,
-      `  rows:            ` + Object.entries(r.row_counts).map(([k, v]) => `${k}=${v}`).join('  ')
-    ];
-    return lines.join('\n');
-  });
-  if (!healthy) process.exitCode = 1;
-}
-
-// ─── hcc find-root ───────────────────────────────────────────────────────────
-// Used by shim scripts: prints the current hcc project path.
-
 async function cmdFindRoot(ctx, args) {
   const opts = parseOpts(args);
   if (process.env.HCC_ROOT) {
