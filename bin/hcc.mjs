@@ -37,6 +37,7 @@ import { createEventHelpers } from '../lib/db/events.mjs';
 import { createConnectionHelpers } from '../lib/db/connection.mjs';
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
 import { createCookieAuth } from '../lib/web/cookie-auth.mjs';
+import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { createMsgCommands } from '../lib/cli/commands/msg.mjs';
 import { createCoordinationCommands } from '../lib/cli/commands/coordination.mjs';
 import { createLockCommands } from '../lib/cli/commands/lock.mjs';
@@ -1885,6 +1886,13 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const { WebSocketServer } = await import('ws');
   const pty = ptyModule.default || ptyModule;
   const sessions = new Map();
+
+  const {
+    sessionKey, sessionsForProject,
+    resolveSessionPeerId, sessionBindingForSerialize,
+    serializeBindingSummary, serializeSession,
+    broadcast, hasOpenClients, closeSessionClients
+  } = createSessionSerialize({ sessions, cookieSocketValid, ctx, sameResolvedPath });
   const projectContexts = new Map();
   const prepared = await prepareLocalBus(ctx, opts);
 
@@ -2001,13 +2009,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     );
   }
 
-  function sessionKey(projectCtx, id) {
-    return `${projectCtx.root}\u0000${id}`;
-  }
-
-  function sessionsForProject(projectCtx) {
-    return [...sessions.values()].filter((session) => sameResolvedPath(session.root, projectCtx.root));
-  }
 
   function getSession(projectCtx, id, db = null) {
     const direct = sessions.get(sessionKey(projectCtx, id));
@@ -2024,8 +2025,8 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   }
 
   function readActionToken(input, req) {
-    const headerToken = req.headers['x-hcc-session-token'];
-    return String(input.action_token || input.actionToken || headerToken || '').trim();
+    const headerToken = req.headers["x-hcc-session-token"];
+    return String(input.action_token || input.actionToken || headerToken || "").trim();
   }
 
   function resolveWebActionSession(projectCtx, peer, input, req) {
@@ -2036,22 +2037,20 @@ async function cmdWeb(ctx, args, startMeta = {}) {
     } finally {
       db.close();
     }
-    if (!session || session.status !== 'running') {
-      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action requires a running managed session for ${peer}`, { peer });
+    if (!session || session.status !== "running") {
+      throw new CliError("PEER_IDENTITY_REQUIRED", "Web peer action requires a running managed session for " + peer, { peer });
     }
     const actorPeer = session.peerId || peer;
     if (actorPeer !== peer && session.id !== peer) {
-      throw new CliError('PEER_IDENTITY_MISMATCH', `Web peer action target ${peer} does not match managed session ${actorPeer}`, {
-        peer,
-        actor_peer: actorPeer,
-        session_id: session.id
+      throw new CliError("PEER_IDENTITY_MISMATCH", "Web peer action target " + peer + " does not match managed session " + actorPeer, {
+        peer, actor_peer: actorPeer, session_id: session.id
       });
     }
     const provided = readActionToken(input, req);
     const authorized = Boolean(provided) && [...(session.actionTokens || [])]
       .some((candidate) => tokenMatches(provided, candidate));
     if (!authorized) {
-      throw new CliError('PEER_IDENTITY_REQUIRED', `Web peer action for ${peer} requires the managed session action token`, { peer });
+      throw new CliError("PEER_IDENTITY_REQUIRED", "Web peer action for " + peer + " requires the managed session action token", { peer });
     }
     return actorPeer;
   }
@@ -2059,7 +2058,7 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   function knownPeerIds(projectCtx) {
     const db = connectWebProject(projectCtx);
     try {
-      return db.prepare('SELECT id FROM peers').all().map((row) => row.id);
+      return db.prepare("SELECT id FROM peers").all().map((row) => row.id);
     } finally {
       db.close();
     }
@@ -2071,7 +2070,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
       ...knownPeerIds(projectCtx)
     ], kind);
   }
-
   rememberProject(ctx);
   for (const project of readProjectRegistry()) {
     projectContexts.set(project.root, contextForProject(project.root, project.db, { json: ctx.json }));
@@ -2730,183 +2728,6 @@ async function cmdWeb(ctx, args, startMeta = {}) {
   const gcPoller = setInterval(runAutoGc, 6 * 60 * 60 * 1000);
 
   // ── Serialize + broadcast helpers ─────────────────────────────────────────
-  function resolveSessionPeerId(db, session) {
-    if (!session) return null;
-    if (!db) return session.peerId || session.id || null;
-
-    if (session.type === 'tmux' && session.pane) {
-      const byTarget = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE runtime_target = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.pane);
-      if (byTarget?.peer) {
-        session.peerId = byTarget.peer;
-        return byTarget.peer;
-      }
-    }
-
-    if (session.id) {
-      const byRuntime = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE runtime_session_id = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.id);
-      if (byRuntime?.peer) {
-        session.peerId = byRuntime.peer;
-        return byRuntime.peer;
-      }
-
-      const byPeer = db.prepare(`
-        SELECT peer
-        FROM peer_bindings
-        WHERE peer = ?
-        LIMIT 1
-      `).get(session.id);
-      if (byPeer?.peer) {
-        session.peerId = byPeer.peer;
-        return byPeer.peer;
-      }
-    }
-
-    session.peerId = session.peerId || session.id || null;
-    return session.peerId;
-  }
-
-  function sessionBindingForSerialize(db, session, peerId) {
-    if (!session) return null;
-    if (!db) return session.binding || null;
-
-    if (session.type === 'tmux' && session.pane) {
-      const byTarget = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE runtime_target = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.pane);
-      if (byTarget) return byTarget;
-    }
-
-    for (const peer of [peerId, session.peerId, session.id]) {
-      if (!peer) continue;
-      const byPeer = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE peer = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(peer);
-      if (byPeer) return byPeer;
-    }
-
-    if (session.id) {
-      const byRuntime = db.prepare(`
-        SELECT *
-        FROM peer_bindings
-        WHERE runtime_session_id = ?
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-      `).get(session.id);
-      if (byRuntime) return byRuntime;
-    }
-
-    return session.binding || null;
-  }
-
-  function serializeBindingSummary(binding, session) {
-    if (!binding) return null;
-    return {
-      peer: binding.peer || session?.peerId || session?.id || null,
-      provider: binding.provider || session?.kind || 'other',
-      provider_session_id: binding.provider_session_id || null,
-      provider_session_name: binding.provider_session_name || null,
-      resume_mode: binding.resume_mode || null,
-      resume_arg: binding.resume_arg || null,
-      command: binding.command || null,
-      transport: binding.transport || session?.type || null,
-      runtime_session_id: binding.runtime_session_id || session?.id || null,
-      runtime_target: binding.runtime_target || session?.pane || null,
-      created_at: binding.created_at || null,
-      updated_at: binding.updated_at || null
-    };
-  }
-
-  function serializeSession(session, db = null) {
-    const peerId = resolveSessionPeerId(db, session);
-    const binding = serializeBindingSummary(sessionBindingForSerialize(db, session, peerId), session);
-    const providerSessionLabel = binding?.provider_session_id || binding?.provider_session_name || null;
-    return {
-      id: session.id,
-      peer_id: peerId,
-      kind: session.kind,
-      role: session.role,
-      command: session.command,
-      cwd: session.cwd,
-      pid: session.pid,
-      pane: session.pane || null,
-      root: session.root || session.ctx?.root || ctx.root,
-      status: session.status,
-      type: session.type || 'pty',
-      created_at: session.createdAt,
-      exited_at: session.exitedAt || null,
-      binding,
-      provider_session_known: Boolean(providerSessionLabel),
-      provider_session_label: providerSessionLabel,
-      // action_token is intentionally NOT serialized here: it used to be leaked
-      // to every client via GET /api/sessions. It is now delivered only to the
-      // client that opens the session's terminal WebSocket (see the snapshot
-      // frame), so only the controlling client can use it (net-05).
-      warning: session.warning || null
-    };
-  }
-
-  function broadcast(session, payload) {
-    const text = JSON.stringify(payload);
-    for (const client of [...session.clients]) {
-      if (!cookieSocketValid(client)) {
-        session.clients.delete(client);
-        continue;
-      }
-      if (client.readyState === client.OPEN) client.send(text);
-    }
-  }
-
-  function hasOpenClients(session) {
-    if (!session?.clients?.size) return false;
-    let open = false;
-    for (const client of [...session.clients]) {
-      if (!cookieSocketValid(client)) {
-        session.clients.delete(client);
-        continue;
-      }
-      if (client.readyState === client.OPEN || client.readyState === 1) {
-        open = true;
-      } else {
-        session.clients.delete(client);
-      }
-    }
-    return open;
-  }
-
-  function closeSessionClients(session) {
-    if (!session) return;
-    session.actionTokens?.clear();
-    if (!session.clients?.size) return;
-    for (const client of [...session.clients]) {
-      try {
-        if (client.readyState === client.OPEN || client.readyState === 1) client.close(1001, 'runtime stopping');
-        else if (typeof client.terminate === 'function') client.terminate();
-      } catch {
-        try { if (typeof client.terminate === 'function') client.terminate(); } catch {}
-      }
-    }
-  }
-
   function detachTmuxSession(session, status = 'detached') {
     stopTmuxStream(session);
     if (session.exitPoller) { clearInterval(session.exitPoller); session.exitPoller = null; }

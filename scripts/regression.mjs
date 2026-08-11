@@ -6766,13 +6766,14 @@ async function syntaxAndHelp() {
   if (webUiTemplateSource.includes("sessionRuntimeNote(s) + (s.command || '')")) {
     fail('managed session display still uses command text as the primary runtime identity');
   }
+  const sessionSerializeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'), 'utf8');
   for (const expected of [
     'function sessionBindingForSerialize(db, session, peerId)',
     'function serializeBindingSummary(binding, session)',
     'provider_session_known: Boolean(providerSessionLabel)',
     'provider_session_label: providerSessionLabel'
   ]) {
-    if (!hccSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
+    if (!sessionSerializeSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
   }
   for (const expected of [
     'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
