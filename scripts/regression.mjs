@@ -6791,9 +6791,6 @@ async function syntaxAndHelp() {
     "const sender = 'web';",
     "auditActorPeer: 'web'",
     "auditSource: 'web'",
-    "addEvent(db, 'peer.start.requested'",
-    "addEvent(db, 'peer.attach.requested'",
-    "addEvent(db, 'peer.stop.requested'",
     "addEvent(eventDb, 'web.session.stop_requested'",
     "addEvent(db, 'tmux.session.gc'"
   ]) {
