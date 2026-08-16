@@ -1,44 +1,24 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
-import http from 'node:http';
-import https from 'node:https';
 import path from 'node:path';
 import process from 'node:process';
 import { randomBytes } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
-import { performance } from 'node:perf_hooks';
+
 import { setTimeout as sleep } from 'node:timers/promises';
-import { URL, fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+
 import { CliError } from '../lib/shared/errors.mjs';
 import { publicCliFailure } from '../lib/shared/errors.mjs';
-import { redactCliArgs, redactSecrets } from '../lib/shared/redact.mjs';
-import {
-  CLOCK_GRACE_SEC,
-  classifyClockDrift,
-  clockGraceSuppressed,
-  readClockGraceUntil
-} from '../lib/shared/clock-grace.mjs';
-import {
-  clockSafetyUnavailable,
-  observeClockSafety,
-  observeClockSafetyInTransaction,
-  previewClockSafety
-} from '../lib/core/coordination/clock-safety.mjs';
-import {
-  DB_SCHEMA_VERSION,
-  execWithBusyRetry,
-  readSchemaVersion,
-  tx
-} from '../lib/db/schema.mjs';
-import { initSchemaWithBackup } from '../lib/db/migration-backup.mjs';
+import { redactSecrets } from '../lib/shared/redact.mjs';
+import { clockGraceSuppressed, readClockGraceUntil } from '../lib/shared/clock-grace.mjs';
+import { clockSafetyUnavailable, observeClockSafety, observeClockSafetyInTransaction } from '../lib/core/coordination/clock-safety.mjs';
+import { DB_SCHEMA_VERSION, readSchemaVersion, tx } from '../lib/db/schema.mjs';
+
 import { createEventHelpers } from '../lib/db/events.mjs';
 import { createConnectionHelpers } from '../lib/db/connection.mjs';
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
-import { createCookieAuth } from '../lib/web/cookie-auth.mjs';
-import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
-import { createTmuxStream } from '../lib/web/tmux-stream.mjs';
+
 import { createMsgCommands } from '../lib/cli/commands/msg.mjs';
 import { createCoordinationCommands } from '../lib/cli/commands/coordination.mjs';
 import { createLockCommands } from '../lib/cli/commands/lock.mjs';
@@ -58,262 +38,50 @@ import { createUpCommand } from '../lib/cli/commands/up.mjs';
 import { createEvidenceRuntime } from '../lib/core/peers/evidence-runtime.mjs';
 import { createWebStartup } from '../lib/web/startup.mjs';
 import { createWebRuntime } from '../lib/web/runtime-main.mjs';
-import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
-import {
-  intOpt,
-  parseOpts,
-  positiveSafeIntOpt,
-  required,
-  splitGlobalArgs,
-  validateOpts,
-  wantsHelp
-} from '../lib/cli-args.mjs';
+
+import { intOpt, parseOpts, positiveSafeIntOpt, required, splitGlobalArgs, validateOpts, wantsHelp } from '../lib/cli-args.mjs';
 import { leaseDeadline, renewOwnedLocks } from '../lib/core/coordination/lease-renewal.mjs';
-import {
-  commandPath,
-  createContext as createCliContext,
-  packageRoot,
-  shellCommand as shellCommandWithQuote,
-  tailFile
-} from '../lib/cli-runtime.mjs';
+import { commandPath, createContext as createCliContext, shellCommand as shellCommandWithQuote } from '../lib/cli-runtime.mjs';
 import { createCoordinationState } from '../lib/coordination-state.mjs';
-import {
-  formatJson,
-  printResult,
-  shellExports,
-  shellQuoteArg,
-  table
-} from '../lib/format.mjs';
+import { formatJson, printResult, shellExports, shellQuoteArg, table } from '../lib/format.mjs';
 import { readPackageMeta } from '../lib/package-meta.mjs';
-import {
-  removeGuidanceBlocks as removeGuidanceBlocksForRoot,
-  writeGuidance as writeGuidanceForRoot
-} from '../lib/guidance.mjs';
-import {
-  contextForProject,
-  globalRuntimePath,
-  projectDbPath,
-  runtimePath,
-  webLogPath
-} from '../lib/runtime/paths.mjs';
-import {
-  clearRuntime,
-  readGlobalRuntimeFile,
-  readHealthyGlobalRuntime,
-  readHealthyRuntime,
-  readRuntime,
-  readRuntimeFile,
-  reclaimRuntimePointerFiles,
-  runtimeProcessIdentity,
-  writeGlobalRuntime,
-  writeRuntime
-} from '../lib/runtime/state.mjs';
-import { createFatalShutdownController } from '../lib/runtime/fatal-shutdown.mjs';
-import { runtimeBufferGcUnavailable, runtimeRequest } from '../lib/runtime/client.mjs';
-import {
-  applyBufferPlan,
-  bufferPlanGcCutoffs,
-  deferBufferPlan,
-  planBufferFiles,
-  pruneBufferFiles
-} from '../lib/runtime/buffer-gc.mjs';
-import {
-  applyClockSafeBufferPlan,
-  createBufferGcPlanStore
-} from '../lib/runtime/buffer-gc-protocol.mjs';
-import {
-  collectBufferEvidence,
-  externalBufferEvidence,
-  externalBufferOwnerKey,
-  externalBufferSessionIds,
-  readExternalBufferMetadata
-} from '../lib/runtime/buffer-evidence.mjs';
-import { withBufferDirectoryLease } from '../lib/runtime/buffer-directory-lease.mjs';
-import {
-  detectBranch,
-  detectRoot
-} from '../lib/project-context.mjs';
-import {
-  changedFiles,
-  normalizeListText
-} from '../lib/handoff.mjs';
-import {
-  annotateTasksWithLiveness,
-  taskOwnerStateText
-} from '../lib/core/peers/liveness.mjs';
-import {
-  normalizeStateResources,
-  renderStateSummary,
-  renderStatusSummary
-} from '../lib/ui/state-render.mjs';
+import { removeGuidanceBlocks as removeGuidanceBlocksForRoot, writeGuidance as writeGuidanceForRoot } from '../lib/guidance.mjs';
+import { globalRuntimePath, runtimePath } from '../lib/runtime/paths.mjs';
+import { readRuntime, reclaimRuntimePointerFiles } from '../lib/runtime/state.mjs';
+
+import { runtimeRequest } from '../lib/runtime/client.mjs';
+
+import { detectBranch, detectRoot } from '../lib/project-context.mjs';
+import { changedFiles, normalizeListText } from '../lib/handoff.mjs';
+import { annotateTasksWithLiveness, taskOwnerStateText } from '../lib/core/peers/liveness.mjs';
+import { normalizeStateResources, renderStateSummary, renderStatusSummary } from '../lib/ui/state-render.mjs';
 import { createHelpFunctions } from '../lib/ui/help.mjs';
 import { createMessageStore } from '../lib/core/coordination/messages.mjs';
 import { createTaskStore } from '../lib/core/coordination/tasks.mjs';
-import {
-  classifyPeerActivity,
-  peerEvidenceAllowsReap,
-  resolvePeerEvidence
-} from '../lib/core/peers/evidence.mjs';
+import { classifyPeerActivity } from '../lib/core/peers/evidence.mjs';
 import { refreshHookOwnerIdentity } from '../lib/core/peers/hook-owner.mjs';
-import {
-  conditionalTmuxKill,
-  conditionalTmuxRename,
-  finalizeTmuxGcBindingMutation,
-  prepareTmuxRestartBinding,
-  rollbackTmuxRestartBinding,
-  validateTmuxDestructiveEvidence,
-  validateTmuxGcBindingEvidence,
-  validateTmuxGcDeadProcessEvidence
-} from '../lib/core/peers/tmux-safety.mjs';
-import {
-  inspectProcessIdentity,
-  waitForLiveProcessIdentity
-} from '../lib/process/identity.mjs';
-import {
-  capturePtyStartupEvidence,
-  installPtyTerminationHandlers,
-  ptyStartupFailureDisposition,
-  ptyTerminationSignal,
-  stopPtyAfterStartupFailure,
-  trackPtyExit
-} from '../lib/process/pty-lifecycle.mjs';
-import {
-  parseTaskIds,
-  positiveIntOpt,
-  taskRowsText
-} from '../lib/task-cli.mjs';
-import {
-  LAUNCH_FINGERPRINT_ENV,
-  PROVIDER_STATE_ENV,
-  WEB_CHILD_ENV,
-  childSessionEnv,
-  isolatedEnvCommandArgs,
-  isRelaunchableProviderSession,
-  launchFingerprint,
-  providerRestartReason
-} from '../lib/core/sessions/launch.mjs';
-import {
-  expectedWebHost,
-  isLoopbackHost,
-  listenServer,
-  localRuntimeUrl,
-  makeWebToken,
-  nextSessionId,
-  publicRuntimeUrl,
-  rememberRuntimeToken,
-  requestUrl,
-  runtimeBaseUrl,
-  validateWebTokenOpts,
-  webRuntimeMatchesRequest
-} from '../lib/web/runtime.mjs';
-import {
-  authOk,
-  isLoopbackRemote,
-  readJsonRequest,
-  requestIsSecure,
-  requestMatchesProxyOrigin,
-  requestOriginMatches,
-  sendFile,
-  sendHttp,
-  sendJson,
-  tokenMatches
-} from '../lib/web/http.mjs';
+
+import { parseTaskIds, positiveIntOpt, taskRowsText } from '../lib/task-cli.mjs';
+import { childSessionEnv } from '../lib/core/sessions/launch.mjs';
+
+import { sendHttp } from '../lib/web/http.mjs';
 import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
-import {
-  API_VERSION,
-  apiVersionUnsupportedBody,
-  readHttpApiVersion,
-  readWebSocketApiVersion
-} from '../lib/web/api-version.mjs';
-import { ensureSelfSignedCert } from '../lib/web/tls.mjs';
+
 import * as webUiTemplate from '../lib/web/ui-template.mjs';
-import {
-  bindingFromRun,
-  buildPeerCommand,
-  defaultSessionCommand,
-  hasResumeOpts,
-  inferPeerKind
-} from '../lib/integrations/providers.mjs';
-import {
-  providerSessionParts,
-  providerSessionPeerId
-} from '../lib/core/peers/session.mjs';
-import {
-  bindingHasRuntime,
-  bindingFromDetected
-} from '../lib/core/peers/bindings.mjs';
+import { buildPeerCommand, inferPeerKind } from '../lib/integrations/providers.mjs';
+import { providerSessionParts, providerSessionPeerId } from '../lib/core/peers/session.mjs';
+import { bindingHasRuntime } from '../lib/core/peers/bindings.mjs';
 import { reconcileRunningPeerBindings } from '../lib/core/peers/reconcile.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
-import {
-  ensureTmuxAvailable,
-  runTmux,
-  tmuxCapturePane,
-  tmuxCursorInfo,
-  tmuxCursorPayload,
-  tmuxEnvironmentArgs,
-  tmuxHasSession,
-  tmuxKillSession,
-  tmuxLaunchFingerprint,
-  tmuxListSessionNames,
-  tmuxManagedSessionName,
-  tmuxManagedSessionNameMatches,
-  tmuxManagedSessionPrefixMatches,
-  tmuxPaneInfo,
-  tmuxProviderState,
-  tmuxSendLiteral,
-  tmuxSessionEnvironmentValue,
-  tmuxSessionHasClients
-} from '../lib/tmux.mjs';
-import {
-  lockArgv,
-  lockBaseResource,
-  lockLabel,
-  lockScope,
-  locksConflict,
-  normalizeLockScope,
-  scopedLockResource
-} from '../lib/core/coordination/locks.mjs';
-import {
-  captureLockAcquireSubject,
-  clockCandidatesFromLocks,
-  observeLockOwnerEvidence,
-  sameLockAcquireSubject
-} from '../lib/core/coordination/lock-evidence.mjs';
+
+import { lockBaseResource, lockLabel, lockScope, locksConflict, scopedLockResource } from '../lib/core/coordination/locks.mjs';
+import { captureLockAcquireSubject, observeLockOwnerEvidence, sameLockAcquireSubject } from '../lib/core/coordination/lock-evidence.mjs';
 import { runOptimisticEvidenceMutation } from '../lib/core/coordination/optimistic-evidence.mjs';
-import {
-  captureGcLockSubjects,
-  captureHistoryGcPlan,
-  createHistoryGcSnapshot,
-  finalizeGcLockSubjects,
-  finalizeHistoryGcBatches,
-  runWithHistoryGcSnapshotCleanup,
-  runWithHistoryGcSnapshotCleanupAsync
-} from '../lib/core/coordination/gc-plan.mjs';
-import {
-  assignTeamWorkers,
-  expandTeamWorkers,
-  inferTeamItems
-} from '../lib/core/coordination/teams.mjs';
-import {
-  autoPeerBasis,
-  autoPeerKind,
-  autoPeerProviderSession,
-  autoPeerResumeId,
-  autoPeerSessionId,
-  readAncestorCliInfo,
-  resolveCurrentPeer,
-  resumeIdFromArgs,
-  sanitizePeerPart,
-  shortHash
-} from '../lib/integrations/peers/identity.mjs';
+
+import { assignTeamWorkers, expandTeamWorkers, inferTeamItems } from '../lib/core/coordination/teams.mjs';
+import { autoPeerBasis, autoPeerKind, autoPeerProviderSession, autoPeerResumeId, autoPeerSessionId, readAncestorCliInfo, resolveCurrentPeer, resumeIdFromArgs, shortHash } from '../lib/integrations/peers/identity.mjs';
 import { inspectProviderProcess } from '../lib/integrations/peers/processes.mjs';
-import {
-  projectRecord,
-  readProjectRegistry,
-  registerProject,
-  registerProjectActivity,
-  writeProjectRegistry
-} from '../lib/runtime/projects.mjs';
+import { registerProjectActivity } from '../lib/runtime/projects.mjs';
 
 // Lazy-load lib modules (they may import node-pty which needs to be optional)
 const _libDir = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'lib');
@@ -431,8 +199,6 @@ const {
 
 const { connect, connectReadOnly, migrateRegisteredProjectDbs } = createConnectionHelpers({ now, dedupePeerBindings, redactedLogText });
 const { upsertPeer, touchPeer, touchCurrentPeer } = createPeerHelpers({ now, addEvent, liveProcessIdentity, detectBranch, registerProjectActivity, upsertCanonicalPeerBinding, autoPeerKind, autoPeerSessionId, autoPeerResumeId, autoPeerDefaults, autoPeerBasis, providerSessionParts });
-
-
 
 const {
   ackMessage,
@@ -751,7 +517,6 @@ function resolveTargetPeer(ctx, opts = {}, key = 'peer', kindHint = 'shell') {
   return resolveCurrentPeer(ctx, opts, key, kindHint);
 }
 
-
 function latestHookProviderSession(db, peer) {
   if (!peer) return null;
   try {
@@ -793,7 +558,6 @@ function writeGuidance(ctx) {
 function removeGuidanceBlocks(ctx) {
   return removeGuidanceBlocksForRoot(ctx.root);
 }
-
 
 // ─── hcc doctor ─────────────────────────────────────────────────────────────
 // Health self-check: SQLite integrity, schema version, WAL/DB size, row counts.

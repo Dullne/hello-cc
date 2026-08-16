@@ -6934,7 +6934,6 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
       !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
       !hccSource.includes("} from '../lib/runtime/client.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime/buffer-gc.mjs'") ||
       !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
       !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
       !hccSource.includes("} from '../lib/task-cli.mjs'") ||
@@ -6943,12 +6942,10 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../lib/core/peers/session.mjs'") ||
       !hccSource.includes("} from '../lib/core/peers/bindings.mjs'") ||
       !hccSource.includes("import { createPeerBindingStore } from '../lib/db/stores/peers.mjs'") ||
-      !hccSource.includes("} from '../lib/tmux.mjs'") ||
       !hccSource.includes("} from '../lib/core/coordination/locks.mjs'") ||
       !hccSource.includes("} from '../lib/core/coordination/teams.mjs'") ||
       !hccSource.includes("} from '../lib/integrations/peers/identity.mjs'") ||
       !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
-      !hccSource.includes("} from '../lib/web/runtime.mjs'") ||
       !hccSource.includes("} from '../lib/web/http.mjs'") ||
       !hccSource.includes("import * as webUiTemplate from '../lib/web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
