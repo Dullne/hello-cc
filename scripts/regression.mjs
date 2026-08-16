@@ -6519,7 +6519,9 @@ async function syntaxAndHelp() {
   for (const file of libModuleFiles()) {
     run(process.execPath, ['--check', path.join(repoRoot, file)]);
   }
-  const hccSource = fs.readFileSync(hccBin, 'utf8');
+  // bin/hcc.mjs is a thin entry; the CLI composition lives in lib/cli/app.mjs.
+  const hccSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'app.mjs'), 'utf8');
+  const binSource = fs.readFileSync(hccBin, 'utf8');
   const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
   const errorsCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'errors.mjs'), 'utf8');
   const sharedErrorsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shared', 'errors.mjs'), 'utf8');
@@ -6785,8 +6787,8 @@ async function syntaxAndHelp() {
     if (!sessionSerializeSource.includes(expected)) fail(`sessions API binding summary missing: ${expected}`);
   }
   for (const expected of [
-    'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
-    'import { createWebRuntime } from \'../lib/web/runtime-main.mjs\'',
+    'import { createWebPeerActions } from \'../web/peer-actions.mjs\'',
+    'import { createWebRuntime } from \'../web/runtime-main.mjs\'',
     'const { cmdWeb } = createWebRuntime({'
   ]) {
     if (!hccSource.includes(expected)) fail(`web peer action API wiring missing: ${expected}`);
@@ -6918,36 +6920,36 @@ async function syntaxAndHelp() {
       if (typeof mod[name] !== 'function') fail(`${moduleName} missing export: ${name}`);
     }
   }
-  if (!hccSource.includes("import { readPackageMeta } from '../lib/package-meta.mjs'") ||
-      !hccSource.includes("} from '../lib/cli-args.mjs'") ||
-      !hccSource.includes("import { CliError } from '../lib/shared/errors.mjs'") ||
-      !hccSource.includes("} from '../lib/db/schema.mjs'") ||
-      !hccSource.includes("} from '../lib/cli-runtime.mjs'") ||
-      !hccSource.includes("import { createCoordinationState } from '../lib/coordination-state.mjs'") ||
-      !hccSource.includes("import { createWebPeerActions } from '../lib/web/peer-actions.mjs'") ||
-      !hccSource.includes("} from '../lib/format.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime/paths.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime/state.mjs'") ||
-      !hccSource.includes("} from '../lib/project-context.mjs'") ||
-      !hccSource.includes("} from '../lib/handoff.mjs'") ||
-      !hccSource.includes("} from '../lib/core/peers/liveness.mjs'") ||
-      !hccSource.includes("} from '../lib/ui/state-render.mjs'") ||
-      !hccSource.includes("import { createHelpFunctions } from '../lib/ui/help.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime/client.mjs'") ||
-      !hccSource.includes("import { createMessageStore } from '../lib/core/coordination/messages.mjs'") ||
-      !hccSource.includes("import { createTaskStore } from '../lib/core/coordination/tasks.mjs'") ||
-      !hccSource.includes("} from '../lib/task-cli.mjs'") ||
-      !hccSource.includes("} from '../lib/core/sessions/launch.mjs'") ||
-      !hccSource.includes("} from '../lib/integrations/providers.mjs'") ||
-      !hccSource.includes("} from '../lib/core/peers/session.mjs'") ||
-      !hccSource.includes("} from '../lib/core/peers/bindings.mjs'") ||
-      !hccSource.includes("import { createPeerBindingStore } from '../lib/db/stores/peers.mjs'") ||
-      !hccSource.includes("} from '../lib/core/coordination/locks.mjs'") ||
-      !hccSource.includes("} from '../lib/core/coordination/teams.mjs'") ||
-      !hccSource.includes("} from '../lib/integrations/peers/identity.mjs'") ||
-      !hccSource.includes("} from '../lib/runtime/projects.mjs'") ||
-      !hccSource.includes("} from '../lib/web/http.mjs'") ||
-      !hccSource.includes("import * as webUiTemplate from '../lib/web/ui-template.mjs'") ||
+  if (!hccSource.includes("import { readPackageMeta } from '../package-meta.mjs'") ||
+      !hccSource.includes("} from '../cli-args.mjs'") ||
+      !hccSource.includes("import { CliError } from '../shared/errors.mjs'") ||
+      !hccSource.includes("} from '../db/schema.mjs'") ||
+      !hccSource.includes("} from '../cli-runtime.mjs'") ||
+      !hccSource.includes("import { createCoordinationState } from '../coordination-state.mjs'") ||
+      !hccSource.includes("import { createWebPeerActions } from '../web/peer-actions.mjs'") ||
+      !hccSource.includes("} from '../format.mjs'") ||
+      !hccSource.includes("} from '../runtime/paths.mjs'") ||
+      !hccSource.includes("} from '../runtime/state.mjs'") ||
+      !hccSource.includes("} from '../project-context.mjs'") ||
+      !hccSource.includes("} from '../handoff.mjs'") ||
+      !hccSource.includes("} from '../core/peers/liveness.mjs'") ||
+      !hccSource.includes("} from '../ui/state-render.mjs'") ||
+      !hccSource.includes("import { createHelpFunctions } from '../ui/help.mjs'") ||
+      !hccSource.includes("} from '../runtime/client.mjs'") ||
+      !hccSource.includes("import { createMessageStore } from '../core/coordination/messages.mjs'") ||
+      !hccSource.includes("import { createTaskStore } from '../core/coordination/tasks.mjs'") ||
+      !hccSource.includes("} from '../task-cli.mjs'") ||
+      !hccSource.includes("} from '../core/sessions/launch.mjs'") ||
+      !hccSource.includes("} from '../integrations/providers.mjs'") ||
+      !hccSource.includes("} from '../core/peers/session.mjs'") ||
+      !hccSource.includes("} from '../core/peers/bindings.mjs'") ||
+      !hccSource.includes("import { createPeerBindingStore } from '../db/stores/peers.mjs'") ||
+      !hccSource.includes("} from '../core/coordination/locks.mjs'") ||
+      !hccSource.includes("} from '../core/coordination/teams.mjs'") ||
+      !hccSource.includes("} from '../integrations/peers/identity.mjs'") ||
+      !hccSource.includes("} from '../runtime/projects.mjs'") ||
+      !hccSource.includes("} from '../web/http.mjs'") ||
+      !hccSource.includes("import * as webUiTemplate from '../web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
       !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
     fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');

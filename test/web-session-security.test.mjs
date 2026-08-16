@@ -139,8 +139,9 @@ test('active project requests refresh registry activity through the nonblocking 
   assert.match(rememberProject, /if \(activity\) registerProjectActivity\(normalized\)/);
   assert.match(rememberProject, /registerProject\(normalized, \{ nonblocking \}\)/);
   assert.match(webRuntimeSource, /\{ register: true, nonblocking: true \}/);
-  // webErrorStatus (REGISTRY_BUSY -> 503) stayed in bin/hcc.mjs
-  assert.match(hccSource, /REGISTRY_BUSY.*503/s);
+  // webErrorStatus (REGISTRY_BUSY -> 503) lives in lib/cli/app.mjs
+  const appSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'app.mjs'), 'utf8');
+  assert.match(appSource, /REGISTRY_BUSY.*503/s);
 });
 
 test('trusted proxy startup rejects either half of the pinned-origin contract', (t) => {
