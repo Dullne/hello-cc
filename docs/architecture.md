@@ -31,17 +31,21 @@ architectural idea: split by boundary, not by convenience.
 
 ## Current Pressure Points
 
-The codebase has already extracted many focused modules under `lib/`, including
-schema, runtime state, task/message stores, peer identity, provider command
-building, tmux helpers, Web HTTP helpers, and render helpers.
+The 2026-08 monolith split is complete: `bin/hcc.mjs` is a thin entrypoint that
+imports `lib/cli/app.mjs`. All composition (constants, shared helpers, command
+factory wiring, dispatch, `main()`) lives in `lib/cli/app.mjs`; command groups
+live in `lib/cli/commands/`; the Web runtime lives in `lib/web/`
+(`startup.mjs`, `runtime-main.mjs`, `cookie-auth.mjs`, `session-serialize.mjs`,
+`tmux-stream.mjs`); GC lives in `lib/cli/commands/gc.mjs` plus
+`lib/core/coordination/gc-plan.mjs`; runtime evidence helpers live in
+`lib/core/peers/evidence-runtime.mjs`.
 
 The remaining structural pressure is mostly:
 
-- `bin/hcc.mjs` still contains command dispatch, command handlers, Web server
-  setup, HTTP routes, WebSocket terminal handling, tmux session management, PTY
-  session management, external buffer adoption, and shutdown cleanup.
-- `cmdWeb()` is the largest mixed boundary. It should be treated as a Web
-  runtime subsystem, not as a normal CLI command body.
+- `lib/web/runtime-main.mjs` still hosts the whole `cmdWeb()` closure (HTTP
+  routes, WebSocket handling, tmux/PTY session management, external buffer
+  adoption, shutdown) as one unit. Splitting it further requires introducing an
+  explicit shared-state container first.
 - `scripts/regression.mjs` is a valuable full regression gate, but it should
   eventually become a runner over domain-specific regression modules.
 
@@ -174,10 +178,11 @@ scripts/
 
 ## Boundary Rules
 
-`bin/hcc.mjs` should become a thin entrypoint. It may parse global arguments,
-create the root context, invoke dispatch, and convert top-level errors to CLI
-output. It should not own Web routing, DB schema, tmux streaming, provider
-command construction, or task state machines.
+`bin/hcc.mjs` is a thin entrypoint: it imports `runCli()` from
+`lib/cli/app.mjs` and nothing else. Argument parsing, context creation,
+dispatch, and top-level error conversion live in `lib/cli/app.mjs`. Neither
+file should own Web routing, DB schema, tmux streaming, provider command
+construction, or task state machines.
 
 `lib/cli/` owns command parsing and command handlers. A command handler can
 open a database, call stores or core services, and print results. It should not
@@ -296,12 +301,15 @@ npm package contents stable unless the task explicitly says otherwise.
    re-export files temporarily if the import churn becomes too large.
 
 3. Split the Web runtime by subsystem.
-   Extract project selection, session manager, Web routes, WebSocket terminal
-   handling, tmux stream, PTY session, and external buffer adoption from
-   `cmdWeb()` in separate commits.
+   Partially done: cookie auth, session serialization, tmux streaming, and web
+   startup are separate modules. The remaining `cmdWeb()` closure
+   (project selection, session manager, Web routes, WebSocket terminal
+   handling, PTY session, external buffer adoption) still lives as one unit in
+   `lib/web/runtime-main.mjs`; extract it in separate commits after
+   introducing an explicit shared-state container.
 
-4. Make `bin/hcc.mjs` a thin entrypoint.
-   Move dispatch and command groups under `lib/cli/commands/`.
+4. Make `bin/hcc.mjs` a thin entrypoint. (Done in 2026-08: 6 lines, delegating
+   to `lib/cli/app.mjs`; command groups live under `lib/cli/commands/`.)
 
 5. Split regression tests by domain.
    Keep `npm test` as the single full regression command, but make it call

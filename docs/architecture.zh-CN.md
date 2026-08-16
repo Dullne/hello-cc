@@ -31,13 +31,19 @@ store、hooks、config、execution adapter 分开。hello-cc 不需要 Rust crat
 store、peer identity、provider command builder、tmux helper、Web HTTP helper
 和 render helper。
 
+2026-08 的单体拆分已完成：`bin/hcc.mjs` 是薄入口（6 行），只导入
+`lib/cli/app.mjs`。全部装配（常量、共享助手、命令工厂接线、dispatch、
+`main()`）在 `lib/cli/app.mjs`；命令组在 `lib/cli/commands/`；Web runtime 在
+`lib/web/`（startup、runtime-main、cookie-auth、session-serialize、
+tmux-stream）；GC 在 `lib/cli/commands/gc.mjs` 与
+`lib/core/coordination/gc-plan.mjs`；运行时证据助手在
+`lib/core/peers/evidence-runtime.mjs`。
+
 剩余结构压力主要在：
 
-- `bin/hcc.mjs` 仍包含 command dispatch、command handler、Web server setup、
-  HTTP routes、WebSocket terminal、tmux session 管理、PTY session 管理、
-  external buffer adoption 和 shutdown cleanup。
-- `cmdWeb()` 是最大的混合边界。它应该被视为 Web runtime 子系统，而不是普通
-  CLI command body。
+- `lib/web/runtime-main.mjs` 仍以单一闭包承载整个 `cmdWeb()`（HTTP routes、
+  WebSocket terminal、tmux/PTY session 管理、external buffer adoption、
+  shutdown）。进一步拆分需要先引入显式共享状态容器。
 - `scripts/regression.mjs` 是有价值的全量回归入口，但后续应该变成一个调用领域
   regression module 的 runner。
 
@@ -170,9 +176,10 @@ scripts/
 
 ## 边界规则
 
-`bin/hcc.mjs` 应该变成很薄的入口。它可以解析全局参数、创建 root context、调用
-dispatch，并把顶层错误转换为 CLI 输出。它不应该拥有 Web routing、DB schema、
-tmux streaming、provider command construction 或 task state machine。
+`bin/hcc.mjs` 是薄入口：只从 `lib/cli/app.mjs` 导入 `runCli()`。参数解析、
+context 创建、dispatch 和顶层错误转换都在 `lib/cli/app.mjs`。两个文件都
+不应该拥有 Web routing、DB schema、tmux streaming、provider command
+construction 或 task state machine。
 
 `lib/cli/` 负责命令解析和命令处理器。命令处理器可以打开数据库、调用 store 或
 core service，并打印结果。当逻辑可以放进 `core`、`runtime`、`terminal`、`web`
@@ -283,8 +290,8 @@ release -> shared
    分提交从 `cmdWeb()` 抽出 project selection、session manager、Web routes、
    WebSocket terminal、tmux stream、PTY session 和 external buffer adoption。
 
-4. 让 `bin/hcc.mjs` 变成薄入口。
-   把 dispatch 和 command groups 移到 `lib/cli/commands/`。
+4. 让 `bin/hcc.mjs` 变成薄入口。（2026-08 已完成：6 行，委托给
+   `lib/cli/app.mjs`；命令组在 `lib/cli/commands/`。）
 
 5. 按领域拆 regression。
    保持 `npm test` 是唯一全量回归命令，但让它调用 `scripts/regression/` 下的
