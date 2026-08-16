@@ -6534,7 +6534,7 @@ async function syntaxAndHelp() {
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
   const cmdWebSource = hccSource.slice(
     hccSource.indexOf('async function cmdWeb('),
-    hccSource.indexOf('async function cmdRun(', hccSource.indexOf('async function cmdWeb('))
+    hccSource.indexOf('async function cmdScan(', hccSource.indexOf('async function cmdWeb('))
   );
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
