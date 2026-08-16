@@ -6583,6 +6583,20 @@ async function syntaxAndHelp() {
   ]) {
     if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
+  // hccWebProcessMatches/splitProcessArgs/stopOrphanWebRuntimes moved to lib/web/startup.mjs
+  const webStartupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'startup.mjs'), 'utf8');
+  for (const expected of [
+    'function hccWebProcessMatches(',
+    'const { global, rest } = splitGlobalArgs(hccArgs);',
+    "if (rest[0] !== 'web') return false;",
+    'sameResolvedPath(global.root, ctx.root)',
+    'sameResolvedPath(global.db, ctx.dbPath)',
+    'async function stopOrphanWebRuntimes(',
+    'await stopOrphanWebRuntimes(ctx, existing.pid || null);',
+    'await stopOrphanWebRuntimes(ctx);'
+  ]) {
+    if (!webStartupSource.includes(expected)) fail(`web startup guard missing: ${expected}`);
+  }
   for (const expected of [
     'function listTmuxPanesOnce()',
     'let autoAttachScanInFlight = false;',
@@ -6591,16 +6605,7 @@ async function syntaxAndHelp() {
     'const attached = attachedTmuxState(ctx, db);',
     'function killOldTmuxForRebind(',
     'function providerSessionBindingMatches(',
-    'function hccWebProcessMatches(',
-    'function splitProcessArgs(line)',
-    'const { global, rest } = splitGlobalArgs(hccArgs);',
-    "if (rest[0] !== 'web') return false;",
-    'sameResolvedPath(global.root, ctx.root)',
-    'sameResolvedPath(global.db, ctx.dbPath)',
     'sameResolvedPath(',
-    'async function stopOrphanWebRuntimes(',
-    'await stopOrphanWebRuntimes(ctx, existing.pid || null);',
-    'await stopOrphanWebRuntimes(ctx);',
     'const restoredTmuxDbs = new Set();',
     'if (restoredTmuxDbs.has(dbKey)) continue;',
     'input.rebindOldTmux',

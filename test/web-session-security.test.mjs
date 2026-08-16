@@ -122,7 +122,9 @@ test('origin matching normalizes only default ports on the selected authority', 
 test('server uses the tested shared proxy helpers and requires a fixed proxy origin', () => {
   assert.doesNotMatch(hccSource, /function requestIsSecure\s*\(/);
   assert.doesNotMatch(hccSource, /function requestOriginMatches\s*\(/);
-  assert.match(hccSource, /--trust-proxy requires --proxy-origin/);
+  // proxyOriginForOpts moved to lib/web/startup.mjs
+  const startupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'startup.mjs'), 'utf8');
+  assert.match(startupSource, /--trust-proxy requires --proxy-origin/);
   assert.match(hccSource, /proxy_origin: proxyOrigin/);
   assert.match(hccSource, /requestMatchesProxyOrigin\(req, \{ trustProxy, proxyOrigin \}\)/);
   assert.match(hccSource, /PROXY_ORIGIN_MISMATCH/);
