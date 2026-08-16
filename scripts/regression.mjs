@@ -6534,7 +6534,7 @@ async function syntaxAndHelp() {
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
   const cmdWebSource = hccSource.slice(
     hccSource.indexOf('async function cmdWeb('),
-    hccSource.indexOf('async function cmdScan(', hccSource.indexOf('async function cmdWeb('))
+    hccSource.indexOf('// ─── hcc gc', hccSource.indexOf('async function cmdWeb('))
   );
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
@@ -6642,6 +6642,8 @@ async function syntaxAndHelp() {
   if (hccSource.includes("if (sessName) tmuxKillSession(sessName);")) {
     fail('web stop kill_tmux still kills tmux by session name without DB-proven guard');
   }
+  // tmux GC helpers moved to lib/cli/commands/tmux.mjs
+  const tmuxGcSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'tmux.mjs'), 'utf8');
   for (const expected of [
     'async function cmdTmux(',
     'async function planTmuxGc(',
@@ -6677,7 +6679,7 @@ async function syntaxAndHelp() {
     "SET transport = 'detached'",
     "addEvent(db, 'tmux.session.gc'"
   ]) {
-    if (!hccSource.includes(expected)) fail(`tmux gc guard missing: ${expected}`);
+    if (!tmuxGcSource.includes(expected)) fail(`tmux gc guard missing: ${expected}`);
   }
   const bindingFinalizerSource = tmuxSafetySource.slice(
     tmuxSafetySource.indexOf('export function finalizeTmuxGcBindingMutation('),
@@ -6791,10 +6793,13 @@ async function syntaxAndHelp() {
     "const sender = 'web';",
     "auditActorPeer: 'web'",
     "auditSource: 'web'",
-    "addEvent(eventDb, 'web.session.stop_requested'",
-    "addEvent(db, 'tmux.session.gc'"
+    "addEvent(eventDb, 'web.session.stop_requested'"
   ]) {
     if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
+  }
+  // tmux GC event emission moved to lib/cli/commands/tmux.mjs
+  if (!tmuxGcSource.includes("addEvent(db, 'tmux.session.gc'")) {
+    fail('web peer action API support missing: addEvent(db, \'tmux.session.gc\'');
   }
   const actionResolverSource = hccSource.slice(
     hccSource.indexOf('function resolveWebActionSession('),
