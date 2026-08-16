@@ -239,7 +239,7 @@ test('runtime pointer cleanup requires the exact current pid', (t) => {
 });
 
 test('Web fatal wiring retains one complete session shutdown path', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
   const serializeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'), 'utf8');
   assert.ok(serializeSource.includes('function closeSessionClients('), 'closeSessionClients moved to session-serialize.mjs');
   assert.match(source, /createFatalShutdownController/);

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('web runtime verifies a complete process identity before opening its listener', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
   const command = source.indexOf('async function cmdWeb(ctx, args, startMeta = {})');
   const identityWait = source.indexOf('await waitForLiveProcessIdentity(process.pid', command);
   const identityFailure = source.indexOf("'RUNTIME_IDENTITY_UNAVAILABLE'", identityWait);
@@ -20,7 +20,7 @@ test('web runtime verifies a complete process identity before opening its listen
 });
 
 test('startup auto-GC runs only after all tmux sessions are restored', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
   const restoreLoop = source.indexOf('const restoredTmuxDbs = new Set();');
   const requestHandler = source.indexOf('const handleWebRequest = async', restoreLoop);
   const startupGc = source.indexOf('runAutoGc();', restoreLoop);
@@ -31,7 +31,7 @@ test('startup auto-GC runs only after all tmux sessions are restored', () => {
 });
 
 test('external session reconciliation compares the current owner before treating a missing out file as exit', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
   const poller = source.indexOf('session.exitPoller = setInterval', source.indexOf('function adoptExternalSession'));
   const ownerRead = source.indexOf('const currentOwnerKey = externalBufferOwnerKey(currentMeta);', poller);
   const ownerMismatch = source.indexOf('currentOwnerKey !== session.externalOwnerKey', ownerRead);

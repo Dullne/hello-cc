@@ -14,14 +14,15 @@ import { webIndexHtml } from '../lib/web/ui-template.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccSource = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
+const webRuntimeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
 const cookieAuthSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
 
 function sourceBetween(start, end) {
-  const startIndex = hccSource.indexOf(start);
-  const endIndex = hccSource.indexOf(end, startIndex + start.length);
+  const startIndex = webRuntimeSource.indexOf(start);
+  const endIndex = webRuntimeSource.indexOf(end, startIndex + start.length);
   assert.notEqual(startIndex, -1, `missing source marker: ${start}`);
   assert.notEqual(endIndex, -1, `missing source marker: ${end}`);
-  return hccSource.slice(startIndex, endIndex);
+  return webRuntimeSource.slice(startIndex, endIndex);
 }
 
 test('one shared constant-time comparator protects per-connection action tokens', async () => {
@@ -125,9 +126,9 @@ test('server uses the tested shared proxy helpers and requires a fixed proxy ori
   // proxyOriginForOpts moved to lib/web/startup.mjs
   const startupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'startup.mjs'), 'utf8');
   assert.match(startupSource, /--trust-proxy requires --proxy-origin/);
-  assert.match(hccSource, /proxy_origin: proxyOrigin/);
-  assert.match(hccSource, /requestMatchesProxyOrigin\(req, \{ trustProxy, proxyOrigin \}\)/);
-  assert.match(hccSource, /PROXY_ORIGIN_MISMATCH/);
+  assert.match(webRuntimeSource, /proxy_origin: proxyOrigin/);
+  assert.match(webRuntimeSource, /requestMatchesProxyOrigin\(req, \{ trustProxy, proxyOrigin \}\)/);
+  assert.match(webRuntimeSource, /PROXY_ORIGIN_MISMATCH/);
 });
 
 test('active project requests refresh registry activity through the nonblocking throttle', () => {
@@ -137,7 +138,8 @@ test('active project requests refresh registry activity through the nonblocking 
   );
   assert.match(rememberProject, /if \(activity\) registerProjectActivity\(normalized\)/);
   assert.match(rememberProject, /registerProject\(normalized, \{ nonblocking \}\)/);
-  assert.match(hccSource, /\{ register: true, nonblocking: true \}/);
+  assert.match(webRuntimeSource, /\{ register: true, nonblocking: true \}/);
+  // webErrorStatus (REGISTRY_BUSY -> 503) stayed in bin/hcc.mjs
   assert.match(hccSource, /REGISTRY_BUSY.*503/s);
 });
 

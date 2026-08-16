@@ -6532,10 +6532,8 @@ async function syntaxAndHelp() {
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
-  const cmdWebSource = hccSource.slice(
-    hccSource.indexOf('async function cmdWeb('),
-    hccSource.indexOf('// ─── hcc gc', hccSource.indexOf('async function cmdWeb('))
-  );
+  // cmdWeb moved whole to lib/web/runtime-main.mjs
+  const cmdWebSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
     'statusSummary: webStatusSummary',
@@ -6581,7 +6579,7 @@ async function syntaxAndHelp() {
     'session.inputRefreshTimer = setTimeout',
     'scheduleTmuxInputRefresh(session)'
   ]) {
-    if (!hccSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
+    if (!cmdWebSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
   // hccWebProcessMatches/splitProcessArgs/stopOrphanWebRuntimes moved to lib/web/startup.mjs
   const webStartupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'startup.mjs'), 'utf8');
@@ -6625,9 +6623,9 @@ async function syntaxAndHelp() {
     "addEvent(db, 'tmux.session.rebound'",
     "addEvent(eventDb, 'provider.session.rebound'"
   ]) {
-    if (!hccSource.includes(expected)) fail(`tmux auto-attach/rebind guard missing: ${expected}`);
+    if (!cmdWebSource.includes(expected)) fail(`tmux auto-attach/rebind guard missing: ${expected}`);
   }
-  if (hccSource.includes("return line.includes(`--root ${root}`) || line.includes(`--db ${db}`);")) {
+  if (cmdWebSource.includes("return line.includes(`--root ${root}`) || line.includes(`--db ${db}`);")) {
     fail('orphan web runtime cleanup still uses substring matching for --root/--db');
   }
   for (const expected of [
@@ -6642,9 +6640,9 @@ async function syntaxAndHelp() {
     'killDbProvenTmuxSession(reqCtx, db, peerId)',
     'safeTmuxKillPlan(reqCtx, stopDb, peerId, session.pane || null)'
   ]) {
-    if (!hccSource.includes(expected)) fail(`tmux kill safety guard missing: ${expected}`);
+    if (!cmdWebSource.includes(expected)) fail(`tmux kill safety guard missing: ${expected}`);
   }
-  if (hccSource.includes("if (sessName) tmuxKillSession(sessName);")) {
+  if (cmdWebSource.includes("if (sessName) tmuxKillSession(sessName);")) {
     fail('web stop kill_tmux still kills tmux by session name without DB-proven guard');
   }
   // tmux GC helpers moved to lib/cli/commands/tmux.mjs
@@ -6714,9 +6712,9 @@ async function syntaxAndHelp() {
       bindingFinalizerSource.indexOf('updatePeer(currentSubject)')) {
     fail('tmux GC finalizer updates peer state before binding CAS');
   }
-  const autoAttachSource = hccSource.slice(
-    hccSource.indexOf('function scanAndAttachDetectedPeers()'),
-    hccSource.indexOf('scanAndAttachDetectedPeers();')
+  const autoAttachSource = cmdWebSource.slice(
+    cmdWebSource.indexOf('function scanAndAttachDetectedPeers()'),
+    cmdWebSource.indexOf('scanAndAttachDetectedPeers();')
   );
   if ((autoAttachSource.match(/runTmux\(\['list-panes'/g) || []).length > 0) {
     fail('auto-attach scan calls tmux list-panes inside scanAndAttachDetectedPeers instead of using listTmuxPanesOnce');
@@ -6724,9 +6722,9 @@ async function syntaxAndHelp() {
   if (!autoAttachSource.includes('panes = listTmuxPanesOnce();')) {
     fail('auto-attach scan no longer uses one tmux pane listing per tick');
   }
-  const managedStartSource = hccSource.slice(
-    hccSource.indexOf('function startTmuxManagedSession(input)'),
-    hccSource.indexOf('function restoreTmuxManagedSessions')
+  const managedStartSource = cmdWebSource.slice(
+    cmdWebSource.indexOf('function startTmuxManagedSession(input)'),
+    cmdWebSource.indexOf('function restoreTmuxManagedSessions')
   );
   if (!managedStartSource.includes('rebindOldTmux: true')) {
     fail('managed tmux start no longer marks explicit rebind cleanup');
@@ -6741,9 +6739,9 @@ async function syntaxAndHelp() {
   ]) {
     if (!managedStartSource.includes(expected)) fail(`managed tmux start no longer marks session env: ${expected}`);
   }
-  const restoreSource = hccSource.slice(
-    hccSource.indexOf('function restoreTmuxManagedSessions'),
-    hccSource.indexOf('function startPtySession')
+  const restoreSource = cmdWebSource.slice(
+    cmdWebSource.indexOf('function restoreTmuxManagedSessions'),
+    cmdWebSource.indexOf('function startPtySession')
   );
   if (restoreSource.includes('rebindOldTmux')) {
     fail('restore path must not kill old tmux sessions as a rebind');
@@ -6788,6 +6786,13 @@ async function syntaxAndHelp() {
   }
   for (const expected of [
     'import { createWebPeerActions } from \'../lib/web/peer-actions.mjs\'',
+    'import { createWebRuntime } from \'../lib/web/runtime-main.mjs\'',
+    'const { cmdWeb } = createWebRuntime({'
+  ]) {
+    if (!hccSource.includes(expected)) fail(`web peer action API wiring missing: ${expected}`);
+  }
+  for (const expected of [
+    'import { createWebPeerActions } from \'../web/peer-actions.mjs\'',
     '} = createWebPeerActions({',
     'const peerActionMatch = url.pathname.match(/^\\/api\\/peers\\/([^/]+)\\/actions\\/([^/]+)$/)',
     "const readOnly = ['status', 'state', 'inbox'].includes(action)",
@@ -6800,24 +6805,24 @@ async function syntaxAndHelp() {
     "auditSource: 'web'",
     "addEvent(eventDb, 'web.session.stop_requested'"
   ]) {
-    if (!hccSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
+    if (!cmdWebSource.includes(expected)) fail(`web peer action API support missing: ${expected}`);
   }
   // tmux GC event emission moved to lib/cli/commands/tmux.mjs
   if (!tmuxGcSource.includes("addEvent(db, 'tmux.session.gc'")) {
     fail('web peer action API support missing: addEvent(db, \'tmux.session.gc\'');
   }
-  const actionResolverSource = hccSource.slice(
-    hccSource.indexOf('function resolveWebActionSession('),
-    hccSource.indexOf('function knownPeerIds(')
+  const actionResolverSource = cmdWebSource.slice(
+    cmdWebSource.indexOf('function resolveWebActionSession('),
+    cmdWebSource.indexOf('function knownPeerIds(')
   );
   if (!actionResolverSource.includes('tokenMatches(provided, candidate)') ||
       !actionResolverSource.includes('session.actionTokens') ||
       actionResolverSource.includes('provided !== expected')) {
     fail('resolveWebActionSession must use the shared constant-time token comparator');
   }
-  const websocketInputSource = hccSource.slice(
-    hccSource.indexOf("ws.on('message', (raw) => {"),
-    hccSource.indexOf("ws.on('close', () => {", hccSource.indexOf("ws.on('message', (raw) => {"))
+  const websocketInputSource = cmdWebSource.slice(
+    cmdWebSource.indexOf("ws.on('message', (raw) => {"),
+    cmdWebSource.indexOf("ws.on('close', () => {", cmdWebSource.indexOf("ws.on('message', (raw) => {"))
   );
   if (!websocketInputSource.includes('tokenMatches(msg.action_token, connectionActionToken)') ||
       websocketInputSource.includes('session.actionToken')) {
