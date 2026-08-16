@@ -33,8 +33,8 @@ function instrumentProtocol(source) {
   return result;
 }
 
-function instrumentCli(source) {
-  let result = source.replace('#!/usr/bin/env node\n', `#!/usr/bin/env node\n${helperSource}`);
+function instrumentGcCommand(source) {
+  let result = helperSource + source;
   result = result.replace(
     '  // A clock jump can make every lock look expired at once.',
     `  if (process.env.HCC_TEST_GC_GRACE_PHASE === 'before-locks') __gcTestExtendGrace();\n\n` +
@@ -71,7 +71,7 @@ export async function load(url, context, nextLoad) {
   let instrumented = source;
   if (url.endsWith('/lib/runtime/buffer-gc-protocol.mjs')) instrumented = instrumentProtocol(source);
   else if (url.endsWith('/lib/core/coordination/gc-plan.mjs')) instrumented = instrumentGcPlan(source);
-  else if (url.endsWith('/bin/hcc.mjs')) instrumented = instrumentCli(source);
+  else if (url.endsWith('/lib/cli/commands/gc.mjs')) instrumented = instrumentGcCommand(source);
   else return loaded;
   if (instrumented === source) throw new Error(`GC grace race loader did not instrument ${url}`);
   return { ...loaded, source: instrumented, shortCircuit: true };
