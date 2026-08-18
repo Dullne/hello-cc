@@ -6535,8 +6535,10 @@ async function syntaxAndHelp() {
   const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
   // cmdWeb moved whole to lib/web/runtime-main.mjs; subsystem modules extend it
-  const cmdWebSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8') +
-    fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'project-contexts.mjs'), 'utf8');
+  const cmdWebSource = [
+    'runtime-main.mjs', 'project-contexts.mjs', 'external-sessions.mjs',
+    'liveness-reaper.mjs', 'buffer-gc-runtime.mjs', 'tmux-sessions.mjs'
+  ].map((f) => fs.readFileSync(path.join(repoRoot, 'lib', 'web', f), 'utf8')).join('\n');
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
     'statusSummary: webStatusSummary',
