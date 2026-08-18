@@ -14,8 +14,9 @@ import { webIndexHtml } from '../lib/web/ui-template.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccSource = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
-const webRuntimeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8') +
-  fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'project-contexts.mjs'), 'utf8');
+const webRuntimeSource = [
+  'runtime-main.mjs', 'project-contexts.mjs', 'http-routes.mjs'
+].map((f) => fs.readFileSync(path.join(repoRoot, 'lib', 'web', f), 'utf8')).join('\n');
 const cookieAuthSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
 
 function sourceBetween(start, end) {

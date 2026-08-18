@@ -20,7 +20,10 @@ test('web runtime verifies a complete process identity before opening its listen
 });
 
 test('startup auto-GC runs only after all tmux sessions are restored', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
+  // the HTTP handler lives in lib/web/http-routes.mjs; append it so the
+  // restore-loop -> runAutoGc() -> request-handler ordering stays checkable
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8') +
+    fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'http-routes.mjs'), 'utf8');
   const restoreLoop = source.indexOf('const restoredTmuxDbs = new Set();');
   const requestHandler = source.indexOf('const handleWebRequest = async', restoreLoop);
   const startupGc = source.indexOf('runAutoGc();', restoreLoop);

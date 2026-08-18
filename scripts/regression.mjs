@@ -6538,7 +6538,7 @@ async function syntaxAndHelp() {
   const cmdWebSource = [
     'runtime-main.mjs', 'project-contexts.mjs', 'external-sessions.mjs',
     'liveness-reaper.mjs', 'buffer-gc-runtime.mjs', 'tmux-sessions.mjs',
-    'auto-attach.mjs', 'pty-sessions.mjs'
+    'auto-attach.mjs', 'pty-sessions.mjs', 'http-routes.mjs'
   ].map((f) => fs.readFileSync(path.join(repoRoot, 'lib', 'web', f), 'utf8')).join('\n');
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
