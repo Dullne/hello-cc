@@ -6653,6 +6653,9 @@ async function syntaxAndHelp() {
   }
   // tmux GC helpers moved to lib/cli/commands/tmux.mjs
   const tmuxGcSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'tmux.mjs'), 'utf8');
+  const webAutoAttachSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'auto-attach.mjs'), 'utf8');
+  const webTmuxSessionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-sessions.mjs'), 'utf8');
+  const webProjectContextsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'project-contexts.mjs'), 'utf8');
   for (const expected of [
     'async function cmdTmux(',
     'async function planTmuxGc(',
@@ -6718,9 +6721,9 @@ async function syntaxAndHelp() {
       bindingFinalizerSource.indexOf('updatePeer(currentSubject)')) {
     fail('tmux GC finalizer updates peer state before binding CAS');
   }
-  const autoAttachSource = cmdWebSource.slice(
-    cmdWebSource.indexOf('function scanAndAttachDetectedPeers()'),
-    cmdWebSource.lastIndexOf('scanAndAttachDetectedPeers();')
+  // scoped to the auto-attach module itself
+  const autoAttachSource = webAutoAttachSource.slice(
+    webAutoAttachSource.indexOf('function scanAndAttachDetectedPeers()')
   );
   if ((autoAttachSource.match(/runTmux\(\['list-panes'/g) || []).length > 0) {
     fail('auto-attach scan calls tmux list-panes inside scanAndAttachDetectedPeers instead of using listTmuxPanesOnce');
@@ -6728,9 +6731,9 @@ async function syntaxAndHelp() {
   if (!autoAttachSource.includes('panes = listTmuxPanesOnce();')) {
     fail('auto-attach scan no longer uses one tmux pane listing per tick');
   }
-  const managedStartSource = cmdWebSource.slice(
-    cmdWebSource.indexOf('function startTmuxManagedSession(input)'),
-    cmdWebSource.indexOf('function restoreTmuxManagedSessions')
+  const managedStartSource = webTmuxSessionsSource.slice(
+    webTmuxSessionsSource.indexOf('function startTmuxManagedSession(input)'),
+    webTmuxSessionsSource.indexOf('function restoreTmuxManagedSessions')
   );
   if (!managedStartSource.includes('rebindOldTmux: true')) {
     fail('managed tmux start no longer marks explicit rebind cleanup');
@@ -6745,9 +6748,8 @@ async function syntaxAndHelp() {
   ]) {
     if (!managedStartSource.includes(expected)) fail(`managed tmux start no longer marks session env: ${expected}`);
   }
-  const restoreSource = cmdWebSource.slice(
-    cmdWebSource.indexOf('function restoreTmuxManagedSessions'),
-    cmdWebSource.indexOf('function startPtySession')
+  const restoreSource = webTmuxSessionsSource.slice(
+    webTmuxSessionsSource.indexOf('function restoreTmuxManagedSessions')
   );
   if (restoreSource.includes('rebindOldTmux')) {
     fail('restore path must not kill old tmux sessions as a rebind');
@@ -6817,9 +6819,9 @@ async function syntaxAndHelp() {
   if (!tmuxGcSource.includes("addEvent(db, 'tmux.session.gc'")) {
     fail('web peer action API support missing: addEvent(db, \'tmux.session.gc\'');
   }
-  const actionResolverSource = cmdWebSource.slice(
-    cmdWebSource.indexOf('function resolveWebActionSession('),
-    cmdWebSource.indexOf('function knownPeerIds(')
+  const actionResolverSource = webProjectContextsSource.slice(
+    webProjectContextsSource.indexOf('function resolveWebActionSession('),
+    webProjectContextsSource.indexOf('function knownPeerIds(')
   );
   if (!actionResolverSource.includes('tokenMatches(provided, candidate)') ||
       !actionResolverSource.includes('session.actionTokens') ||
