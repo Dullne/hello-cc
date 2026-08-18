@@ -31,7 +31,7 @@ test('startup auto-GC runs only after all tmux sessions are restored', () => {
 });
 
 test('external session reconciliation compares the current owner before treating a missing out file as exit', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
+  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'external-sessions.mjs'), 'utf8');
   const poller = source.indexOf('session.exitPoller = setInterval', source.indexOf('function adoptExternalSession'));
   const ownerRead = source.indexOf('const currentOwnerKey = externalBufferOwnerKey(currentMeta);', poller);
   const ownerMismatch = source.indexOf('currentOwnerKey !== session.externalOwnerKey', ownerRead);
