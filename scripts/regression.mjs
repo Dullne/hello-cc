@@ -6537,7 +6537,8 @@ async function syntaxAndHelp() {
   // cmdWeb moved whole to lib/web/runtime-main.mjs; subsystem modules extend it
   const cmdWebSource = [
     'runtime-main.mjs', 'project-contexts.mjs', 'external-sessions.mjs',
-    'liveness-reaper.mjs', 'buffer-gc-runtime.mjs', 'tmux-sessions.mjs'
+    'liveness-reaper.mjs', 'buffer-gc-runtime.mjs', 'tmux-sessions.mjs',
+    'auto-attach.mjs', 'pty-sessions.mjs'
   ].map((f) => fs.readFileSync(path.join(repoRoot, 'lib', 'web', f), 'utf8')).join('\n');
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
@@ -6719,7 +6720,7 @@ async function syntaxAndHelp() {
   }
   const autoAttachSource = cmdWebSource.slice(
     cmdWebSource.indexOf('function scanAndAttachDetectedPeers()'),
-    cmdWebSource.indexOf('scanAndAttachDetectedPeers();')
+    cmdWebSource.lastIndexOf('scanAndAttachDetectedPeers();')
   );
   if ((autoAttachSource.match(/runTmux\(\['list-panes'/g) || []).length > 0) {
     fail('auto-attach scan calls tmux list-panes inside scanAndAttachDetectedPeers instead of using listTmuxPanesOnce');
