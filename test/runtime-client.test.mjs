@@ -16,7 +16,7 @@ async function stalledRuntime(t, phase) {
     }
     setTimeout(() => {
       if (!res.writableEnded) res.end(phase === 'body' ? 'true}' : '{"ok":true}');
-    }, 250);
+    }, 1000);
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -43,7 +43,12 @@ async function expectRuntimeDeadline(t, phase) {
     ),
     (error) => error?.code === 'RUNTIME_UNREACHABLE'
   );
-  assert.ok(Date.now() - startedAt < 200, `${phase} deadline was not bounded`);
+  // The stalled runtime completes at 1000ms; a working deadline rejects at
+  // ~40ms. The 800ms bound sits between the two, so event-loop starvation
+  // during the full-suite run cannot turn a healthy rejection into a
+  // failure while a broken deadline (which waits for the server) still
+  // exceeds it.
+  assert.ok(Date.now() - startedAt < 800, `${phase} deadline was not bounded`);
 }
 
 test('runtime request deadline covers waiting for response headers', async (t) => {

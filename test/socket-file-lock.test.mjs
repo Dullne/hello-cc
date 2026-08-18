@@ -42,7 +42,7 @@ function captureThrown(fn) {
   return value;
 }
 
-async function waitForPath(file, timeoutMs = 5000) {
+async function waitForPath(file, timeoutMs = 30000) {
   const deadline = performance.now() + timeoutMs;
   while (!fs.existsSync(file)) {
     if (performance.now() >= deadline) throw new Error(`timed out waiting for ${file}`);
@@ -50,7 +50,7 @@ async function waitForPath(file, timeoutMs = 5000) {
   }
 }
 
-function waitForExit(child, { allowSignal = false, timeoutMs = 5000 } = {}) {
+function waitForExit(child, { allowSignal = false, timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
     let stderr = '';
     const timer = setTimeout(() => reject(new Error(`timed out waiting for child: ${stderr}`)), timeoutMs);
@@ -102,6 +102,9 @@ function startHolder(t, target, root, suffix = '') {
 }
 
 test('serializes real concurrent child processes without lock files', async (t) => {
+  // Four fresh node processes contend with the whole unit suite for CPU;
+  // the assertion is serialization order, not wall-clock speed, so the
+  // child waits below use generous deadlines.
   const root = sandbox(t);
   const target = path.join(root, 'registry.json');
   const log = path.join(root, 'sequence.log');
