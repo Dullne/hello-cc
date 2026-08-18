@@ -26,5 +26,6 @@ RUN git init \
  && git add -A \
  && git commit -q -m "test snapshot" || true
 
-# Smoke that the CLI loads, then run the regression suite.
-CMD ["sh", "-c", "node --version && tmux -V && node ./bin/hcc.mjs --help >/dev/null && node ./scripts/regression.mjs"]
+# Smoke that the CLI loads, then run the full test suite: unit tests
+# (node --test test/*.test.mjs) plus the 13-stage end-to-end regression.
+CMD ["sh", "-c", "node --version && tmux -V && node ./bin/hcc.mjs --help >/dev/null && npm test"]
