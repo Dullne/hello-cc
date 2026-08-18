@@ -41,9 +41,12 @@ tmux-stream）；GC 在 `lib/cli/commands/gc.mjs` 与
 
 剩余结构压力主要在：
 
-- `lib/web/runtime-main.mjs` 仍以单一闭包承载整个 `cmdWeb()`（HTTP routes、
-  WebSocket terminal、tmux/PTY session 管理、external buffer adoption、
-  shutdown）。进一步拆分需要先引入显式共享状态容器。
+- （已于 2026-08 完成）原 3100 行 `cmdWeb()` 闭包已全部分解为 `lib/web/` 下的
+  子系统模块，各自通过 `create*(deps)` 工厂注入依赖：project-contexts、
+  external-sessions、liveness-reaper、buffer-gc-runtime、tmux-sessions、
+  auto-attach、pty-sessions、http-routes、startup、cookie-auth、
+  session-serialize、tmux-stream。`runtime-main.mjs` 现在是组合根（参数解析、
+  按依赖序装配工厂、WebSocket 终端处理、server 搭建与 shutdown）。
 - `scripts/regression.mjs` 是有价值的全量回归入口，但后续应该变成一个调用领域
   regression module 的 runner。
 

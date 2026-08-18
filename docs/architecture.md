@@ -34,20 +34,26 @@ architectural idea: split by boundary, not by convenience.
 The 2026-08 monolith split is complete: `bin/hcc.mjs` is a thin entrypoint that
 imports `lib/cli/app.mjs`. All composition (constants, shared helpers, command
 factory wiring, dispatch, `main()`) lives in `lib/cli/app.mjs`; command groups
-live in `lib/cli/commands/`; the Web runtime lives in `lib/web/`
-(`startup.mjs`, `runtime-main.mjs`, `cookie-auth.mjs`, `session-serialize.mjs`,
-`tmux-stream.mjs`); GC lives in `lib/cli/commands/gc.mjs` plus
+live in `lib/cli/commands/`; GC lives in `lib/cli/commands/gc.mjs` plus
 `lib/core/coordination/gc-plan.mjs`; runtime evidence helpers live in
 `lib/core/peers/evidence-runtime.mjs`.
 
+The former 3100-line `cmdWeb()` closure is fully decomposed into `lib/web/`
+subsystem modules, each behind a `create*(deps)` factory:
+`project-contexts.mjs`, `external-sessions.mjs`, `liveness-reaper.mjs`,
+`buffer-gc-runtime.mjs`, `tmux-sessions.mjs`, `auto-attach.mjs`,
+`pty-sessions.mjs`, `http-routes.mjs`, `startup.mjs`, `cookie-auth.mjs`,
+`session-serialize.mjs`, `tmux-stream.mjs`. `runtime-main.mjs` is now the
+composition root (option parsing, factory wiring in dependency order, the
+WebSocket terminal handler, server setup, and shutdown).
+
 The remaining structural pressure is mostly:
 
-- `lib/web/runtime-main.mjs` still hosts the whole `cmdWeb()` closure (HTTP
-  routes, WebSocket handling, tmux/PTY session management, external buffer
-  adoption, shutdown) as one unit. Splitting it further requires introducing an
-  explicit shared-state container first.
 - `scripts/regression.mjs` is a valuable full regression gate, but it should
   eventually become a runner over domain-specific regression modules.
+- `lib/web/tmux-sessions.mjs` is the largest subsystem module (~1300 lines);
+  its kill/rebind planning could split further once tmux GC command handling
+  and session lifecycle settle.
 
 ## Target Layout
 
@@ -300,13 +306,10 @@ npm package contents stable unless the task explicitly says otherwise.
    `messages`, `help`, `state-render`, and release helpers. Keep compatibility
    re-export files temporarily if the import churn becomes too large.
 
-3. Split the Web runtime by subsystem.
-   Partially done: cookie auth, session serialization, tmux streaming, and web
-   startup are separate modules. The remaining `cmdWeb()` closure
-   (project selection, session manager, Web routes, WebSocket terminal
-   handling, PTY session, external buffer adoption) still lives as one unit in
-   `lib/web/runtime-main.mjs`; extract it in separate commits after
-   introducing an explicit shared-state container.
+3. Split the Web runtime by subsystem. (Done in 2026-08: twelve subsystem
+   modules under `lib/web/`, each behind a `create*(deps)` factory;
+   `runtime-main.mjs` is the composition root with the WebSocket terminal
+   handler and shutdown.)
 
 4. Make `bin/hcc.mjs` a thin entrypoint. (Done in 2026-08: 6 lines, delegating
    to `lib/cli/app.mjs`; command groups live under `lib/cli/commands/`.)
