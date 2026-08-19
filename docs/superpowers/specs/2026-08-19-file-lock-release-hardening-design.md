@@ -92,8 +92,37 @@ change and pass afterward. Existing injected-worker cleanup tests continue to
 cover explicit release and termination failures.
 
 Verification will include repeated macOS Node 24 unit runs, the targeted file
-lock and schema migration tests, full macOS regression, and the Docker Node 24
-Linux suite.
+lock and schema migration tests, full macOS regression, and the container gate
+below.
+
+## Local Container Acceptance Gate
+
+The release candidate must be built locally from a fresh, no-cache Docker build
+using the repository Dockerfile. Its declared target environment is Node 24 on
+Linux with tmux installed. The same immutable image will run the complete test
+command in three consecutive, isolated containers. Every run must report:
+
+- the free-identifier audit passing for every factory module;
+- all unit tests passing, apart from explicitly documented platform skips;
+- all 13 regression stages completing with `FULL_REGRESSION_OK`;
+- no leaked hello-cc test container or tmux session after completion.
+
+The 13-stage regression is the repository's executable acceptance boundary for
+the public workflows: Web startup and shutdown, hooks and provider shims,
+Runtime API and TLS/authentication, SQLite initialization and migration,
+multi-project switching, buffer and history GC, tmux-backed start/attach/restore,
+PTY and WebSocket input, messages and broadcasts, identity enforcement,
+`down`, `gc`, `pack`, `doctor`, syntax, help, and maintenance cleanup.
+
+Package behavior must also be tested from the artifact that would be published,
+not only from the source tree. `npm pack` will produce the `1.0.1` tarball; a
+fourth clean Node 24 container will install that exact tarball and verify package
+metadata, CLI help, a real `node-pty` launch, a temporary project/database
+initialization, and a local Web runtime health/start/stop smoke test.
+
+Any failure in these local container checks blocks the Git tag, GitHub Release,
+and npm publication. Passing source tests alone is not sufficient to call the
+new version releasable.
 
 ## Release And Attribution
 
