@@ -301,6 +301,18 @@ test('maps nonblocking and bounded contention waits to stable errors', async (t)
   await waitForExit(holder.child);
 });
 
+test('no-create acquisition leaves a missing target parent absent', (t) => {
+  const root = sandbox(t);
+  const parent = path.join(root, 'missing', 'parent');
+  const target = path.join(parent, 'registry.json');
+
+  assert.throws(
+    () => withFileLock(target, () => {}, { createParent: false }),
+    (error) => error?.code === 'ENOENT'
+  );
+  assert.equal(fs.existsSync(parent), false);
+});
+
 test('kill -9 of a holder releases the kernel endpoint', async (t) => {
   const root = sandbox(t);
   const target = path.join(root, 'registry.json');
