@@ -491,8 +491,31 @@ async function assertTmuxGcPolicy() {
   insertRuntimeTargetBinding(clientUnknownBindingPeer, 'shell', 'tmux-gc-binding-client-unknown-session', clientUnknownBindingPane);
   const eventActivePane = parsePane(hcc(['peer', 'start', eventPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
   const eventActiveSession = run('tmux', ['display-message', '-p', '-t', eventActivePane, '#{session_name}']).trim();
+  // The runtime intentionally re-adopts orphan managed tmux sessions every
+  // five seconds. Stop it before backdating these synthetic GC bindings so the
+  // fixture cannot become runtime-managed between the text and JSON dry-runs.
+  await stopRuntime();
   withMeshDb((db) => {
     const t = Math.floor(Date.now() / 1000) - 30 * 86400;
+    for (const [peer, pane] of [
+      [stalePeer, stalePane],
+      [peerFilterPeer, peerFilterPane],
+      [attachedPeer, attachedPane],
+      [deadBindingPeer, deadBindingPane],
+      [reusedBindingPeer, reusedBindingPane],
+      [clientUnknownBindingPeer, clientUnknownBindingPane]
+    ]) {
+      db.prepare(`
+        UPDATE peer_bindings
+        SET transport = 'tmux', runtime_target = ?, updated_at = ?
+        WHERE peer = ?
+      `).run(pane, t, peer);
+    }
+    db.prepare(`
+      UPDATE peer_bindings
+      SET transport = 'tmux', runtime_target = ?
+      WHERE peer = ?
+    `).run(eventActivePane, eventPeer);
     db.prepare('UPDATE peers SET last_seen_at = ? WHERE id IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
     db.prepare("UPDATE peers SET status = 'exited' WHERE id IN (?, ?)").run(stalePeer, peerFilterPeer);
     db.prepare('UPDATE peer_bindings SET updated_at = ? WHERE peer IN (?, ?, ?)').run(t, stalePeer, peerFilterPeer, attachedPeer);
@@ -5445,7 +5468,10 @@ async function bufferGcArbitrationWorkflow() {
   if (!firstApply.ok || replayApply.ok) fail('buffer GC token was not exactly once');
 
   const cutoffMs = Date.now() - 60_000;
-  const oldTime = new Date(cutoffMs - 60_000);
+  // Ordinary deletion checks use a non-zero retention window so crossing a
+  // wall-clock second cannot legitimately activate clock-jump protection.
+  const stableGcRetentionDays = 1;
+  const oldTime = new Date(Date.now() - 2 * 86400_000);
   const rootBufs = path.join(root, '.hello-cc', 'bufs');
   const siblingBufs = path.join(secondProjectRoot, '.hello-cc', 'bufs');
   fs.mkdirSync(rootBufs, { recursive: true });
@@ -5586,7 +5612,9 @@ async function bufferGcArbitrationWorkflow() {
   const parentAlias = path.join(aliasContainer, 'parent');
   fs.symlinkSync(path.dirname(secondProjectRoot), parentAlias);
   const siblingAliasRoot = path.join(parentAlias, path.basename(secondProjectRoot));
-  const gcOutput = hccFrom(['--json', 'gc', '--older-than', '0', '--yes'], siblingAliasRoot);
+  const gcOutput = hccFrom([
+    '--json', 'gc', '--older-than', String(stableGcRetentionDays), '--yes'
+  ], siblingAliasRoot);
   fs.rmSync(aliasContainer, { recursive: true, force: true });
   const gcPayload = JSON.parse(gcOutput);
   const result = gcPayload.data || {};
@@ -5609,7 +5637,9 @@ async function bufferGcArbitrationWorkflow() {
   } finally {
     rootGcClockDb.close();
   }
-  const rootGcPayload = JSON.parse(hcc(['--json', 'gc', '--older-than', '0', '--yes']));
+  const rootGcPayload = JSON.parse(hcc([
+    '--json', 'gc', '--older-than', String(stableGcRetentionDays), '--yes'
+  ]));
   const rootGcResult = rootGcPayload.data || {};
   if (rootGcResult.buf_files !== 1 || rootGcResult.protected_buf_files < liveFiles.length ||
       rootGcResult.deferred_buf_files < legacyFiles.length || fs.existsSync(rootOrphan)) {
@@ -5735,7 +5765,9 @@ async function bufferGcArbitrationWorkflow() {
   const normalOrphan = path.join(siblingBufs, `gc-actual-dir-normal-${testId}.out`);
   fs.writeFileSync(normalOrphan, 'actual directory normal baseline');
   fs.utimesSync(normalOrphan, oldTime, oldTime);
-  const normalGc = JSON.parse(hccFrom(['--json', 'gc', '--older-than', '0', '--yes'], secondProjectRoot)).data;
+  const normalGc = JSON.parse(hccFrom([
+    '--json', 'gc', '--older-than', String(stableGcRetentionDays), '--yes'
+  ], secondProjectRoot)).data;
   if (fs.existsSync(gapOrphan) || fs.existsSync(normalOrphan) || Number(normalGc.buf_files || 0) < 2) {
     fail(`actual runtime buffer directory did not delete against a live baseline: ${JSON.stringify(normalGc)}`);
   }
