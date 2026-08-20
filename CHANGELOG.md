@@ -46,6 +46,11 @@ startup in fresh macOS npm installations.
 - Background Web startup keeps its immediate child-exit failure but allows a
   bounded 60-second health window, avoiding false failures on loaded macOS CI
   hosts where process identity and project restoration can exceed 30 seconds.
+- Manual buffer GC allows a bounded 30-second window for runtime evidence
+  planning and apply, while still deferring all eligible files if the runtime
+  remains unavailable.
+- Per-connection Web action tokens now require their issuing terminal socket to
+  still be open, closing the handshake race before asynchronous token cleanup.
 
 ### Compatibility Notes
 

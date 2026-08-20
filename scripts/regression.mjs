@@ -26,6 +26,7 @@ const outDir = path.join(os.tmpdir(), `hcc-reg-out-${testId}`);
 const tmuxSession = `hcc-reg-${process.pid}`;
 const tmuxSocketName = `hcc-reg-${testId}`.replace(/[^A-Za-z0-9_-]/g, '-');
 const secondProjectRoot = path.join(root, 'second-project');
+const TERMINAL_WEBSOCKET_TIMEOUT_MS = 15_000;
 const realHome = process.env.HOME || os.homedir();
 const realRegistryFile = path.join(realHome, '.hello-cc', 'projects.json');
 const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
@@ -1605,7 +1606,10 @@ async function expectWebSocketMarker(peer, marker) {
     let sawSnapshot = false;
     let sawMarker = false;
     const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} websocket timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} websocket timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
       if (result.status !== 0) reject(new Error(result.stderr || result.stdout || 'inject failed'));
@@ -1622,14 +1626,17 @@ async function expectWebSocketMarker(peer, marker) {
         resolve();
       }
     });
-    ws.on('error', reject);
+    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
 }
 
 async function openTerminalWebSocket(peer) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} websocket open timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} websocket open timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('open', () => {
       clearTimeout(timer);
       resolve(ws);
@@ -1650,7 +1657,10 @@ async function openSessionActionChannel(peer, params = {}) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
     const ws = new WebSocket(url, runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} action token fetch timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} action token fetch timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
       if (msg.type === 'snapshot') {
@@ -1691,7 +1701,10 @@ async function fetchTerminalSnapshot(peer, params = {}) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
     const ws = new WebSocket(url, runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} terminal snapshot timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} terminal snapshot timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
       if (msg.type !== 'snapshot') return;
@@ -1909,7 +1922,10 @@ async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
     const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} resize replace timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} resize replace timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('open', () => {
       const result = hccMaybe(['inject', peer, `echo ${marker}`]);
       if (result.status !== 0) reject(new Error(result.stderr || result.stdout || 'inject failed'));
@@ -1926,7 +1942,7 @@ async function expectResizeReplaceSnapshot(peer, marker) {
         resolve();
       }
     });
-    ws.on('error', reject);
+    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
 }
 
@@ -1938,7 +1954,10 @@ async function expectWebSocketInputVisible(peer, marker) {
     let sawFrameAfterInput = false;
     let actionToken = '';
     const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
-    const timer = setTimeout(() => reject(new Error(`${peer} websocket input visibility timeout`)), 5000);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error(`${peer} websocket input visibility timeout`));
+    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
       const data = String(msg.data || '');
@@ -1961,7 +1980,7 @@ async function expectWebSocketInputVisible(peer, marker) {
         resolve();
       }
     });
-    ws.on('error', reject);
+    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
 }
 

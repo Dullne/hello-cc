@@ -40,6 +40,8 @@ test('one shared constant-time comparator protects per-connection action tokens'
   );
   assert.match(actionResolver, /session\.actionTokens/);
   assert.match(actionResolver, /tokenMatches\(provided, candidate\)/);
+  assert.match(actionResolver, /session\.actionTokenSockets\?\.get\(candidate\)/);
+  assert.match(actionResolver, /socket\?\.readyState === WebSocket\.OPEN/);
 
   const socketInput = sourceBetween("ws.on('message', (raw) => {", "ws.on('close', () => {");
   assert.match(socketInput, /tokenMatches\(msg\.action_token, connectionActionToken\)/);
@@ -53,8 +55,10 @@ test('terminal sockets mint and revoke independent write tokens', () => {
   );
   assert.match(upgrade, /const connectionActionToken = newSessionActionToken\(\)/);
   assert.match(upgrade, /session\.actionTokens\.add\(connectionActionToken\)/);
+  assert.match(upgrade, /session\.actionTokenSockets\.set\(connectionActionToken, ws\)/);
   assert.match(upgrade, /action_token: connectionActionToken/);
   assert.match(upgrade, /session\.actionTokens\.delete\(connectionActionToken\)/);
+  assert.match(upgrade, /session\.actionTokenSockets\.delete\(connectionActionToken\)/);
   assert.match(upgrade, /msg\.type === 'resize'.*tokenMatches\(msg\.action_token, connectionActionToken\)/s);
 });
 
