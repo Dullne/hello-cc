@@ -433,6 +433,13 @@ async function assertTmuxGcPolicy() {
   managedTmuxSessions.add(rootEventSession);
   managedTmuxSessions.add(manualSession);
 
+  // Create the one runtime-managed authority before the bulk synthetic tmux
+  // fixtures. Leaving the runtime up while those sessions are created lets its
+  // five-second orphan scan adopt them and contend with this start on slow CI.
+  const eventActivePane = parsePane(hcc(['peer', 'start', eventPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
+  const eventActiveSession = run('tmux', ['display-message', '-p', '-t', eventActivePane, '#{session_name}']).trim();
+  await stopRuntime();
+
   run('tmux', ['new-session', '-d', '-s', staleSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', peerFilterSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
   run('tmux', ['new-session', '-d', '-s', attachedSession, '-e', `HCC_ROOT=${root}`, '-c', root, 'bash', '--noprofile', '--norc']);
@@ -490,12 +497,6 @@ async function assertTmuxGcPolicy() {
   insertRuntimeTargetBinding(deadBindingPeer, 'shell', 'tmux-gc-binding-dead-session', deadBindingPane);
   insertRuntimeTargetBinding(reusedBindingPeer, 'shell', 'tmux-gc-binding-reused-session', reusedBindingPane);
   insertRuntimeTargetBinding(clientUnknownBindingPeer, 'shell', 'tmux-gc-binding-client-unknown-session', clientUnknownBindingPane);
-  const eventActivePane = parsePane(hcc(['peer', 'start', eventPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
-  const eventActiveSession = run('tmux', ['display-message', '-p', '-t', eventActivePane, '#{session_name}']).trim();
-  // The runtime intentionally re-adopts orphan managed tmux sessions every
-  // five seconds. Stop it before backdating these synthetic GC bindings so the
-  // fixture cannot become runtime-managed between the text and JSON dry-runs.
-  await stopRuntime();
   withMeshDb((db) => {
     const t = Math.floor(Date.now() / 1000) - 30 * 86400;
     for (const [peer, pane] of [
