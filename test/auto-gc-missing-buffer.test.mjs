@@ -61,15 +61,20 @@ function fixture(t, name) {
   return { root, bufs, db };
 }
 
-function runAutomaticGc({ root, db }) {
+function emptyBufferEvidence() {
+  return {
+    protectedPaths: new Set(),
+    unknownPaths: new Set(),
+    gcCutoffs: []
+  };
+}
+
+function runAutomaticGc({ root, db }, overrides = {}) {
   return runGc({ root }, db, {
     olderThanDays: 14,
     scope: 'auto',
-    collectBufferEvidenceNow: () => ({
-      protectedPaths: new Set(),
-      unknownPaths: new Set(),
-      gcCutoffs: []
-    })
+    collectBufferEvidenceNow: emptyBufferEvidence,
+    ...overrides
   });
 }
 
@@ -262,5 +267,82 @@ test('automatic GC rejects an ancestor replacement during buffer planning', (t) 
   assert.equal(replaced, true);
   assert.equal(fs.readFileSync(externalVictim, 'utf8'), 'external');
   assert.equal(fs.readFileSync(path.join(movedStateDirectory, 'bufs', 'victim.out'), 'utf8'), 'internal');
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
+
+test('automatic GC rejects a project-root alias retargeted by initial evidence collection', (t) => {
+  const state = fixture(t, 'root-alias-retarget');
+  const alias = path.join(path.dirname(state.root), 'project-alias');
+  const outsideRoot = path.join(path.dirname(state.root), 'outside-project');
+  const outsideBufs = path.join(outsideRoot, '.hello-cc', 'bufs');
+  const victim = path.join(outsideBufs, 'victim.out');
+  fs.mkdirSync(outsideBufs, { recursive: true });
+  fs.writeFileSync(victim, 'external');
+  const oldTime = new Date((nowSec - 15 * 86400) * 1000);
+  fs.utimesSync(victim, oldTime, oldTime);
+  fs.symlinkSync(state.root, alias);
+  const expectedDirectory = path.join(fs.realpathSync.native(state.root), '.hello-cc', 'bufs');
+  let evidenceDirectory;
+
+  assert.throws(
+    () => runAutomaticGc({ ...state, root: alias }, {
+      collectBufferEvidenceNow(directory) {
+        evidenceDirectory = directory;
+        fs.unlinkSync(alias);
+        fs.symlinkSync(outsideRoot, alias);
+        return emptyBufferEvidence();
+      }
+    }),
+    (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+  );
+  assert.equal(evidenceDirectory, expectedDirectory);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'external');
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
+
+test('automatic GC guards paths until database history mutation begins', (t) => {
+  const state = fixture(t, 'guard-lifetime');
+  const stateDirectory = path.dirname(state.bufs);
+  const movedStateDirectory = `${stateDirectory}.moved`;
+  const outsideStateDirectory = path.join(path.dirname(state.root), 'outside-lifetime-state');
+  const outsideBufs = path.join(outsideStateDirectory, 'bufs');
+  fs.mkdirSync(state.bufs);
+  fs.mkdirSync(outsideBufs, { recursive: true });
+  const canonicalBufs = fs.realpathSync.native(state.bufs);
+
+  const originalRealpathNative = fs.realpathSync.native;
+  let evidenceCalls = 0;
+  let armed = false;
+  let guardedBufferResolutions = 0;
+  let replaced = false;
+  fs.realpathSync.native = function interceptedRealpath(value, ...args) {
+    const resolved = originalRealpathNative.call(this, value, ...args);
+    if (armed && path.resolve(String(value)) === canonicalBufs) {
+      guardedBufferResolutions += 1;
+      if (guardedBufferResolutions === 2) {
+        replaced = true;
+        fs.renameSync(stateDirectory, movedStateDirectory);
+        fs.symlinkSync(outsideStateDirectory, stateDirectory);
+      }
+    }
+    return resolved;
+  };
+  try {
+    assert.throws(
+      () => runAutomaticGc(state, {
+        collectBufferEvidenceNow() {
+          evidenceCalls += 1;
+          if (evidenceCalls === 2) armed = true;
+          return emptyBufferEvidence();
+        }
+      }),
+      (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+    );
+  } finally {
+    fs.realpathSync.native = originalRealpathNative;
+  }
+
+  assert.equal(replaced, true);
+  assert.equal(fs.lstatSync(stateDirectory).isSymbolicLink(), true);
   assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
 });
