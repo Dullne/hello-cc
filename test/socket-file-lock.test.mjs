@@ -101,6 +101,104 @@ function startHolder(t, target, root, suffix = '') {
   return { child, ready, release };
 }
 
+function startHalfOpenProbe(t, endpoint, expectedBanner, root) {
+  const ready = path.join(root, 'half-open-probe-ready');
+  const stop = path.join(root, 'half-open-probe-stop');
+  const ports = [];
+  for (let index = 0; ports.length < 4; index += 1) {
+    const digest = index === 0
+      ? createHash('sha256').update(endpoint.key).digest()
+      : createHash('sha256')
+        .update(`hcc-file-lock-port-v1\0${index}\0${endpoint.key}`)
+        .digest();
+    const port = 20_000 + digest.readUInt32BE(0) % 40_000;
+    if (!ports.includes(port)) ports.push(port);
+  }
+  assert.equal(ports[0], endpoint.port);
+  const source = String.raw`
+    import fs from 'node:fs';
+    import net from 'node:net';
+    const [host, encodedPorts, expectedBanner, ready, stop] = process.argv.slice(1);
+    const ports = JSON.parse(encodedPorts);
+    let socket = null;
+    let retryTimer = null;
+    let nextPortIndex = 0;
+    const stopTimer = setInterval(() => {
+      if (!fs.existsSync(stop)) return;
+      clearTimeout(retryTimer);
+      try { socket?.destroy(); } finally { process.exit(0); }
+    }, 10);
+    const retry = () => {
+      if (retryTimer !== null) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, 10);
+    };
+    const connect = () => {
+      if (fs.existsSync(stop)) {
+        clearInterval(stopTimer);
+        process.exit(0);
+      }
+      if (socket !== null) return;
+      let bannerConfirmed = false;
+      let received = '';
+      const port = ports[nextPortIndex];
+      nextPortIndex = (nextPortIndex + 1) % ports.length;
+      const candidate = net.createConnection({
+        host,
+        port,
+        allowHalfOpen: true
+      });
+      socket = candidate;
+      let bannerTimer = setTimeout(() => {
+        bannerTimer = null;
+        if (!bannerConfirmed) candidate.destroy();
+      }, 250);
+      const clearBannerTimer = () => {
+        clearTimeout(bannerTimer);
+        bannerTimer = null;
+      };
+      candidate.setEncoding('utf8');
+      candidate.on('data', (chunk) => { received += chunk; });
+      candidate.once('end', () => {
+        clearBannerTimer();
+        if (received !== expectedBanner) {
+          candidate.destroy();
+          return;
+        }
+        fs.writeFileSync(ready, 'ready');
+        bannerConfirmed = true;
+      });
+      candidate.once('error', () => {
+        if (!bannerConfirmed) {
+          clearBannerTimer();
+          candidate.destroy();
+        }
+      });
+      candidate.once('close', () => {
+        clearBannerTimer();
+        if (socket === candidate) socket = null;
+        if (bannerConfirmed) {
+          clearInterval(stopTimer);
+          process.exit(0);
+        }
+        retry();
+      });
+    };
+    connect();
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source,
+    endpoint.host, JSON.stringify(ports), expectedBanner, ready, stop], {
+    cwd: repoRoot,
+    stdio: ['ignore', 'ignore', 'pipe']
+  });
+  t.after(() => {
+    try { child.kill('SIGKILL'); } catch {}
+  });
+  return { child, ready, stop };
+}
+
 test('serializes real concurrent child processes without lock files', async (t) => {
   // Four fresh node processes contend with the whole unit suite for CPU;
   // the assertion is serialization order, not wall-clock speed, so the
@@ -212,6 +310,207 @@ test('kill -9 of a holder releases the kernel endpoint', async (t) => {
   holder.child.kill('SIGKILL');
   await exited;
   assert.equal(withFileLock(target, () => 'recovered', { nonblocking: true }), 'recovered');
+});
+
+test('release closes a half-open identity probe before publishing RELEASED', async (t) => {
+  const root = sandbox(t);
+  const target = path.join(root, 'registry.json');
+  const endpoint = lockModule.fileLockEndpoint(target);
+  const identity = createHash('sha256')
+    .update(`hcc-file-lock-v1\0${endpoint.key}`)
+    .digest('hex');
+  const expectedBanner = `HCC_FILE_LOCK_V1 ${identity}\n`;
+  const probe = startHalfOpenProbe(t, endpoint, expectedBanner, root);
+  const probeExit = waitForExit(probe.child);
+  probeExit.catch(() => {});
+  const probeClosed = new Promise((resolve) => probe.child.once('close', resolve));
+  let releaseStarted;
+  let hasPrimaryError = false;
+  let primaryError;
+
+  try {
+    const result = withFileLock(target, () => {
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = performance.now() + 5000;
+      while (!fs.existsSync(probe.ready)) {
+        const remaining = deadline - performance.now();
+        assert.ok(remaining > 0, 'timed out waiting for the half-open identity probe');
+        Atomics.wait(wait, 0, 0, Math.min(10, remaining));
+      }
+      releaseStarted = performance.now();
+      return 'released';
+    });
+    const releaseElapsed = performance.now() - releaseStarted;
+    assert.equal(result, 'released');
+    assert.ok(releaseElapsed < 2500, `release took ${releaseElapsed}ms`);
+    assert.equal(
+      withFileLock(target, () => 'reacquired', { nonblocking: true }),
+      'reacquired'
+    );
+    assert.equal(probe.child.exitCode, null);
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+  }
+
+  const cleanupErrors = [];
+  const killProbe = () => {
+    if (probe.child.exitCode !== null || probe.child.signalCode !== null) return;
+    try {
+      if (!probe.child.kill('SIGKILL')) {
+        const error = new Error('failed to kill the half-open identity probe');
+        error.code = 'ERR_HALF_OPEN_PROBE_KILL_FAILED';
+        cleanupErrors.push(error);
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  };
+  try {
+    fs.writeFileSync(probe.stop, 'stop');
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  }
+  let exitTimer;
+  try {
+    await Promise.race([
+      probeExit,
+      new Promise((_, reject) => {
+        exitTimer = setTimeout(() => {
+          const error = new Error('timed out waiting for the half-open identity probe to exit');
+          error.code = 'ERR_HALF_OPEN_PROBE_EXIT_TIMEOUT';
+          reject(error);
+        }, 5000);
+      })
+    ]);
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  } finally {
+    clearTimeout(exitTimer);
+  }
+  let closeTimer;
+  try {
+    await Promise.race([
+      probeClosed,
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => {
+          const error = new Error('timed out waiting to reap the half-open identity probe');
+          error.code = 'ERR_HALF_OPEN_PROBE_REAP_TIMEOUT';
+          reject(error);
+        }, 5000);
+      })
+    ]);
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  } finally {
+    clearTimeout(closeTimer);
+  }
+
+  const failures = hasPrimaryError ? [primaryError, ...cleanupErrors] : cleanupErrors;
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'half-open probe test and cleanup failed', {
+      cause: failures[0]
+    });
+  }
+});
+
+test('terminal listener failure wins when release joins an in-flight close', async (t) => {
+  const root = sandbox(t);
+  const closeStartedBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const closeStarted = new Int32Array(closeStartedBuffer);
+  let worker = null;
+  let workerExit = null;
+  let callbackRan = false;
+  const lock = lockModule.createFileLock({
+    workerFactory({ workerSource, workerData }) {
+      const injectedSource = String.raw`
+        const net = require('node:net');
+        const { parentPort, workerData } = require('node:worker_threads');
+        const state = new Int32Array(workerData.stateBuffer);
+        const closeStarted = new Int32Array(workerData.testCloseStartedBuffer);
+        const originalListen = net.Server.prototype.listen;
+        const originalClose = net.Server.prototype.close;
+        const pendingCloseCallbacks = [];
+        let releaseObserved = false;
+        let injectFailure = true;
+        let delayCloseCallbacks = false;
+
+        parentPort.on('message', (message) => {
+          if (message?.type !== 'release') return;
+          releaseObserved = true;
+          setImmediate(() => {
+            for (const callback of pendingCloseCallbacks.splice(0)) callback();
+          });
+        });
+
+        net.Server.prototype.listen = function(...args) {
+          const callbackIndex = args.length - 1;
+          const callback = args[callbackIndex];
+          if (typeof callback !== 'function') return originalListen.apply(this, args);
+          const server = this;
+          args[callbackIndex] = function(...callbackArgs) {
+            callback.apply(this, callbackArgs);
+            if (injectFailure &&
+                Atomics.load(state, 0) === workerData.states.ACQUIRED) {
+              injectFailure = false;
+              delayCloseCallbacks = true;
+              const error = new Error('injected bound listener failure');
+              error.code = 'ERR_TEST_LISTENER_FAILURE';
+              server.emit('error', error);
+            }
+          };
+          return originalListen.apply(this, args);
+        };
+
+        net.Server.prototype.close = function(callback) {
+          if (!delayCloseCallbacks || typeof callback !== 'function') {
+            return originalClose.call(this, callback);
+          }
+          if (Atomics.compareExchange(closeStarted, 0, 0, 1) === 0) {
+            Atomics.notify(closeStarted, 0);
+          }
+          return originalClose.call(this, (error) => {
+            const deliver = () => callback(error);
+            if (releaseObserved) setImmediate(deliver);
+            else pendingCloseCallbacks.push(deliver);
+          });
+        };
+      ` + workerSource;
+      worker = new Worker(injectedSource, {
+        eval: true,
+        workerData: { ...workerData, testCloseStartedBuffer: closeStartedBuffer },
+        execArgv: []
+      });
+      workerExit = new Promise((resolve, reject) => {
+        worker.once('exit', resolve);
+        worker.once('error', reject);
+      });
+      workerExit.catch(() => {});
+      return worker;
+    }
+  });
+  t.after(async () => {
+    if (worker === null) return;
+    try { await worker.terminate(); } catch {}
+  });
+
+  const error = captureThrown(() => lock(path.join(root, 'registry.json'), () => {
+    callbackRan = true;
+    assert.notEqual(
+      Atomics.wait(closeStarted, 0, 0, 5000),
+      'timed-out',
+      'timed out waiting for the injected listener close'
+    );
+    return 'callback completed';
+  }, { nonblocking: true }));
+
+  assert.equal(callbackRan, true);
+  assert.equal(error?.code, 'ERR_FILE_LOCK_RELEASE_FAILED');
+  assert.equal(await workerExit, 0);
 });
 
 test('derives a fixed endpoint from the canonical target and shares it with aliases', (t) => {

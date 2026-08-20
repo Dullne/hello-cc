@@ -4,7 +4,7 @@
 
 **Goal:** Make socket-backed file-lock release deterministic in the presence of half-open probe clients, prepare an untagged `1.0.1` release candidate, and prove the candidate with fresh macOS Node 24 and local Linux-container evidence.
 
-**Architecture:** The worker remains the sole owner of lock listeners and the synchronous parent protocol remains unchanged. The worker additionally owns a set of accepted inbound sockets; every shutdown path first stops listeners and then destroys those sockets so `server.close()` completion no longer depends on peer behavior. Release metadata and the existing release-contract test move to `1.0.1`, while the published `v1.0.0` contract remains immutable.
+**Architecture:** The worker remains the sole owner of lock listeners and the synchronous parent protocol remains unchanged. The worker additionally owns a set of accepted inbound sockets and one shared in-flight close operation; concurrent shutdown callers join that operation instead of observing an already-cleared listener array. Every shutdown first stops listeners and then destroys local socket handles, while a terminal listener, bind, or top-level failure always outranks a concurrent normal release. Destroying the worker handle does not require an `allowHalfOpen` peer to close its still-writable half after it has already received the worker's FIN. Release metadata and the existing release-contract test move to `1.0.1`, while the published `v1.0.0` contract remains immutable.
 
 **Tech Stack:** Node.js 24 ESM, `node:test`, worker threads, loopback `net.Server`, npm packaging, Docker/Colima, tmux, SQLite, HTTP/WebSocket regression tests.
 
@@ -13,7 +13,7 @@
 ## File Map
 
 - Modify `test/socket-file-lock.test.mjs`: add a real-worker regression whose child keeps an accepted identity-probe connection half-open.
-- Modify `lib/shared/socket-lock-worker.mjs`: track accepted inbound sockets and destroy them during every listener shutdown.
+- Modify `lib/shared/socket-lock-worker.mjs`: track accepted inbound sockets, coalesce concurrent listener shutdowns, and preserve terminal-failure priority over release.
 - Review only `lib/shared/file-lock.mjs`: confirm the synchronous API, five-second release bound, state protocol, and fail-closed cleanup errors are unchanged.
 - Modify `test/release-contract.test.mjs`: move only the current release metadata assertions to `1.0.1` and require the new changelog section.
 - Modify `package.json` and `package-lock.json`: set the release-candidate version to `1.0.1` without creating a tag.
@@ -28,49 +28,88 @@
 
 - [ ] **Step 1: Add a real half-open probe child helper**
 
-Add this helper after `startHolder`. It retries until the lock worker appears, verifies the exact identity banner, deliberately leaves its writable half open after the server ends its half, and exits only when the server destroys the connection or the test writes the stop file.
+Add this helper after `startHolder`. It derives the same four unique candidate ports from `endpoint.key`, probes them serially until the lock worker appears, and verifies the exact identity banner. An unconfirmed attempt is destroyed and retried after a banner timeout, socket error, banner mismatch, or close; after confirmation the child deliberately leaves its writable half open. The stop file is the deterministic exit signal used by the test cleanup, because destroying the worker's local socket after its FIN does not require the remote `allowHalfOpen` side to close.
 
 ```js
 function startHalfOpenProbe(t, endpoint, expectedBanner, root) {
   const ready = path.join(root, 'half-open-probe-ready');
   const stop = path.join(root, 'half-open-probe-stop');
+  const ports = [];
+  for (let index = 0; ports.length < 4; index += 1) {
+    const digest = index === 0
+      ? createHash('sha256').update(endpoint.key).digest()
+      : createHash('sha256')
+        .update(`hcc-file-lock-port-v1\0${index}\0${endpoint.key}`)
+        .digest();
+    const port = 20_000 + digest.readUInt32BE(0) % 40_000;
+    if (!ports.includes(port)) ports.push(port);
+  }
+  assert.equal(ports[0], endpoint.port);
   const source = String.raw`
     import fs from 'node:fs';
     import net from 'node:net';
-    const [host, portText, expectedBanner, ready, stop] = process.argv.slice(1);
-    const port = Number(portText);
-    let connected = false;
+    const [host, encodedPorts, expectedBanner, ready, stop] = process.argv.slice(1);
+    const ports = JSON.parse(encodedPorts);
     let socket = null;
     let retryTimer = null;
-
-    const finish = (code) => {
-      if (retryTimer) clearTimeout(retryTimer);
-      try { socket?.destroy(); } catch {}
-      process.exit(code);
-    };
+    let nextPortIndex = 0;
     const stopTimer = setInterval(() => {
-      if (fs.existsSync(stop)) finish(0);
+      if (!fs.existsSync(stop)) return;
+      clearTimeout(retryTimer);
+      try { socket?.destroy(); } finally { process.exit(0); }
     }, 10);
     const retry = () => {
-      if (connected || retryTimer || fs.existsSync(stop)) return;
+      if (retryTimer !== null) return;
       retryTimer = setTimeout(() => {
         retryTimer = null;
         connect();
-      }, 5);
+      }, 10);
     };
     const connect = () => {
+      if (fs.existsSync(stop)) {
+        clearInterval(stopTimer);
+        process.exit(0);
+      }
+      if (socket !== null) return;
+      let bannerConfirmed = false;
       let received = '';
-      socket = net.createConnection({ host, port, allowHalfOpen: true });
-      socket.setEncoding('utf8');
-      socket.on('data', (chunk) => { received += chunk; });
-      socket.once('end', () => {
-        if (received !== expectedBanner) return finish(2);
-        connected = true;
-        fs.writeFileSync(ready, 'ready');
+      const port = ports[nextPortIndex];
+      nextPortIndex = (nextPortIndex + 1) % ports.length;
+      const candidate = net.createConnection({
+        host,
+        port,
+        allowHalfOpen: true
       });
-      socket.once('error', () => retry());
-      socket.once('close', () => {
-        if (connected) {
+      socket = candidate;
+      let bannerTimer = setTimeout(() => {
+        bannerTimer = null;
+        if (!bannerConfirmed) candidate.destroy();
+      }, 250);
+      const clearBannerTimer = () => {
+        clearTimeout(bannerTimer);
+        bannerTimer = null;
+      };
+      candidate.setEncoding('utf8');
+      candidate.on('data', (chunk) => { received += chunk; });
+      candidate.once('end', () => {
+        clearBannerTimer();
+        if (received !== expectedBanner) {
+          candidate.destroy();
+          return;
+        }
+        fs.writeFileSync(ready, 'ready');
+        bannerConfirmed = true;
+      });
+      candidate.once('error', () => {
+        if (!bannerConfirmed) {
+          clearBannerTimer();
+          candidate.destroy();
+        }
+      });
+      candidate.once('close', () => {
+        clearBannerTimer();
+        if (socket === candidate) socket = null;
+        if (bannerConfirmed) {
           clearInterval(stopTimer);
           process.exit(0);
         }
@@ -79,10 +118,8 @@ function startHalfOpenProbe(t, endpoint, expectedBanner, root) {
     };
     connect();
   `;
-  const child = spawn(process.execPath, [
-    '--input-type=module', '-e', source,
-    endpoint.host, String(endpoint.port), expectedBanner, ready, stop
-  ], {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source,
+    endpoint.host, JSON.stringify(ports), expectedBanner, ready, stop], {
     cwd: repoRoot,
     stdio: ['ignore', 'ignore', 'pipe']
   });
@@ -95,7 +132,7 @@ function startHalfOpenProbe(t, endpoint, expectedBanner, root) {
 
 - [ ] **Step 2: Add the real-worker behavior test**
 
-Place this test next to the other real socket-lock lifecycle cases. It waits inside the synchronous callback, starts the release timer only after the child has confirmed the banner, requires completion well below the existing five-second failure bound, and proves immediate reacquisition.
+Place this test next to the other real socket-lock lifecycle cases. It waits inside the synchronous callback, starts the release timer only after the child has confirmed the banner, requires completion well below the existing five-second failure bound, and proves immediate nonblocking reacquisition while the remote child remains alive with its write half open. Bind both exit and close observation before running the lock. Keep the early `probeExit` promise's normal 30-second safety timer so setup and release time do not consume the cleanup budget; only after writing the stop file, race that promise against a separate five-second cleanup timer. On a stop or exit-wait failure, fall back to `SIGKILL`, then wait for the child's close/reap event with a second bounded timeout so the test hook can still perform final cleanup. Clear both cleanup timers. Preserve a primary test or release failure as the first `AggregateError` entry and `cause` when cleanup also fails; cleanup-only failures remain visible instead of being swallowed.
 
 ```js
 test('release closes a half-open identity probe before publishing RELEASED', async (t) => {
@@ -107,32 +144,100 @@ test('release closes a half-open identity probe before publishing RELEASED', asy
     .digest('hex');
   const expectedBanner = `HCC_FILE_LOCK_V1 ${identity}\n`;
   const probe = startHalfOpenProbe(t, endpoint, expectedBanner, root);
-  const wait = new Int32Array(new SharedArrayBuffer(4));
-  let releaseStartedAt = null;
+  const probeExit = waitForExit(probe.child);
+  probeExit.catch(() => {});
+  const probeClosed = new Promise((resolve) => probe.child.once('close', resolve));
+  let releaseStarted;
+  let hasPrimaryError = false;
+  let primaryError;
 
   try {
     const result = withFileLock(target, () => {
+      const wait = new Int32Array(new SharedArrayBuffer(4));
       const deadline = performance.now() + 5000;
       while (!fs.existsSync(probe.ready)) {
-        if (performance.now() >= deadline) {
-          throw new Error('timed out waiting for half-open identity probe');
-        }
-        Atomics.wait(wait, 0, 0, 10);
+        const remaining = deadline - performance.now();
+        assert.ok(remaining > 0, 'timed out waiting for the half-open identity probe');
+        Atomics.wait(wait, 0, 0, Math.min(10, remaining));
       }
-      releaseStartedAt = performance.now();
+      releaseStarted = performance.now();
       return 'released';
     });
-
+    const releaseElapsed = performance.now() - releaseStarted;
     assert.equal(result, 'released');
-    const releaseElapsedMs = performance.now() - releaseStartedAt;
-    assert.ok(releaseElapsedMs < 2500, `release took ${releaseElapsedMs}ms`);
-    await waitForExit(probe.child);
+    assert.ok(releaseElapsed < 2500, `release took ${releaseElapsed}ms`);
     assert.equal(
       withFileLock(target, () => 'reacquired', { nonblocking: true }),
       'reacquired'
     );
-  } finally {
+    assert.equal(probe.child.exitCode, null);
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+  }
+
+  const cleanupErrors = [];
+  const killProbe = () => {
+    if (probe.child.exitCode !== null || probe.child.signalCode !== null) return;
+    try {
+      if (!probe.child.kill('SIGKILL')) {
+        const error = new Error('failed to kill the half-open identity probe');
+        error.code = 'ERR_HALF_OPEN_PROBE_KILL_FAILED';
+        cleanupErrors.push(error);
+      }
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  };
+  try {
     fs.writeFileSync(probe.stop, 'stop');
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  }
+  let exitTimer;
+  try {
+    await Promise.race([
+      probeExit,
+      new Promise((_, reject) => {
+        exitTimer = setTimeout(() => {
+          const error = new Error('timed out waiting for the half-open identity probe to exit');
+          error.code = 'ERR_HALF_OPEN_PROBE_EXIT_TIMEOUT';
+          reject(error);
+        }, 5000);
+      })
+    ]);
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  } finally {
+    clearTimeout(exitTimer);
+  }
+  let closeTimer;
+  try {
+    await Promise.race([
+      probeClosed,
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => {
+          const error = new Error('timed out waiting to reap the half-open identity probe');
+          error.code = 'ERR_HALF_OPEN_PROBE_REAP_TIMEOUT';
+          reject(error);
+        }, 5000);
+      })
+    ]);
+  } catch (error) {
+    cleanupErrors.push(error);
+    killProbe();
+  } finally {
+    clearTimeout(closeTimer);
+  }
+
+  const failures = hasPrimaryError ? [primaryError, ...cleanupErrors] : cleanupErrors;
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'half-open probe test and cleanup failed', {
+      cause: failures[0]
+    });
   }
 });
 ```
@@ -148,7 +253,7 @@ Run:
   test/socket-file-lock.test.mjs
 ```
 
-Expected: FAIL after approximately five seconds. The error graph must contain `ERR_FILE_LOCK_RELEASE_FAILED` and `ERR_FILE_LOCK_WORKER_TERMINATION_UNCONFIRMED`; a syntax error, child timeout, or banner mismatch is not the required RED result.
+Expected: FAIL from `withFileLock` release after approximately five seconds. The error graph must contain `ERR_FILE_LOCK_RELEASE_FAILED` and `ERR_FILE_LOCK_WORKER_TERMINATION_UNCONFIRMED`; cleanup explicitly stops and reaps the child, and any cleanup failure is aggregated after rather than replacing that primary error. A syntax error, child timeout, or banner mismatch is not the required RED result.
 
 - [ ] **Step 4: Retain the demonstrated regression after recording the RED output**
 
@@ -161,22 +266,28 @@ Do not commit production code in this step. Keep the failing test in the working
 - Test: `test/socket-file-lock.test.mjs`
 - Review: `lib/shared/file-lock.mjs`
 
-- [ ] **Step 1: Add accepted-socket ownership beside the listener state**
+- [ ] **Step 1: Add accepted-socket ownership and shutdown state beside the listeners**
 
-Inside `runSocketLockWorker`, add one worker-local set. Do not include the outgoing sockets created by `probeOccupant`.
+Inside `runSocketLockWorker`, add the worker-local accepted-socket set, one shared in-flight close operation, and a terminal-failure priority flag. Do not include the outgoing sockets created by `probeOccupant`.
 
 ```js
 const acceptedSockets = new Set();
+let servers = [];
+let closeOperation = null;
+let contentionDeadline = null;
+let releasing = false;
+let terminalFailureRequested = false;
 ```
 
 - [ ] **Step 2: Add idempotent connection registration and cleanup helpers**
 
-Place these helpers after `finish`. `destroyAcceptedSockets` intentionally does not clear the set; each socket removes itself on its real `close` event, preserving accurate ownership until the handle is closed.
+Place these helpers after `lockBanner`. `destroyAcceptedSockets` intentionally does not clear the set; each socket removes itself on its real local `close` event, preserving accurate ownership until the worker handle is closed. Consume accepted-socket errors so a reset or forced local destroy cannot become an unhandled event; listener errors continue through the existing server handlers.
 
 ```js
-function serveLockBanner(socket, identity) {
+function serveLock(socket, identity) {
   acceptedSockets.add(socket);
   socket.once('close', () => acceptedSockets.delete(socket));
+  socket.on('error', () => {});
   socket.end(lockBanner(identity));
 }
 
@@ -187,52 +298,241 @@ function destroyAcceptedSockets() {
 }
 ```
 
-- [ ] **Step 3: Stop listeners before destroying all accepted sockets**
+- [ ] **Step 3: Add a deterministic RED test for release joining terminal cleanup**
 
-Replace `closeServers` with the following implementation. It preserves the existing first-error aggregation and callback completion rule, including the zero-listener path.
+Place this regression beside the half-open lifecycle case. It patches only the
+test worker's `net.Server`: after acquisition it emits one bound-listener error,
+holds the resulting `server.close` callback until the parent sends `release`,
+and therefore forces release to join cleanup that is already in flight.
+
+```js
+test('terminal listener failure wins when release joins an in-flight close', async (t) => {
+  const root = sandbox(t);
+  const closeStartedBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const closeStarted = new Int32Array(closeStartedBuffer);
+  let worker = null;
+  let workerExit = null;
+  let callbackRan = false;
+  const lock = lockModule.createFileLock({
+    workerFactory({ workerSource, workerData }) {
+      const injectedSource = String.raw`
+        const net = require('node:net');
+        const { parentPort, workerData } = require('node:worker_threads');
+        const state = new Int32Array(workerData.stateBuffer);
+        const closeStarted = new Int32Array(workerData.testCloseStartedBuffer);
+        const originalListen = net.Server.prototype.listen;
+        const originalClose = net.Server.prototype.close;
+        const pendingCloseCallbacks = [];
+        let releaseObserved = false;
+        let injectFailure = true;
+        let delayCloseCallbacks = false;
+
+        parentPort.on('message', (message) => {
+          if (message?.type !== 'release') return;
+          releaseObserved = true;
+          setImmediate(() => {
+            for (const callback of pendingCloseCallbacks.splice(0)) callback();
+          });
+        });
+
+        net.Server.prototype.listen = function(...args) {
+          const callbackIndex = args.length - 1;
+          const callback = args[callbackIndex];
+          if (typeof callback !== 'function') return originalListen.apply(this, args);
+          const server = this;
+          args[callbackIndex] = function(...callbackArgs) {
+            callback.apply(this, callbackArgs);
+            if (injectFailure &&
+                Atomics.load(state, 0) === workerData.states.ACQUIRED) {
+              injectFailure = false;
+              delayCloseCallbacks = true;
+              const error = new Error('injected bound listener failure');
+              error.code = 'ERR_TEST_LISTENER_FAILURE';
+              server.emit('error', error);
+            }
+          };
+          return originalListen.apply(this, args);
+        };
+
+        net.Server.prototype.close = function(callback) {
+          if (!delayCloseCallbacks || typeof callback !== 'function') {
+            return originalClose.call(this, callback);
+          }
+          if (Atomics.compareExchange(closeStarted, 0, 0, 1) === 0) {
+            Atomics.notify(closeStarted, 0);
+          }
+          return originalClose.call(this, (error) => {
+            const deliver = () => callback(error);
+            if (releaseObserved) setImmediate(deliver);
+            else pendingCloseCallbacks.push(deliver);
+          });
+        };
+      ` + workerSource;
+      worker = new Worker(injectedSource, {
+        eval: true,
+        workerData: { ...workerData, testCloseStartedBuffer: closeStartedBuffer },
+        execArgv: []
+      });
+      workerExit = new Promise((resolve, reject) => {
+        worker.once('exit', resolve);
+        worker.once('error', reject);
+      });
+      workerExit.catch(() => {});
+      return worker;
+    }
+  });
+  t.after(async () => {
+    if (worker === null) return;
+    try { await worker.terminate(); } catch {}
+  });
+
+  const error = captureThrown(() => lock(path.join(root, 'registry.json'), () => {
+    callbackRan = true;
+    assert.notEqual(
+      Atomics.wait(closeStarted, 0, 0, 5000),
+      'timed-out',
+      'timed out waiting for the injected listener close'
+    );
+    return 'callback completed';
+  }, { nonblocking: true }));
+
+  assert.equal(callbackRan, true);
+  assert.equal(error?.code, 'ERR_FILE_LOCK_RELEASE_FAILED');
+  assert.equal(await workerExit, 0);
+});
+```
+
+Run:
+
+```bash
+/opt/homebrew/opt/node@24/bin/node \
+  --test \
+  --test-name-pattern='terminal listener failure wins when release joins an in-flight close' \
+  test/socket-file-lock.test.mjs
+```
+
+Expected before the production change: FAIL because the second `closeServers`
+call sees the already-cleared listener array, publishes `RELEASED`, and lets
+`captureThrown` observe no release error. Keep this focused RED in the working
+tree.
+
+- [ ] **Step 4: Stop listeners before destroying all accepted sockets**
+
+Replace `closeServers` with the following implementation. The first caller creates and owns the operation; later callers append waiters to that operation. A joiner destroys the current accepted-socket set again only after `cleanupStarted`; a reentrant join during the initial listener loop must let that loop call `close` on every listener before the first socket destruction. The implementation preserves first-error aggregation, and its completion gate prevents a synchronous `server.close` callback or throw from publishing status before every listener has received `close` and accepted-handle destruction has started. Operation state is cleared once, before its copied waiter list runs; every waiter is invoked once with the same result.
 
 ```js
 function closeServers(callback) {
-  const closing = servers;
-  servers = [];
-  if (closing.length === 0) {
-    destroyAcceptedSockets();
-    callback(null);
+  if (closeOperation !== null) {
+    closeOperation.callbacks.push(callback);
+    if (closeOperation.cleanupStarted) destroyAcceptedSockets();
     return;
   }
-  let remaining = closing.length;
-  let firstError = null;
-  const closed = (error = null) => {
-    if (error && !firstError) firstError = error;
-    remaining -= 1;
-    if (remaining === 0) callback(firstError);
+  const closing = servers;
+  servers = [];
+  const operation = {
+    callbacks: [callback],
+    cleanupStarted: false,
+    closing,
+    completed: false,
+    firstError: null,
+    remaining: closing.length
   };
-  for (const server of closing) {
-    try {
-      server.close(closed);
-    } catch (error) {
+  closeOperation = operation;
+  const complete = () => {
+    if (operation.completed || !operation.cleanupStarted || operation.remaining !== 0) return;
+    operation.completed = true;
+    closeOperation = null;
+    const callbacks = operation.callbacks;
+    operation.callbacks = [];
+    operation.closing = [];
+    for (const waiting of callbacks) waiting(operation.firstError);
+  };
+  const closed = (error = null) => {
+    if (error && !operation.firstError) operation.firstError = error;
+    operation.remaining -= 1;
+    complete();
+  };
+  for (const server of operation.closing) {
+    let settled = false;
+    const serverClosed = (error = null) => {
+      if (settled) return;
+      settled = true;
       closed(error);
+    };
+    try {
+      server.close(serverClosed);
+    } catch (error) {
+      serverClosed(error);
     }
   }
   destroyAcceptedSockets();
+  operation.cleanupStarted = true;
+  complete();
 }
 ```
 
-- [ ] **Step 4: Route inbound lock connections through the ownership helper**
+- [ ] **Step 5: Give terminal failure priority over concurrent release**
+
+Add one helper for listener, non-`EADDRINUSE` bind, synchronous bind, and top-level failures. Route those terminal paths through it instead of directly calling `finish(states.FAILED, 1)`. `retryCleanly` remains a normal contention cleanup: only its own close error requests terminal failure, while an already-requested concurrent failure suppresses the retry. Make `finish` enforce the flag as a final guard, and make the release waiter preserve normal `RELEASE_FAILED` behavior for a standalone `server.close` error while publishing `FAILED` when a terminal failure was requested.
+
+```js
+function finish(status, detail = 0) {
+  if (finished) return;
+  if (terminalFailureRequested) {
+    status = states.FAILED;
+    detail = 1;
+  }
+  finished = true;
+  publish(status, detail);
+  parentPort.close();
+}
+
+function requestTerminalFailure() {
+  if (finished) return;
+  terminalFailureRequested = true;
+  generation += 1;
+  closeServers(() => finish(states.FAILED, 1));
+}
+
+function retryCleanly(attemptGeneration) {
+  if (finished || attemptGeneration !== generation) return;
+  generation += 1;
+  closeServers((error) => {
+    if (error) requestTerminalFailure();
+    else if (!terminalFailureRequested) retryAfterContention();
+  });
+}
+
+closeServers((error) => {
+  if (terminalFailureRequested) finish(states.FAILED, 1);
+  else finish(error ? states.RELEASE_FAILED : states.RELEASED, error ? 1 : 0);
+});
+```
+
+- [ ] **Step 6: Route inbound lock connections through the ownership helper**
 
 Replace the server constructor inside `bindCandidate`:
 
 ```js
-candidate = net.createServer((socket) => serveLockBanner(socket, target.identity));
+candidate = net.createServer((socket) => serveLock(socket, target.identity));
 ```
 
-- [ ] **Step 5: Run the focused test and verify GREEN**
+- [ ] **Step 7: Run the half-open test and verify GREEN**
 
 Run the same command as Task 1 Step 3.
 
-Expected: PASS; release completes in under 2.5 seconds, the half-open child exits because its socket is destroyed, and the same target is reacquired nonblocking.
+Expected: PASS; release completes in under 2.5 seconds and the same target is immediately reacquired nonblocking while the `allowHalfOpen` child is still alive. The test then writes the stop file, gives the already-bound `probeExit` promise a fresh five-second cleanup window, and performs a separately bounded close/reap wait, so setup and release latency do not consume the cleanup budget, normal cleanup leaves no child, and abnormal cleanup cannot hang the test indefinitely. Worker-side `socket.destroy()` closes the local handle needed by `server.close`; after the worker has already sent FIN with the banner, TCP still permits the remote peer's write half to remain open until that peer explicitly closes it.
 
-- [ ] **Step 6: Run adjacent Node 24 lock and migration coverage**
+- [ ] **Step 8: Run the terminal-cleanup reentry test and verify GREEN**
+
+Run the focused command from Step 3 again.
+
+Expected: PASS; the release request joins the shared `closeOperation`, the
+terminal failure retains priority over concurrent release, the caller receives
+`ERR_FILE_LOCK_RELEASE_FAILED`, and the worker exits normally after publishing
+the failure state.
+
+- [ ] **Step 9: Run adjacent Node 24 lock and migration coverage**
 
 Run:
 
@@ -245,9 +545,9 @@ Run:
   test/file-lock.test.mjs test/schema-v7.test.mjs
 ```
 
-Expected: every command exits 0. The complete socket-lock file passes, both historical macOS symptoms pass, and the existing injected release/termination failure tests remain unchanged.
+Expected: every command exits 0. The complete socket-lock file reports 21 tests, 21 passes, and 0 failures; both historical macOS symptoms pass, the terminal-cleanup reentry regression passes, and the existing injected release/termination failure tests remain unchanged.
 
-- [ ] **Step 7: Confirm fail-closed invariants are untouched**
+- [ ] **Step 10: Confirm fail-closed invariants are untouched**
 
 Review `git diff -- lib/shared/file-lock.mjs lib/shared/socket-lock-worker.mjs` and verify:
 
@@ -259,7 +559,7 @@ terminateWorker and cleanup-error aggregation are unchanged
 withFileLock remains synchronous
 ```
 
-- [ ] **Step 8: Commit the RED-GREEN fix**
+- [ ] **Step 11: Commit the RED-GREEN fix**
 
 ```bash
 git add test/socket-file-lock.test.mjs lib/shared/socket-lock-worker.mjs
@@ -339,11 +639,12 @@ boundaries unchanged.
 
 ### Highlights
 
-- File-lock workers now close every accepted identity-probe socket before
-  publishing `RELEASED`, so a half-open local client cannot hold release open
-  until the five-second failure bound.
-- Added a real-worker regression that holds the client write direction open,
-  proves prompt release, and immediately reacquires the same lock endpoint.
+- File-lock workers now destroy every local accepted identity-probe handle before
+  publishing `RELEASED`, so listener completion no longer waits for a peer's
+  still-open write half until the five-second failure bound.
+- Added a real-worker regression that keeps the remote client write direction
+  open through prompt release, immediately reacquires the same lock endpoint,
+  and then explicitly stops and awaits the probe child.
 
 ### Compatibility Notes
 
@@ -428,7 +729,7 @@ for run in {1..20}; do
 done
 ```
 
-Expected: 20/20 commands exit 0 without a five-second release delay or a leftover child process.
+Expected: 20/20 commands exit 0 without a five-second release delay. Each iteration proves immediate reacquisition while the probe child remains half-open, then explicitly writes its stop file and awaits exit, leaving no child process behind.
 
 - [ ] **Step 3: Run three complete unit-suite passes under Node 24**
 
