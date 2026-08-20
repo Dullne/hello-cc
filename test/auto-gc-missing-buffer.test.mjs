@@ -94,3 +94,35 @@ test('automatic GC still rejects an existing buffer-directory symlink', (t) => {
   assert.throws(() => runAutomaticGc(state));
   assert.equal(fs.lstatSync(state.bufs).isSymbolicLink(), true);
 });
+
+test('automatic GC rejects a buffer directory replaced by a symlink after preflight', (t) => {
+  const state = fixture(t, 'preflight-symlink-race');
+  const moved = `${state.bufs}.moved`;
+  const outside = path.join(path.dirname(state.root), 'outside');
+  fs.mkdirSync(state.bufs);
+  fs.mkdirSync(outside);
+
+  const originalLstatSync = fs.lstatSync;
+  let replaced = false;
+  fs.lstatSync = function interceptedLstat(value, ...args) {
+    const stat = originalLstatSync.call(this, value, ...args);
+    if (!replaced && path.resolve(String(value)) === path.resolve(state.bufs)) {
+      replaced = true;
+      fs.renameSync(state.bufs, moved);
+      fs.symlinkSync(outside, state.bufs);
+    }
+    return stat;
+  };
+  try {
+    assert.throws(
+      () => runAutomaticGc(state),
+      (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+    );
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+
+  assert.equal(replaced, true);
+  assert.equal(fs.lstatSync(state.bufs).isSymbolicLink(), true);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
