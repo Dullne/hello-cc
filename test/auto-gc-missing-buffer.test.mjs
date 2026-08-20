@@ -18,7 +18,7 @@ function unusedPeerDependency() {
   throw new Error('peer dependency should not be used for an empty auto-GC subject');
 }
 
-function createTestRunGc(now = () => nowSec) {
+function createTestRunGc(now = () => nowSec, overrides = {}) {
   return createGcCommands({
     now,
     UNKNOWN_EVIDENCE_GRACE_SEC: 120,
@@ -26,7 +26,8 @@ function createTestRunGc(now = () => nowSec) {
     peerMutationSubject: unusedPeerDependency,
     mutatePeerWithEvidence: unusedPeerDependency,
     observeClockSafetyInTransactionOrThrow: observeClockSafetyInTransaction,
-    observePeerEvidence: unusedPeerDependency
+    observePeerEvidence: unusedPeerDependency,
+    ...overrides
   }).runGc;
 }
 
@@ -378,5 +379,111 @@ test('automatic GC rechecks paths after the final clock read before history muta
   assert.equal(nowCalls, 4);
   assert.equal(replaced, true);
   assert.equal(fs.lstatSync(stateDirectory).isSymbolicLink(), true);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
+
+test('automatic GC guards the optimistic clock write after history snapshot creation', (t) => {
+  const state = fixture(t, 'guard-before-optimistic-clock');
+  const movedBufs = `${state.bufs}.moved`;
+  fs.mkdirSync(state.bufs);
+  state.db.prepare(`
+    INSERT INTO peers(id, kind, status, created_at, last_seen_at)
+    VALUES ('live-owner', 'shell', 'idle', ?, ?)
+  `).run(nowSec - 100, nowSec - 100);
+  state.db.prepare(`
+    INSERT INTO locks(resource, base_resource, scope, owner, expires_at, created_at, ttl_sec)
+    VALUES ('src/live', 'src/live', '*', 'live-owner', ?, ?, 90)
+  `).run(nowSec - 1, nowSec - 100);
+  state.db.prepare(`
+    UPDATE meta SET value = ? WHERE key = 'clock_last_observed_at'
+  `).run(String(nowSec - 1));
+  const initialLease = state.db.prepare(`
+    SELECT expires_at, ttl_sec FROM locks WHERE resource = 'src/live'
+  `).get();
+
+  let snapshotOpen = false;
+  let replaced = false;
+  const hookedDb = new Proxy(state.db, {
+    get(target, property) {
+      if (property === 'exec') {
+        return (sql) => {
+          const statement = String(sql).trim();
+          if (statement === 'BEGIN;') snapshotOpen = true;
+          const result = target.exec(sql);
+          if (snapshotOpen && statement === 'COMMIT;' && !replaced) {
+            snapshotOpen = false;
+            replaced = true;
+            fs.renameSync(state.bufs, movedBufs);
+            fs.mkdirSync(state.bufs);
+          }
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  const raceRunGc = createTestRunGc(() => nowSec, {
+    peerMutationSubject(db, peerId) {
+      return {
+        peer: db.prepare(`
+          SELECT id, status, pid, pid_start_token, pid_command_hash, last_seen_at
+          FROM peers WHERE id = ?
+        `).get(peerId) || null,
+        binding: null
+      };
+    },
+    observePeerEvidence: () => ({ state: 'live' })
+  });
+
+  assert.throws(
+    () => runAutomaticGc({ ...state, db: hookedDb }, {}, raceRunGc),
+    (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+  );
+  assert.equal(replaced, true);
+  assert.equal(
+    state.db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get().value,
+    String(nowSec - 1)
+  );
+  assert.deepEqual(state.db.prepare(`
+    SELECT expires_at, ttl_sec FROM locks WHERE resource = 'src/live'
+  `).get(), initialLease);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
+
+test('automatic GC guards the in-buffer clock write after its current-time read', (t) => {
+  const state = fixture(t, 'guard-before-buffer-clock');
+  const stateDirectory = path.dirname(state.bufs);
+  const movedStateDirectory = `${stateDirectory}.moved`;
+  const outsideStateDirectory = path.join(path.dirname(state.root), 'outside-buffer-clock-state');
+  fs.mkdirSync(state.bufs);
+  fs.mkdirSync(path.join(outsideStateDirectory, 'bufs'), { recursive: true });
+  state.db.prepare(`
+    UPDATE meta SET value = ? WHERE key = 'clock_last_observed_at'
+  `).run(String(nowSec - 2));
+
+  let nowCalls = 0;
+  let replaced = false;
+  const raceRunGc = createTestRunGc(() => {
+    nowCalls += 1;
+    if (nowCalls === 2) {
+      replaced = true;
+      fs.renameSync(stateDirectory, movedStateDirectory);
+      fs.symlinkSync(outsideStateDirectory, stateDirectory);
+      return nowSec;
+    }
+    return nowSec - 1;
+  });
+
+  assert.throws(
+    () => runAutomaticGc(state, {}, raceRunGc),
+    (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+  );
+  assert.equal(nowCalls, 2);
+  assert.equal(replaced, true);
+  assert.equal(
+    state.db.prepare("SELECT value FROM meta WHERE key = 'clock_last_observed_at'").get().value,
+    String(nowSec - 1)
+  );
   assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
 });
