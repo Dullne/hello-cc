@@ -5991,11 +5991,24 @@ async function tmuxBackedStartWorkflow() {
   if (!restoredAuthority?.payload?.tmux_session_created || !restoredAuthority?.payload?.tmux_session_id) {
     fail(`startup auto GC left no complete immutable tmux authority: ${JSON.stringify({ authorityBindingAfterStop, restoredAuthority })}`);
   }
-  withMeshDb((db) => db.prepare('UPDATE events SET created_at = ? WHERE id = ?')
-    .run(oldAuthorityAt, restoredAuthority.id));
+  const authorityGcNow = Math.floor(Date.now() / 1000);
+  withMeshDb((db) => {
+    db.prepare('UPDATE events SET created_at = ? WHERE id = ?')
+      .run(oldAuthorityAt, restoredAuthority.id);
+    // Backdating the fixture must not itself look like a real wall-clock jump.
+    // Establish the same current baseline used by the other explicit GC tests.
+    db.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
+    db.prepare(`
+      INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(String(authorityGcNow));
+  });
   // This assertion exercises manual history pruning. Request it explicitly
   // instead of racing the runtime's asynchronous startup auto-GC.
-  hcc(['gc', '--older-than', '14', '--history', '--yes']);
+  const authorityGc = JSON.parse(hcc(['--json', 'gc', '--older-than', '14', '--history', '--yes']));
+  if (authorityGc.data?.deferred_age_based || Number(authorityGc.data?.deferred_old_events || 0) !== 0) {
+    fail(`tmux authority history GC was unexpectedly deferred: ${JSON.stringify(authorityGc.data)}`);
+  }
   const authorityRowsAfterFullGc = withMeshDb((db) => db.prepare(`
     SELECT id FROM events
     WHERE type = 'tmux.session.attached'
