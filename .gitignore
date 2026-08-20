@@ -1,4 +1,5 @@
 node_modules/
+.worktrees/
 .hello-cc/
 *.log
 AGENTS.md
