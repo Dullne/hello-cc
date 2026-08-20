@@ -44,8 +44,8 @@ startup in fresh macOS npm installations.
   reports success, including safe handling for PID reuse and a bounded timeout
   when shutdown cannot be confirmed.
 - Background Web startup keeps its immediate child-exit failure but allows a
-  bounded 30-second health window, avoiding false failures on loaded macOS CI
-  hosts where process identity and project restoration can exceed 15 seconds.
+  bounded 60-second health window, avoiding false failures on loaded macOS CI
+  hosts where process identity and project restoration can exceed 30 seconds.
 
 ### Compatibility Notes
 
