@@ -7,17 +7,18 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
+const currentRelease = '1.0.1';
 
 const englishDocs = ['README.md', 'docs/README.md', 'docs/commands.md', 'docs/guide.md'];
 const chineseDocs = ['README.zh-CN.md', 'docs/README.zh-CN.md', 'docs/commands.zh-CN.md', 'docs/guide.zh-CN.md'];
 
-test('v1 metadata and Docker verification contract stay pinned', () => {
+test('current release metadata and Docker verification contract stay pinned', () => {
   const pkg = JSON.parse(read('package.json'));
   const lock = JSON.parse(read('package-lock.json'));
   const dockerfile = read('Dockerfile');
-  assert.equal(pkg.version, '1.0.0');
-  assert.equal(lock.version, '1.0.0');
-  assert.equal(lock.packages[''].version, '1.0.0');
+  assert.equal(pkg.version, currentRelease);
+  assert.equal(lock.version, currentRelease);
+  assert.equal(lock.packages[''].version, currentRelease);
   assert.match(dockerfile, /RUN npm ci --no-audit --no-fund/);
   assert.match(dockerfile, /node --version && tmux -V/);
   assert.doesNotMatch(dockerfile, /RUN npm install /);
@@ -55,6 +56,7 @@ test('CLI help and changelog expose the same v1 boundaries', () => {
     /provider peer ID/i, /Runtime API v2/, /process evidence/i, /120-second/,
     /--history/, /--tls/, /--trust-proxy/, /plaintext/i, /existing server directory/i
   ]) assert.match(help, expected);
+  assert.match(changelog, /## 1\.0\.1/);
   assert.match(changelog, /## 1\.0\.0/);
   assert.match(changelog, /### Accepted Risks/);
   assert.match(changelog, /no automatic\s+alias, graph rewrite, or migration/i);

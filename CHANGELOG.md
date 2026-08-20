@@ -16,6 +16,40 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.0.1
+
+### Summary
+
+hello-cc 1.0.1 is a file-lock determinism and release-reliability patch. It
+makes worker shutdown reclaim kernel lock endpoints deterministically when an
+identity probe keeps its client write half open.
+
+### Highlights
+
+- The socket-lock worker now tracks each locally accepted socket and destroys
+  those accepted handles during server shutdown, so release no longer depends
+  on the peer closing its writable half after reading the lock banner.
+- A real half-open identity-probe regression verifies that release returns
+  promptly, a nonblocking reacquisition succeeds immediately, and the probe is
+  explicitly stopped and awaited during final cleanup.
+
+### Compatibility Notes
+
+- No CLI command or package-surface behavior changes are intended. Schema v7,
+  Runtime API v2, the authenticated browser's ability to choose any existing
+  server directory as a project root, and the 1.0.0 accepted-risk boundaries
+  are unchanged.
+- The existing five-second fail-closed deadline and cleanup-error behavior are
+  unchanged.
+
+### Validation
+
+The 1.0.1 release gate requires repeated macOS Node 24 tests; a no-cache Linux
+Node 24/tmux image build followed by three complete `npm test` runs in that same
+image, each ending with `FULL_REGRESSION_OK`; and a fourth clean container that
+installs the same 1.0.1 package tarball and passes PTY, database, and Web smoke
+checks.
+
 ## 1.0.0
 
 ### Summary
