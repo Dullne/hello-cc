@@ -5993,7 +5993,9 @@ async function tmuxBackedStartWorkflow() {
   }
   withMeshDb((db) => db.prepare('UPDATE events SET created_at = ? WHERE id = ?')
     .run(oldAuthorityAt, restoredAuthority.id));
-  hcc(['gc', '--older-than', '14', '--yes']);
+  // This assertion exercises manual history pruning. Request it explicitly
+  // instead of racing the runtime's asynchronous startup auto-GC.
+  hcc(['gc', '--older-than', '14', '--history', '--yes']);
   const authorityRowsAfterFullGc = withMeshDb((db) => db.prepare(`
     SELECT id FROM events
     WHERE type = 'tmux.session.attached'
