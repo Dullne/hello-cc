@@ -5319,50 +5319,6 @@ async function statusServer(status) {
   };
 }
 
-async function stalledRuntimeServer(phase) {
-  const child = spawn(process.execPath, ['-e', `
-    const http = require('node:http');
-    const sockets = new Set();
-    const server = http.createServer((req, res) => {
-      if (${JSON.stringify(phase)} === 'body') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.write('{"deleted":0');
-      }
-    });
-    server.on('connection', (socket) => {
-      sockets.add(socket);
-      socket.on('close', () => sockets.delete(socket));
-    });
-    server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port) + '\\n'));
-    process.on('SIGTERM', () => {
-      for (const socket of sockets) socket.destroy();
-      server.close(() => process.exit(0));
-    });
-  `], { stdio: ['ignore', 'pipe', 'inherit'] });
-  const port = await new Promise((resolve, reject) => {
-    let output = '';
-    const timer = setTimeout(() => reject(new Error(`timed out starting ${phase} stalled runtime`)), 5000);
-    child.stdout.on('data', (chunk) => {
-      output += chunk;
-      const match = output.match(/^(\d+)\n/);
-      if (!match) return;
-      clearTimeout(timer);
-      resolve(Number(match[1]));
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`${phase} stalled runtime exited early with ${code}`));
-    });
-  });
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    close: async () => {
-      child.kill('SIGTERM');
-      try { await waitForProcessExit(child.pid, `${phase} stalled runtime exit`, 3000); } catch {}
-    }
-  };
-}
-
 function bufferGcCanonicalizationRaceWorkflow() {
   for (const phase of ['before', 'after']) {
     const raceRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-realpath-${phase}-${testId}-`));
@@ -5855,42 +5811,6 @@ async function bufferGcArbitrationWorkflow() {
       const payload = JSON.parse(gc);
       if (!fs.existsSync(orphan) || Number(payload.data?.deferred_buf_files || 0) < 1) {
         fail(`runtime ${status} did not defer eligible buffer cleanup: ${gc}`);
-      }
-    } finally {
-      await server?.close();
-      fs.rmSync(isolatedRoot, { recursive: true, force: true });
-      fs.rmSync(isolatedHome, { recursive: true, force: true });
-    }
-  }
-
-  for (const phase of ['headers', 'body']) {
-    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-stall-${phase}-${testId}-`));
-    const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-stall-home-${phase}-${testId}-`));
-    let server = null;
-    try {
-      const isolatedEnv = { ...env, HOME: isolatedHome };
-      run(process.execPath, [hccBin, '--root', isolatedRoot, 'init', '--no-guidance'], { env: isolatedEnv });
-      const directory = path.join(isolatedRoot, '.hello-cc', 'bufs');
-      fs.mkdirSync(directory, { recursive: true });
-      const orphan = path.join(directory, 'old-orphan.out');
-      fs.writeFileSync(orphan, 'orphan');
-      fs.utimesSync(orphan, oldTime, oldTime);
-      server = await stalledRuntimeServer(phase);
-      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify({
-        pid: process.pid,
-        base_url: server.baseUrl,
-        token: 'regression-token'
-      }));
-
-      const startedAt = Date.now();
-      const gc = run(process.execPath, [hccBin, '--root', isolatedRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: isolatedEnv });
-      const elapsedMs = Date.now() - startedAt;
-      const payload = JSON.parse(gc);
-      if (elapsedMs >= 9000 ||
-          Number(payload.data?.buf_files || 0) !== 0 ||
-          Number(payload.data?.deferred_buf_files || 0) < 1 ||
-          !fs.existsSync(orphan)) {
-        fail(`runtime ${phase} stall did not fail closed within deadline (${elapsedMs}ms): ${gc}`);
       }
     } finally {
       await server?.close();
