@@ -86,6 +86,20 @@ test('Chinese install docs cover supported platforms and verification', () => {
   assert.match(text, /Linux[^。\n]*(?:系统|发行版)[^。\n]*包管理器[^。\n]*(?:而不是|不要使用|不使用)[^。\n]*Homebrew/);
 });
 
+test('CI and 1.0.1 notes expose the macOS PTY packaging contract', () => {
+  const workflow = read('.github/workflows/test.yml');
+  const releaseNotes = read('CHANGELOG.md').split('## 1.0.0')[0];
+
+  assert.match(workflow, /name: Verify install and PTY contract/);
+  assert.match(workflow, /node --test test\/release-contract\.test\.mjs/);
+  assert.match(workflow, /captures a complete real PTY identity/);
+  assert.doesNotMatch(workflow, /chmod/);
+  assert.match(releaseNotes, /node-pty.*1\.2\.0-beta\.15/is);
+  assert.match(releaseNotes, /1\.1\.0.*non-executable Darwin helpers/is);
+  assert.match(releaseNotes, /exact(?:ly)? pin/i);
+  assert.match(releaseNotes, /Linux.*macOS.*WSL/is);
+});
+
 test('CLI help and changelog expose the same v1 boundaries', () => {
   const help = execFileSync(process.execPath, [path.join(repoRoot, 'bin', 'hcc.mjs'), 'web', '--help'], {
     encoding: 'utf8'

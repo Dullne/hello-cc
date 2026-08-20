@@ -20,9 +20,10 @@ backfills.
 
 ### Summary
 
-hello-cc 1.0.1 is a file-lock determinism and release-reliability patch. It
-makes worker shutdown reclaim kernel lock endpoints deterministically when an
-identity probe keeps its client write half open.
+hello-cc 1.0.1 is a file-lock determinism, fresh-install, and release-reliability
+patch. It makes worker shutdown reclaim kernel lock endpoints deterministically
+when an identity probe keeps its client write half open, and restores real PTY
+startup in fresh macOS npm installations.
 
 ### Highlights
 
@@ -32,6 +33,13 @@ identity probe keeps its client write half open.
 - A real half-open identity-probe regression verifies that release returns
   promptly, a nonblocking reacquisition succeeds immediately, and the probe is
   explicitly stopped and awaited during final cleanup.
+- `node-pty` is exactly pinned to `1.2.0-beta.15`. The stable `node-pty 1.1.0`
+  npm artifact contains non-executable Darwin helpers, which makes a fresh
+  macOS install fail with `posix_spawnp failed`; the selected artifact publishes
+  both Darwin helpers with executable modes.
+- Linux, macOS, and WSL installation instructions now list Node.js 24, tmux
+  commands for the major system package managers, CLI verification, and safe
+  handling for npm global-install permission errors.
 
 ### Compatibility Notes
 
@@ -41,6 +49,10 @@ identity probe keeps its client write half open.
   are unchanged.
 - The existing five-second fail-closed deadline and cleanup-error behavior are
   unchanged.
+- `node-pty@1.2.0-beta.15` is a bounded prerelease dependency risk. The exact
+  pin prevents unreviewed beta movement, and release tests verify the installed
+  version, regular-file identity, executable modes, and a real PTY. There is no
+  postinstall or CI-only `chmod` workaround.
 
 ### Validation
 
@@ -48,7 +60,9 @@ The 1.0.1 release gate requires repeated macOS Node 24 tests; a no-cache Linux
 Node 24/tmux image build followed by three complete `npm test` runs in that same
 image, each ending with `FULL_REGRESSION_OK`; and a fourth clean container that
 installs the same 1.0.1 package tarball and passes PTY, database, and Web smoke
-checks.
+checks. Fresh macOS consumer installs must pass both normal and
+`--ignore-scripts` installation, proving that executable helper modes come from
+the package artifact rather than lifecycle-script mutation.
 
 ## 1.0.0
 

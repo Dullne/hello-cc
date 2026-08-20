@@ -40,6 +40,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify install and PTY contract
+        run: |
+          node --test test/release-contract.test.mjs
+          node --test --test-name-pattern='captures a complete real PTY identity' test/process-identity.test.mjs
+
       - name: Smoke test
         run: npm run smoke
 
