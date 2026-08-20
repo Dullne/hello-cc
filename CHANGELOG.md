@@ -52,9 +52,9 @@ startup in fresh macOS npm installations.
 - Per-connection Web action tokens now require their issuing terminal socket to
   still be open, closing the handshake race before asynchronous token cleanup.
 - Runtime request deadlines now reach the underlying HTTP transport, and peer
-  start/attach operations use a bounded 60-second window while stop and
-  terminal-input operations use 30 seconds, instead of all inheriting the
-  shorter read-request default.
+  start/attach preflight and mutation requests use a bounded 60-second window
+  while stop and terminal-input operations use 30 seconds, instead of all
+  inheriting the shorter read-request default.
 
 ### Compatibility Notes
 

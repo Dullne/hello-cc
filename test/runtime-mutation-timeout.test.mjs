@@ -17,7 +17,7 @@ test('session mutations use bounded deadlines matched to their tmux work', () =>
   assert.match(runtimeClientSource, /export const RUNTIME_SESSION_MUTATION_TIMEOUT_MS = 30_000/);
   assert.equal(
     peerSource.match(/timeoutMs: RUNTIME_SESSION_START_TIMEOUT_MS/g)?.length,
-    2
+    4
   );
   assert.equal(
     peerSource.match(/timeoutMs: RUNTIME_SESSION_MUTATION_TIMEOUT_MS/g)?.length,
