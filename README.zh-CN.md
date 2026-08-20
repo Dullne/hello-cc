@@ -57,9 +57,40 @@ hello-cc 支持 Linux 和 macOS。需要 Node.js 24 或更新版本；可被浏�
 Linux 可以通过 `/proc` 做更完整的进程自动发现。macOS 上建议通过 hello-cc
 shim 或 `hcc peer start` 启动会话，以获得可靠的 tmux 托管终端。
 
+先通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本，再按
+系统安装 `tmux`：
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update && sudo apt-get install -y tmux
+# Fedora / RHEL
+sudo dnf install -y tmux
+# 旧版 RHEL / CentOS
+sudo yum install -y tmux
+# Alpine
+sudo apk add tmux
+# Arch Linux
+sudo pacman -S --needed tmux
+# openSUSE
+sudo zypper install tmux
+# 仅 macOS
+brew install tmux
+```
+
+Linux 必须使用当前发行版的系统包管理器，而不是 Homebrew。root shell 可以省略
+`sudo`。WSL 用户应在 WSL 内部执行对应 Linux 发行版的命令。然后安装并验证：
+
 ```bash
 npm install -g @logicseek/hello-cc
+node --version
+npm --version
+tmux -V
+hcc --version
+hcc --help
 ```
+
+如果 npm 报 `EACCES`，请使用 Node 版本管理器或用户自有的 npm prefix，不要用
+`sudo npm install -g` 绕过权限问题。
 
 更新已有的全局安装：
 

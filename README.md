@@ -70,9 +70,41 @@ currently supported; use WSL for a Linux-like environment.
 Linux has richer process auto-discovery through `/proc`. On macOS, use
 hello-cc shims or `hcc peer start` for reliable tmux-managed terminal sessions.
 
+Install Node.js 24 or newer from the official Node.js packages or a Node
+version manager. Then install `tmux` for your platform:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update && sudo apt-get install -y tmux
+# Fedora / RHEL
+sudo dnf install -y tmux
+# Older RHEL / CentOS
+sudo yum install -y tmux
+# Alpine
+sudo apk add tmux
+# Arch Linux
+sudo pacman -S --needed tmux
+# openSUSE
+sudo zypper install tmux
+# macOS only
+brew install tmux
+```
+
+On Linux, use the distribution package manager; Homebrew is only the macOS
+command above. Root shells can omit `sudo`. In WSL, run the matching Linux
+distribution commands inside WSL. Then install and verify hello-cc:
+
 ```bash
 npm install -g @logicseek/hello-cc
+node --version
+npm --version
+tmux -V
+hcc --version
+hcc --help
 ```
+
+If npm reports `EACCES`, use a Node version manager or a user-owned npm prefix;
+do not work around it with `sudo npm install -g`.
 
 Update an existing global install:
 

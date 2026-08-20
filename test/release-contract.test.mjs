@@ -66,6 +66,26 @@ test('Chinese v1 user docs state breaking behavior and accepted risks', () => {
   }
 });
 
+test('English install docs cover supported platforms and verification', () => {
+  const text = ['README.md', 'docs/guide.md'].map(read).join('\n');
+  for (const expected of [
+    /Node\.js 24/, /npm install -g @logicseek\/hello-cc/, /apt-get/, /dnf/,
+    /yum install/, /apk/, /pacman/, /zypper/, /brew install tmux/, /WSL/,
+    /node --version[\s\S]*tmux -V[\s\S]*hcc --version/
+  ]) assert.match(text, expected, `English install docs are missing ${expected}`);
+  assert.match(text, /Linux[^.\n]*(?:system|distribution) package manager/i);
+});
+
+test('Chinese install docs cover supported platforms and verification', () => {
+  const text = ['README.zh-CN.md', 'docs/guide.zh-CN.md'].map(read).join('\n');
+  for (const expected of [
+    /Node\.js 24/, /npm install -g @logicseek\/hello-cc/, /apt-get/, /dnf/,
+    /yum install/, /apk/, /pacman/, /zypper/, /brew install tmux/, /Linux/, /macOS/,
+    /WSL/, /验证/, /node --version[\s\S]*tmux -V[\s\S]*hcc --version/
+  ]) assert.match(text, expected, `Chinese install docs are missing ${expected}`);
+  assert.match(text, /Linux[^。\n]*(?:系统|发行版)[^。\n]*包管理器[^。\n]*(?:而不是|不要使用|不使用)[^。\n]*Homebrew/);
+});
+
 test('CLI help and changelog expose the same v1 boundaries', () => {
   const help = execFileSync(process.execPath, [path.join(repoRoot, 'bin', 'hcc.mjs'), 'web', '--help'], {
     encoding: 'utf8'

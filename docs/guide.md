@@ -40,11 +40,69 @@ the supported downgrade contract.
 
 ## Install, Update, And Uninstall
 
+### Prerequisites
+
+Install Node.js 24 or newer from the official Node.js packages or a Node
+version manager. Browser-controllable terminals also require `tmux`:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y tmux
+# Fedora / RHEL
+sudo dnf install -y tmux
+# Older RHEL / CentOS
+sudo yum install -y tmux
+# Alpine
+sudo apk add tmux
+# Arch Linux
+sudo pacman -S --needed tmux
+# openSUSE
+sudo zypper install tmux
+# macOS only
+brew install tmux
+```
+
+On Linux, use the distribution package manager, not Homebrew. A root shell can
+omit `sudo`. WSL follows the matching Linux distribution instructions inside
+WSL; native Windows shells are not supported.
+
+`hcc web` can attempt to install tmux when a supported package manager and
+sufficient privileges are available. Manual installation is the deterministic
+choice for servers, containers, and non-interactive sudo configurations.
+
+### Install And Verify
+
 Install hello-cc globally:
 
 ```bash
 npm install -g @logicseek/hello-cc
 ```
+
+If npm reports `EACCES`, use a Node version manager or configure a user-owned
+npm prefix. Do not use `sudo npm install -g`, because it can create root-owned
+package and configuration files.
+
+Verify every prerequisite and the installed CLI:
+
+```bash
+node --version
+npm --version
+tmux -V
+hcc --version
+hcc --help
+```
+
+The Node version must start with `v24` or a newer major. Every command above
+must exit successfully before starting a managed terminal.
+
+To avoid a global install, use:
+
+```bash
+npx @logicseek/hello-cc web
+```
+
+### Update And Uninstall
 
 Update an existing global install:
 

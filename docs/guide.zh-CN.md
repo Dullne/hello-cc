@@ -36,11 +36,66 @@ v1 会把恢复的数据库重新迁移到 schema v7；用旧版本 hello-cc 打
 
 ## 安装、更新和卸载
 
+### 前置依赖
+
+通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本。浏览器可
+控制的终端还需要 `tmux`：
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y tmux
+# Fedora / RHEL
+sudo dnf install -y tmux
+# 旧版 RHEL / CentOS
+sudo yum install -y tmux
+# Alpine
+sudo apk add tmux
+# Arch Linux
+sudo pacman -S --needed tmux
+# openSUSE
+sudo zypper install tmux
+# 仅 macOS
+brew install tmux
+```
+
+Linux 必须使用当前发行版的系统包管理器，而不是 Homebrew。root shell 可以省略
+`sudo`。WSL 用户应在 WSL 内部按对应 Linux 发行版安装；不支持原生 Windows
+shell。
+
+当存在受支持的包管理器且权限足够时，`hcc web` 可以尝试自动安装 tmux。对于
+服务器、容器和非交互式 sudo 环境，手动安装是确定性更高的方式。
+
+### 安装和验证
+
 全局安装 hello-cc：
 
 ```bash
 npm install -g @logicseek/hello-cc
 ```
+
+如果 npm 报 `EACCES`，请使用 Node 版本管理器或配置用户自有的 npm prefix。
+不要使用 `sudo npm install -g`，否则可能产生 root 所有的包和配置文件。
+
+验证全部前置依赖和 CLI：
+
+```bash
+node --version
+npm --version
+tmux -V
+hcc --version
+hcc --help
+```
+
+Node 版本应为 `v24` 开头或更高主版本；启动托管终端前，上述命令都应成功退出。
+
+不全局安装时可以使用：
+
+```bash
+npx @logicseek/hello-cc web
+```
+
+### 更新和卸载
 
 更新已有的全局安装：
 
