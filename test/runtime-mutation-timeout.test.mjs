@@ -12,11 +12,16 @@ test('runtime request forwards the caller deadline to the HTTP transport', () =>
   assert.match(runtimeClientSource, /runtimeHttpRequest\([\s\S]*timeoutMs: opts\.timeoutMs/);
 });
 
-test('session mutations use a bounded 30 second runtime deadline', () => {
+test('session mutations use bounded deadlines matched to their tmux work', () => {
+  assert.match(runtimeClientSource, /export const RUNTIME_SESSION_START_TIMEOUT_MS = 60_000/);
   assert.match(runtimeClientSource, /export const RUNTIME_SESSION_MUTATION_TIMEOUT_MS = 30_000/);
   assert.equal(
+    peerSource.match(/timeoutMs: RUNTIME_SESSION_START_TIMEOUT_MS/g)?.length,
+    2
+  );
+  assert.equal(
     peerSource.match(/timeoutMs: RUNTIME_SESSION_MUTATION_TIMEOUT_MS/g)?.length,
-    3
+    1
   );
   assert.match(
     coordinationSource,
