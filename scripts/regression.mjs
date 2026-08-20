@@ -4074,6 +4074,10 @@ async function multiProjectWebWorkflow() {
         !arbitraryRuntime.process_identity?.commandHash) {
       fail(`project API runtime pointer omitted the shared runtime fingerprint:\n${JSON.stringify(arbitraryRuntime, null, 2)}`);
     }
+    const arbitraryBufs = path.join(arbitraryRoot, '.hello-cc', 'bufs');
+    if (fs.existsSync(arbitraryBufs)) {
+      fail('project registration eagerly created the optional buffer directory');
+    }
     fs.rmSync(path.join(arbitraryRoot, '.hello-cc'), { recursive: true, force: true });
     await sleep(1250);
     if (fs.existsSync(path.join(arbitraryRoot, '.hello-cc'))) {
