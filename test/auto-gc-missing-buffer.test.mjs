@@ -18,15 +18,19 @@ function unusedPeerDependency() {
   throw new Error('peer dependency should not be used for an empty auto-GC subject');
 }
 
-const { runGc } = createGcCommands({
-  now: () => nowSec,
-  UNKNOWN_EVIDENCE_GRACE_SEC: 120,
-  BUFS_DIR_NAME: 'bufs',
-  peerMutationSubject: unusedPeerDependency,
-  mutatePeerWithEvidence: unusedPeerDependency,
-  observeClockSafetyInTransactionOrThrow: observeClockSafetyInTransaction,
-  observePeerEvidence: unusedPeerDependency
-});
+function createTestRunGc(now = () => nowSec) {
+  return createGcCommands({
+    now,
+    UNKNOWN_EVIDENCE_GRACE_SEC: 120,
+    BUFS_DIR_NAME: 'bufs',
+    peerMutationSubject: unusedPeerDependency,
+    mutatePeerWithEvidence: unusedPeerDependency,
+    observeClockSafetyInTransactionOrThrow: observeClockSafetyInTransaction,
+    observePeerEvidence: unusedPeerDependency
+  }).runGc;
+}
+
+const runGc = createTestRunGc();
 
 function fixture(t, name) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-auto-gc-${name}-`));
@@ -69,8 +73,8 @@ function emptyBufferEvidence() {
   };
 }
 
-function runAutomaticGc({ root, db }, overrides = {}) {
-  return runGc({ root }, db, {
+function runAutomaticGc({ root, db }, overrides = {}, command = runGc) {
+  return command({ root }, db, {
     olderThanDays: 14,
     scope: 'auto',
     collectBufferEvidenceNow: emptyBufferEvidence,
@@ -342,6 +346,36 @@ test('automatic GC guards paths until database history mutation begins', (t) => 
     fs.realpathSync.native = originalRealpathNative;
   }
 
+  assert.equal(replaced, true);
+  assert.equal(fs.lstatSync(stateDirectory).isSymbolicLink(), true);
+  assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
+});
+
+test('automatic GC rechecks paths after the final clock read before history mutation', (t) => {
+  const state = fixture(t, 'guard-after-clock-read');
+  const stateDirectory = path.dirname(state.bufs);
+  const movedStateDirectory = `${stateDirectory}.moved`;
+  const outsideStateDirectory = path.join(path.dirname(state.root), 'outside-clock-state');
+  fs.mkdirSync(state.bufs);
+  fs.mkdirSync(path.join(outsideStateDirectory, 'bufs'), { recursive: true });
+
+  let nowCalls = 0;
+  let replaced = false;
+  const raceRunGc = createTestRunGc(() => {
+    nowCalls += 1;
+    if (nowCalls === 4) {
+      replaced = true;
+      fs.renameSync(stateDirectory, movedStateDirectory);
+      fs.symlinkSync(outsideStateDirectory, stateDirectory);
+    }
+    return nowSec;
+  });
+
+  assert.throws(
+    () => runAutomaticGc(state, {}, raceRunGc),
+    (error) => error?.code === 'PROJECT_PATH_FORBIDDEN'
+  );
+  assert.equal(nowCalls, 4);
   assert.equal(replaced, true);
   assert.equal(fs.lstatSync(stateDirectory).isSymbolicLink(), true);
   assert.equal(state.db.prepare('SELECT COUNT(*) AS count FROM events').get().count, 1);
