@@ -40,6 +40,12 @@ startup in fresh macOS npm installations.
 - Linux, macOS, and WSL installation instructions now list Node.js 24, tmux
   commands for the major system package managers, CLI verification, and safe
   handling for npm global-install permission errors.
+- `hcc down` now waits for the exact Runtime process identity to exit before it
+  reports success, including safe handling for PID reuse and a bounded timeout
+  when shutdown cannot be confirmed.
+- Background Web startup keeps its immediate child-exit failure but allows a
+  bounded 30-second health window, avoiding false failures on loaded macOS CI
+  hosts where process identity and project restoration can exceed 15 seconds.
 
 ### Compatibility Notes
 

@@ -8,6 +8,7 @@ import {
   inspectProcessIdentity,
   parseLinuxStatStartTicks,
   parsePsStartIdentity,
+  waitForProcessIdentityExit,
   waitForLiveProcessIdentity
 } from '../lib/process/identity.mjs';
 
@@ -282,6 +283,55 @@ test('returns unknown at the monotonic identity deadline', async () => {
   assert.deepEqual(result, { state: 'unknown', identity: null });
   assert.equal(monotonicMs, 110);
   assert.equal(inspections, 3);
+});
+
+test('waits for the exact process identity to exit', async () => {
+  const stored = { pid: 42, startToken: 'boot-a:100', commandHash: 'a'.repeat(64) };
+  const observations = [
+    { state: 'live', identity: stored },
+    { state: 'dead', identity: null }
+  ];
+  let monotonicMs = 0;
+
+  const result = await waitForProcessIdentityExit(stored, {
+    timeoutMs: 20,
+    intervalMs: 5,
+    inspect: () => observations.shift(),
+    monotonicNow: () => monotonicMs,
+    sleep: async (delayMs) => { monotonicMs += delayMs; }
+  });
+
+  assert.deepEqual(result, { state: 'dead', identity: null });
+  assert.equal(monotonicMs, 5);
+});
+
+test('treats PID reuse as exit of the stored process instance', async () => {
+  const stored = { pid: 42, startToken: 'boot-a:100', commandHash: 'a'.repeat(64) };
+  const replacement = { pid: 42, startToken: 'boot-a:200', commandHash: 'b'.repeat(64) };
+
+  const result = await waitForProcessIdentityExit(stored, {
+    inspect: () => ({ state: 'live', identity: replacement }),
+    monotonicNow: () => 0,
+    sleep: async () => { throw new Error('must not sleep after PID reuse'); }
+  });
+
+  assert.deepEqual(result, { state: 'dead', identity: null });
+});
+
+test('reports a still-live process when the exit deadline expires', async () => {
+  const stored = { pid: 42, startToken: 'boot-a:100', commandHash: 'a'.repeat(64) };
+  let monotonicMs = 10;
+
+  const result = await waitForProcessIdentityExit(stored, {
+    timeoutMs: 10,
+    intervalMs: 6,
+    inspect: () => ({ state: 'live', identity: stored }),
+    monotonicNow: () => monotonicMs,
+    sleep: async (delayMs) => { monotonicMs += delayMs; }
+  });
+
+  assert.deepEqual(result, { state: 'live', identity: stored });
+  assert.equal(monotonicMs, 20);
 });
 
 test('captures a complete real PTY identity that remains live across delayed exec', async (t) => {
