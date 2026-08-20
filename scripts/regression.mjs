@@ -9713,6 +9713,10 @@ function uninstallWorkflow() {
 
 async function processEvidenceWorkflow() {
   log('process evidence: live, reused, legacy, dead, root mismatch');
+  // These fixtures deliberately backdate peers beyond the production reaper's
+  // grace window. Keep the runtime stopped until the external-adoption cases so
+  // a 30-second scheduler tick cannot turn an evidence snapshot into exited.
+  await stopRuntime();
 
   const createOwnedTask = (peer, title) => {
     const output = hcc(['task', 'create', '--from', 'human', '--to', peer, '--title', title]);
@@ -9818,6 +9822,8 @@ async function processEvidenceWorkflow() {
     cleanupBindingPeers(rootPeer);
   }
 
+  startRuntime();
+  await waitRuntime();
   const externalDir = path.join(root, '.hello-cc', 'bufs');
   const shortExternalId = `evidence-external-short-${testId}`;
   const shortProducer = spawn(process.execPath, [
