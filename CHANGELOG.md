@@ -20,10 +20,11 @@ backfills.
 
 ### Summary
 
-hello-cc 1.0.1 is a file-lock determinism, fresh-install, and release-reliability
-patch. It makes worker shutdown reclaim kernel lock endpoints deterministically
-when an identity probe keeps its client write half open, and restores real PTY
-startup in fresh macOS npm installations.
+hello-cc 1.0.1 is a file-lock determinism, buffer-GC safety, fresh-install, and
+release-reliability patch. It makes worker shutdown reclaim kernel lock
+endpoints deterministically when an identity probe keeps its client write half
+open, restores real PTY startup in fresh macOS npm installations, and keeps
+automatic GC fail-closed when optional buffer paths disappear or change.
 
 ### Highlights
 
@@ -49,6 +50,14 @@ startup in fresh macOS npm installations.
 - Manual buffer GC allows a bounded 30-second window for runtime evidence
   planning and apply, while still deferring all eligible files if the runtime
   remains unavailable.
+- Automatic GC now treats a missing `.hello-cc/bufs` leaf as empty without
+  recreating it. A missing state directory, a symlinked path component, an
+  inode replacement, or a retargeted project-root alias fails closed with
+  `PROJECT_PATH_FORBIDDEN` before buffer, clock, lock, or history mutation.
+- Buffer path identity is retained through evidence collection, lease
+  acquisition, planning, clock reads, and database transactions. GC uses a
+  no-create lease while existing file-lock callers retain their original
+  parent-creation behavior.
 - Per-connection Web action tokens now require their issuing terminal socket to
   still be open, closing the handshake race before asynchronous token cleanup.
 - Runtime request deadlines now reach the underlying HTTP transport, and peer
@@ -62,6 +71,8 @@ startup in fresh macOS npm installations.
   Runtime API v2, the authenticated browser's ability to choose any existing
   server directory as a project root, and the 1.0.0 accepted-risk boundaries
   are unchanged.
+- Stable project-root aliases remain supported. Only path disappearance,
+  replacement, symlink traversal, or alias retargeting during GC is rejected.
 - The existing five-second fail-closed deadline and cleanup-error behavior are
   unchanged.
 - `node-pty@1.2.0-beta.15` is a bounded prerelease dependency risk. The exact
@@ -71,13 +82,16 @@ startup in fresh macOS npm installations.
 
 ### Validation
 
-The 1.0.1 release gate requires repeated macOS Node 24 tests; a no-cache Linux
+The 1.0.1 release gate includes repeated macOS Node 24 tests; a no-cache Linux
 Node 24/tmux image build followed by three complete `npm test` runs in that same
 image, each ending with `FULL_REGRESSION_OK`; and a fourth clean container that
-installs the same 1.0.1 package tarball and passes PTY, database, and Web smoke
-checks. Fresh macOS consumer installs must pass both normal and
-`--ignore-scripts` installation, proving that executable helper modes come from
-the package artifact rather than lifecycle-script mutation.
+installs the same 1.0.1 package tarball and passes PTY, database, Web, and
+missing-buffer GC smoke checks. Fresh macOS consumer installs pass both normal
+and `--ignore-scripts` installation, proving that executable helper modes come
+from the package artifact rather than lifecycle-script mutation. GC regression
+coverage includes absent optional leaves, symlink and ancestor replacement,
+alias retargeting, no-create lock acquisition, and path guards around clock and
+history writes.
 
 ## 1.0.0
 
