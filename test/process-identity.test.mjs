@@ -105,8 +105,8 @@ test('returns unknown when macOS start identity changes during inspection', (t) 
     if (command === 'sysctl') return successfulCommand('26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n');
     if (args.at(-1) === 'lstart=') {
       return successfulCommand(startReads++ === 0
-        ? 'Mon Aug  3 06:10:11 2026\n'
-        : 'Mon Aug  3 06:10:12 2026\n');
+        ? 'S  Mon Aug  3 06:10:11 2026\n'
+        : 'R+ Mon Aug  3 06:10:12 2026\n');
     }
     if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
     throw new Error(`unexpected fixture command: ${command} ${args.join(' ')}`);
@@ -119,6 +119,107 @@ test('returns unknown when macOS start identity changes during inspection', (t) 
     spawnMock.mock.restore();
     syncBuiltinESMExports();
   }
+});
+
+for (const scenario of [
+  { name: 'zombie present before inspection', first: 'Z', last: 'Z', expected: 'dead', reads: 1 },
+  { name: 'unsupported primary state remains unknown', first: 'X', last: 'X', expected: 'unknown', reads: 1 },
+  { name: 'becomes a zombie during inspection', first: 'S', last: 'Z+', expected: 'dead', reads: 2 },
+  { name: 'ordinary process with documented state modifiers', first: 'S+<>AELNSsVWX', last: 'R+', expected: 'live', reads: 2 },
+  { name: 'sleeping process using FIFO page replacement', first: 'SS', last: 'SS', expected: 'live', reads: 2 },
+  { name: 'sleeping process being debugged', first: 'SX', last: 'SX', expected: 'live', reads: 2 },
+  { name: 'stopped process being debugged', first: 'TX', last: 'TX', expected: 'live', reads: 2 },
+  { name: 'malformed initial state', first: 'invalid', last: 'S', expected: 'unknown', reads: 1 },
+  { name: 'malformed confirming state', first: 'S', last: 'S!', expected: 'unknown', reads: 2 }
+]) {
+  test(`macOS process state: ${scenario.name}`, t => {
+    t.mock.method(process, 'kill', () => {}); // PID remains addressable, including Z.
+    let reads = 0;
+    const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
+      if (command === 'sysctl') {
+        assert.deepEqual(args, ['-n', 'kern.bootsessionuuid']);
+        return successfulCommand('26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n');
+      }
+      if (args.at(-1) === 'lstart=') {
+        assert.deepEqual(args.slice(-4), ['-o', 'stat=', '-o', 'lstart=']);
+        const state = reads++ === 0 ? scenario.first : scenario.last;
+        return successfulCommand(`${state} Mon Aug  3 06:10:11 2026\n`);
+      }
+      if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
+      throw new Error('unexpected fixture command');
+    });
+    syncBuiltinESMExports();
+    try {
+      const observed = withPlatform('darwin', () => inspectProcessIdentity(42));
+      assert.equal(observed.state, scenario.expected);
+      assert.equal(reads, scenario.reads);
+      if (scenario.expected !== 'live') assert.equal(observed.identity, null);
+      else assert.equal(observed.identity.startToken, 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026');
+    } finally {
+      spawnMock.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+}
+
+test('an owned unreaped macOS zombie is dead to both inspection and exit waiting', t => {
+  if (process.platform !== 'darwin') { t.skip('Darwin zombie acceptance'); return; }
+  // Python is only a parent that can defer waitpid; Node reaps its own child
+  // processes automatically. Every path releases and reaps this owned child.
+  const script = String.raw`
+import json, os, subprocess, sys, time
+node, module = sys.argv[1:]
+probe_script = 'import fs from "node:fs"; import {inspectProcessIdentity,waitForProcessIdentityExit} from '+json.dumps(module)+''';
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+if(input.capture) console.log(JSON.stringify(inspectProcessIdentity(input.pid)));
+else console.log(JSON.stringify({observedState:inspectProcessIdentity(input.pid).state,
+waitState:(await waitForProcessIdentityExit(input.owner,{timeoutMs:200,intervalMs:25})).state}));'''
+def probe(payload):
+    result=subprocess.run([node,'--input-type=module','-e',probe_script],input=json.dumps(payload),text=True,capture_output=True,timeout=3)
+    if result.returncode: raise RuntimeError('owned process probe failed')
+    return json.loads(result.stdout)
+r,w=os.pipe(); pid=os.fork()
+if pid==0:
+    os.close(w)
+    try: os.read(r,1)
+    finally: os._exit(0)
+os.close(r); report={}; released=False
+try:
+    captured=probe({'capture':True,'pid':pid})
+    report['initialObservedState']=captured['state']
+    if captured['state']!='live': raise RuntimeError('owned process identity unavailable')
+    os.write(w,b'1'); released=True
+    deadline=time.monotonic()+3
+    while time.monotonic()<deadline:
+        result=subprocess.run(['ps','-p',str(pid),'-o','stat='],capture_output=True,text=True,timeout=1)
+        report['psState']=result.stdout.strip()
+        if report['psState'].startswith('Z'): break
+        time.sleep(0.02)
+    os.kill(pid,0); report['pidStillPresent']=True
+    report.update(probe({'pid':pid,'owner':captured['identity']}))
+finally:
+    if not released:
+        try: os.write(w,b'1')
+        except OSError: pass
+    os.close(w)
+    reaped,status=os.waitpid(pid,0)
+    report['reapedByParent']=reaped==pid
+    report['childExitedNormally']=os.WIFEXITED(status) and os.WEXITSTATUS(status)==0
+    print(json.dumps(report))
+`;
+  const result = childProcess.spawnSync('python3', ['-c', script, process.execPath,
+    new URL('../lib/process/identity.mjs', import.meta.url).href], { encoding: 'utf8', timeout: 15000 });
+  if (result.error?.code === 'ENOENT') { t.skip('Python 3 unavailable for owned fork fixture'); return; }
+  assert.equal(result.status, 0, 'owned zombie fixture failed');
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.initialObservedState, 'live');
+  assert.match(report.psState, /^Z/);
+  assert.equal(report.pidStillPresent, true);
+  assert.equal(report.observedState, 'dead');
+  assert.equal(report.waitState, 'dead');
+  assert.equal(report.reapedByParent, true);
+  assert.equal(report.childExitedNormally, true);
+  t.diagnostic(JSON.stringify(report));
 });
 
 test('collects the same macOS identity under different caller locales', (t) => {
@@ -135,8 +236,8 @@ test('collects the same macOS identity under different caller locales', (t) => {
       options.env.LC_ALL === 'C' && options.env.LANG === 'C';
     if (args.at(-1) === 'lstart=') {
       return successfulCommand(deterministic || process.env.TZ === 'Asia/Shanghai'
-        ? 'Mon Aug  3 06:10:11 2026\n'
-        : 'Sun Aug  2 15:10:11 2026\n');
+        ? 'S  Mon Aug  3 06:10:11 2026\n'
+        : 'S  Sun Aug  2 15:10:11 2026\n');
     }
     if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
     throw new Error(`unexpected fixture command: ${command} ${args.join(' ')}`);
@@ -178,7 +279,7 @@ test('returns unknown for malformed or unavailable macOS boot session UUID', (t)
   const bootOutputs = ['not a boot UUID\n', '{ sec = 100, usec = 42 } Mon Aug  3 06:10:11 2026\n'];
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
     if (command === 'sysctl') return successfulCommand(bootOutputs.shift());
-    if (args.at(-1) === 'lstart=') return successfulCommand('Mon Aug  3 06:10:11 2026\n');
+    if (args.at(-1) === 'lstart=') return successfulCommand('S  Mon Aug  3 06:10:11 2026\n');
     if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
     throw new Error(`unexpected fixture command: ${command} ${args.join(' ')}`);
   });
@@ -384,7 +485,7 @@ test('macOS identity remains stable when wall-clock boot time changes', (t) => {
     commands.push(args.at(-1));
     if (command === 'sysctl' && args.at(-1) === 'kern.bootsessionuuid') return successfulCommand('26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n');
     if (command === 'sysctl' && args.at(-1) === 'kern.boottime') return successfulCommand(`{ sec = 100, usec = ${bootTime++} }\n`);
-    if (args.at(-1) === 'lstart=') return successfulCommand('Mon Aug  3 06:10:11 2026\n');
+    if (args.at(-1) === 'lstart=') return successfulCommand('S  Mon Aug  3 06:10:11 2026\n');
     if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
     throw new Error('unexpected identity probe');
   });

@@ -6,7 +6,31 @@ import os from 'node:os';
 import path from 'node:path';
 import { runtimeRequest } from '../lib/runtime/client.mjs';
 import { readRuntime } from '../lib/runtime/state.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { makeWebToken, normalizeRequestBody } from '../lib/web/runtime.mjs';
+
+test('runtime deadlines preserve root identity headers and reject a rebound selection before HTTP', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-client-root-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const root = path.join(directory, 'project'); fs.mkdirSync(root);
+  const initialRootIdentity = captureSelectedCwdSnapshot(root);
+  const ctx = { root, dbPath: path.join(root, 'mesh.db'), initialRootIdentity };
+  const observed = [];
+  const server = http.createServer((req, res) => {
+    observed.push(req.headers);
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true}');
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections?.(); }));
+  const runtime = { base_url: `http://127.0.0.1:${server.address().port}` };
+  assert.deepEqual(await runtimeRequest(ctx, 'GET', '/api/runtime', null, runtime, { timeoutMs: 1000 }), { ok: true });
+  assert.deepEqual(JSON.parse(Buffer.from(observed[0]['x-hcc-root-identity'], 'base64url').toString()), {
+    canonical: initialRootIdentity.canonical, identity: initialRootIdentity.identity
+  });
+  fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+  await assert.rejects(runtimeRequest(ctx, 'GET', '/api/runtime', null, runtime, { timeoutMs: 1000 }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(observed.length, 1, 'A rebound selection must not reach the runtime');
+});
 
 async function stalledRuntime(t, phase) {
   const server = http.createServer((_req, res) => {
@@ -36,12 +60,21 @@ async function expectRuntimeDeadline(t, phase) {
     runtimeRequest(
       { root: '/tmp/runtime-client-test', dbPath: '/tmp/runtime-client-test/mesh.db' },
       'POST',
-      '/api/runtime/gc-buffers',
-      { cutoffMs: 1, dryRun: false },
+      '/api/runtime/gc-buffers?token=query-secret',
+      { cutoffMs: 1, dryRun: false, evidence: 'body-secret' },
       { base_url: baseUrl, token: 'test-token' },
       { timeoutMs: 40 }
     ),
-    (error) => error?.code === 'RUNTIME_UNREACHABLE'
+    (error) => {
+      assert.equal(error?.code, 'RUNTIME_UNREACHABLE');
+      assert.equal(error.extra.method, 'POST');
+      assert.equal(error.extra.path, '/api/runtime/gc-buffers');
+      assert.equal(error.extra.timeoutMs, 40);
+      assert.ok(Number.isSafeInteger(error.extra.elapsedMs) && error.extra.elapsedMs >= 0);
+      assert.ok(['Error', 'TimeoutError'].includes(error.extra.errorName));
+      assert.doesNotMatch(JSON.stringify(error.extra), /query-secret|body-secret|test-token/);
+      return true;
+    }
   );
   // The stalled runtime completes at 1000ms; a working deadline rejects at
   // ~40ms. The 800ms bound sits between the two, so event-loop starvation
@@ -57,6 +90,24 @@ test('runtime request deadline covers waiting for response headers', async (t) =
 
 test('runtime request deadline covers waiting for the complete response body', async (t) => {
   await expectRuntimeDeadline(t, 'body');
+});
+
+test('an aborted default-budget request reports only its method and path without retrying', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('caller aborted'));
+  await assert.rejects(runtimeRequest(
+    { root: '/tmp/runtime-client-test', dbPath: '/tmp/runtime-client-test/mesh.db' },
+    'GET', '/api/sessions?token=query-secret#private-fragment', null,
+    { base_url: 'http://127.0.0.1:1', token: 'test-token' }, { signal: controller.signal }
+  ), (error) => {
+    assert.equal(error.code, 'RUNTIME_UNREACHABLE');
+    assert.equal(error.extra.method, 'GET');
+    assert.equal(error.extra.path, '/api/sessions');
+    assert.equal(error.extra.timeoutMs, 8000);
+    assert.equal(error.extra.errorName, 'Error');
+    assert.doesNotMatch(JSON.stringify(error.extra), /query-secret|private-fragment|test-token/);
+    return true;
+  });
 });
 
 test('request body normalization keeps the http and https transports consistent', () => {

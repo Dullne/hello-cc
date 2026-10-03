@@ -8,12 +8,14 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
-import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import { inspectProcessIdentity, compareProcessIdentity } from '../lib/process/identity.mjs';
+import { redactSecrets } from '../lib/shared/redact.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import { readReentryTrace } from './shim-reentry-probe.mjs';
 
@@ -34,14 +36,16 @@ const COOKIE_WEBSOCKET_SNAPSHOT_TIMEOUT_MS = 5_000;
 const COOKIE_EXPIRY_FIXTURE_TTL_SEC = Math.ceil(COOKIE_WEBSOCKET_SNAPSHOT_TIMEOUT_MS / 1000) + 2;
 const realHome = process.env.HOME || os.homedir();
 const realRegistryFile = path.join(realHome, '.hello-cc', 'projects.json');
-const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
-  encoding: 'utf8',
-  stdio: ['ignore', 'pipe', 'ignore']
-}).stdout.trim();
+let realTmuxBin = '';
 const port = 22000 + (process.pid % 10000);
 
 let tmuxStarted = false;
 let runtimePid = null;
+let runtimeOwner = null;
+let currentStage = 'startup';
+let lastStopDiagnostic = null;
+const diagnosticSecrets = new Set();
+const fixtureFailures = new WeakSet();
 const managedTmuxSessions = new Set();
 
 const env = {
@@ -59,18 +63,153 @@ delete env.TMUX;
 delete env.TMUX_PANE;
 
 function log(message) {
+  currentStage = String(message);
   process.stdout.write(`${message}\n`);
 }
 
 function fail(message) {
+  const error = fixtureFailureError(message);
   if (process.env.GITHUB_ACTIONS === 'true') {
-    const escaped = String(message)
+    const escaped = fixtureDiagnosticText({ stage: currentStage, failure: fixtureFailureDiagnostic(error) }, diagnosticSecrets)
       .replace(/%/g, '%25')
       .replace(/\r/g, '%0D')
       .replace(/\n/g, '%0A');
     process.stderr.write(`::error::${escaped}\n`);
   }
-  throw new Error(message);
+  throw error;
+}
+
+export function fixtureFailureError(message) {
+  const error = new Error(String(message));
+  Object.defineProperty(error, 'fixtureStack', {
+    value: Object.freeze(new Error('fixture failure').stack.split('\n').slice(1, 7))
+  });
+  fixtureFailures.add(error);
+  return error;
+}
+
+export function fixtureFailureDiagnostic(error) {
+  const names = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AssertionError', 'AbortError'];
+  return {
+    name: names.includes(error?.name) ? error.name : 'Error',
+    stack: fixtureFailures.has(error)
+      ? error.fixtureStack
+      : new Error('regression failure handler').stack.split('\n').slice(1, 7)
+  };
+}
+
+export function fixtureDiagnosticText(value, secrets = []) {
+  function scrub(text) {
+    for (const secret of secrets) {
+      if (typeof secret === 'string' && secret.length >= 8) text = text.split(secret).join('[REDACTED]');
+    }
+    return redactSecrets(text)
+      .replace(/("(?:[^"\\]*token|authorization|cookie|[^"\\]*secret|password)"\s*:\s*)"(?:\\.|[^"\\])*"/gi, '$1"[REDACTED]"');
+  }
+  function visit(entry) {
+    if (typeof entry === 'string') return scrub(entry);
+    if (Array.isArray(entry)) return entry.map(visit);
+    if (entry && typeof entry === 'object') return Object.fromEntries(Object.entries(entry).map(([key, item]) => [key, visit(item)]));
+    return entry;
+  }
+  return typeof value === 'string' ? scrub(value) : JSON.stringify(visit(redactSecrets(value)));
+}
+
+function fixturePsState(pid) {
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], {
+    encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore']
+  });
+  const state = String(result.stdout || '').trim();
+  return result.status === 0 && /^[A-Za-z+<>NslLWE-]{1,16}$/.test(state) ? state : null;
+}
+
+export function observeFixtureOwner(owner, { inspect = inspectProcessIdentity, psState = fixturePsState } = {}) {
+  if (compareProcessIdentity(owner, owner) !== 'live') return { state: 'unknown', reason: 'missing_owner_identity' };
+  const observed = inspect(owner.pid);
+  const state = psState(owner.pid);
+  const details = { pid: owner.pid, psState: state, observedState: observed.state };
+  if (observed.state === 'dead') return { ...details, state: 'exited', reason: 'process_dead' };
+  if (/^[ZX]/i.test(state || '')) return { ...details, state: 'exited', reason: 'zombie_or_dead' };
+  if (observed.state !== 'live' || compareProcessIdentity(observed.identity, observed.identity) !== 'live') {
+    return { ...details, state: 'unknown', reason: 'identity_unavailable' };
+  }
+  details.birthHash = crypto.createHash('sha256').update(observed.identity.startToken).digest('hex');
+  details.commandHash = observed.identity.commandHash;
+  if (compareProcessIdentity(owner, observed.identity) === 'dead') return { ...details, state: 'exited', reason: 'pid_reused' };
+  if (owner.commandHash !== observed.identity.commandHash) return { ...details, state: 'unknown', reason: 'command_changed' };
+  return { ...details, state: 'same-owner', reason: 'identity_match' };
+}
+
+export function signalFixtureOwner(owner, signal, { observe = observeFixtureOwner, send = process.kill.bind(process) } = {}) {
+  const observation = observe(owner);
+  if (observation.state !== 'same-owner') return { signal, sent: false, observation };
+  try { send(owner.pid, signal); return { signal, sent: true, observation }; }
+  catch (error) { return { signal, sent: false, observation, code: error.code || 'SIGNAL_FAILED' }; }
+}
+
+export async function waitForFixtureOwnerExit(owner, timeoutMs, {
+  observe = observeFixtureOwner, monotonicNow = () => performance.now(), wait = sleep
+} = {}) {
+  const deadline = monotonicNow() + timeoutMs;
+  for (;;) {
+    const observation = observe(owner);
+    if (observation.state === 'exited') return observation;
+    const remaining = deadline - monotonicNow();
+    if (remaining <= 0) {
+      const error = new Error('runtime fixture owner did not exit before deadline');
+      error.observation = observation;
+      throw error;
+    }
+    await wait(Math.min(100, remaining));
+  }
+}
+
+export function fixtureDownResult(result) {
+  let payload = null;
+  try { payload = JSON.parse(result.stdout || ''); } catch {}
+  const extra = payload?.error?.extra || payload?.error || {};
+  const code = payload?.error?.code || result.error?.code;
+  const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
+  return {
+    status: Number.isSafeInteger(result.status) ? result.status : null,
+    signal: /^SIG[A-Z0-9]{1,12}$/.test(result.signal || '') ? result.signal : null,
+    code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(code) ? code : null,
+    extra: Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
+      Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]]))
+  };
+}
+
+export function fixtureStopEnvironment(base) {
+  const local = { ...base, HCC_RUNTIME_LOCAL_ONLY: '1' };
+  delete local.HCC_RUNTIME_URL;
+  delete local.HCC_RUNTIME_TOKEN;
+  return local;
+}
+
+function rememberRuntimePid(pid) {
+  runtimePid = pid;
+  runtimeOwner = null;
+  try {
+    const pointer = currentRuntime();
+    if (pointer.token) {
+      diagnosticSecrets.add(pointer.token);
+      for (const part of pointer.token.split(/\s+/)) if (part.length >= 8) diagnosticSecrets.add(part);
+    }
+    if (pointer.process_identity?.pid === pid && compareProcessIdentity(pointer.process_identity, pointer.process_identity) === 'live') {
+      runtimeOwner = { ...pointer.process_identity };
+    }
+  } catch {}
+}
+
+function collectRuntimeDiagnostic(extra = {}) {
+  const diagnostic = { stage: currentStage, pid: runtimePid,
+    owner: observeFixtureOwner(runtimeOwner), pointerExists: fs.existsSync(path.join(root, '.hello-cc', 'runtime.json')), ...extra };
+  try {
+    const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { readOnly: true, timeout: 200 });
+    try { diagnostic.events = db.prepare('SELECT id, type FROM events ORDER BY id DESC LIMIT 12').all(); }
+    finally { db.close(); }
+  } catch {}
+  return fixtureDiagnosticText(diagnostic, diagnosticSecrets);
 }
 
 function commandText(command, args) {
@@ -84,6 +223,10 @@ function sh(value) {
 function canonicalPath(value) {
   try { return fs.realpathSync(value); }
   catch { return path.resolve(value); }
+}
+
+export function isRegressionEntry(entry = process.argv[1], filename = import.meta.filename) {
+  return Boolean(entry) && canonicalPath(entry) === canonicalPath(filename);
 }
 
 function samePath(a, b) {
@@ -1602,15 +1745,7 @@ function assertHtmlCsp(response, html, label) {
 }
 
 function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    // Linux keeps an exited child addressable until PID 1 reaps its zombie.
-    // Product liveness treats that state as dead, and the regression wait must
-    // use the same semantic boundary instead of waiting forever on kill(0).
-    return process.platform !== 'linux' || inspectProcessIdentity(pid).state !== 'dead';
-  } catch {
-    return false;
-  }
+  return inspectProcessIdentity(pid).state !== 'dead' && !/^[ZX]/i.test(fixturePsState(pid) || '');
 }
 
 async function waitForProcessExit(pid, label, timeoutMs = 5000) {
@@ -2561,7 +2696,7 @@ function startRuntime(options = {}) {
   const output = hcc(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance'], { env: runtimeEnv });
   const match = output.match(/^pid:\s*(\d+)/m);
   if (!match) fail(`hcc web did not print background pid:\n${output}`);
-  runtimePid = Number.parseInt(match[1], 10);
+  rememberRuntimePid(Number.parseInt(match[1], 10));
   if (!output.includes('web started in background')) fail(`hcc web did not report background start:\n${output}`);
 }
 
@@ -2666,7 +2801,7 @@ async function webSecretRedactionWorkflow() {
   ]);
   const match = output.match(/^pid:\s*(\d+)/m);
   if (!match) fail(`redaction web did not print background pid`);
-  runtimePid = Number.parseInt(match[1], 10);
+  rememberRuntimePid(Number.parseInt(match[1], 10));
 
   try {
     await waitRuntime();
@@ -2760,6 +2895,7 @@ async function assertWebWrapperParentSurvives() {
   const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-wrapper-root-${testId}-`));
   const wrapperPort = port + 101;
   let wrapperPid = null;
+  let wrapperOwner = null;
   try {
     const script = [
       'set -e',
@@ -2774,14 +2910,15 @@ async function assertWebWrapperParentSurvives() {
     if (!match) fail(`wrapper hcc web did not print background pid:\n${result.stdout}`);
     wrapperPid = Number.parseInt(match[1], 10);
     ensureFile(path.join(wrapperRoot, '.hello-cc', 'runtime.json'));
+    wrapperOwner = JSON.parse(fs.readFileSync(path.join(wrapperRoot, '.hello-cc', 'runtime.json'), 'utf8')).process_identity;
   } finally {
-    runMaybe(process.execPath, [hccBin, '--root', wrapperRoot, 'down'], { env });
+    runMaybe(process.execPath, [hccBin, '--root', wrapperRoot, 'down'], { env: fixtureStopEnvironment(env) });
     if (wrapperPid) {
       try {
-        await waitForProcessExit(wrapperPid, 'wrapper runtime process exit', 5000);
+        await waitForFixtureOwnerExit(wrapperOwner, 5000);
       } catch {
-        try { process.kill(wrapperPid, 'SIGTERM'); } catch {}
-        try { await waitForProcessExit(wrapperPid, 'wrapper runtime process exit after SIGTERM', 2000); } catch {}
+        signalFixtureOwner(wrapperOwner, 'SIGTERM');
+        try { await waitForFixtureOwnerExit(wrapperOwner, 2000); } catch {}
       }
     }
     try { fs.rmSync(wrapperRoot, { recursive: true, force: true }); } catch {}
@@ -2790,28 +2927,42 @@ async function assertWebWrapperParentSurvives() {
 
 async function stopRuntime() {
   if (!runtimePid) return;
-  const pid = runtimePid;
-  hccMaybe(['down']);
+  const owner = runtimeOwner;
+  const before = observeFixtureOwner(owner);
+  const down = fixtureDownResult(stopFixtureCli());
+  lastStopDiagnostic = { before, down, stack: new Error('stopRuntime').stack.split('\n').slice(1, 7), signals: [] };
   try {
-    await waitForProcessExit(pid, 'runtime process exit', 5000);
+    await waitForFixtureOwnerExit(owner, 5000);
   } catch (err) {
-    try { process.kill(pid, 'SIGTERM'); } catch {}
+    lastStopDiagnostic.atDeadline = collectRuntimeDiagnostic({ before, down });
+    lastStopDiagnostic.signals.push(signalFixtureOwner(owner, 'SIGTERM'));
     try {
-      await waitForProcessExit(pid, 'runtime process exit after SIGTERM', 2000);
+      await waitForFixtureOwnerExit(owner, 2000);
     } catch {
-      try { process.kill(pid, 'SIGKILL'); } catch {}
-      try { await waitForProcessExit(pid, 'runtime process exit after SIGKILL', 2000); } catch {}
-      throw err;
+      lastStopDiagnostic.signals.push(signalFixtureOwner(owner, 'SIGKILL'));
+      try { await waitForFixtureOwnerExit(owner, 2000); } catch {}
     }
+    fail(`runtime stop failed: ${collectRuntimeDiagnostic(lastStopDiagnostic)}`);
   }
+  if (down.status !== 0) fail(`runtime down command failed: ${collectRuntimeDiagnostic(lastStopDiagnostic)}`);
   runtimePid = null;
+  runtimeOwner = null;
+}
+
+function stopFixtureCli() {
+  try {
+    const pointer = currentRuntime();
+    if (compareProcessIdentity(runtimeOwner, pointer.process_identity) === 'live' &&
+        runtimeOwner.commandHash === pointer.process_identity.commandHash) {
+      return hccMaybe(['--json', 'down'], { env: fixtureStopEnvironment(env) });
+    }
+  } catch {}
+  return { status: null, error: { code: 'FIXTURE_OWNER_POINTER_UNAVAILABLE' } };
 }
 
 function cleanup() {
-  try { hccMaybe(['down']); } catch {}
-  if (runtimePid) {
-    try { process.kill(runtimePid, 'SIGTERM'); } catch {}
-  }
+  try { stopFixtureCli(); } catch {}
+  if (runtimePid) signalFixtureOwner(runtimeOwner, 'SIGTERM');
   const managedPrefixes = [
     tmuxManagedSessionPrefix(root),
     tmuxManagedSessionPrefix(secondProjectRoot)
@@ -2899,7 +3050,7 @@ async function setupRegression() {
   const output = hcc(['web', '--local', '--port', String(port), '--no-discover', '--no-guidance']);
   const match = output.match(/^pid:\s*(\d+)/m);
   if (!match) fail(`hcc web did not print background pid during bootstrap:\n${output}`);
-  runtimePid = Number.parseInt(match[1], 10);
+  rememberRuntimePid(Number.parseInt(match[1], 10));
   await waitRuntime();
   for (const file of liveBufferFiles) ensureFile(file);
   for (const file of liveBufferFiles) fs.rmSync(file, { force: true });
@@ -2979,7 +3130,7 @@ async function setupRegression() {
   const directTlsOutput = hcc(['web', '--local', '--tls', '--port', String(port), '--no-discover', '--no-guidance']);
   const directTlsMatch = directTlsOutput.match(/^pid:\s*(\d+)/m);
   if (!directTlsMatch) fail(`direct TLS web did not print background pid:\n${directTlsOutput}`);
-  runtimePid = Number.parseInt(directTlsMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(directTlsMatch[1], 10));
   await waitFor(async () => {
     const runtimeFile = path.join(root, '.hello-cc', 'runtime.json');
     if (!fs.existsSync(runtimeFile)) return false;
@@ -3038,7 +3189,7 @@ async function setupRegression() {
   const tokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   const tokenMatch = tokenOutput.match(/^pid:\s*(\d+)/m);
   if (!tokenMatch) fail(`token web did not print background pid:\n${tokenOutput}`);
-  runtimePid = Number.parseInt(tokenMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(tokenMatch[1], 10));
   if (!tokenOutput.includes('token=') || !tokenOutput.includes('open: http://<machine-ip>:')) {
     fail(`default web output did not include remote token URL:\n${tokenOutput}`);
   }
@@ -3222,7 +3373,7 @@ async function setupRegression() {
   ]);
   const proxyPidMatch = proxyOutput.match(/^pid:\s*(\d+)/m);
   if (!proxyPidMatch) fail(`trusted-proxy web did not print background pid:\n${proxyOutput}`);
-  runtimePid = Number.parseInt(proxyPidMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(proxyPidMatch[1], 10));
   await waitRuntime();
   const proxyRuntime = currentRuntime();
   if (proxyRuntime.proxy_origin !== proxyOrigin || proxyRuntime.trust_proxy !== true) {
@@ -3308,7 +3459,7 @@ async function setupRegression() {
   ]);
   const restoredPidMatch = restoredOutput.match(/^pid:\s*(\d+)/m);
   if (!restoredPidMatch) fail(`post-proxy web did not print background pid:\n${restoredOutput}`);
-  runtimePid = Number.parseInt(restoredPidMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(restoredPidMatch[1], 10));
   await waitRuntime();
 
   const badJsonResponse = await runtimeFetch('/api/projects', {
@@ -3335,7 +3486,7 @@ async function setupRegression() {
   const stableTokenOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   const stableTokenMatch = stableTokenOutput.match(/^pid:\s*(\d+)/m);
   if (!stableTokenMatch) fail(`stable-token web did not print background pid:\n${stableTokenOutput}`);
-  runtimePid = Number.parseInt(stableTokenMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(stableTokenMatch[1], 10));
   await waitRuntime();
   const stableTokenRuntime = currentRuntime();
   if (stableTokenRuntime.token === tokenRuntime.token) {
@@ -3349,7 +3500,7 @@ async function setupRegression() {
   });
   const fixedTokenMatch = fixedTokenOutput.match(/^pid:\s*(\d+)/m);
   if (!fixedTokenMatch) fail(`fixed-token web did not print background pid:\n${fixedTokenOutput}`);
-  runtimePid = Number.parseInt(fixedTokenMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(fixedTokenMatch[1], 10));
   await waitRuntime();
   const fixedTokenRuntime = currentRuntime();
   if (fixedTokenRuntime.token !== fixedToken || !fixedTokenOutput.includes(`token=${encodeURIComponent(fixedToken)}`)) {
@@ -3360,7 +3511,7 @@ async function setupRegression() {
   const postFixedOutput = hcc(['web', '--host', '0.0.0.0', '--port', String(port), '--no-discover', '--no-guidance']);
   const postFixedMatch = postFixedOutput.match(/^pid:\s*(\d+)/m);
   if (!postFixedMatch) fail(`post-fixed-token web did not print background pid:\n${postFixedOutput}`);
-  runtimePid = Number.parseInt(postFixedMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(postFixedMatch[1], 10));
   await waitRuntime();
   const postFixedRuntime = currentRuntime();
   if (postFixedRuntime.token === fixedToken || fs.existsSync(tokenFile)) {
@@ -3373,7 +3524,7 @@ async function setupRegression() {
   const noTokenOutput = hcc(['web', '--local', '--port', String(port), '--no-token', '--no-discover', '--no-guidance']);
   const noTokenMatch = noTokenOutput.match(/^pid:\s*(\d+)/m);
   if (!noTokenMatch) fail(`explicit no-token web did not print background pid:\n${noTokenOutput}`);
-  runtimePid = Number.parseInt(noTokenMatch[1], 10);
+  rememberRuntimePid(Number.parseInt(noTokenMatch[1], 10));
   if (noTokenOutput.includes('token=')) {
     fail(`explicit no-token web output included token:\n${noTokenOutput}`);
   }
@@ -11229,11 +11380,16 @@ function gcCoverageWorkflow() {
 }
 
 async function main() {
+  realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+  }).stdout.trim();
   process.once('SIGINT', () => { cleanup(); process.exit(130); });
   process.once('SIGTERM', () => { cleanup(); process.exit(143); });
 
   await setupRegression();
+  currentStage = 'webSecretRedactionWorkflow';
   await webSecretRedactionWorkflow();
+  currentStage = 'cookieSessionExpiryWorkflow';
   await cookieSessionExpiryWorkflow();
   log('[2/13] runtime');
   startRuntime();
@@ -11265,12 +11421,18 @@ async function main() {
   log('FULL_REGRESSION_OK');
 }
 
-main().catch((err) => {
+if (isRegressionEntry()) main().catch((err) => {
+  const failure = fixtureFailureDiagnostic(err);
+  const diagnostic = collectRuntimeDiagnostic({ failure, stop: lastStopDiagnostic });
+  process.stderr.write(`[regression failure diagnostic] ${diagnostic}\n`);
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    process.stderr.write(`::error::${diagnostic.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')}\n`);
+  }
   try { assertNoRealProjectRegistryLeak(); } catch (leakErr) {
-    process.stderr.write(`${leakErr.stack || leakErr.message}\n`);
+    process.stderr.write(`${fixtureDiagnosticText(leakErr.stack || leakErr.message, diagnosticSecrets)}\n`);
   }
   cleanup();
-  process.stderr.write(`${err.stack || err.message}\n`);
+  process.stderr.write(`${fixtureDiagnosticText(err.stack || err.message, diagnosticSecrets)}\n`);
   process.exit(1);
 }).finally(() => {
   try {
