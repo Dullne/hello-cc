@@ -75,45 +75,61 @@ jobs:
           set -o pipefail
           HOME="$HCC_TEST_HOME" npm test 2>&1 | tee "$RUNNER_TEMP/hcc-regression.log"
 
+      - name: Verify isolated different-UID filesystem behavior on Linux
+        id: cross_uid
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          sudo "$(command -v node)" --test test/pinned-cwd-cross-uid.test.mjs 2>&1 | tee "$RUNNER_TEMP/hcc-cross-uid.log"
+
       - name: Annotate failed Node tests
-        if: failure() && steps.regression.outcome == 'failure'
+        if: failure() && (steps.regression.outcome == 'failure' || steps.cross_uid.outcome == 'failure')
+        env:
+          HCC_REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
+          HCC_CROSS_UID_OUTCOME: ${{ steps.cross_uid.outcome }}
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
           import path from 'node:path';
-          const log = path.join(process.env.RUNNER_TEMP, 'hcc-regression.log');
           const escape = value => value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
-          let summary = 'npm test failed; inspect the uploaded regression log for details.';
-          if (fs.existsSync(log)) {
-            const file = fs.openSync(log, 'r');
-            try {
-              const size = fs.fstatSync(file).size;
-              const bytes = Buffer.alloc(Math.min(size, 256 * 1024));
-              fs.readSync(file, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
-              const lines = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
-              // Publish only test names, source locations and result counts;
-              // raw error objects, command arguments and environment stay out.
-              const selected = lines.filter(line =>
-                (/^\s*(?:✖|not ok\s+\d+(?:\s+-)?)(?:\s|$)/.test(line) && !/failing tests:/.test(line)) ||
-                /^test at test\/[A-Za-z0-9_./-]+:\d+:\d+$/.test(line) ||
-                /^(?:#|ℹ) (?:tests|pass|fail|cancelled|skipped|todo|duration_ms) \d/.test(line)
-              ).map(line => line.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 350));
-              const details = [...new Set(selected)].slice(-24).join('\n').slice(0, 6000);
-              if (details) summary += '\n' + details;
-            } finally { fs.closeSync(file); }
+          const checks = [
+            { name: 'Regression test', outcome: process.env.HCC_REGRESSION_OUTCOME, file: 'hcc-regression.log' },
+            { name: 'Different-UID test', outcome: process.env.HCC_CROSS_UID_OUTCOME, file: 'hcc-cross-uid.log' }
+          ];
+          for (const check of checks.filter(check => check.outcome === 'failure')) {
+            const log = path.join(process.env.RUNNER_TEMP, check.file);
+            let summary = check.name + ' failed; inspect the uploaded log for details.';
+            if (fs.existsSync(log)) {
+              const file = fs.openSync(log, 'r');
+              try {
+                const size = fs.fstatSync(file).size;
+                const bytes = Buffer.alloc(Math.min(size, 256 * 1024));
+                fs.readSync(file, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
+                const lines = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
+                // Publish only test names, source locations, result counts and
+                // recognized error codes; raw errors, arguments and env stay out.
+                const selected = lines.filter(line =>
+                  (/^\s*(?:✖|not ok\s+\d+(?:\s+-)?)(?:\s|$)/.test(line) && !/failing tests:/.test(line)) ||
+                  /^test at test\/[A-Za-z0-9_./-]+:\d+:\d+$/.test(line) ||
+                  /^(?:#|ℹ) (?:tests|pass|fail|cancelled|skipped|todo|duration_ms) \d/.test(line)
+                ).map(line => line.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 350));
+                const codes = lines.flatMap(line => [...line.matchAll(/\b(?:ERR_[A-Z0-9_]{1,60}|EACCES|ENOENT|EPERM|PROJECT_PATH_FORBIDDEN|HCC_PINNED_(?:CWD_CHANGED|EXEC_FAILED))\b/g)]
+                  .map(match => 'error code: ' + match[0]));
+                const details = [...new Set([...selected, ...codes])].slice(-24).join('\n').slice(0, 6000);
+                if (details) summary += '\n' + details;
+              } finally { fs.closeSync(file); }
+            }
+            process.stdout.write('::error title=' + check.name + ' failure::' + escape(summary) + '\n');
           }
-          process.stdout.write('::error title=Regression test failure::' + escape(summary) + '\n');
           NODE
-
-      - name: Verify isolated different-UID filesystem behavior on Linux
-        if: runner.os == 'Linux'
-        run: sudo "$(command -v node)" --test test/pinned-cwd-cross-uid.test.mjs
 
       - name: Upload regression log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: regression-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hcc-regression.log
+          path: |
+            ${{ runner.temp }}/hcc-regression.log
+            ${{ runner.temp }}/hcc-cross-uid.log
           if-no-files-found: warn
           retention-days: 14

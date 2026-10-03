@@ -27,7 +27,19 @@ test('a different UID cannot redirect a captured launch by replacing its parent 
     fs.chownSync(bootstrap, 2001, 2001);
     t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
 
-    const moduleUrl = pathToFileURL(path.resolve('lib/process/pinned-cwd.mjs')).href;
+    // A runner checkout can live below a private home. The other UID needs
+    // readable copies of public test subjects, not access to that home.
+    // Keep this staging root-owned and unwritable by either child UID.
+    const source = path.join(fixture, 'source');
+    fs.cpSync(new URL('../lib/', import.meta.url), source, { recursive: true });
+    fs.chmodSync(source, 0o755);
+    for (const relative of fs.readdirSync(source, { recursive: true })) {
+      const target = path.join(source, relative);
+      const stat = fs.lstatSync(target);
+      assert.ok(stat.isDirectory() || stat.isFile(), 'Staged test sources must be ordinary files or directories');
+      fs.chmodSync(target, stat.isDirectory() ? 0o755 : 0o644);
+    }
+    const moduleUrl = pathToFileURL(path.join(source, 'process/pinned-cwd.mjs')).href;
     const ownerSource = `
       import { spawnSync } from 'node:child_process';
       import { preparePinnedCwdLaunch } from ${JSON.stringify(moduleUrl)};

@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 import { inspectProcessIdentity } from '../lib/process/identity.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
+import { readReentryTrace } from './shim-reentry-probe.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -27,6 +28,10 @@ const tmuxSession = `hcc-reg-${process.pid}`;
 const tmuxSocketName = `hcc-reg-${testId}`.replace(/[^A-Za-z0-9_-]/g, '-');
 const secondProjectRoot = path.join(root, 'second-project');
 const TERMINAL_WEBSOCKET_TIMEOUT_MS = 15_000;
+const COOKIE_WEBSOCKET_SNAPSHOT_TIMEOUT_MS = 5_000;
+// now() uses whole seconds: TTL=1 may leave only 1ms before expiry. Reserve
+// the existing snapshot budget plus clock quantization/setup margin first.
+const COOKIE_EXPIRY_FIXTURE_TTL_SEC = Math.ceil(COOKIE_WEBSOCKET_SNAPSHOT_TIMEOUT_MS / 1000) + 2;
 const realHome = process.env.HOME || os.homedir();
 const realRegistryFile = path.join(realHome, '.hello-cc', 'projects.json');
 const realTmuxBin = spawnSync('sh', ['-lc', 'command -v tmux || true'], {
@@ -1521,7 +1526,7 @@ async function waitForFile(file, expected, label = file) {
   ensureFile(file, expected);
 }
 
-async function waitForFileContent(file, expected, label = file) {
+async function waitForFileContent(file, expected, label = file, { diagnostics = null } = {}) {
   const deadline = Date.now() + 10000;
   let actual = '(missing)';
   while (Date.now() < deadline) {
@@ -1532,6 +1537,15 @@ async function waitForFileContent(file, expected, label = file) {
     await sleep(100);
   }
   if (actual !== expected) {
+    if (diagnostics) {
+      const detail = JSON.stringify(diagnostics());
+      if (process.env.GITHUB_ACTIONS === 'true') {
+        const escaped = detail.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+        process.stderr.write(`::error title=Shim regression diagnostic::${escaped}\n`);
+      } else {
+        process.stderr.write(`Shim regression diagnostic: ${detail}\n`);
+      }
+    }
     fail(`timed out waiting for ${label}\nexpected: ${expected}\nactual: ${actual}`);
   }
   ensureFile(file, expected);
@@ -1868,7 +1882,7 @@ async function openCookieTerminalWebSocket(peer, sid, params = {}) {
       settled = true;
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} cookie websocket snapshot timeout`));
-    }, 5000);
+    }, COOKIE_WEBSOCKET_SNAPSHOT_TIMEOUT_MS);
     const rejectBeforeSnapshot = (err) => {
       if (settled) return;
       settled = true;
@@ -2560,7 +2574,7 @@ async function cookieSessionExpiryWorkflow() {
     env: {
       ...env,
       HCC_REGRESSION_TEST: '1',
-      HCC_REGRESSION_WEB_SESSION_TTL_SEC: '1'
+      HCC_REGRESSION_WEB_SESSION_TTL_SEC: String(COOKIE_EXPIRY_FIXTURE_TTL_SEC)
     }
   });
   try {
@@ -2588,26 +2602,33 @@ async function cookieSessionExpiryWorkflow() {
     const auth = await issueBrowserSessionCookie();
     ws = await openCookieTerminalWebSocket(expirySessionId, auth.sid, { root });
     if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
-    const closed = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), 5000);
+    // Listen before waiting so spontaneous expiry is retained. Start the close
+    // deadline only after expiry, and defer rejection to avoid an unhandled
+    // error while this fixture is still waiting for the cookie to expire.
+    const closed = new Promise(resolve => {
       ws.once('close', (code, reason) => {
-        clearTimeout(timer);
         resolve({ code, reason: String(reason || '') });
       });
-      ws.once('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+      ws.once('error', error => resolve({ error }));
     });
 
-    await sleep(1200);
+    // Issuance precedes the snapshot. Waiting a complete TTL from the snapshot
+    // therefore guarantees expiry even at either side of a whole-second tick.
+    await sleep(COOKIE_EXPIRY_FIXTURE_TTL_SEC * 1000);
     ws.send(JSON.stringify({
       type: 'input',
       data: `echo ${marker}\r`,
       action_token: ws.hccActionToken,
       epoch: ws.hccControl.epoch
     }));
-    const closeResult = await closed;
+    const closeResult = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), 5000);
+      closed.then(result => {
+        clearTimeout(timer);
+        if (result.error) reject(result.error);
+        else resolve(result);
+      });
+    });
     if (closeResult.code !== 4001 || !closeResult.reason.includes('session expired')) {
       fail(`expired cookie websocket did not close with 4001/session expired:\n${JSON.stringify(closeResult, null, 2)}`);
     }
@@ -6259,13 +6280,52 @@ async function shimTmuxWorkflow() {
     cwd: root,
     env: { ...shimEnv, HCC_REG_VALUE: 'shim-second' }
   });
-  parsePane(restarted);
+  const restartedPane = parsePane(restarted);
   const secondEnvFile = path.join(outDir, 'shim-env-second');
   hcc(['inject', peer, `printf '%s\\n' "$HCC_REG_VALUE" > ${secondEnvFile}`]);
   await waitForFile(secondEnvFile, 'shim-second', 'shim env restart');
   const reentryFile = path.join(outDir, 'shim-reentry');
-  hcc(['inject', peer, `HCC_FAKE_STAY_ALIVE=0 HCC_REG_VALUE=shim-third ${sh(shim)} --resume shim-regression-session > ${sh(reentryFile)} 2>&1`]);
-  await waitForFileContent(reentryFile, 'fake-claude --resume shim-regression-session', 'shim tmux pane re-entry');
+  const reentryTrace = path.join(outDir, 'shim-reentry-stages');
+  const reentryStatus = path.join(outDir, 'shim-reentry-status');
+  const reentryProvider = path.join(outDir, 'shim-reentry-provider');
+  const reentryProbe = pathToFileURL(path.join(repoRoot, 'scripts', 'shim-reentry-probe.mjs')).href;
+  const reentryEventId = withMeshDb(db => db.prepare('SELECT MAX(id) AS id FROM events').get().id || 0);
+  const reentryStarted = Date.now();
+  hcc(['inject', peer, `printf 'started\\n' > ${sh(reentryStatus)}; HCC_FAKE_STAY_ALIVE=0 HCC_REG_VALUE=shim-third HCC_FAKE_LOG=${sh(reentryProvider)} HCC_REGRESSION_REENTRY_TRACE=${sh(reentryTrace)} HCC_REGRESSION_REENTRY_BIN=${sh(hccBin)} NODE_OPTIONS="\${NODE_OPTIONS:+\${NODE_OPTIONS} }"${sh(`--import=${reentryProbe}`)} ${sh(shim)} --resume shim-regression-session > ${sh(reentryFile)} 2>&1; printf '%s\\n' "$?" >> ${sh(reentryStatus)}`]);
+  await waitForFileContent(reentryFile, 'fake-claude --resume shim-regression-session', 'shim tmux pane re-entry', {
+    diagnostics: () => {
+      // Query only this fixture's pane and fixed event types. Full terminal
+      // captures, process arguments, request bodies and environment are excluded.
+      const paneResult = spawnSync('tmux', ['display-message', '-p', '-t', restartedPane,
+        '#{pane_id}|#{pane_dead}|#{pane_current_command}'], {
+        env, encoding: 'utf8', timeout: 1000, maxBuffer: 1024, stdio: ['ignore', 'pipe', 'ignore']
+      });
+      const paneParts = (paneResult.stdout || '').trim().split('|');
+      const pane = {
+        found: paneResult.status === 0 && /^%\d+$/.test(paneParts[0] || ''),
+        dead: paneParts[1] === '1',
+        command: /^[A-Za-z0-9_.-]{1,40}$/.test(paneParts[2] || '') ? paneParts[2] : 'unknown'
+      };
+      let status = [];
+      try { status = fs.readFileSync(reentryStatus, 'utf8').slice(0, 32).trim().split('\n'); } catch {}
+      let events = [];
+      let db;
+      try {
+        db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { timeout: 250, readOnly: true });
+        events = db.prepare(`SELECT type, created_at FROM events WHERE id > ? AND actor = ?
+          AND type IN ('peer.attach.requested', 'tmux.session.attached', 'tmux.session.detached', 'tmux.session.exited')
+          ORDER BY id DESC LIMIT 8`).all(reentryEventId, peer);
+      } catch { events = [{ state: 'unavailable' }]; }
+      finally { if (db) db.close(); }
+      return {
+        elapsed_ms: Date.now() - reentryStarted,
+        shell_started: status[0] === 'started',
+        shell_exit: /^\d{1,3}$/.test(status[1] || '') ? Number(status[1]) : null,
+        provider_entered: fs.existsSync(reentryProvider),
+        pane, stages: readReentryTrace(reentryTrace), events
+      };
+    }
+  });
   hcc(['peer', 'stop', peer]);
 
   const exitedResume = 'shim-exited-session';
