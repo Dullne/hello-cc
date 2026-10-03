@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - codex/dsh-stable-source
+      - codex/dsh-stable-fixes
   pull_request:
 
 permissions:

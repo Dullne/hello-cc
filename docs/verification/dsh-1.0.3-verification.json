@@ -1,0 +1,129 @@
+{
+  "createdAt": "2026-10-03T15:00:23.319322+00:00",
+  "version": "1.0.3",
+  "baseCommit": "3721f2258a98e95feb751ab6b4c52fe1ad1f5e90",
+  "npmTag": "latest",
+  "packageSha256": "a279300b94901c011a312662385df91d2806312de708270838edad31df29ea7d",
+  "fileCount": 217,
+  "unit": {
+    "tests": 918,
+    "pass": 917,
+    "fail": 0,
+    "skipped": 1
+  },
+  "factoryAuditModules": 63,
+  "regressionStepsPassed": 13,
+  "installedOfficialChecksPassed": 8,
+  "officialHarness": "0.2.0-rc.2",
+  "priorDiagnosticFailures": 35,
+  "priorDiagnosticsResolved": [
+    {
+      "file": "test/cli-lifecycle-pid.test.mjs",
+      "diagnosticCount": 4,
+      "testFileSha256": "97e0e7135fbaaccb6e239fdf58325c764e57d8eea8e484c8891e95450e490a6b",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/codex-app-server.test.mjs",
+      "diagnosticCount": 3,
+      "testFileSha256": "5d2e0b60c41567fb96a314786358a491e6a9627181c5f7771150ec28c2cf428f",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/codex-sessions.test.mjs",
+      "diagnosticCount": 2,
+      "testFileSha256": "88822734aeab030e75ec156e53891b2704b6907e28d79e0208a2e844305fe9f3",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/integration-hooks-regression.test.mjs",
+      "diagnosticCount": 4,
+      "testFileSha256": "93791b717b427145e3784cdd23e96cbaec035c2322368efad9d353f5b7e7491b",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/provider-peer-identity.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "df558e0f51416a15fbbf90d5ce23935e28564409c2df16c654a1d3570e8ebb9f",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/task-results.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "9cedd1f541a79cdedd4711e658483daf0fde1142e911668444aabf188ca1405c",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-native-sessions.test.mjs",
+      "diagnosticCount": 4,
+      "testFileSha256": "c520b8d4d0d2dd8f00cabc0b10038d849491934c7617a6242c7bc9dba497c24d",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-peer-actions.test.mjs",
+      "diagnosticCount": 3,
+      "testFileSha256": "de4c67a9ae15870c477c1fd3f5a3baa1f03a50079fa0f195fc3508e7818f3b7f",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-request-boundary.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "ca192ada28999149234db8ed29662bf05671a30257a3e88563b15d36910dea9f",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-startup-race.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "f95cca2e2f3b081b77b9d2649a05d39ba0160739e834f7513a1cd624d3752574",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-terminal-assets.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "72ea8d9dc72601bfdbdb556d7c0df313bb1cb96a70cec5306e0bb598300ee83e",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-ui-codex.test.mjs",
+      "diagnosticCount": 6,
+      "testFileSha256": "fa6b226f16b39946a18f35557103b7f44cd64f0fbc25327c688939974a020b78",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-ui-interactions.test.mjs",
+      "diagnosticCount": 3,
+      "testFileSha256": "29102cf745e7d94b18779e04de4d608ad6331c14b6838242c6966653038b0918",
+      "status": "covered by passing restored full unit suite"
+    },
+    {
+      "file": "test/web-ui-terminal-command.test.mjs",
+      "diagnosticCount": 1,
+      "testFileSha256": "25c6c3de42f8c055383c0299cc26bd764a36774b72f2c9ab761052f7af0f9bd7",
+      "status": "covered by passing restored full unit suite"
+    }
+  ],
+  "additionalRepairs": [
+    "Explicit native ownership lease, cleanup retry, process identity fencing and legacy listener compatibility",
+    "Managed state and database permissions, per-project PTY and FIFO paths",
+    "Persistent native user/peer message origins",
+    "Test fixture port isolation",
+    "Scope obsolete launch form assertion to the launch form"
+  ],
+  "historicalAttemptsPreserved": [
+    "scanner naming incompatibility",
+    "restored suite: 8 additional assertions and 2 fixture collisions",
+    "approval label matched by obsolete global form assertion"
+  ],
+  "protectedStableFiles": {
+    "lib/integrations/dsh-collaboration.mjs": "d38053344f8f423d29535621d7f60e5ecc7e74887ac68c45e9c947655bfb2733",
+    "lib/integrations/dsh-cordis.mjs": "681a40aad5652f436ee4b99d616059df7ffb4062ff7fdb1c2cccc72c3d311f5d",
+    "lib/integrations/dsh.mjs": "1c5767677e684677d1cc4f2e9b46242b44496358c1f728e2979a4a05c863ef3a",
+    "test/dsh-collaboration.test.mjs": "2ec380ee58690e0d8afc6bc2e9498b66c52647550f4780a4a940d41f78b825e9",
+    "test/dsh-cordis.test.mjs": "c8a6abb800aafa3c8a0167351bf90cbedca6b9b513d869a395f7595c53d95e39"
+  },
+  "limits": [
+    "Silent or legacy ownership listeners are conservatively rejected.",
+    "One Linux proc-filesystem unit test skips on macOS.",
+    "Remote CI, npm publication and current-device activation require separate exact-artifact receipts."
+  ]
+}

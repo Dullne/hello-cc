@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { createNativeStore, nativePaths, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 
 function fixture(t) {
@@ -39,6 +40,34 @@ test('native pointer writes use private permissions and leave no temporary files
     assert.equal(fs.statSync(paths.pointer).mode & 0o777, 0o600);
     assert.equal(fs.statSync(paths.dir).mode & 0o777, 0o700);
   }
+});
+
+test('native writers tighten existing owned state and database while reads remain non-mutating', (t) => {
+  const f = fixture(t);
+  const state = path.join(f.ctx.root, '.hello-cc');
+  const native = path.join(state, 'native');
+  const dbPath = path.join(native, 'state.db');
+  fs.mkdirSync(native, { recursive: true, mode: 0o755 });
+  fs.chmodSync(state, 0o755);
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec("CREATE TABLE preserved (value TEXT); INSERT INTO preserved VALUES ('existing')");
+  legacy.close();
+  fs.chmodSync(dbPath, 0o644);
+
+  assert.equal(nativePaths(f.ctx).db, fs.realpathSync(dbPath));
+  assert.equal(readNativePointer(f.ctx), null);
+  assert.equal(fs.statSync(state).mode & 0o777, 0o755);
+  assert.equal(fs.statSync(native).mode & 0o777, 0o755);
+  assert.equal(fs.statSync(dbPath).mode & 0o777, 0o644);
+
+  const store = f.store();
+  assert.equal(store.db.prepare('SELECT value FROM preserved').get().value, 'existing');
+  assert.equal(fs.statSync(state).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(native).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(dbPath).mode & 0o777, 0o600);
+  store.saveWorker({ peer: 'worker', provider: 'codex', cwd: f.ctx.root, status: 'ready' });
+  assert.equal(fs.existsSync(`${dbPath}-wal`), true);
+  assert.equal(fs.existsSync(`${dbPath}-shm`), true);
 });
 
 for (const parent of ['.hello-cc', path.join('.hello-cc', 'native')]) {
@@ -131,4 +160,33 @@ test('native store restart preserves queued and terminal records and marks only 
   });
   assert.equal(restarted.pending('worker-a').message_id, 1);
   if (process.platform !== 'win32') assert.equal(fs.statSync(nativePaths(f.ctx).db).mode & 0o777, 0o600);
+});
+
+
+test('native delivery origin is durable and duplicate queueing cannot promote peer messages', (t) => {
+  const f = fixture(t), store = f.store();
+  assert.equal(store.queue('a', 1, 'peer-original').origin, 'peer');
+  assert.equal(store.queue('a', 1, 'user-retry', 'user').origin, 'peer');
+  assert.equal(store.queue('a', 2, 'user-original', 'user').origin, 'user');
+  store.updateDelivery(2, 'submitted', 'turn-user', { received: true });
+  assert.equal(store.delivery('a', 2).origin, 'user');
+  assert.throws(() => store.queue('a', 3, 'invalid-origin', 'spoofed'), { code: 'BAD_ARGS' });
+  store.close();
+  const resumed = f.store();
+  assert.equal(resumed.delivery('a', 1).origin, 'peer');
+  assert.equal(resumed.delivery('a', 2).origin, 'user');
+});
+
+test('legacy native deliveries migrate as peer data without inferred user authority', (t) => {
+  const f = fixture(t), paths = nativePaths(f.ctx, { create: true });
+  const legacy = new DatabaseSync(paths.db);
+  legacy.exec(`CREATE TABLE deliveries (
+    id INTEGER PRIMARY KEY, peer TEXT NOT NULL, message_id INTEGER NOT NULL,
+    submission_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, turn_id TEXT,
+    detail TEXT, updated_at INTEGER NOT NULL, UNIQUE(peer, message_id));
+    INSERT INTO deliveries VALUES (1,'web',1,'legacy','queued',NULL,NULL,1);`);
+  legacy.close();
+  const migrated = f.store();
+  assert.equal(migrated.delivery('web', 1).origin, 'peer');
+  assert.equal(migrated.queue('web', 2, 'new-local-user', 'user').origin, 'user');
 });

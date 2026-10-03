@@ -16,6 +16,40 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.0.3
+
+### Summary
+
+This maintenance release keeps DeepSeek Harness on the normal npm `latest`
+channel and repairs the CLI, native-session and Web regressions identified while
+archiving 1.0.2. It retains the verified Cordis cleanup and recovery behavior.
+
+### Highlights
+
+- Preserve provider process identity during registration and discovery; update
+  owned hooks without discarding unrelated hooks or damaged user configuration.
+- Keep explicit hook database routing and quote generated terminal arguments.
+- Preserve the recorded origin of native submissions across restarts; peer
+  messages cannot gain local-user authority from their sender name or text.
+- Keep managed state directories and database files private without replacing
+  existing data or changing external database parent permissions. Terminal stream
+  buffers follow each session's project.
+- Bound streaming updates and long-message rendering while preserving complete
+  copied content, reader position, approval details and session ownership checks.
+- Isolate request parsing failures, retain local/proxy access contracts, serialize
+  Web startup and resolve terminal assets with npm dependency hoisting.
+- Native runtime ownership uses alternate ports for identifiable unrelated local
+  listeners while keeping one owner per project. Silent or legacy listeners are
+  rejected conservatively, and ownership remains until shutdown completes.
+
+### Validation
+
+The full restored regression suite and the installed official Harness package
+checks run against this composed release. The frozen file manifest and verification
+record live under `docs/verification/`; those source-only records are excluded
+from the npm package. Publication, current-device activation and real-model
+acceptance are recorded separately from source and CI checks.
+
 ## 1.0.2
 
 ### Summary

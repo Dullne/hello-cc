@@ -3,7 +3,9 @@ name: DeepSeek Harness package acceptance
 on:
   push:
     branches:
+      - master
       - codex/dsh-stable-source
+      - codex/dsh-stable-fixes
   pull_request:
   workflow_dispatch:
 
@@ -64,23 +66,24 @@ jobs:
           const metadata = JSON.parse(packed)[0];
           const tarball = path.join(root, 'candidate', metadata.filename);
           execFileSync('tar', ['-xzf', tarball, '-C', path.join(root, 'unpacked')], { env });
-          const published = JSON.parse(fs.readFileSync('docs/verification/dsh-1.0.2-package.json', 'utf8'));
-          let publishedContentMatch = null;
-          if (metadata.version === published.version) {
-            assert.deepEqual(metadata.files.map(file => file.path).sort(), Object.keys(published.files).sort(),
-              'The 1.0.2 package file set must match the published artifact');
-            for (const [file, expected] of Object.entries(published.files)) {
-              assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'unpacked', 'package', file))).digest('hex'),
-                expected, `Published file differs: ${file}`);
-            }
-            publishedContentMatch = true;
+          const manifestPath = `docs/verification/dsh-${metadata.version}-package.json`;
+          const frozen = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          assert.equal(metadata.version, frozen.version, 'Frozen manifest version must match');
+          assert.deepEqual(metadata.files.map(file => file.path).sort(), Object.keys(frozen.files).sort(),
+            'The package file set must match the frozen release artifact');
+          for (const [file, expected] of Object.entries(frozen.files)) {
+            assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'unpacked', 'package', file))).digest('hex'),
+              expected, `Frozen release file differs: ${file}`);
           }
+          assert.equal(createHash('sha256').update(fs.readFileSync(tarball)).digest('hex'), frozen.sha256,
+            'Packed tarball must match the frozen release artifact');
+          const frozenContentMatch = true;
           const receipt = {
             schemaVersion: 1, createdAt: new Date().toISOString(),
             revision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
             platform: { os: process.platform, architecture: process.arch, node: process.version },
             harness: '0.2.0-rc.2', pnpm: '12.8.1',
-            publishedContentMatch,
+            frozenManifest: manifestPath, frozenContentMatch,
             package: { name: metadata.name, version: metadata.version, filename: metadata.filename,
               fileCount: metadata.files.length,
               sha256: createHash('sha256').update(fs.readFileSync(tarball)).digest('hex') },

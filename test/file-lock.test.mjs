@@ -5,12 +5,47 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { withFileLock } from '../lib/shared/file-lock.mjs';
+import { acquireFileLock, createFileLockLease, withFileLock } from '../lib/shared/file-lock.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const projectsModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/runtime/projects.mjs')).href;
 const lockModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/shared/file-lock.mjs')).href;
 const NONBLOCKING_LOCK_DEADLINE_MS = 2_500;
+
+test('explicit file lock lease remains held across await and releases idempotently', async (t) => {
+  const target = path.join(sandbox(t), 'lease');
+  const lease = acquireFileLock(target, { nonblocking: true });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    lease.assertHeld();
+    assert.throws(() => acquireFileLock(target, { nonblocking: true }), { code: 'ERR_FILE_LOCK_BUSY' });
+  } finally { lease.release(); }
+  lease.release();
+  assert.throws(() => lease.assertHeld(), { code: 'ERR_FILE_LOCK_LOST' });
+  const replacement = acquireFileLock(target, { nonblocking: true });
+  replacement.release();
+});
+
+test('explicit file lock lease reports lost ownership and retains release failure evidence', (t) => {
+  const failure = new Error('lease worker release failed');
+  let resources;
+  let releases = 0;
+  const acquire = createFileLockLease({ workerFactory({ state, states }) {
+    resources = { state, states };
+    Atomics.store(state, 0, states.ACQUIRED);
+    return { unref() {}, failure: () => failure, terminate() {}, postMessage() {
+      releases += 1;
+      Atomics.store(state, 0, states.RELEASE_FAILED);
+    } };
+  } });
+  const lease = acquire(path.join(sandbox(t), 'lease'));
+  lease.assertHeld();
+  Atomics.store(resources.state, 0, resources.states.FAILED);
+  assert.throws(() => lease.assertHeld(), { code: 'ERR_FILE_LOCK_LOST' });
+  assert.throws(() => lease.release(), (error) => error === failure);
+  assert.throws(() => lease.release(), (error) => error === failure);
+  assert.equal(releases, 1);
+});
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-file-lock-'));

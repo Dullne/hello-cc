@@ -8,7 +8,7 @@ DeepSeek Harness（`dsh`）可以与 Claude Code、Codex 共用 hello-cc 的项�
 
 支持 Linux 和 macOS；Windows 使用 WSL，不支持原生 Windows shell。容器验证与实际设备验收分别记录。
 
-此接入包含在 hello-cc 1.0.2，沿用 npm 的 latest 标签。在 Node.js 24+ 环境执行 `npm install -g @logicseek/hello-cc` 安装。验证源码时，用本仓库的 CLI：
+此接入自 hello-cc 1.0.2 起提供，沿用 npm 的 latest 标签。在 Node.js 24+ 环境执行 `npm install -g @logicseek/hello-cc` 安装。验证源码时，用本仓库的 CLI：
 
 ```bash
 node /absolute/path/to/hello-cc/bin/hcc.mjs --root /path/to/project dsh setup --mode cordis
@@ -115,7 +115,7 @@ hcc native start --peer dsh-reviewer --provider dsh --binary /absolute/path/to/d
 
 ```bash
 npm pack --ignore-scripts
-dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.1.tgz
+dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.3.tgz
 ```
 
 Harness 的 pnpm 策略要求明确允许原生依赖构建。若首次 add 返回 `ERR_PNPM_IGNORED_BUILDS`，在所选 profile 的 `pnpm-workspace.yaml` 中合并以下配置，然后重跑同一 add 命令；默认位置是 `~/.dsh/profiles/web/pnpm-workspace.yaml`，自定义 DSH_HOME 时以该目录为准。保留文件中已有设置，只批准候选包使用的固定版本：
@@ -125,7 +125,7 @@ allowBuilds:
   node-pty@1.2.0-beta.15: true
 ```
 
-安装后由 Harness profile 的 `dsh.profile.bundles` 选择包；不要再同时加载项目 Cordis/hooks overlay。bundle 已通过实际 npm 安装、官方 add/重复 add/remove、隔离 profile 加载和真实模型工具调用。2026-10-02 已安装到本机真实 desktop profile 并热加载，配套 ACP 使用既有 DeepSeek 路由完成真实工具调用；初次桌面 sub2api 模型返回账户仅允许 Codex 官方客户端的 403；随后桌面默认模型已变为官方 DeepSeek，沿用当时配置的新建会话完成 hcc_state、hcc_message_send 和真实 completed 回合。原 sub2api 路由限制仍存在。1.0.2 沿用 npm latest 标签发布。profile 插件安装/移除由 Harness 管理，项目 overlay 则使用 `setup --mode off` 关闭。
+安装后由 Harness profile 的 `dsh.profile.bundles` 选择包；不要再同时加载项目 Cordis/hooks overlay。bundle 已通过实际 npm 安装、官方 add/重复 add/remove、隔离 profile 加载和真实模型工具调用。2026-10-02 已安装到本机真实 desktop profile 并热加载，配套 ACP 使用既有 DeepSeek 路由完成真实工具调用；初次桌面 sub2api 模型返回账户仅允许 Codex 官方客户端的 403；随后桌面默认模型已变为官方 DeepSeek，沿用当时配置的新建会话完成 hcc_state、hcc_message_send 和真实 completed 回合。原 sub2api 路由限制仍存在。1.0.3 沿用 npm latest 标签发布。profile 插件安装/移除由 Harness 管理，项目 overlay 则使用 `setup --mode off` 关闭。
 
 验证记录见 Cordis/native 验收 (源码目录: `docs/verification/2026-10-02-dsh-cordis-native.md`)、兼容桥记录 (源码目录: `docs/verification/2026-10-02-dsh-official-bridge.md`) 和详细接入计划 (源码目录: `docs/plans/2026-10-02-dsh-integration.md`)。真实模型验收在临时项目和自有进程中完成；既有会话与模型凭据保留；本机实际安装记录见 Mac 接入验收 (源码目录: `docs/verification/2026-10-02-dsh-device-install.md`)。Linux 容器已验证，实际 WSL/员工设备和真实业务签收尚未完成；隔离订单样例已完成报告、证据、交接、解锁与任务结束验证。
 

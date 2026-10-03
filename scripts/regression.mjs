@@ -4420,7 +4420,14 @@ async function multiProjectWebWorkflow() {
 
   const htmlResponse = await fetch(currentRuntimeUrl('/'));
   const html = await htmlResponse.text();
-  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
+  const startForm = html.match(/<form\b[^>]*\bid="startForm"[^>]*>[\s\S]*?<\/form>/)?.[0];
+  if (!startForm) fail('web form missing startForm');
+  // Approval details may display the working directory. The simplified launch
+  // form must still derive it from the selected project instead of an input.
+  if (startForm.includes('Working directory') || /<input\b[^>]*(?:id|name)="(?:cwd|workdir)"/.test(startForm)) {
+    fail('web launch form still exposes Working directory');
+  }
+  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'commandbar', 'lineInput', 'Send text to active terminal']) {
     if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
   }
   for (const expected of [

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { createTmuxStream } from '../lib/web/tmux-stream.mjs';
+import { shellQuoteArg } from '../lib/format.mjs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -44,8 +47,33 @@ test('external session reconciliation compares the current owner before treating
     'external exit must compare generation before applying missing-output cleanup');
 });
 
-test('tmux stream FIFOs are created in their owning project buffer directory', () => {
-  const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'), 'utf8');
-  assert.match(source, /const streamDirectory = bufferDirectory\(session\.ctx \|\| ctx\)/);
-  assert.match(source, /path\.join\(streamDirectory, `tmux-/);
-});
+for (const sessionOwnsProject of [true, false]) {
+  test('tmux stream FIFOs use the ' + (sessionOwnsProject ? 'session project' : 'runtime project fallback'), { skip: process.platform === 'win32' }, t => {
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-stream-project-')));
+    const primary = path.join(sandbox, 'primary'), sibling = path.join(sandbox, 'sibling'), bin = path.join(sandbox, 'bin');
+    for (const folder of [primary, sibling, bin]) fs.mkdirSync(folder);
+    // A test-owned unavailable tmux keeps every command away from user panes.
+    fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+    const oldPath = process.env.PATH; process.env.PATH = bin + path.delimiter + (oldPath || '');
+    const expected = path.join(sessionOwnsProject ? sibling : primary, '.hello-cc', 'bufs'), observed = [];
+    const session = { id: 'test-stream', pane: '%test-stream', type: 'tmux', status: 'running', ...(sessionOwnsProject ? { ctx: { root: sibling } } : {}) };
+    const stream = createTmuxStream({ ctx: { root: primary }, now: () => 1, broadcast() {}, refreshPeerIoHeartbeat() {}, shellQuoteArg,
+      withBufferDirectoryLease(directory, fn) {
+        assert.equal(directory, expected); const result = fn();
+        for (const name of fs.readdirSync(directory)) {
+          const stat = fs.statSync(path.join(directory, name));
+          if (stat.isFIFO()) observed.push({ directory, mode: stat.mode & 0o777 });
+        }
+        return result;
+      } });
+    t.after(() => {
+      stream.stopTmuxStream(session);
+      if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    assert.equal(stream.startTmuxStream(session), 'poll');
+    assert.deepEqual(observed, [{ directory: expected, mode: 0o600 }]);
+    assert.equal(fs.statSync(expected).mode & 0o777, 0o700);
+    assert.equal(fs.existsSync(path.join(sessionOwnsProject ? primary : sibling, '.hello-cc')), false);
+  });
+}
