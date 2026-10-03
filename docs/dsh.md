@@ -113,7 +113,7 @@ Project overlays work directly from source. The managed manifest records the Cor
 
 ```bash
 npm pack --ignore-scripts
-dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.3.tgz
+dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.4.tgz
 ```
 
 Harness requires explicit approval for native dependency builds. If add returns `ERR_PNPM_IGNORED_BUILDS`, merge the following into the selected profile's `pnpm-workspace.yaml` and rerun the same add command. The default path is `~/.dsh/profiles/web/pnpm-workspace.yaml`; use the configured DSH_HOME when different. Preserve existing settings and approve only the candidate's pinned native dependency:
@@ -123,7 +123,7 @@ allowBuilds:
   node-pty@1.2.0-beta.15: true
 ```
 
-Harness selects bundles through the profile's `dsh.profile.bundles`; do not also load the project Cordis/hooks overlay. Actual npm installation, official add/repeated add/remove, profile resolution and real-model collaboration calls have passed. The actual macOS desktop profile was installed and hot-loaded on 2026-10-02. Its paired ACP worker completed real collaboration calls using the existing DeepSeek route. The initially configured desktop sub2api model returned HTTP 403 because that account only accepts official Codex clients. After the desktop default was observed to have changed to official DeepSeek, a new session completed hcc_state, hcc_message_send and a real completed turn with that existing selection. The original sub2api route restriction remains. The 1.0.3 release uses the normal npm latest channel. Harness manages profile package removal; project-overlay integration is disabled with `setup --mode off`.
+Harness selects bundles through the profile's `dsh.profile.bundles`; do not also load the project Cordis/hooks overlay. Actual npm installation, official add/repeated add/remove, profile resolution and real-model collaboration calls have passed. The actual macOS desktop profile was installed and hot-loaded on 2026-10-02. Its paired ACP worker completed real collaboration calls using the existing DeepSeek route. The initially configured desktop sub2api model returned HTTP 403 because that account only accepts official Codex clients. After the desktop default was observed to have changed to official DeepSeek, a new session completed hcc_state, hcc_message_send and a real completed turn with that existing selection. The original sub2api route restriction remains. Maintenance releases use the normal npm latest channel. Harness manages profile package removal; project-overlay integration is disabled with `setup --mode off`.
 
 See Cordis/native acceptance (source checkout: `docs/verification/2026-10-02-dsh-cordis-native.md`), bridge acceptance (source checkout: `docs/verification/2026-10-02-dsh-official-bridge.md`), and the integration plan (source checkout: `docs/plans/2026-10-02-dsh-integration.md`). Real-model checks used temporary projects and owned processes, without replacing existing user sessions. The isolated order fixture passed artifact/evidence/handoff/lock-release/task-completion checks. See the Mac device receipt (source checkout: `docs/verification/2026-10-02-dsh-device-install.md`). Publication, deployment, other-device installation and genuine business acceptance remain separate delivery stages.
 

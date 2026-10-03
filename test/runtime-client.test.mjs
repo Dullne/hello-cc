@@ -36,12 +36,21 @@ async function expectRuntimeDeadline(t, phase) {
     runtimeRequest(
       { root: '/tmp/runtime-client-test', dbPath: '/tmp/runtime-client-test/mesh.db' },
       'POST',
-      '/api/runtime/gc-buffers',
-      { cutoffMs: 1, dryRun: false },
+      '/api/runtime/gc-buffers?token=query-secret',
+      { cutoffMs: 1, dryRun: false, evidence: 'body-secret' },
       { base_url: baseUrl, token: 'test-token' },
       { timeoutMs: 40 }
     ),
-    (error) => error?.code === 'RUNTIME_UNREACHABLE'
+    (error) => {
+      assert.equal(error?.code, 'RUNTIME_UNREACHABLE');
+      assert.equal(error.extra.method, 'POST');
+      assert.equal(error.extra.path, '/api/runtime/gc-buffers');
+      assert.equal(error.extra.timeoutMs, 40);
+      assert.ok(Number.isSafeInteger(error.extra.elapsedMs) && error.extra.elapsedMs >= 0);
+      assert.ok(['Error', 'TimeoutError'].includes(error.extra.errorName));
+      assert.doesNotMatch(JSON.stringify(error.extra), /query-secret|body-secret|test-token/);
+      return true;
+    }
   );
   // The stalled runtime completes at 1000ms; a working deadline rejects at
   // ~40ms. The 800ms bound sits between the two, so event-loop starvation
@@ -57,6 +66,24 @@ test('runtime request deadline covers waiting for response headers', async (t) =
 
 test('runtime request deadline covers waiting for the complete response body', async (t) => {
   await expectRuntimeDeadline(t, 'body');
+});
+
+test('an aborted default-budget request reports only its method and path without retrying', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('caller aborted'));
+  await assert.rejects(runtimeRequest(
+    { root: '/tmp/runtime-client-test', dbPath: '/tmp/runtime-client-test/mesh.db' },
+    'GET', '/api/sessions?token=query-secret#private-fragment', null,
+    { base_url: 'http://127.0.0.1:1', token: 'test-token' }, { signal: controller.signal }
+  ), (error) => {
+    assert.equal(error.code, 'RUNTIME_UNREACHABLE');
+    assert.equal(error.extra.method, 'GET');
+    assert.equal(error.extra.path, '/api/sessions');
+    assert.equal(error.extra.timeoutMs, 8000);
+    assert.equal(error.extra.errorName, 'Error');
+    assert.doesNotMatch(JSON.stringify(error.extra), /query-secret|private-fragment|test-token/);
+    return true;
+  });
 });
 
 test('request body normalization keeps the http and https transports consistent', () => {

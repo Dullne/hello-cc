@@ -1,0 +1,37 @@
+{
+  "createdAt": "2026-10-03T16:08:48.844179+00:00",
+  "version": "1.0.4",
+  "baseCommit": "31eec03c88188051e5858bb2b955190f7a874c3a",
+  "npmTag": "latest",
+  "packageSha256": "65cbabd88a9407801b279648e9de7eb87ed4b3f03d40acf7f846a23bf8382498",
+  "fileCount": 218,
+  "unit": {
+    "tests": 933,
+    "pass": 932,
+    "fail": 0,
+    "skipped": 1
+  },
+  "factoryAuditModules": 64,
+  "regressionStepsPassed": 13,
+  "installedOfficialChecksPassed": 8,
+  "targetedChecksPassed": 49,
+  "officialHarness": "0.2.0-rc.2",
+  "protectedStableFiles": {
+    "lib/integrations/dsh-collaboration.mjs": "d38053344f8f423d29535621d7f60e5ecc7e74887ac68c45e9c947655bfb2733",
+    "lib/integrations/dsh-cordis.mjs": "681a40aad5652f436ee4b99d616059df7ffb4062ff7fdb1c2cccc72c3d311f5d",
+    "lib/integrations/dsh.mjs": "1c5767677e684677d1cc4f2e9b46242b44496358c1f728e2979a4a05c863ef3a",
+    "test/dsh-collaboration.test.mjs": "2ec380ee58690e0d8afc6bc2e9498b66c52647550f4780a4a940d41f78b825e9",
+    "test/dsh-cordis.test.mjs": "c8a6abb800aafa3c8a0167351bf90cbedca6b9b513d869a395f7595c53d95e39"
+  },
+  "repairs": [
+    "Asynchronous shared display-only tmux snapshot replaces 2N synchronous observations during session serialization",
+    "Bounded snapshot age, probe deadline, refresh coalescing, rate limit and shutdown cancellation",
+    "HTTP request error method/path/budget/elapsed diagnostics without query or body; no automatic retry",
+    "Already-cancelled runtime requests are rejected before opening a transport"
+  ],
+  "limits": [
+    "The historical 1.0.3 master macOS broadcast timeout has no proven root cause. This removes a confirmed blocking path; it does not retrospectively establish causation.",
+    "One Linux-only unit check skips on macOS.",
+    "Publication, exact-SHA CI and current-device real model execution have separate external receipts."
+  ]
+}
