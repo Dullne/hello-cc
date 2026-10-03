@@ -41,6 +41,9 @@ jobs:
         with:
           node-version: 24
 
+      - name: Pin npm packaging version
+        run: npm install --global npm@11.17.0 --no-audit --no-fund
+
       - name: Freeze checkout package and record provenance
         id: package
         shell: bash
@@ -52,6 +55,12 @@ jobs:
           import { createHash } from 'node:crypto';
           import { execFileSync } from 'node:child_process';
           import assert from 'node:assert/strict';
+          process.on('uncaughtException', error => {
+            const details = String(error.stack || error.message || error)
+              .replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+            console.error(`::error::${details}`);
+            process.exit(1);
+          });
           const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
           for (const name of ['home', 'official', 'candidate', 'unpacked', 'evidence']) {
             fs.mkdirSync(path.join(root, name), { recursive: true, mode: 0o700 });
@@ -83,6 +92,7 @@ jobs:
             revision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
             platform: { os: process.platform, architecture: process.arch, node: process.version },
             harness: '0.2.0-rc.2', pnpm: '12.8.1',
+            npm: execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(),
             frozenManifest: manifestPath, frozenContentMatch,
             package: { name: metadata.name, version: metadata.version, filename: metadata.filename,
               fileCount: metadata.files.length,
