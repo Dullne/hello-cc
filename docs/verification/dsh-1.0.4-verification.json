@@ -1,13 +1,13 @@
 {
-  "createdAt": "2026-10-03T16:08:48.844179+00:00",
+  "createdAt": "2026-10-03T17:34:29.052292+00:00",
   "version": "1.0.4",
   "baseCommit": "31eec03c88188051e5858bb2b955190f7a874c3a",
   "npmTag": "latest",
-  "packageSha256": "65cbabd88a9407801b279648e9de7eb87ed4b3f03d40acf7f846a23bf8382498",
+  "packageSha256": "516cf1a2b0a93fd79fe9d65388b9dc525e98e3ba10cd0b477795b5dc2715673f",
   "fileCount": 218,
   "unit": {
-    "tests": 933,
-    "pass": 932,
+    "tests": 951,
+    "pass": 950,
     "fail": 0,
     "skipped": 1
   },
@@ -27,11 +27,21 @@
     "Asynchronous shared display-only tmux snapshot replaces 2N synchronous observations during session serialization",
     "Bounded snapshot age, probe deadline, refresh coalescing, rate limit and shutdown cancellation",
     "HTTP request error method/path/budget/elapsed diagnostics without query or body; no automatic retry",
-    "Already-cancelled runtime requests are rejected before opening a transport"
+    "Already-cancelled runtime requests are rejected before opening a transport",
+    "Regression shutdown records the exact owner, fences signals, distinguishes exited/reused/zombie processes, preserves deadlines and emits bounded redacted diagnostics before cleanup",
+    "Darwin process observations include status in both existing start-time probes; Z is dead even while kill(pid, 0) succeeds, documented modifiers including tracing remain live, and malformed evidence remains unknown"
   ],
   "limits": [
     "The historical 1.0.3 master macOS broadcast timeout has no proven root cause. This removes a confirmed blocking path; it does not retrospectively establish causation.",
     "One Linux-only unit check skips on macOS.",
     "Publication, exact-SHA CI and current-device real model execution have separate external receipts."
-  ]
+  ],
+  "fixtureShutdownChecksPassed": 8,
+  "processIdentityAndFixtureTargetedChecksPassed": 41,
+  "darwinZombieRegressionCovered": true,
+  "previousCandidate": {
+    "commit": "010eaf7e240106e7a5405609188632757fdb3635",
+    "published": false,
+    "outcome": "3/4 branch CI jobs passed; macOS regression timed out waiting for runtime exit; original evidence retained in attempt-010eaf7"
+  }
 }

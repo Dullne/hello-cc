@@ -29,6 +29,8 @@ live process and terminal observations continue to guard control actions.
 - Share one short-lived tmux display snapshot across sessions. Cold, stale or
   failed observations remain unknown, and pending probes stop with the runtime.
 - Preserve live checks for terminal control, rebind, stop and ownership.
+- Treat exited macOS zombie processes as dead, so shutdown waits can complete
+  while a parent has yet to reap the PID; malformed observations remain unknown.
 - Include the HTTP method, request path, deadline and elapsed time in runtime
   request failures, without request bodies, query parameters or credentials.
 - Keep DeepSeek Harness on the existing npm `latest` channel.
@@ -40,6 +42,8 @@ shutdown and request diagnostics. Full regression, official installed Harness,
 registry readback and current-Mac model checks have separate verification records.
 The earlier 1.0.3 macOS CI timeout remains historical evidence: removing a known
 blocking path does not identify the specific cause of that earlier timeout.
+Regression shutdown tracks the exact fixture process identity, distinguishes
+reused PIDs and zombies, and retains bounded failure diagnostics before cleanup.
 
 ## 1.0.3
 
