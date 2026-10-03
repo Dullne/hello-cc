@@ -51,9 +51,10 @@ jobs:
       - name: Create a private home for runtime tests
         run: |
           node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
           import fs from 'node:fs';
           const home = fs.mkdtempSync('/tmp/hcc-test-home-');
-          fs.chmodSync(home, 0o700);
+          assert.equal(fs.lstatSync(home).mode & 0o777, 0o700);
           fs.appendFileSync(process.env.GITHUB_ENV, 'HCC_TEST_HOME=' + fs.realpathSync(home) + '\n');
           NODE
 
