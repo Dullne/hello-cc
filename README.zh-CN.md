@@ -37,10 +37,17 @@ unknown 证据获得最长 120 秒宽限。`hcc gc` 默认保留历史，必须�
 `--history`。`--tls` 提供传输加密；`--trust-proxy` 必须固定
 `--proxy-origin`。两项风险是有意保留的：默认在可信内网以明文 HTTP 监听
 `0.0.0.0`，且已认证浏览器可以选择服务器上任意已存在目录。
+默认的 `.hello-cc` 状态目录仅允许当前系统用户访问。不要把项目根目录放在
+不可信系统用户可写的位置；如果其他系统用户可替换项目路径，受管状态会改存于
+`~/.hello-cc/projects/<项目根路径哈希>/`。已有项目本地状态不会自动丢弃或迁移：
+先停止所有旧进程及外部数据库写入者，再运行
+`hcc --root 目录 migrate-state --offline --yes`；原目录保留供恢复。
+若通过 `--db` 或 `HCC_DB` 将数据库放在受管状态目录之外，请自行保护数据库及其
+父目录的权限。
 
 ## 特色
 
-- **项目本地共享状态**：peers、tasks、messages、locks、handoffs 和 events 写入 `<project>/.hello-cc/mesh.db`。
+- **项目共享状态**：peers、tasks、messages、locks、handoffs 和 events 写入私有的 `mesh.db`；路径稳定时保留项目本地目录，否则存于当前用户的 home 目录。
 - **Web 控制真实终端**：浏览器 attach 到和本地终端相同的 tmux pane，不是浏览器里另开的临时 shell。
 - **Claude/Codex 感知项目状态**：hooks 会在模型回答前注入实时 `hcc` 状态。
 - **减少编辑冲突**：通过 advisory lock 和 handoff 显式协调多 agent 修改。
@@ -186,6 +193,10 @@ hcc task done --id 1 --summary "Done"
 - [文档目录](docs/README.zh-CN.md)：全部用户文档和实现文档入口。
 - [用户指南](docs/guide.zh-CN.md)：安装、Web 控制台、协作流程、协作语义和环境变量行为。
 - [命令参考](docs/commands.zh-CN.md)：紧凑公共命令清单。
+- [DeepSeek Harness 接入](docs/dsh.zh-CN.md)：hooks/Cordis 协作、ACP worker、
+  项目配置与 Web 启动；附真实模型和本地包验收记录。
+- [Native 后台 worker](docs/native.zh-CN.md)：HCC 持有的 Codex、Claude SDK、dsh ACP
+  worker，以及投递回执、权限和保存会话的所有权边界。
 - [更新日志](CHANGELOG.md)：已发布版本的 release notes。
 
 ## 测试

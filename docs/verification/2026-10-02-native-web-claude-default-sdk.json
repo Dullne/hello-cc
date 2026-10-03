@@ -1,0 +1,59 @@
+{
+  "startedAt": "2026-10-02T14:05:16.800Z",
+  "directory": "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-3h8REZ",
+  "sourceFiles": {
+    "lib/integrations/codex-interactions.mjs": "66c607b95893b2a6ed2040163eaa0abdecbd38547742ac06acf562fcc5108ec5",
+    "lib/integrations/native/codex.mjs": "0e60c09ccb83a1ba98aac5f689af26cc5d456b006532b66f88c6ccc6b86d9d2d",
+    "lib/integrations/native/claude.mjs": "98af9970bcc3e0991b630ccfa3b851ce5fcec7dadabf5cd959f87f233976b628",
+    "lib/integrations/native/interactions.mjs": "0ceda44c5a6711673a9e5fc1d96c9778bf56d9ccf8a63f1437191ea9e251e0ea",
+    "lib/runtime/native/service.mjs": "b4ba6945197c610701f3387adf1ccbc5dc09e2328dd3be9f6bc0b9f29f48a2ea",
+    "lib/web/native-sessions.mjs": "5f21d5c984913857c67df5e42b5c33e7e5171b4f0f5646ea4e79134531ad0963",
+    "lib/web/ui-native.mjs": "8356d1ef69cd0d9c6bf85ee591930f332c4427708b12317a73e7da8117beb971",
+    "lib/web/ui-interactions.mjs": "e28efbcbe15d36b138fc69b348f3a04c53a42dbd06d88b21c6e68e7d17d5ea4a",
+    "scripts/web-native-interaction-acceptance.mjs": "fc9b87b2818e0346dd6870bc0a7fd0f7d4715e69bee1e54fc8bd1602a71e3da6"
+  },
+  "providers": {
+    "claude": {
+      "sdkVersion": "0.3.287",
+      "dependencyResolution": "default loader: optional SDK installed in isolated worker project; no query injection",
+      "permission": {
+        "method": "claude/canUseTool",
+        "tool": "Write",
+        "requestId": "e9d4d1f5-925b-4a01-b088-75e8203acfb7",
+        "turnId": "12444a8e-52ac-47f2-a11d-dfe54d01cc2f"
+      },
+      "sessionId": "5ce73add-4aeb-4f47-88ea-2e37dc3e6576",
+      "completed": true
+    }
+  },
+  "checks": [
+    {
+      "name": "Default-loaded Claude SDK real Write approval returns to the original model turn",
+      "passed": true
+    },
+    {
+      "name": "Claude model respects a declined real Write operation",
+      "passed": true
+    },
+    {
+      "name": "claude local return retains original provider session",
+      "passed": true
+    },
+    {
+      "name": "zero browser errors; current implementation unchanged during real acceptance",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-3h8REZ/claude-real-permission.png"
+  ],
+  "pageErrors": [],
+  "consoleErrors": [],
+  "completed": true,
+  "browser": "Browser plugin not available; isolated installed Chrome and Playwright",
+  "modelInferenceCalled": true,
+  "runtimeClosed": true,
+  "protectedConfigUnchanged": true,
+  "temporaryProviderHomesRemoved": true,
+  "finishedAt": "2026-10-02T14:05:39.874Z"
+}

@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "startedAt": "2026-10-02T12:11:23.031Z",
+  "completedAt": "2026-10-02T12:12:59.507Z",
+  "scope": "isolated real authenticated native runtime and shared HCC bus",
+  "node": "v24.19.0",
+  "authenticatedCalls": true,
+  "isolatedTestProject": true,
+  "authentication": "caller provider route, private temporary provider state",
+  "providers": {
+    "codex": {
+      "status": "passed",
+      "version": "codex-cli 0.144.6",
+      "prompts": 5,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "steer": true,
+        "interrupt": true,
+        "close": true,
+        "fork": false,
+        "approvals": true,
+        "userInput": true,
+        "mcp": true
+      },
+      "sessionId": "01a0fc86-c0ff-7020-84f8-117f892ccdb3"
+    },
+    "claude": {
+      "status": "passed",
+      "sdk": {
+        "version": "0.3.287",
+        "entrySha256": "21fbc4b359e517a370524dd6e25c40c5eab40368eb122491530ac4233021925d",
+        "dependencyResolution": "explicit external SDK entry injection",
+        "executableSource": "SDK default bundled CLI"
+      },
+      "prompts": 4,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "interrupt": true,
+        "close": true,
+        "steer": false,
+        "fork": false,
+        "approvals": true,
+        "mcp": true
+      },
+      "sessionId": "6befc6c8-ffe2-44c0-b837-c1355a38fc3c"
+    },
+    "dsh": {
+      "status": "passed",
+      "version": "0.2.0-rc.2",
+      "prompts": 4,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "steer": false,
+        "interrupt": true,
+        "close": true,
+        "fork": false,
+        "approvals": true,
+        "mcp": true
+      },
+      "sessionId": "a2b9211a-5f07-4a9e-9eb7-5bdcc0e1818b"
+    }
+  },
+  "checks": [
+    {
+      "name": "codex: real turn, correlated reply, ACK, idempotent queue",
+      "passed": true,
+      "messageId": 1,
+      "turnId": "01a0fc86-c284-7cb0-9489-cd93dda64eed"
+    },
+    {
+      "name": "codex: persistent session retains previous turn",
+      "passed": true
+    },
+    {
+      "name": "codex: owned close/resume preserves identity and history",
+      "passed": true
+    },
+    {
+      "name": "codex: active interruption has terminal evidence, no reply/ACK",
+      "passed": true,
+      "requestStatus": "accepted",
+      "terminalState": "failed"
+    },
+    {
+      "name": "codex: pending real approval explicitly declined",
+      "passed": true,
+      "method": "item/commandExecution/requestApproval"
+    },
+    {
+      "name": "codex: real approval request denied and outside write absent",
+      "passed": true
+    },
+    {
+      "name": "claude: real turn, correlated reply, ACK, idempotent queue",
+      "passed": true,
+      "messageId": 10,
+      "turnId": "cdd4fc20-e334-4ae5-8116-b35b3433d8fe"
+    },
+    {
+      "name": "claude: persistent session retains previous turn",
+      "passed": true
+    },
+    {
+      "name": "claude: owned close/resume preserves identity and history",
+      "passed": true
+    },
+    {
+      "name": "claude: active interruption has terminal evidence, no reply/ACK",
+      "passed": true,
+      "requestStatus": "interrupt_requested",
+      "terminalState": "failed"
+    },
+    {
+      "name": "dsh: real turn, correlated reply, ACK, idempotent queue",
+      "passed": true,
+      "messageId": 17,
+      "turnId": "e22e7e2f-f674-47ca-84bc-01febd5cbe89"
+    },
+    {
+      "name": "dsh: persistent session retains previous turn",
+      "passed": true
+    },
+    {
+      "name": "dsh: owned close/resume preserves identity and history",
+      "passed": true
+    },
+    {
+      "name": "dsh: active interruption has terminal evidence, no reply/ACK",
+      "passed": true,
+      "requestStatus": "interrupting",
+      "terminalState": "failed"
+    }
+  ],
+  "sourceFiles": {
+    "lib/integrations/codex-interactions.mjs": "cd3135f227164b320bb845044e382f37d8ed9ed53f494d8a48b79f6e69fc4080",
+    "lib/integrations/native/claude.mjs": "8a351ea2429c3a32418842cc511fa09c0582d871f93671788149026014d16cff",
+    "lib/integrations/native/codex.mjs": "85eb64b1a9a83ef3a223ea1dd6e9e412c2c017c1fbed2f71ec054f30d970acf9",
+    "lib/integrations/native/dsh-acp.mjs": "4e6d5910e054aeba5abd9df103cd417d2ba89e22a89fb2b65223ca4cf0523a72",
+    "lib/integrations/native/index.mjs": "ae6726349ff1a55ffcd1a926e5a5459373a76e2545f622e0b4fbfd641e0f1cc5",
+    "lib/integrations/native/interactions.mjs": "0ceda44c5a6711673a9e5fc1d96c9778bf56d9ccf8a63f1437191ea9e251e0ea",
+    "lib/integrations/native/jsonrpc.mjs": "42d9cc5d8f992c8726a3861cf7fcdedc58925615616a3bed1a71d499b819a8b4",
+    "lib/mcp/scope.mjs": "71f4ade7705d3db6a493340f4321cb447584e10ccb05ee3d86edbf50f28542ca",
+    "lib/mcp/stdio.mjs": "b473796486c15e9d55cbc67b8ca6bdd21dbce989fbbcd548ee9c0143d02ebb35",
+    "lib/mcp/tools.mjs": "59d2926bde55ec839bd7fc818b06dada2929131eb2f96b21998879134664c63c",
+    "lib/process/identity.mjs": "d0f9158d31a859c998333f40b133bff78c67928b68f91336bc71ad43c6c3cbac",
+    "lib/runtime/native/client.mjs": "592bd0ca2d40bc0bd52544fd2f173f620ee5fc4f9a92d30c9b37aa3be8946a9e",
+    "lib/runtime/native/service.mjs": "b4ba6945197c610701f3387adf1ccbc5dc09e2328dd3be9f6bc0b9f29f48a2ea",
+    "lib/runtime/native/store.mjs": "b0dd9a5285b2746a2a0c661ca04dd7f8fa94ffc316e1347406ad90a11f836af1",
+    "lib/web/codex-app-server.mjs": "6a3eeab81f7ce674984accfb36c642b2bb77e0b75a88e49fbc9b4be19e3daf4d",
+    "lib/web/native-sessions.mjs": "2869848a91d01585ea6eda6381793ddaa478cdb3b61bfd2e3ae5388ffd892f4a"
+  },
+  "sourceUnchangedDuringRun": true,
+  "fullSourceManifestSha256": "b8e41a2a0bf4f56ed2ff2dd0d453056a554c887b753f724a8e96a87a07fd37c4",
+  "cleanup": {
+    "runtimeStopped": true,
+    "temporaryCredentialsRemoved": true
+  },
+  "limitations": [
+    "The acceptance harness calls the same native service/adapters with an isolated environment factory; this does not prove CLI default dependency resolution or packaged distribution.",
+    "No existing TUI/Desktop session, published build or business task acceptance was exercised."
+  ],
+  "provenance": {
+    "harness": "scripts/native-live-acceptance.mjs",
+    "environmentFactoryInjected": true,
+    "repositoryDefaultClaudeSdkResolutionVerified": false,
+    "publishedPackageVerified": false,
+    "fullBrowserUiVerified": false
+  }
+}

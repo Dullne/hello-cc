@@ -43,11 +43,20 @@ grace. `hcc gc` retains history unless `--history` is explicit. `--tls` encrypts
 the console; `--trust-proxy` requires a fixed `--proxy-origin`. Two risks remain
 intentional: the default listener is plaintext HTTP on `0.0.0.0` for trusted
 LANs, and an authenticated browser may select any existing server directory.
+Managed `.hello-cc` state is private to the current OS user. Keep project roots
+behind cross-user-stable paths for project-local storage. For a root that
+another OS user could replace, hello-cc stores managed state under
+`~/.hello-cc/projects/<root-hash>/` instead. An existing project-local state
+must be migrated explicitly while every old writer is stopped:
+`hcc --root DIR migrate-state --offline --yes`. Migration keeps the original
+directory for recovery. If you set `--db` or `HCC_DB` outside managed state,
+secure that database and its parent directory yourself.
 
 ## Highlights
 
 - **Shared project memory**: peers, tasks, messages, locks, handoffs, and
-  events are stored in `<project>/.hello-cc/mesh.db`.
+  events are stored in a private managed `mesh.db` (project-local for stable
+  roots, otherwise under the current user's home directory).
 - **Real terminal control**: Web attaches to the same local tmux pane as your
   terminal, not a separate browser-only shell.
 - **Claude/Codex awareness**: hooks inject live `hcc` state before model turns,
@@ -207,6 +216,10 @@ generic session-isolation assumptions.
 - [User Guide](docs/guide.md): setup, Web console, workflows, coordination
   semantics, and environment behavior.
 - [Command Reference](docs/commands.md): compact public command list.
+- [DeepSeek Harness](docs/dsh.md): hooks/Cordis collaboration, ACP workers,
+  project setup and Web launch, with real-model and local-package acceptance evidence.
+- [Native Workers](docs/native.md): HCC-owned Codex, Claude SDK, and dsh ACP
+  workers, delivery receipts, permissions, and saved-session ownership.
 - [Changelog](CHANGELOG.md): release notes for published versions.
 - [Design Notes](docs/design.md): product boundaries and coordination model.
 - [Implementation Notes](docs/implementation.md): architecture and internal

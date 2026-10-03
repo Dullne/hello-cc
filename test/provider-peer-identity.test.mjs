@@ -8,10 +8,28 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { providerSessionPeerId } from '../lib/core/peers/session.mjs';
+import { derivePeerId } from '../lib/discover.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
+
+test('discovery uses the hook/shim peer identity for full provider session names', () => {
+  const previous = process.env.HCC_PEER;
+  delete process.env.HCC_PEER;
+  try {
+    const first = derivePeerId('codex', '', 'feature-one');
+    const second = derivePeerId('codex', '', 'feature-two');
+    assert.equal(first, providerSessionPeerId('codex', 'feature-one'));
+    assert.equal(second, providerSessionPeerId('codex', 'feature-two'));
+    assert.notEqual(first, second);
+    assert.equal(derivePeerId('codex', 'session-id', null), providerSessionPeerId('codex', 'session-id'));
+    assert.equal(derivePeerId('codex', '', 'feature-one', 'custom-peer'), 'custom-peer');
+  } finally {
+    if (previous === undefined) delete process.env.HCC_PEER;
+    else process.env.HCC_PEER = previous;
+  }
+});
 
 function v1PeerId(kind, providerId) {
   const digest = createHash('sha1').update(providerId).digest('hex');

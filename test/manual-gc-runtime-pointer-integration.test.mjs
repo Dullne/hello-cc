@@ -63,7 +63,7 @@ test('manual GC reclaims a confirmed-dead fingerprinted runtime pointer', (t) =>
       commandHash: 'd'.repeat(64)
     },
     base_url: 'http://127.0.0.1:1'
-  }));
+  }), { mode: 0o600 });
 
   const result = JSON.parse(runHcc(
     state.root,
@@ -88,7 +88,7 @@ test('manual GC keeps an unreachable pointer with a live matching fingerprint fa
     pid: process.pid,
     process_identity: observed.identity,
     base_url: 'http://127.0.0.1:1'
-  }));
+  }), { mode: 0o600 });
 
   const result = JSON.parse(runHcc(
     state.root,

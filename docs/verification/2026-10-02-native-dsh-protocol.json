@@ -1,0 +1,124 @@
+{
+  "verifiedAt": "2026-10-02",
+  "scope": "protocol-only",
+  "package": "@deepseek-ai/dsh",
+  "invocation": [
+    "--profile",
+    "acp"
+  ],
+  "transport": "owned child process; stdio JSON-RPC 2.0 newline frames",
+  "isolation": {
+    "workspace": "new empty temporary directory",
+    "dshHome": "new empty temporary directory",
+    "environment": "allowlist: PATH, DSH_HOME, DSH_TELEMETRY_DISABLED",
+    "userDshHomeSupplied": false,
+    "inheritedEnvironmentPassed": false,
+    "credentialsInherited": false
+  },
+  "baseline": "0.2.0-rc.2",
+  "node": "v24.19.0",
+  "credentialsInherited": false,
+  "promptCalls": 0,
+  "records": [],
+  "initialize": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "deepseek-harness-acp",
+      "version": "0.0.1"
+    },
+    "agentCapabilities": {
+      "mcpCapabilities": {
+        "http": true
+      },
+      "promptCapabilities": {
+        "image": false,
+        "audio": false,
+        "embeddedContext": false
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "authMethods": []
+  },
+  "new": {
+    "sessionId": "8bb1d464-c83d-4f75-99b4-496dac377cdd",
+    "configOptionIds": [
+      "model",
+      "reasoning_effort"
+    ]
+  },
+  "cancel": {
+    "method": "session/cancel",
+    "kind": "notification",
+    "sent": true
+  },
+  "close": {},
+  "adapterOpen": {
+    "provider": "dsh",
+    "transport": "acp",
+    "protocolVersion": 1,
+    "baselineVersion": "0.2.0-rc.2",
+    "sessionId": "7bc001b5-e54f-4ddf-aba5-aa7cd6184d2f",
+    "status": "idle",
+    "turnId": null,
+    "submissionId": null,
+    "capabilities": {
+      "create": true,
+      "resume": true,
+      "send": true,
+      "observe": true,
+      "steer": false,
+      "interrupt": true,
+      "close": true,
+      "fork": false
+    },
+    "error": null
+  },
+  "adapterClose": {
+    "provider": "dsh",
+    "transport": "acp",
+    "protocolVersion": 1,
+    "baselineVersion": "0.2.0-rc.2",
+    "sessionId": "7bc001b5-e54f-4ddf-aba5-aa7cd6184d2f",
+    "status": "closed",
+    "turnId": null,
+    "submissionId": null,
+    "capabilities": {
+      "create": true,
+      "resume": true,
+      "send": true,
+      "observe": true,
+      "steer": false,
+      "interrupt": true,
+      "close": true,
+      "fork": false
+    },
+    "error": null
+  },
+  "adapterEvents": [
+    {
+      "provider": "dsh",
+      "sessionId": "7bc001b5-e54f-4ddf-aba5-aa7cd6184d2f",
+      "type": "opened",
+      "resumed": false,
+      "status": "idle"
+    },
+    {
+      "provider": "dsh",
+      "sessionId": "7bc001b5-e54f-4ddf-aba5-aa7cd6184d2f",
+      "type": "closed",
+      "status": "closed"
+    }
+  ],
+  "success": true,
+  "limitations": [
+    "No session/prompt request or model invocation was made.",
+    "Resume was advertised by initialize but was not exercised.",
+    "session/cancel was sent as a notification to an idle session; active-turn interruption was not verified.",
+    "No permission request was exercised.",
+    "This proves protocol initialization and create/close lifecycle compatibility only, not model or business acceptance."
+  ]
+}

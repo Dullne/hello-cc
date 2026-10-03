@@ -6,6 +6,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import * as clockSafety from '../lib/core/coordination/clock-safety.mjs';
+import { scopedLockResource } from '../lib/core/coordination/locks.mjs';
 import { createWebPeerActions } from '../lib/web/peer-actions.mjs';
 import { tx } from '../lib/db/schema.mjs';
 import { CliError, publicCliFailure } from '../lib/shared/errors.mjs';
@@ -84,7 +85,7 @@ function createFixture(options = {}) {
       UPDATE peers SET last_seen_at = 1000, status = COALESCE(?, status) WHERE id = ?
     `).run(status, peer),
     tx,
-    upsertPeer: () => {}
+    upsertPeer: options.upsertPeer || (() => {})
   });
 
   return {
@@ -101,6 +102,28 @@ function createFixture(options = {}) {
     }
   };
 }
+
+test('Web re-register preserves a managed peer identity unless a PID is explicitly supplied', () => {
+  const registered = [];
+  const fixture = createFixture({ upsertPeer: (_db, row) => registered.push(row) });
+  try {
+    fixture.write((db) => db.prepare(`
+      INSERT INTO peers(id, status, pid, pid_start_token, pid_command_hash, last_seen_at)
+      VALUES ('worker', 'working', 123, 'live', 'live', 100)
+    `).run());
+    const context = { root: '/repo', cwd: '/repo' };
+    fixture.actions.webPeerAction(context, 'worker', 'register', { actorPeer: 'worker', kind: 'claude' });
+    assert.equal(registered[0].pid, 123);
+    assert.equal(registered[0].status, 'working');
+    assert.deepEqual(registered[0].processIdentity, { pid: 123, startToken: 'live', commandHash: 'live' });
+
+    fixture.actions.webPeerAction(context, 'new-worker', 'register', { actorPeer: 'new-worker' });
+    assert.equal(registered[1].pid, null);
+    assert.equal(registered[1].processIdentity, null);
+  } finally {
+    fixture.close();
+  }
+});
 
 function seedOwner(fixture, { peer = 'owner', evidence = 'unknown', resource = 'shared', grace = null } = {}) {
   fixture.write((db) => {
@@ -139,6 +162,34 @@ test('Web lock acquire protects an expired unknown owner after a clock gap', () 
     fixture.close();
   }
 });
+
+for (const firstIsScoped of [true, false]) {
+  test(`Web lock actions preserve a colliding logical resource (${firstIsScoped ? 'scoped first' : 'literal first'})`, () => {
+    const fixture = createFixture();
+    try {
+      fixture.write((db) => db.prepare("INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', '1000')").run());
+      const encoded = scopedLockResource('a', 'b').resource;
+      const scoped = { actorPeer: 'worker', resource: 'a', scope: 'b' };
+      const literal = { actorPeer: 'worker', resource: encoded };
+      const first = firstIsScoped ? scoped : literal;
+      const second = firstIsScoped ? literal : scoped;
+      const action = (type, input) => fixture.actions.webPeerAction(
+        { root: '/repo', cwd: '/repo' }, 'worker', type, input
+      );
+
+      action('lock-acquire', first);
+      const before = fixture.read((db) => db.prepare('SELECT * FROM locks').get());
+      assert.throws(() => action('lock-acquire', second), { code: 'LOCK_RESOURCE_COLLISION' });
+      assert.deepEqual(fixture.read((db) => db.prepare('SELECT * FROM locks').get()), before);
+      assert.equal(action('lock-release', second).data.result.released, false);
+      assert.deepEqual(fixture.read((db) => db.prepare('SELECT * FROM locks').get()), before);
+      assert.equal(action('lock-release', first).data.result.released, true);
+      assert.equal(fixture.read((db) => db.prepare('SELECT COUNT(*) AS n FROM locks').get().n), 0);
+    } finally {
+      fixture.close();
+    }
+  });
+}
 
 for (const evidence of ['live', 'dead', 'unknown']) {
   test(`Web heartbeat applies ${evidence} clock evidence without blanket renewal`, () => {

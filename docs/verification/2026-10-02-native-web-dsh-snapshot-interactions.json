@@ -1,0 +1,97 @@
+{
+  "startedAt": "2026-10-02T16:09:03.124Z",
+  "directory": "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C",
+  "sourceFiles": {
+    "lib/integrations/codex-interactions.mjs": "66c607b95893b2a6ed2040163eaa0abdecbd38547742ac06acf562fcc5108ec5",
+    "lib/integrations/native/codex.mjs": "0e60c09ccb83a1ba98aac5f689af26cc5d456b006532b66f88c6ccc6b86d9d2d",
+    "lib/integrations/native/claude.mjs": "98af9970bcc3e0991b630ccfa3b851ce5fcec7dadabf5cd959f87f233976b628",
+    "lib/integrations/native/dsh-acp.mjs": "834bbc5b662f1ccfe398486fcc349cb444da335da792dba0fc2a79cd17de2edb",
+    "lib/integrations/native/jsonrpc.mjs": "42d9cc5d8f992c8726a3861cf7fcdedc58925615616a3bed1a71d499b819a8b4",
+    "lib/integrations/native/interactions.mjs": "0ceda44c5a6711673a9e5fc1d96c9778bf56d9ccf8a63f1437191ea9e251e0ea",
+    "lib/runtime/native/service.mjs": "1c0626740edefce9e2ff0f9e175e206b5ca9b008d708da2319efc71bbe8f4bf6",
+    "lib/web/native-sessions.mjs": "30cad039fbb2d96cdb02597ca28ceb20612d992bc0c20e675404e8687aca6ddd",
+    "lib/web/ui-native.mjs": "51db4cd35569598d1f8b442a7eb9eed40cf9c605525d26d43093a0e82fd289cb",
+    "lib/web/ui-interactions.mjs": "af56191aeb58ce06fc6d3bc2aea2fd60fa19adf6aa0e1002ff5aee8c5cf26d57",
+    "lib/web/ui-template.mjs": "8cc6118b880fd597f4f0cd23a8bba31d35f1fcf7e79fc040f4bdbfa9ebf89dd5",
+    "lib/web/ui-workspace.mjs": "4dd685e07d6bed7341124ca01f66d2ee99cdb2278b051514ca1469582f486ddb",
+    "lib/web/http.mjs": "8f61d2e39187d6cf781ab135d822fbe21973dc1290dc888e8c4b91736db299a8",
+    "scripts/web-native-interaction-acceptance.mjs": "416103a3245059723740a8c5a6cdf5d3cf1b078517b23f61af9f00d7c4cd7851"
+  },
+  "providers": {
+    "dsh": {
+      "runtimeVersion": "0.2.0-rc.2",
+      "publicLauncher": "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-dsh-official-acceptance-m0n74ee2/node_modules/@deepseek-ai/dsh/lib/bin.js",
+      "approvalPolicy": "official tools/pre-execute ask policy in private ACP profile; only the two acceptance-owned target files",
+      "permissionTargets": [
+        "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/requested-write/dsh-allowed.txt",
+        "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-denied/must-not-exist.txt"
+      ],
+      "sessionId": "22801672-a996-41d4-b303-2b88cd6c24c5",
+      "permission": {
+        "method": "session/request_permission",
+        "requestId": 0,
+        "sessionId": "22801672-a996-41d4-b303-2b88cd6c24c5",
+        "turnId": "985fba30-d33b-4b8d-b9f4-d4a2d28134d6",
+        "toolCall": {
+          "toolCallId": "call_00_RfkfdliaWcCfmnYYcJDg0847",
+          "title": "write",
+          "kind": "other",
+          "rawInput": {
+            "file_path": "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/requested-write/dsh-allowed.txt",
+            "content": "DSH_APPROVED_OK"
+          }
+        },
+        "approvalScope": "allow_once"
+      },
+      "refusal": {
+        "method": "session/request_permission",
+        "requestId": 1,
+        "sessionId": "22801672-a996-41d4-b303-2b88cd6c24c5",
+        "turnId": "1f79afa5-26d6-4f03-add3-a094a0d6937f",
+        "target": "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-denied/must-not-exist.txt"
+      },
+      "localReturn": {
+        "sessionId": "22801672-a996-41d4-b303-2b88cd6c24c5",
+        "submissionId": "2ed602d4-a92b-49a4-9099-15b40cb75699"
+      },
+      "completed": true
+    }
+  },
+  "checks": [
+    {
+      "name": "dsh operation summary and persistent details render on desktop and 390px mobile",
+      "passed": true
+    },
+    {
+      "name": "dsh real ACP write approval returns to the original model turn",
+      "passed": true
+    },
+    {
+      "name": "dsh model respects a declined real ACP write operation",
+      "passed": true
+    },
+    {
+      "name": "dsh local return retains original provider session",
+      "passed": true
+    },
+    {
+      "name": "zero browser errors; current implementation unchanged during real acceptance",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-real-permission.png",
+    "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-real-permission-summary.png",
+    "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-real-permission-mobile.png",
+    "/private/var/folders/w2/xwv9k9950t7d3v8t_h2l0gjc0000gn/T/hcc-live-web-interactions-XCwv7C/dsh-real-permission-decline.png"
+  ],
+  "pageErrors": [],
+  "consoleErrors": [],
+  "completed": true,
+  "browser": "Browser plugin not available; isolated installed Chrome and Playwright",
+  "modelInferenceCalled": true,
+  "runtimeClosed": true,
+  "protectedConfigUnchanged": true,
+  "temporaryProviderHomesRemoved": true,
+  "finishedAt": "2026-10-02T16:09:26.150Z"
+}

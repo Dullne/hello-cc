@@ -430,100 +430,118 @@ test('release closes a half-open identity probe before publishing RELEASED', asy
   }
 });
 
-test('terminal listener failure wins when release joins an in-flight close', async (t) => {
-  const root = sandbox(t);
-  const closeStartedBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const closeStarted = new Int32Array(closeStartedBuffer);
-  let worker = null;
-  let workerExit = null;
-  let callbackRan = false;
-  const lock = lockModule.createFileLock({
-    workerFactory({ workerSource, workerData }) {
-      const injectedSource = String.raw`
-        const net = require('node:net');
-        const { parentPort, workerData } = require('node:worker_threads');
-        const state = new Int32Array(workerData.stateBuffer);
-        const closeStarted = new Int32Array(workerData.testCloseStartedBuffer);
-        const originalListen = net.Server.prototype.listen;
-        const originalClose = net.Server.prototype.close;
-        const pendingCloseCallbacks = [];
-        let releaseObserved = false;
-        let injectFailure = true;
-        let delayCloseCallbacks = false;
+for (const lastCandidateOccupied of [false, true]) {
+  test('terminal listener failure wins when release joins an in-flight close' + (lastCandidateOccupied ? ' after an unrelated final candidate collision' : ''), async (t) => {
+    const root = sandbox(t);
+    const closeStartedBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+    const closeStarted = new Int32Array(closeStartedBuffer);
+    let worker = null;
+    let workerExit = null;
+    let callbackRan = false;
+    const lock = lockModule.createFileLock({
+      workerFactory({ workerSource, workerData }) {
+        const injectedSource = String.raw`
+          const net = require('node:net');
+          const { parentPort, workerData } = require('node:worker_threads');
+          const state = new Int32Array(workerData.stateBuffer);
+          const closeStarted = new Int32Array(workerData.testCloseStartedBuffer);
+          const originalListen = net.Server.prototype.listen;
+          const originalClose = net.Server.prototype.close;
+          const pendingCloseCallbacks = [];
+          let releaseObserved = false;
+          let boundServer = null;
+          let delayCloseCallbacks = false;
 
-        parentPort.on('message', (message) => {
-          if (message?.type !== 'release') return;
-          releaseObserved = true;
-          setImmediate(() => {
-            for (const callback of pendingCloseCallbacks.splice(0)) callback();
+          parentPort.on('message', (message) => {
+            if (message?.type !== 'release') return;
+            releaseObserved = true;
+            setImmediate(() => {
+              for (const callback of pendingCloseCallbacks.splice(0)) callback();
+            });
           });
-        });
 
-        net.Server.prototype.listen = function(...args) {
-          const callbackIndex = args.length - 1;
-          const callback = args[callbackIndex];
-          if (typeof callback !== 'function') return originalListen.apply(this, args);
-          const server = this;
-          args[callbackIndex] = function(...callbackArgs) {
-            callback.apply(this, callbackArgs);
-            if (injectFailure &&
-                Atomics.load(state, 0) === workerData.states.ACQUIRED) {
-              injectFailure = false;
-              delayCloseCallbacks = true;
-              const error = new Error('injected bound listener failure');
-              error.code = 'ERR_TEST_LISTENER_FAILURE';
-              server.emit('error', error);
+          net.Server.prototype.listen = function(...args) {
+            const callbackIndex = args.length - 1;
+            const callback = args[callbackIndex];
+            if (typeof callback !== 'function') return originalListen.apply(this, args);
+            const server = this;
+            if (workerData.lastCandidateOccupied && args[0]?.port === workerData.targets.at(-1).ports.at(-1)) {
+              // Exercise the real unrelated-listener fallback without reserving
+              // a fixed port or depending on other concurrently running tests.
+              Atomics.store(closeStarted, 1, 1);
+              setImmediate(() => {
+                const error = new Error('injected unrelated occupied candidate');
+                error.code = 'EADDRINUSE'; server.emit('error', error);
+              });
+              return server;
             }
+            args[callbackIndex] = function(...callbackArgs) {
+              boundServer = server;
+              callback.apply(this, callbackArgs);
+            };
+            return originalListen.apply(this, args);
           };
-          return originalListen.apply(this, args);
-        };
 
-        net.Server.prototype.close = function(callback) {
-          if (!delayCloseCallbacks || typeof callback !== 'function') {
-            return originalClose.call(this, callback);
-          }
-          if (Atomics.compareExchange(closeStarted, 0, 0, 1) === 0) {
-            Atomics.notify(closeStarted, 0);
-          }
-          return originalClose.call(this, (error) => {
-            const deliver = () => callback(error);
-            if (releaseObserved) setImmediate(deliver);
-            else pendingCloseCallbacks.push(deliver);
+          // Acquisition can be published from a probe callback when the final
+          // candidate is occupied. Observe its shared-state transition rather
+          // than assuming the last successful listen callback publishes it.
+          Promise.resolve(Atomics.waitAsync(state, 0, workerData.states.STARTING).value).then(() => {
+            if (Atomics.load(state, 0) !== workerData.states.ACQUIRED || !boundServer) return;
+            delayCloseCallbacks = true;
+            const error = new Error('injected bound listener failure');
+            error.code = 'ERR_TEST_LISTENER_FAILURE';
+            boundServer.emit('error', error);
           });
-        };
-      ` + workerSource;
-      worker = new Worker(injectedSource, {
-        eval: true,
-        workerData: { ...workerData, testCloseStartedBuffer: closeStartedBuffer },
-        execArgv: []
-      });
-      workerExit = new Promise((resolve, reject) => {
-        worker.once('exit', resolve);
-        worker.once('error', reject);
-      });
-      workerExit.catch(() => {});
-      return worker;
-    }
-  });
-  t.after(async () => {
-    if (worker === null) return;
-    try { await worker.terminate(); } catch {}
-  });
 
-  const error = captureThrown(() => lock(path.join(root, 'registry.json'), () => {
-    callbackRan = true;
-    assert.notEqual(
-      Atomics.wait(closeStarted, 0, 0, 5000),
-      'timed-out',
-      'timed out waiting for the injected listener close'
-    );
-    return 'callback completed';
-  }, { nonblocking: true }));
+          net.Server.prototype.close = function(callback) {
+            if (!delayCloseCallbacks || typeof callback !== 'function') {
+              return originalClose.call(this, callback);
+            }
+            if (Atomics.compareExchange(closeStarted, 0, 0, 1) === 0) {
+              Atomics.notify(closeStarted, 0);
+            }
+            return originalClose.call(this, (error) => {
+              const deliver = () => callback(error);
+              if (releaseObserved) setImmediate(deliver);
+              else pendingCloseCallbacks.push(deliver);
+            });
+          };
+        ` + workerSource;
+        worker = new Worker(injectedSource, {
+          eval: true,
+          workerData: { ...workerData, testCloseStartedBuffer: closeStartedBuffer, lastCandidateOccupied },
+          execArgv: []
+        });
+        workerExit = new Promise((resolve, reject) => {
+          worker.once('exit', resolve);
+          worker.once('error', reject);
+        });
+        workerExit.catch(() => {});
+        return worker;
+      }
+    });
+    t.after(async () => {
+      if (worker === null) return;
+      try { await worker.terminate(); } catch {}
+    });
 
-  assert.equal(callbackRan, true);
-  assert.equal(error?.code, 'ERR_FILE_LOCK_RELEASE_FAILED');
-  assert.equal(await workerExit, 0);
-});
+    const error = captureThrown(() => lock(path.join(root, 'registry.json'), () => {
+      callbackRan = true;
+      assert.notEqual(
+        Atomics.wait(closeStarted, 0, 0, 5000),
+        'timed-out',
+        'timed out waiting for the injected listener close'
+      );
+      return 'callback completed';
+    }, { nonblocking: true }));
+
+    assert.equal(callbackRan, true);
+    assert.equal(Boolean(Atomics.load(closeStarted, 1)), lastCandidateOccupied);
+    assert.equal(error?.code, 'ERR_FILE_LOCK_RELEASE_FAILED');
+    worker.ref();
+    assert.equal(await workerExit, 0);
+  });
+}
 
 test('derives a fixed endpoint from the canonical target and shares it with aliases', (t) => {
   const root = sandbox(t);

@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-10-02T12:56:15.702514+00:00",
+  "scope": "local source validation; authenticated model checks are separate receipts",
+  "node": "v24.19.0",
+  "unit": {
+    "command": "node --test --test-concurrency=4",
+    "tests": 786,
+    "pass": 785,
+    "fail": 0,
+    "cancelled": 0,
+    "skipped": 1,
+    "completedAt": "2026-10-02T12:53:02.518263+00:00",
+    "logSha256": "99f13d7e55ac9ede84053040c130ef068126a597a717d90e0401d91b0e87f360"
+  },
+  "factoryAudit": {
+    "command": "node scripts/check-free-identifiers.mjs",
+    "modulesAudited": 63,
+    "freeIdentifiers": 0,
+    "exitCode": 0,
+    "logSha256": "5f7f9e3e882dfd46ef6da4fda355b8f2dc15282629ebeb6b40947f5a800815df"
+  },
+  "unitAndAuditSourceSnapshot": {
+    "startedAt": "2026-10-02T12:52:51.520205+00:00",
+    "completedAt": "2026-10-02T12:53:02.518263+00:00",
+    "sourceManifestSha256": "158826e17033d301e8264ee54560dcc0f6455c99bf4e8d8e4b49469f97eeb33e",
+    "sourceUnchangedDuringRun": true,
+    "sourceChangesDuringRun": []
+  },
+  "regression": {
+    "command": "node scripts/regression.mjs",
+    "stagesPassed": 13,
+    "result": "FULL_REGRESSION_OK",
+    "logCompletedAt": "2026-10-02T12:39:47.713781+00:00",
+    "logSha256": "59e283c27f5a335fcd0dd8990482ec633c8c0936505809275ca780d159042b07",
+    "sourceManifestRecorded": false
+  },
+  "offlineAcceptanceHarness": {
+    "node": "v24.19.0",
+    "syntaxCheck": "passed",
+    "defaultHelpDoesNotRunProviders": "passed",
+    "crossProviderArgumentGuard": "passed",
+    "initializationFailureCleanup": "passed",
+    "modelCalls": 0,
+    "runtimeStarted": false
+  },
+  "authenticatedReceipts": [
+    {
+      "path": "docs/verification/2026-10-02-native-live-lifecycle.json",
+      "sha256": "40bfd69c0a93e562dcd1180ac8274c91f25904e1a1fbab9c7deaaf7df9bfb195",
+      "checksPassed": 14,
+      "completedAt": "2026-10-02T12:12:59.507Z"
+    },
+    {
+      "path": "docs/verification/2026-10-02-native-live-communication.json",
+      "sha256": "bfad8cff1e8f0b5187b43bbf54b01b229beb7a84a34b624559215f24ce8727e6",
+      "checksPassed": 5,
+      "completedAt": "2026-10-02T12:36:56.907Z"
+    }
+  ],
+  "sourceFiles": {
+    "lib/integrations/codex-interactions.mjs": "609f3bae0aa3adf19d128d7537ddb34644e0ca5653c94c7b31a5eb36a74988e4",
+    "lib/integrations/native/claude.mjs": "d62d106d8125a31662c40123d6f255433e6957e3deab182af5ab89252c915df5",
+    "lib/integrations/native/codex.mjs": "527b725991900f2bdd7c5e555a2e45f7f090a2a56fe70aae59248bfb0e8fca4d",
+    "lib/integrations/native/dsh-acp.mjs": "6b60cd8c1ccc4fb205fc58bceaf22e65ba3ba5f86d54e74d67ce6dad1f0bf2df",
+    "lib/integrations/native/index.mjs": "ae6726349ff1a55ffcd1a926e5a5459373a76e2545f622e0b4fbfd641e0f1cc5",
+    "lib/integrations/native/interactions.mjs": "0ceda44c5a6711673a9e5fc1d96c9778bf56d9ccf8a63f1437191ea9e251e0ea",
+    "lib/integrations/native/jsonrpc.mjs": "42d9cc5d8f992c8726a3861cf7fcdedc58925615616a3bed1a71d499b819a8b4",
+    "lib/mcp/scope.mjs": "71f4ade7705d3db6a493340f4321cb447584e10ccb05ee3d86edbf50f28542ca",
+    "lib/mcp/stdio.mjs": "b473796486c15e9d55cbc67b8ca6bdd21dbce989fbbcd548ee9c0143d02ebb35",
+    "lib/mcp/tools.mjs": "56913d1a2c5857aeca638e56a8aa3da2c1ed116abe7d58c40ec2e1f80a2b2c06",
+    "lib/process/identity.mjs": "64e9b802005883a51668fb0f45df5a38167d0eec1c08cb2de6faee2bbbd29431",
+    "lib/runtime/native/client.mjs": "592bd0ca2d40bc0bd52544fd2f173f620ee5fc4f9a92d30c9b37aa3be8946a9e",
+    "lib/runtime/native/service.mjs": "b4ba6945197c610701f3387adf1ccbc5dc09e2328dd3be9f6bc0b9f29f48a2ea",
+    "lib/runtime/native/store.mjs": "b0dd9a5285b2746a2a0c661ca04dd7f8fa94ffc316e1347406ad90a11f836af1",
+    "lib/web/codex-app-server.mjs": "409dad5f7100b8026a2f556f6c4dad53cb9c4d29fff510fe16b3db43d1ad2203",
+    "lib/web/native-sessions.mjs": "5f21d5c984913857c67df5e42b5c33e7e5171b4f0f5646ea4e79134531ad0963",
+    "scripts/native-live-acceptance.mjs": "a795ec05e6d9c7792e5ce4c9ae06a0bd1595e26715ba7eb9c2b35c353903bf07",
+    "lib/integrations/dsh.mjs": "13386246d2fbdc412378b94a7536fdf49fbc1643789ea4e9e9e5db68a1720e0b"
+  },
+  "communicationReceiptRelevantSourcesMatchCurrent": true,
+  "limitations": [
+    "Unit/audit, regression and authenticated receipts retain separate execution times and snapshots.",
+    "Claude authenticated acceptance used explicit external SDK entry injection, not repository-default SDK resolution.",
+    "No published-package installation, full browser UI or real business task acceptance was exercised."
+  ],
+  "logPaths": {
+    "unit": "/tmp/hcc-native-live-unit-sealed-20261002.log",
+    "factoryAudit": "/tmp/hcc-native-live-audit-sealed-20261002.log",
+    "regression": "/tmp/hcc-native-live-regression-final-20261002.log"
+  }
+}

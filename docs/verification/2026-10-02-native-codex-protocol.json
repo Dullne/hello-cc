@@ -1,0 +1,46 @@
+{
+  "verification_date": "2026-10-02",
+  "timezone": "Asia/Shanghai",
+  "provider": "codex",
+  "installed_version": "codex-cli 0.144.6",
+  "runtime": "Node.js 24",
+  "transport": "owned app-server subprocess over stdio",
+  "result": "passed",
+  "isolation": {
+    "home": "temporary isolated directory",
+    "codex_home": "temporary isolated directory",
+    "cwd": "temporary isolated project directory",
+    "child_environment": ["PATH", "HOME", "CODEX_HOME"],
+    "provider_credentials_supplied": false,
+    "existing_desktop_or_tui_session_attached": false,
+    "existing_configuration_modified": false,
+    "temporary_directories_removed": true
+  },
+  "actual_protocol_operations": [
+    { "method": "initialize", "kind": "request", "result": "successful response" },
+    { "method": "initialized", "kind": "notification", "result": "sent" },
+    {
+      "method": "thread/start",
+      "kind": "request",
+      "params": {
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user"
+      },
+      "result": "thread identity returned; adapter status idle"
+    },
+    {
+      "operation": "adapter.close",
+      "kind": "owned subprocess teardown",
+      "result": "awaited transport close; adapter status closed"
+    }
+  ],
+  "model_prompts_sent": 0,
+  "limitations": [
+    "No model inference or real business response was requested.",
+    "turn/start, turn/steer, interruption and approvals were not exercised against the real provider in this smoke verification.",
+    "Resume was not exercised against the real provider.",
+    "This verifies the installed CLI protocol and the adapter, not the closed-source desktop application bridge.",
+    "Temporary thread identifiers and paths are intentionally omitted."
+  ]
+}

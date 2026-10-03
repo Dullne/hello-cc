@@ -41,6 +41,7 @@ const managedTmuxSessions = new Set();
 
 const env = {
   ...process.env,
+  NODE_NO_WARNINGS: '1',
   HOME: home,
   PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
   SHELL: '/bin/bash'
@@ -1606,29 +1607,73 @@ async function expectWebSocketMarker(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
     let sawMarker = false;
-    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(runtimeWsUrl(peer), runtimeWsOptions()));
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} websocket timeout`));
     }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
-    ws.on('open', () => {
-      const result = hccMaybe(['inject', peer, `echo ${marker}`]);
-      if (result.status !== 0) reject(new Error(result.stderr || result.stdout || 'inject failed'));
-    });
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
-      if (msg.type === 'snapshot') sawSnapshot = true;
+      if (msg.type === 'snapshot') {
+        sawSnapshot = true;
+        claimTerminalControl(ws).then(() => ws.send(JSON.stringify({
+          type: 'input', data: `echo ${marker}\r`, action_token: ws.hccActionToken,
+          epoch: ws.hccControl.epoch
+        }))).catch(reject);
+      }
       if (['snapshot', 'data', 'replace'].includes(msg.type) && String(msg.data || '').includes(marker)) {
         sawMarker = true;
       }
       if (sawSnapshot && sawMarker) {
         clearTimeout(timer);
+        releaseTerminalControl(ws);
         ws.close();
         resolve();
       }
     });
     ws.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
+}
+
+// Keep the private token and public fencing epoch on each test connection.
+// Reconnecting helpers explicitly claim control before an authorized write.
+function trackTerminalControl(ws) {
+  ws.on('message', (raw) => {
+    let message;
+    try { message = JSON.parse(String(raw)); } catch { return; }
+    if (message.action_token) ws.hccActionToken = message.action_token;
+    if (message.control) ws.hccControl = message.control;
+  });
+  return ws;
+}
+
+async function claimTerminalControl(ws) {
+  if (ws.hccControl?.can_control) return ws.hccControl;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error('terminal control claim timeout')), 5000);
+    const finish = (error = null) => {
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      if (error) reject(error);
+      else resolve(ws.hccControl);
+    };
+    const onMessage = (raw) => {
+      let message;
+      try { message = JSON.parse(String(raw)); } catch { return; }
+      if (message.type === 'error') finish(new Error(`terminal control claim failed: ${JSON.stringify(message.error)}`));
+      else if (message.type === 'control' && message.control?.can_control) finish();
+    };
+    ws.on('message', onMessage);
+    ws.send(JSON.stringify({ type: 'control', action: 'claim', action_token: ws.hccActionToken,
+      epoch: ws.hccControl?.epoch, force: true }));
+  });
+}
+
+function releaseTerminalControl(ws) {
+  if (ws?.readyState === WebSocket.OPEN && ws.hccControl?.can_control) {
+    ws.send(JSON.stringify({ type: 'control', action: 'release', action_token: ws.hccActionToken,
+      epoch: ws.hccControl.epoch }));
+  }
 }
 
 async function openTerminalWebSocket(peer) {
@@ -1657,7 +1702,7 @@ async function openSessionActionChannel(peer, params = {}) {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const ws = new WebSocket(url, runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(url, runtimeWsOptions()));
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} action token fetch timeout`));
@@ -1666,7 +1711,7 @@ async function openSessionActionChannel(peer, params = {}) {
       const msg = JSON.parse(String(raw));
       if (msg.type === 'snapshot') {
         clearTimeout(timer);
-        resolve({ token: msg.action_token || '', ws });
+        resolve({ token: msg.action_token || '', ws, get epoch() { return ws.hccControl?.epoch; } });
       }
     });
     ws.on('error', (err) => { clearTimeout(timer); reject(err); });
@@ -1677,8 +1722,23 @@ async function fetchSessionActionToken(peer, params = {}) {
   return (await openSessionActionChannel(peer, params)).token;
 }
 
+async function stopControlledSession(id, payload = {}, projectRoot = root) {
+  const channel = await openSessionActionChannel(id, { root: projectRoot });
+  try {
+    await claimTerminalControl(channel.ws);
+    return await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, action_token: channel.token, epoch: channel.epoch })
+    }, { root: projectRoot });
+  } finally {
+    await closeTerminalWebSocket(channel.ws);
+  }
+}
+
 async function closeTerminalWebSocket(ws) {
   if (!ws || ws.readyState === WebSocket.CLOSED) return;
+  releaseTerminalControl(ws);
   await new Promise((resolve) => {
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
@@ -1701,7 +1761,7 @@ async function fetchTerminalSnapshot(peer, params = {}) {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const ws = new WebSocket(url, runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(url, runtimeWsOptions()));
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} terminal snapshot timeout`));
@@ -1710,6 +1770,7 @@ async function fetchTerminalSnapshot(peer, params = {}) {
       const msg = JSON.parse(String(raw));
       if (msg.type !== 'snapshot') return;
       clearTimeout(timer);
+      releaseTerminalControl(ws);
       try { ws.close(); } catch {}
       resolve(String(msg.data || ''));
     });
@@ -1796,12 +1857,12 @@ async function openCookieTerminalWebSocket(peer, sid, params = {}) {
   }
   return new Promise((resolve, reject) => {
     let settled = false;
-    const ws = new WebSocket(url, {
+    const ws = trackTerminalControl(new WebSocket(url, {
       headers: {
         Cookie: `hcc_sid=${sid}`,
         Origin: new URL(baseUrl).origin
       }
-    });
+    }));
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -1922,23 +1983,25 @@ async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
 async function expectResizeReplaceSnapshot(peer, marker) {
   await new Promise((resolve, reject) => {
     let sawSnapshot = false;
-    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(runtimeWsUrl(peer), runtimeWsOptions()));
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} resize replace timeout`));
     }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
-    ws.on('open', () => {
-      const result = hccMaybe(['inject', peer, `echo ${marker}`]);
-      if (result.status !== 0) reject(new Error(result.stderr || result.stdout || 'inject failed'));
-    });
     ws.on('message', (raw) => {
       const msg = JSON.parse(String(raw));
       if (msg.type === 'snapshot') {
         sawSnapshot = true;
-        ws.send(JSON.stringify({ type: 'resize', cols: 96, rows: 28 }));
+        claimTerminalControl(ws).then(() => {
+          ws.send(JSON.stringify({ type: 'input', data: `echo ${marker}\r`,
+            action_token: ws.hccActionToken, epoch: ws.hccControl.epoch }));
+          ws.send(JSON.stringify({ type: 'resize', cols: 96, rows: 28,
+            action_token: ws.hccActionToken, epoch: ws.hccControl.epoch }));
+        }).catch(reject);
       }
       if (sawSnapshot && msg.type === 'replace' && String(msg.data || '').includes(marker)) {
         clearTimeout(timer);
+        releaseTerminalControl(ws);
         ws.close();
         resolve();
       }
@@ -1953,8 +2016,7 @@ async function expectWebSocketInputVisible(peer, marker) {
     let sent = false;
     let sawMarkerAfterInput = false;
     let sawFrameAfterInput = false;
-    let actionToken = '';
-    const ws = new WebSocket(runtimeWsUrl(peer), runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(runtimeWsUrl(peer), runtimeWsOptions()));
     const timer = setTimeout(() => {
       try { ws.terminate(); } catch {}
       reject(new Error(`${peer} websocket input visibility timeout`));
@@ -1964,10 +2026,11 @@ async function expectWebSocketInputVisible(peer, marker) {
       const data = String(msg.data || '');
       if (msg.type === 'snapshot') {
         sawSnapshot = true;
-        if (msg.action_token) actionToken = msg.action_token;
         if (!sent) {
           sent = true;
-          ws.send(JSON.stringify({ type: 'input', data: `echo ${marker}\r`, action_token: actionToken }));
+          claimTerminalControl(ws).then(() => ws.send(JSON.stringify({ type: 'input',
+            data: `echo ${marker}\r`, action_token: ws.hccActionToken,
+            epoch: ws.hccControl.epoch }))).catch(reject);
         }
         return;
       }
@@ -1977,6 +2040,7 @@ async function expectWebSocketInputVisible(peer, marker) {
       }
       if (sawSnapshot && sawFrameAfterInput && sawMarkerAfterInput) {
         clearTimeout(timer);
+        releaseTerminalControl(ws);
         ws.close();
         resolve();
       }
@@ -1991,7 +2055,7 @@ async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
-    const ws = new WebSocket(url, runtimeWsOptions());
+    const ws = trackTerminalControl(new WebSocket(url, runtimeWsOptions()));
     const rejectedMarker = `REJECTED_${testId}_${Math.random().toString(16).slice(2)}`;
     const acceptedMarker = `ACCEPTED_${testId}_${Math.random().toString(16).slice(2)}`;
     let snapshotToken = '';
@@ -2008,6 +2072,7 @@ async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      releaseTerminalControl(ws);
       try { ws.close(); } catch {}
       if (err) reject(err);
       else resolve();
@@ -2018,7 +2083,7 @@ async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}
       output += String(message.data || '');
       if (message.type === 'snapshot' && !snapshotToken) {
         snapshotToken = message.action_token || '';
-        const frame = { type: 'input', data: `echo ${rejectedMarker}\r` };
+        const frame = { type: 'input', data: `echo ${rejectedMarker}\r`, epoch: ws.hccControl.epoch };
         if (suppliedToken !== undefined) frame.action_token = suppliedToken;
         ws.send(JSON.stringify(frame));
         setTimeout(() => {
@@ -2027,11 +2092,12 @@ async function assertTerminalInputTokenRejected(peer, suppliedToken, params = {}
             return;
           }
           checkedRejected = true;
-          ws.send(JSON.stringify({
+          claimTerminalControl(ws).then(() => ws.send(JSON.stringify({
             type: 'input',
             data: `echo ${acceptedMarker}\r`,
-            action_token: snapshotToken
-          }));
+            action_token: snapshotToken,
+            epoch: ws.hccControl.epoch
+          }))).catch(finish);
         }, 350);
       }
       if (checkedRejected && output.includes(acceptedMarker)) finish();
@@ -2384,7 +2450,7 @@ async function assertShimIgnoresGlobalRuntime(generateShim) {
       started_at: Math.floor(Date.now() / 1000),
       global_runtime: true
     };
-    fs.writeFileSync(path.join(fakeHome, '.hello-cc', 'runtime.json'), JSON.stringify(globalRuntime, null, 2));
+    fs.writeFileSync(path.join(fakeHome, '.hello-cc', 'runtime.json'), JSON.stringify(globalRuntime, null, 2), { mode: 0o600 });
 
     const hccWrapper = path.join(testDir, 'hcc-wrapper');
     fs.writeFileSync(hccWrapper, `#!/usr/bin/env bash\nexec ${sh(process.execPath)} ${sh(hccBin)} "$@"\n`, { mode: 0o755 });
@@ -2488,13 +2554,17 @@ function startRuntime(options = {}) {
 async function cookieSessionExpiryWorkflow() {
   const expirySessionId = `cookie-expiry-${testId}`;
   const marker = `EXPIRED_COOKIE_INPUT_${testId}`;
+  // Sessions use whole-second timestamps. A one-second TTL can expire during
+  // the initial WebSocket/PTY snapshot, before this test reaches its assertion.
+  // Keep a bounded setup window, then explicitly wait past the same TTL.
+  const cookieTtlSec = 10;
   let ws = null;
 
   startRuntime({
     env: {
       ...env,
       HCC_REGRESSION_TEST: '1',
-      HCC_REGRESSION_WEB_SESSION_TTL_SEC: '1'
+      HCC_REGRESSION_WEB_SESSION_TTL_SEC: String(cookieTtlSec)
     }
   });
   try {
@@ -2523,7 +2593,7 @@ async function cookieSessionExpiryWorkflow() {
     ws = await openCookieTerminalWebSocket(expirySessionId, auth.sid, { root });
     if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
     const closed = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), 5000);
+      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), (cookieTtlSec + 5) * 1000);
       ws.once('close', (code, reason) => {
         clearTimeout(timer);
         resolve({ code, reason: String(reason || '') });
@@ -2534,11 +2604,12 @@ async function cookieSessionExpiryWorkflow() {
       });
     });
 
-    await sleep(1200);
+    await sleep(cookieTtlSec * 1000 + 200);
     ws.send(JSON.stringify({
       type: 'input',
       data: `echo ${marker}\r`,
-      action_token: ws.hccActionToken
+      action_token: ws.hccActionToken,
+      epoch: ws.hccControl.epoch
     }));
     const closeResult = await closed;
     if (closeResult.code !== 4001 || !closeResult.reason.includes('session expired')) {
@@ -2558,7 +2629,7 @@ async function cookieSessionExpiryWorkflow() {
       try { ws.terminate(); } catch {}
     }
     try {
-      await runtimeFetch(`/api/sessions/${encodeURIComponent(expirySessionId)}/stop`, { method: 'POST' }, { root });
+      await stopControlledSession(expirySessionId);
     } catch {}
     await stopRuntime();
   }
@@ -2607,7 +2678,8 @@ async function webSecretRedactionWorkflow() {
     }, { root });
     if (!create.ok) fail(`redaction PTY create failed with status ${create.status}`);
     terminalWs = await openCookieTerminalWebSocket(sessionId, sid, { root });
-    terminalWs.send(JSON.stringify({ type: 'resize', cols: 90, rows: 28 }));
+    terminalWs.send(JSON.stringify({ type: 'resize', cols: 90, rows: 28,
+      action_token: terminalWs.hccActionToken, epoch: terminalWs.hccControl.epoch }));
 
     const badProject = await fetch(new URL(`/api/projects?token=${encodeURIComponent(secret)}`, runtime.base_url), {
       method: 'POST',
@@ -2652,7 +2724,7 @@ async function webSecretRedactionWorkflow() {
       try { terminalWs.terminate(); } catch {}
     }
     try {
-      await runtimeFetch(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: 'POST' }, { root });
+      await stopControlledSession(sessionId);
     } catch {}
     await stopRuntime();
   }
@@ -2740,6 +2812,10 @@ function cleanup() {
   }
   if (fs.existsSync(path.join(fakeBin, 'tmux'))) {
     runMaybe('tmux', ['kill-server']);
+  }
+  if (process.env.HCC_REGRESSION_PRESERVE_ARTIFACTS === '1') {
+    log(`regression artifacts preserved: ${root}`);
+    return;
   }
   for (const dir of [root, home, fakeBin, outDir]) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
@@ -4353,7 +4429,14 @@ async function multiProjectWebWorkflow() {
 
   const htmlResponse = await fetch(currentRuntimeUrl('/'));
   const html = await htmlResponse.text();
-  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory', 'commandbar', 'lineInput', 'Send text to active terminal']) {
+  const startFormHtml = html.match(/<form\b[^>]*\bid="startForm"[^>]*>[\s\S]*?<\/form>/)?.[0];
+  if (!startFormHtml) fail('web form missing simplified session form');
+  // A current-directory label in an approval or session details is valid;
+  // obsolete creation inputs must be checked inside the creation form.
+  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'Working directory']) {
+    if (startFormHtml.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
+  }
+  for (const forbidden of ['commandbar', 'lineInput', 'Send text to active terminal']) {
     if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
   }
   for (const expected of [
@@ -4369,17 +4452,16 @@ async function multiProjectWebWorkflow() {
   }
   for (const expected of [
     'id="langSelect"',
-    "localStorage.getItem('hcc.lang')",
-    "localStorage.setItem('hcc.lang', lang)",
-    "document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en'",
-    "zh: {",
-    "language: '语言'",
-    "projectState: '项目状态'",
-    "noSessionSelected: '未选择会话'",
-    "sendMessage: '发送消息'",
-    "peers: '协作方'",
-    "noPeers: '没有协作方。'",
-    "'status.active': '活跃'",
+    'window.hccUi',
+    'hccUi.language',
+    'hccUi.tr(key',
+    '"language":"语言"',
+    '"projectState":"项目状态"',
+    '"noSessionSelected":"未选择会话"',
+    '"sendMessage":"发送消息"',
+    '"peers":"协作方"',
+    '"noPeers":"没有协作方。"',
+    '"status.active":"活跃"',
     "data-i18n=\"language\"",
     "data-i18n-placeholder=\"projectPathPlaceholder\"",
     "data-i18n-title=\"collapseSidebar\"",
@@ -4426,7 +4508,7 @@ async function multiProjectWebWorkflow() {
     'setPointerCapture',
     'sideIsCollapsed(opposite) ? 0',
     'Math.abs(delta) <= 3',
-    "localStorage.setItem('hcc.collapse.' + side, on ? '1' : '0');\n      applySideWidths();",
+    "hccUi.safeSet('hcc.collapse.' + side, on ? '1' : '0');\n      applySideWidths();",
     'cursor: col-resize'
   ]) {
     if (!html.includes(expected)) fail(`web layout missing resizable sidebar support: ${expected}`);
@@ -4436,13 +4518,13 @@ async function multiProjectWebWorkflow() {
   }
   for (const expected of [
     'function stateCardCollapsed(section)',
-    "localStorage.getItem('hcc.stateCard.' + section + '.collapsed')",
+    "hccUi.safeGet('hcc.stateCard.' + section + '.collapsed')",
     'function stateCardHtml(section, title, count, bodyHtml)',
     'state-card-toggle',
     'aria-expanded=',
     'state-card-collapsed',
     'function bindStateCardToggles()',
-    "localStorage.setItem('hcc.stateCard.' + section + '.collapsed'",
+    "hccUi.safeSet('hcc.stateCard.' + section + '.collapsed'",
     "stateCardHtml('automation'",
     "stateCardHtml('timeline'",
     "stateCardHtml('messages'",
@@ -4474,10 +4556,17 @@ async function multiProjectWebWorkflow() {
   for (const expected of [
     'term.onData((data) => {',
     'sendTerminalInput(data);',
-    'function flushPendingTerminalInput(id, socket)',
-    "socket.send(JSON.stringify({ type: 'input', data, action_token: actionToken }))"
+    "function sendTerminalInput(data, inputId = '')",
+    'epoch: controlEpoch()',
+    "...(inputId ? { input_id: inputId } : {})",
+    "msg.type === 'input_ack' && handoffStore.acknowledge(currentProject, id, msg.input_id)",
+    'handoffStore.uncertain(currentProject, id)',
+    'Connection recovery never replays terminal input or a draft.'
   ]) {
     if (!html.includes(expected)) fail(`web terminal input forwarding missing: ${expected}`);
+  }
+  if (html.includes('flushPendingTerminalInput') || html.includes('pendingTerminalInput')) {
+    fail('web terminal recovery must not buffer or replay terminal input');
   }
   if (!html.includes("stateCardHtml('timeline'") || !html.includes('renderTimelineItem') || !html.includes('bodyPinned') || !html.includes('refreshCurrentState')) {
     fail('web state panel missing collaboration timeline or refresh routing');
@@ -4530,14 +4619,7 @@ async function multiProjectWebWorkflow() {
     return json.session;
   };
   const stopSession = async (id, payload = null, projectRoot = root) => {
-    const options = payload
-      ? {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        }
-      : { method: 'POST' };
-    const response = await runtimeFetch(`/api/sessions/${encodeURIComponent(id)}/stop`, options, { root: projectRoot });
+    const response = await stopControlledSession(id, payload || {}, projectRoot);
     const json = await response.json();
     if (!response.ok) fail(`web provider session stop failed: ${JSON.stringify(json)}`);
     return json.session;
@@ -4685,7 +4767,8 @@ async function multiProjectWebWorkflow() {
       const inputResponse = await cookieRuntimeFetch(inputRoute, cookieAdmin, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: `echo ${marker}\r` })
+        body: JSON.stringify({ data: `echo ${marker}\r`, action_token: cookieAdminWs.hccActionToken,
+          epoch: cookieAdminWs.hccControl.epoch })
       }, { root });
       if (!inputResponse.ok) fail(`same-origin cookie administrator input returned ${inputResponse.status}`);
     });
@@ -4708,7 +4791,7 @@ async function multiProjectWebWorkflow() {
     const cookieStop = await cookieRuntimeFetch(stopRoute, cookieAdmin, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}'
+      body: JSON.stringify({ action_token: cookieAdminWs.hccActionToken, epoch: cookieAdminWs.hccControl.epoch })
     }, { root });
     if (!cookieStop.ok) fail(`same-origin cookie administrator stop returned ${cookieStop.status}`);
   } finally {
@@ -4805,14 +4888,16 @@ async function multiProjectWebWorkflow() {
     kind: 'shell',
     command: 'bash --noprofile --norc'
   });
-  const encodedActionToken = await fetchSessionActionToken(encodedActionId, { root });
+  const encodedActionChannel = await openSessionActionChannel(encodedActionId, { root });
+  const encodedActionToken = encodedActionChannel.token;
   const siblingActionId = `web-action-sibling-${testId}`;
   const siblingActionSession = await startProvider({
     id: siblingActionId,
     kind: 'shell',
     command: 'bash --noprofile --norc'
   }, otherRoot);
-  const siblingActionToken = await fetchSessionActionToken(siblingActionId, { root: otherRoot });
+  const siblingActionChannel = await openSessionActionChannel(siblingActionId, { root: otherRoot });
+  const siblingActionToken = siblingActionChannel.token;
   if (!encodedActionToken || !siblingActionToken) {
     fail(`alternate sessions did not deliver action tokens:\n${JSON.stringify({ encodedActionSession, siblingActionSession }, null, 2)}`);
   }
@@ -4845,10 +4930,12 @@ async function multiProjectWebWorkflow() {
   }
   await closeTerminalWebSocket(secondManagedChannel.ws);
   await expectActionTokenRejected(secondManagedChannel.token, 'closed-connection');
+  await claimTerminalControl(managedActionChannel.ws);
+  await claimTerminalControl(encodedActionChannel.ws);
   const encodedPeerAction = await runtimeFetch(`/api/peers/${encodeURIComponent(encodedActionId)}/actions/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: encodedActionToken, renew_locks: false })
+    body: JSON.stringify({ action_token: encodedActionToken, epoch: encodedActionChannel.epoch, renew_locks: false })
   }, { root });
   if (!encodedPeerAction.ok) {
     fail(`URL-encoded peer action rejected its own token:\n${await encodedPeerAction.text()}`);
@@ -4857,11 +4944,13 @@ async function multiProjectWebWorkflow() {
   const actionNext = await (await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionSession.peer_id || managedActionSession.id)}/actions/task-next`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionToken })
+    body: JSON.stringify({ action_token: managedActionToken, epoch: managedActionChannel.epoch })
   }, { root })).json();
   if (!actionNext.ok || actionNext.action !== 'task-next' || String(actionNext.data?.task?.id) !== taskMatch[1]) {
     fail(`web task-next action did not claim pending task #${taskMatch[1]}:\n${JSON.stringify(actionNext, null, 2)}`);
   }
+  await closeTerminalWebSocket(encodedActionChannel.ws);
+  await closeTerminalWebSocket(siblingActionChannel.ws);
   await stopSession(encodedActionSession.id);
   await stopSession(siblingActionSession.id, null, otherRoot);
   // Cookie-authenticated terminal sockets are tied to the opaque browser
@@ -4875,7 +4964,7 @@ async function multiProjectWebWorkflow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      action_token: managedActionToken,
+      action_token: managedActionToken, epoch: managedActionChannel.epoch,
       resource: webTtlResource,
       task: Number(taskMatch[1]),
       ttl: 60
@@ -4893,7 +4982,7 @@ async function multiProjectWebWorkflow() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action_token: managedActionToken,
+        action_token: managedActionToken, epoch: managedActionChannel.epoch,
         renew_locks: true,
         ...(ttlOverride === null ? {} : { ttl: ttlOverride })
       })
@@ -4937,7 +5026,7 @@ async function multiProjectWebWorkflow() {
   const unknownHeartbeatResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionToken, renew_locks: true })
+    body: JSON.stringify({ action_token: managedActionToken, epoch: managedActionChannel.epoch, renew_locks: true })
   }, { root });
   const unknownHeartbeat = await unknownHeartbeatResponse.json();
   if (!unknownHeartbeatResponse.ok || unknownHeartbeat.data?.renewed !== 0) {
@@ -4953,7 +5042,7 @@ async function multiProjectWebWorkflow() {
   const graceHeartbeatResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionToken, renew_locks: true })
+    body: JSON.stringify({ action_token: managedActionToken, epoch: managedActionChannel.epoch, renew_locks: true })
   }, { root });
   const graceHeartbeat = await graceHeartbeatResponse.json();
   const graceHeartbeatState = withMeshDb((db) => ({
@@ -5033,7 +5122,7 @@ async function multiProjectWebWorkflow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      action_token: managedActionToken,
+      action_token: managedActionToken, epoch: managedActionChannel.epoch,
       id: evidenceTaskId,
       reason: 'owner process identity was reused',
       policy: 'stale',
@@ -5094,7 +5183,7 @@ async function multiProjectWebWorkflow() {
   const liveLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionToken, resource: liveExpiredResource, ttl: 60 })
+    body: JSON.stringify({ action_token: managedActionToken, epoch: managedActionChannel.epoch, resource: liveExpiredResource, ttl: 60 })
   }, { root });
   const liveLockResult = await liveLockResponse.json();
   if (liveLockResponse.ok || liveLockResult.error?.code !== 'LOCK_HELD') {
@@ -5122,7 +5211,7 @@ async function multiProjectWebWorkflow() {
   const deadLockResponse = await runtimeFetch(`/api/peers/${encodeURIComponent(managedActionPeer)}/actions/lock-acquire`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_token: managedActionToken, resource: deadLockResource, ttl: 60 })
+    body: JSON.stringify({ action_token: managedActionToken, epoch: managedActionChannel.epoch, resource: deadLockResource, ttl: 60 })
   }, { root });
   const deadLockResult = await deadLockResponse.json();
   if (!deadLockResponse.ok || !deadLockResult.ok || deadLockResult.data?.lock?.owner !== managedActionPeer) {
@@ -5151,7 +5240,7 @@ async function multiProjectWebWorkflow() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      action_token: managedActionToken,
+      action_token: managedActionToken, epoch: managedActionChannel.epoch,
       resource: 'web/identity-spoof-lock',
       task: Number(ownerTaskMatch[1])
     })
@@ -5465,7 +5554,7 @@ async function bufferGcArbitrationWorkflow() {
 
   const liveId = `gc-live-external-${testId}`;
   const liveFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${liveId}.${suffix}`));
-  for (const file of liveFiles.slice(0, 3)) fs.writeFileSync(file, file.endsWith('.out') ? 'live\n' : '');
+  for (const file of liveFiles.slice(0, 3)) fs.writeFileSync(file, file.endsWith('.out') ? 'live\n' : '', { mode: 0o600 });
   const identity = inspectProcessIdentity(process.pid).identity;
   fs.writeFileSync(liveFiles[3], JSON.stringify({
     id: liveId,
@@ -5479,7 +5568,7 @@ async function bufferGcArbitrationWorkflow() {
     wrapper_identity: identity,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
     return (data.sessions || []).some((session) => session.id === liveId);
@@ -5488,8 +5577,8 @@ async function bufferGcArbitrationWorkflow() {
 
   const legacyId = `gc-legacy-${testId}`;
   const legacyFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${legacyId}.${suffix}`));
-  for (const file of legacyFiles.slice(0, 3)) fs.writeFileSync(file, '');
-  fs.writeFileSync(legacyFiles[3], JSON.stringify({ id: legacyId, pid: process.pid, wrapper_pid: process.pid }));
+  for (const file of legacyFiles.slice(0, 3)) fs.writeFileSync(file, '', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[3], JSON.stringify({ id: legacyId, pid: process.pid, wrapper_pid: process.pid }), { mode: 0o600 });
   for (const file of legacyFiles) fs.utimesSync(file, oldTime, oldTime);
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
@@ -5499,7 +5588,7 @@ async function bufferGcArbitrationWorkflow() {
   const siblingLiveId = `gc-sibling-external-${testId}`;
   const siblingLiveFiles = ['out', 'in', 'resize', 'meta']
     .map((suffix) => path.join(siblingBufs, `${siblingLiveId}.${suffix}`));
-  for (const file of siblingLiveFiles.slice(0, 3)) fs.writeFileSync(file, '');
+  for (const file of siblingLiveFiles.slice(0, 3)) fs.writeFileSync(file, '', { mode: 0o600 });
   fs.writeFileSync(siblingLiveFiles[3], JSON.stringify({
     id: siblingLiveId,
     kind: 'shell',
@@ -5512,7 +5601,7 @@ async function bufferGcArbitrationWorkflow() {
     wrapper_identity: identity,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root: secondProjectRoot })).json();
     return (data.sessions || []).some((session) => session.id === siblingLiveId);
@@ -5811,7 +5900,7 @@ async function bufferGcArbitrationWorkflow() {
         base_url: server?.baseUrl || 'http://127.0.0.1:1',
         token: 'regression-token'
       };
-      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify(pointer));
+      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify(pointer), { mode: 0o600 });
       const gc = run(process.execPath, [hccBin, '--root', isolatedRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: isolatedEnv });
       const payload = JSON.parse(gc);
       if (!fs.existsSync(orphan) || Number(payload.data?.deferred_buf_files || 0) < 1) {
@@ -6467,16 +6556,45 @@ function identityEnforcementWorkflow() {
       db2.close();
     }
 
-    hccFrom(['run', '--peer', 'fake-runner', '--', process.execPath, '-e', 'process.exit(0)'], identityRoot, { env: identityEnv });
+    const readRunOwner = () => {
+      const ownerDb = new DatabaseSync(dbPath);
+      try {
+        return {
+          peer: ownerDb.prepare('SELECT * FROM peers WHERE id = ?').get('real-peer'),
+          binding: ownerDb.prepare('SELECT * FROM peer_bindings WHERE peer = ?').get('real-peer') || null,
+          runEvents: ownerDb.prepare("SELECT * FROM events WHERE actor = 'real-peer' AND type LIKE 'run.session.%' ORDER BY id").all()
+        };
+      } finally {
+        ownerDb.close();
+      }
+    };
+    // Earlier identity commands registered real-peer with the live regression
+    // parent as owner. Correcting --peer must preserve that occupied identity.
+    const ownerBeforeRun = readRunOwner();
+    const occupiedRun = hccFromMaybe(['--json', 'run', '--peer', 'fake-runner', '--', process.execPath, '-e', 'process.exit(0)'], identityRoot, { env: identityEnv });
+    let occupiedError;
+    try { occupiedError = JSON.parse(occupiedRun.stderr).error; } catch {}
+    if (occupiedRun.status === 0 || occupiedError?.code !== 'PEER_SESSION_EXISTS' || occupiedError?.peer !== 'real-peer') {
+      fail(`run did not protect the existing system peer owner:\nstdout=${occupiedRun.stdout}\nstderr=${occupiedRun.stderr}`);
+    }
+    if (JSON.stringify(readRunOwner()) !== JSON.stringify(ownerBeforeRun)) {
+      fail('rejected run changed the existing system peer, binding, or run events');
+    }
+
+    const runnerEnv = { ...identityEnv, HCC_PEER: 'real-runner' };
+    hccFrom(['run', '--peer', 'fake-runner', '--', process.execPath, '-e', 'process.exit(0)'], identityRoot, { env: runnerEnv });
     const db3 = new DatabaseSync(dbPath);
     try {
-      const realRunner = db3.prepare('SELECT id, status FROM peers WHERE id = ?').get('real-peer');
+      const realRunner = db3.prepare('SELECT id, status FROM peers WHERE id = ?').get('real-runner');
       const fakeRunner = db3.prepare('SELECT id FROM peers WHERE id = ?').get('fake-runner');
       if (!realRunner || realRunner.status !== 'exited' || fakeRunner) {
         fail(`run did not enforce system peer identity:\n${JSON.stringify({ realRunner, fakeRunner }, null, 2)}`);
       }
     } finally {
       db3.close();
+    }
+    if (JSON.stringify(readRunOwner()) !== JSON.stringify(ownerBeforeRun)) {
+      fail('fresh run changed the occupied system peer owner');
     }
 
     hccFrom(['peer', 'stop', 'fake-target'], identityRoot, { env: identityEnv });
@@ -6749,21 +6867,28 @@ async function syntaxAndHelp() {
     'function detectedPeerCanStop(peer)',
     "if (['exited', 'detached'].includes(status)) return false;",
     'const canStop = detectedPeerCanStop(p);',
-    '${canStop ?',
+    "${dshCoordinationPeer(p) ? '' : canStop ?",
     'function providerSessionKnown(session)',
     "tr('providerSession') + '=' + sessionProvider(session) + ':' + (value || tr('unknown'))",
-    'sessionCardDetailText(s)',
+    "sessionDetailsHtml('managed:' + s.id",
+    "[tr('runtime'), sessionRuntimeTarget(s)]",
+    "[tr('providerSession'), sessionProvider(s) + ':' + (sessionProviderSessionValue(s) || tr('unknown'))]",
+    "[tr('command'), s.command]",
+    "[tr('cwd'), path]",
     'const activeDetectedPeers = visibleDetected.filter((p) => peerIsActive(p));',
     'const staleDetectedPeers = visibleDetected.filter((p) => !peerIsActive(p));',
-    "localStorage.setItem('hcc.showStaleDetected'",
+    "hccUi.safeSet('hcc.showStaleDetected'",
     'id="toggleStaleDetected"',
-    "if (e.target.closest('[data-action]')) return;",
+    "if (e.target.closest('details, [data-action]')) return;",
     'id="stopKillLabel" data-i18n="dialog.killTmux"',
     'id="stopCancelBtn" type="button" data-i18n="dialog.cancel"',
     'id="stopConfirmBtn" type="button" data-i18n="stop"'
   ]) {
     if (!webUiTemplateSource.includes(expected)) fail(`web display regression guard missing: ${expected}`);
   }
+  // Execute the shipped renderer as well: a helper name alone does not prove
+  // session identities remain visible or disclosure/action clicks stay local.
+  run(process.execPath, ['--test', path.join(repoRoot, 'test', 'web-ui-session-display.test.mjs')]);
   if (webUiTemplateSource.includes("p.status === 'running' ?")) {
     fail('detected peer action rendering still depends on status === running instead of liveness');
   }
@@ -7436,7 +7561,7 @@ async function syntaxAndHelp() {
       fail('runtime state clearRuntime did not remove the reused-pid global pointer');
     }
 
-    fs.writeFileSync(globalRuntimeFile, '{bad');
+    fs.writeFileSync(globalRuntimeFile, '{bad', { mode: 0o600 });
     if (runtimeState.readGlobalRuntimeFile() !== null) {
       fail('runtime state readGlobalRuntimeFile did not reject invalid JSON');
     }
@@ -9271,8 +9396,9 @@ async function syntaxAndHelp() {
   };
   const html = webUiTemplate.webIndexHtml({ nonce: 'regression-template-nonce' });
   if (!html.includes('<!doctype html>') ||
-      !html.includes('<div class="app">') ||
-      !html.includes('<script src="/assets/xterm.js"></script>')) {
+      !html.includes('<div class="app" data-view="terminal">') ||
+      !html.includes('<script src="/assets/xterm.js"></script>') ||
+      !html.includes('<script src="/assets/addon-fit.js"></script>')) {
     fail('web UI template module did not render the expected shell HTML');
   }
   const jsonReq = Readable.from(['{"ok":true}']);
@@ -9383,7 +9509,7 @@ async function syntaxAndHelp() {
     process.env.HOME = tlsHome;
     const webTls = await import(path.join(repoRoot, 'lib', 'web', 'tls.mjs'));
     tlsCredentials = webTls.ensureSelfSignedCert();
-    const tlsDir = path.join(tlsHome, '.hello-cc', 'tls');
+    const tlsDir = path.join(fs.realpathSync(tlsHome), '.hello-cc', 'tls');
     const currentPointerPath = path.join(tlsDir, 'current.json');
     const currentGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
     const generationNames = {
@@ -9419,27 +9545,28 @@ async function syntaxAndHelp() {
     }
     const originalTlsCert = tlsCredentials.cert;
     const originalTlsCertPath = tlsCredentials.certPath;
-    const originalReadFileSync = fs.readFileSync;
-    let pointerReads = 0;
+    const originalLstatSync = fs.lstatSync;
+    let pointerChecks = 0;
     let pointerSwitchedBeforeDelete = false;
-    fs.readFileSync = (file, ...args) => {
+    fs.lstatSync = (file, ...args) => {
       if (path.resolve(String(file)) === path.resolve(currentPointerPath)) {
-        pointerReads += 1;
-        // Read 1 validates the old current; read 2 starts cleanup; read 3 is
-        // the deletion-time TOCTOU guard for the stale switched-current row.
-        if (pointerReads === 3) {
+        pointerChecks += 1;
+        // The private reader lstat-checks before and after each descriptor
+        // read. Checks 1-2 validate the old current; 3-4 start cleanup; check
+        // 5 is the deletion-time guard for the stale switched-current row.
+        if (pointerChecks === 5) {
           const nextPointerPath = path.join(tlsDir, `.current-regression-${testId}.tmp`);
           fs.writeFileSync(nextPointerPath, `${JSON.stringify({ generation: generationNames.switchedCurrent })}\n`, { mode: 0o600 });
           fs.renameSync(nextPointerPath, currentPointerPath);
           pointerSwitchedBeforeDelete = true;
         }
       }
-      return originalReadFileSync(file, ...args);
+      return originalLstatSync(file, ...args);
     };
     try {
       tlsCredentials = webTls.ensureSelfSignedCert();
     } finally {
-      fs.readFileSync = originalReadFileSync;
+      fs.lstatSync = originalLstatSync;
     }
     const publishedGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
     const remainingGenerations = fs.readdirSync(tlsDir, { withFileTypes: true })
@@ -9455,14 +9582,14 @@ async function syntaxAndHelp() {
     ].sort();
     if (tlsCredentials.cert !== originalTlsCert ||
         tlsCredentials.certPath !== originalTlsCertPath ||
-        !pointerSwitchedBeforeDelete || pointerReads < 4 ||
+        !pointerSwitchedBeforeDelete || pointerChecks < 6 ||
         publishedGeneration !== generationNames.switchedCurrent ||
         !fs.existsSync(path.join(tlsDir, generationNames.initialCurrent, '.published')) ||
         !fs.existsSync(path.join(tlsDir, generationNames.switchedCurrent, '.published')) ||
         !fs.existsSync(path.join(tlsDir, generationNames.activeCreating, '.creating')) ||
         fs.existsSync(path.join(tlsDir, generationNames.deadCreating)) ||
         JSON.stringify(remainingGenerations) !== JSON.stringify(expectedRemainingGenerations)) {
-      fail(`TLS generation cleanup violated current/previous/candidate lifecycle protection:\n${JSON.stringify({ generationNames, pointerReads, pointerSwitchedBeforeDelete, publishedGeneration, remainingGenerations }, null, 2)}`);
+      fail(`TLS generation cleanup violated current/previous/candidate lifecycle protection:\n${JSON.stringify({ generationNames, pointerChecks, pointerSwitchedBeforeDelete, publishedGeneration, remainingGenerations }, null, 2)}`);
     }
   } finally {
     if (savedTlsHome === undefined) delete process.env.HOME;
@@ -9520,11 +9647,14 @@ async function syntaxAndHelp() {
   expectEqual(webRuntime.publicRuntimeUrl(ipv6WildcardRuntime, '/tmp/hcc project'), 'http://<machine-ip>:8788/?token=tok&project=%2Ftmp%2Fhcc%20project', 'publicRuntimeUrl ipv6 wildcard');
   expectEqual(webRuntime.localRuntimeUrl(localRuntime, null), 'http://127.0.0.1:8789/?token=tok', 'localRuntimeUrl no project');
   const mainHelp = run(process.execPath, [hccBin, '--help']);
-  if (mainHelp.includes('setup') || mainHelp.includes('--web-managed')) {
+  if (/^\s*setup(?:\s|$)/m.test(mainHelp) || mainHelp.includes('--web-managed')) {
     fail(`public help exposes maintenance or removed commands:\n${mainHelp}`);
   }
   if (!mainHelp.includes('  update                       Update the global npm install of hello-cc')) {
     fail(`main help missing update command:\n${mainHelp}`);
+  }
+  if (!mainHelp.includes('  dsh <setup|status|web>        Connect DeepSeek Harness through project-local hooks')) {
+    fail(`main help missing dsh command:\n${mainHelp}`);
   }
   if (!mainHelp.includes('  state [--peer ID]            Show timeline and next coordination action')) {
     fail(`main help missing state command:\n${mainHelp}`);
@@ -10020,9 +10150,9 @@ async function processEvidenceWorkflow() {
   const legacyProcess = spawn('sleep', ['30'], { stdio: 'ignore' });
   const legacyFiles = ['out', 'in', 'resize', 'meta']
     .map((suffix) => path.join(externalDir, `${legacyExternalId}.${suffix}`));
-  fs.writeFileSync(legacyFiles[0], 'legacy external\n');
-  fs.writeFileSync(legacyFiles[1], '');
-  fs.writeFileSync(legacyFiles[2], '');
+  fs.writeFileSync(legacyFiles[0], 'legacy external\n', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[1], '', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[2], '', { mode: 0o600 });
   fs.writeFileSync(legacyFiles[3], JSON.stringify({
     id: legacyExternalId,
     kind: 'shell',
@@ -10033,7 +10163,7 @@ async function processEvidenceWorkflow() {
     wrapper_pid: legacyProcess.pid,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
     return (data.sessions || []).some((session) => session.id === legacyExternalId);
@@ -10708,17 +10838,18 @@ function manualGcRetentionContractWorkflow() {
   }
 }
 
-// Name-authoritative re-adoption + dead-peer reaper (session leak hardening).
+// Intentional detach persists; unpaused orphans recover by name and dead peers
+// are reaped without treating terminal detachment as process death.
 async function sessionRecoveryWorkflow() {
   if (!tmuxAvailable()) {
     log('session recovery skipped (tmux not installed)');
     return;
   }
-  log('session recovery: re-adopt orphan tmux + reap dead peer');
+  log('session recovery: persistent detach + explicit resume + orphan adoption + dead peer reaping');
   if (!fs.existsSync(path.join(root, '.hello-cc', 'runtime.json'))) startRuntime();
   await waitRuntime();
 
-  // ── Default Stop (no kill) must not strand a live managed session ──
+  // Default Stop pauses Web adoption while leaving the local terminal alive.
   const readoptPeer = 'readopt-shell';
   const pane = parsePane(hcc(['peer', 'start', readoptPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
   const sessionName = tmuxManagedSession(root, readoptPeer);
@@ -10750,22 +10881,57 @@ async function sessionRecoveryWorkflow() {
       detachedTakeover.status === 0) {
     fail(`live detached tmux pane did not block takeover: ${JSON.stringify(detachedRow)}\n${detachedTakeover.stdout}\n${detachedTakeover.stderr}`);
   }
-  // Within a few poll cycles the name-sweep must re-adopt the still-live session.
+  const pauseEvent = eventPayloads('web.adoption.paused')
+    .find((event) => event.payload?.peer === readoptPeer && event.payload?.pane === pane);
+  if (!pauseEvent) fail('default detach did not persist its adoption pause');
+  // A genuinely orphaned binding has no intentional pause. Simulate runtime
+  // state loss while keeping the managed tmux name and process identity.
+  const orphanPeer = 'unpaused-orphan-shell';
+  const orphanPane = parsePane(hcc(['peer', 'start', orphanPeer, '--kind', 'shell', '--', 'bash', '--noprofile', '--norc']));
+  const orphanSessionName = tmuxManagedSession(root, orphanPeer);
+  await stopRuntime();
+  withMeshDb((db) => {
+    db.prepare('UPDATE peer_bindings SET runtime_target = NULL WHERE peer = ?').run(orphanPeer);
+    db.prepare("UPDATE peers SET status = 'detached' WHERE id = ?").run(orphanPeer);
+  });
+  startRuntime();
+  await waitRuntime();
   await waitFor(() => {
-    const row = peerBindingRow(readoptPeer);
-    return Boolean(row && row.runtime_target === pane);
-  }, 'orphan managed tmux session re-adoption', 20000);
+    const row = peerBindingRow(orphanPeer);
+    return Boolean(row && row.runtime_target === orphanPane);
+  }, 'unpaused orphan managed tmux session re-adoption', 20000);
+  // Cover another auto-attach cycle after restart: it must not override a pause.
+  await sleep(5500);
+  binding = peerBindingRow(readoptPeer);
+  if (!binding || binding.runtime_target !== null ||
+      runMaybe('tmux', ['has-session', '-t', sessionName]).status !== 0) {
+    fail(`runtime restart or polling overrode an intentional live-terminal detach:\n${JSON.stringify(binding, null, 2)}`);
+  }
+  const pausedSessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
+  if ((pausedSessions.sessions || []).some((session) => session.id === readoptPeer && session.status === 'running')) {
+    fail(`intentionally detached session was automatically re-adopted:\n${JSON.stringify(pausedSessions, null, 2)}`);
+  }
+  const resumeResponse = await runtimeFetch('/api/sessions/attach', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: readoptPeer, kind: 'shell', pane, force: true })
+  }, { root });
+  const resumed = await resumeResponse.json();
+  if (!resumeResponse.ok || resumed.session?.pane !== pane) {
+    fail(`explicit attach did not resume the same detached terminal:\n${JSON.stringify(resumed, null, 2)}`);
+  }
   const restoredStatus = withMeshDb((db) => db.prepare('SELECT status FROM peers WHERE id = ?').get(readoptPeer)?.status);
-  if (restoredStatus !== 'running') fail(`re-adopted peer not marked running (status=${restoredStatus})`);
-  // Re-enterability: the runtime now exposes the session again.
+  if (restoredStatus !== 'running') fail(`explicitly resumed peer not marked running (status=${restoredStatus})`);
+  // Both explicit resume and automatic orphan recovery expose a live session.
   const sessions = await (await runtimeFetch('/api/sessions', {}, { root })).json();
   if (!(sessions.sessions || []).some((s) => s.id === readoptPeer && s.status === 'running')) {
-    fail(`re-adopted session not exposed by /api/sessions:\n${JSON.stringify(sessions, null, 2)}`);
+    fail(`explicitly resumed session not exposed by /api/sessions:\n${JSON.stringify(sessions, null, 2)}`);
+  }
+  if (!(sessions.sessions || []).some((session) => session.id === orphanPeer && session.pane === orphanPane && session.status === 'running')) {
+    fail(`unpaused orphan session not exposed by /api/sessions:\n${JSON.stringify(sessions, null, 2)}`);
   }
   hcc(['task', 'takeover', '--peer', 'human', '--id', detachedTaskId, '--reason', 'detached evidence cleanup', '--force']);
   hcc(['task', 'update', '--peer', 'human', '--id', detachedTaskId, '--status', 'abandoned', '--summary', 'detached evidence cleanup']);
-  // Destroying the live session is the real teardown path (CLI peer stop has
-  // no kill flag; the web API's kill_tmux is the equivalent). Kill it directly
+  // Destroying the live session is the real teardown path. Kill it directly
   // so it does not leak into the final tmux-session leak assertion.
   runMaybe('tmux', ['kill-session', '-t', sessionName]);
   if (runMaybe('tmux', ['has-session', '-t', sessionName]).status === 0) {
@@ -10774,6 +10940,11 @@ async function sessionRecoveryWorkflow() {
   withMeshDb((db) => {
     db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(readoptPeer);
     db.prepare('DELETE FROM peers WHERE id = ?').run(readoptPeer);
+  });
+  runMaybe('tmux', ['kill-session', '-t', orphanSessionName]);
+  withMeshDb((db) => {
+    db.prepare('DELETE FROM peer_bindings WHERE peer = ?').run(orphanPeer);
+    db.prepare('DELETE FROM peers WHERE id = ?').run(orphanPeer);
   });
 
   // ── A peer whose process is gone must be reaped, not stuck at 'running' ──

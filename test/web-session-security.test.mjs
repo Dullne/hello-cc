@@ -62,12 +62,15 @@ test('terminal sockets mint and revoke independent write tokens', () => {
   assert.match(upgrade, /msg\.type === 'resize'.*tokenMatches\(msg\.action_token, connectionActionToken\)/s);
 });
 
-test('browser receives action tokens only from snapshots and sends them on input', () => {
+test('browser receives connection tokens from snapshots, fences input, and never replays uncertain input', () => {
   const html = webIndexHtml({ nonce: 'test-session-nonce' });
   assert.match(html, /const sessionActionTokens = new Map\(\);/);
   assert.match(html, /sessionActionTokens\.set\(id, msg\.action_token\)/);
-  assert.match(html, /pendingTerminalInput/);
-  assert.match(html, /flushPendingTerminalInput\(id/);
+  assert.doesNotMatch(html, /pendingTerminalInput|flushPendingTerminalInput/);
+  assert.match(html, /action_token: actionToken, epoch: controlEpoch\(\)/);
+  assert.match(html, /msg\.type === 'input_ack'.*handoffStore\.acknowledge\(currentProject, id, msg\.input_id\)/);
+  assert.match(html, /handoffStore\.uncertain\(currentProject, id\)/);
+  assert.match(html, /sessionControls\.get\(active\)\?\.can_control/);
   assert.match(html, /sendTerminalInput\(data\)/);
   assert.match(html, /sendTerminalInput\(text \+ '\\r'\)/);
   assert.doesNotMatch(html, /session\.action_token/);

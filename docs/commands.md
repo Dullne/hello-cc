@@ -14,12 +14,54 @@ authenticated access to any existing server directory are accepted risks.
 
 ```text
 hcc update [--tag TAG] [--registry URL] [--dry-run]
+hcc --root DIR migrate-state --offline --yes
 hcc uninstall [--purge --yes]
 ```
 
-`hcc update` updates the global npm install. `hcc uninstall` removes local
-hooks, shims, and the shell PATH entry; add `--purge --yes` only when you also want to remove the
-current project's `.hello-cc` data and guidance blocks.
+`hcc update` updates the global npm install. If another OS user can replace a
+project path, managed state is kept in a private directory under the current
+user's home. Existing project-local `.hello-cc` data requires an explicit
+offline migration: stop all hello-cc and external writers first, then run
+`migrate-state --offline --yes`. It copies SQLite snapshots (including WAL
+contents) and other validated state, keeps the old directory untouched, and
+rebuilds managed DSH path-bound configuration. Do not restart an old writer
+against the retained directory. `hcc uninstall` removes local hooks, shims,
+and the shell PATH entry; add `--purge --yes` only when you also want to remove
+the selected current project's managed data and guidance blocks. A retained
+legacy migration source is not deleted by purge.
+Private-state creation and purge leave a durable authority marker so a retained
+or newly written project-local database cannot silently become active again.
+After purge, a remaining legacy directory still requires an explicit offline
+`migrate-state --offline --yes`; if no legacy directory remains, a fresh `init`
+creates new private state. If a private store disappears without an explicit
+purge, restore it from backup or use `uninstall --purge --yes` to deliberately
+discard the missing state before starting fresh.
+An interrupted private purge stays marked `purging`; normal access fails closed.
+After confirming old writers are stopped, repeat `uninstall --purge --yes` to
+finish deleting that private store. If the project root is replaced by a new
+directory at the same path, its inode no longer matches the old private binding.
+The CLI intentionally refuses automatic purge or rebinding: preserve and back
+up both the old private store and its `.authority.json` marker, stop all writers,
+and have an operator compare the old and new root identities before a manual
+recovery. Do not delete the marker alone or point the new root at the old data.
+
+## Read-only Diagnostics
+
+```text
+hcc doctor [--codex] [--json]
+```
+
+By default, doctor only checks project database integrity and schema compatibility;
+corruption or an unsupported schema returns a nonzero exit code. `--codex` additionally
+runs bounded `codex --version` and `codex app-server --help` probes in temporary
+HOME/CODEX_HOME directories and removes their startup files. Hook checks read the
+original Codex home's `hooks.json` and existing project hook invocation events. Help
+advertises startup arguments; it does not prove a protocol handshake or model availability.
+Hook configuration, historical invocation, stdout delivery, and provider acceptance
+are separate facts. No explicit stdout receipt is recorded, so delivery, acceptance,
+and trust remain `unknown`. Diagnostics never start a model/session, execute hooks, or
+change accounts, trust, or shims. Unknown optional diagnostics do not fail a healthy
+database. JSON adds `data.codex`; the default report remains unchanged.
 
 ## Start And Stop
 
@@ -36,8 +78,43 @@ Use `--local` to bind only `127.0.0.1`, `--token` or `HCC_WEB_TOKEN` to set an
 explicit token, `HCC_RUNTIME_CA` to trust a private HTTPS Runtime API CA, and
 `--no-token` only in trusted local/test environments. Use `hcc up` only when you
 want coordination without the Web console or shims. Provider shims only join
-projects with a local `.hello-cc/runtime.json` from `hcc web`; they do not use a
+projects with a managed `runtime.json` from `hcc web`; they do not use a
 global runtime to manage arbitrary directories.
+
+## Native Workers
+
+```text
+hcc native up
+hcc native start --peer NAME --provider codex|claude|dsh [--cwd DIR] [--model MODEL] [--binary PATH] [--resume last]
+hcc native send --peer NAME --body TEXT [--from NAME] [--task ID]
+hcc native status
+hcc native deliveries [--peer NAME]
+hcc native events --peer NAME [--after ID]
+hcc native requests --peer NAME
+hcc native respond --peer NAME --request ID --decision accept|decline|cancel [--response-file JSON]
+hcc native interrupt --peer NAME [--turn ID]
+hcc native close --peer NAME
+hcc native down
+```
+
+These commands manage HCC-owned background workers through Codex app-server,
+the optional Claude Agent SDK, or dsh ACP. A successful send queues a message;
+inspect delivery receipts for submission, acceptance, and completion. Only saved
+sessions owned by the same HCC peer/provider can resume. Existing TUI/Desktop
+sessions keep their own transport. Hosted permission requests and questions wait
+for an explicit Web or local CLI response bound to the current worker/session/turn.
+See [Native Workers](native.md) for response-file examples, SDK installation, receipt meanings,
+and current integration boundaries.
+
+## DeepSeek Harness
+
+```text
+hcc dsh setup [--mode hooks|cordis|off]
+hcc dsh status [--dsh-bin PATH]
+hcc dsh web [--mode hooks|cordis|off] [--dsh-bin PATH] [--dsh-home PATH] -- [dsh arguments]
+```
+
+Use `@deepseek-ai/dsh@0.2.0-rc.2` and Node.js 24+. Setup defaults to hooks on first use; `--mode cordis` provides native `hcc_*` tools and ACK after context commit, while `--mode off` disables overlay injection. Later calls retain the saved mode. Status checks content and the executable without model calls. Harness flags follow `--`. Harness Web owns its conversations; use native commands above for HCC-owned workers. See the [integration guide](dsh.md) for routing, bundles and real-model acceptance.
 
 ## Peers And Status
 

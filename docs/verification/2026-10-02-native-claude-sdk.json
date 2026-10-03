@@ -1,0 +1,208 @@
+{
+  "verifiedAt": "2026-10-02",
+  "scope": "sdk-import-api-contract-and-lazy-adapter-lifecycle",
+  "package": {
+    "name": "@anthropic-ai/claude-agent-sdk",
+    "version": "0.3.287",
+    "bundledClaudeCodeVersion": "2.1.287",
+    "registryIntegrity": "sha512-DrYUMzmSVfL1VciNDo/9BhxiVnTsSCKVzxLHB3+NvvRiyN4pfWTKFrUzQesPnWswds9x1Ir10Gi6GRsnjT0UkA==",
+    "entry": "sdk.mjs",
+    "entrySha256": "21fbc4b359e517a370524dd6e25c40c5eab40368eb122491530ac4233021925d",
+    "types": "sdk.d.ts",
+    "typesSha256": "e21c63715af18e383c817716d8cb4a68466ef1b8aff93fc5807c9fcaabbaf240"
+  },
+  "node": "v24.19.0",
+  "installation": {
+    "location": "independent temporary npm prefix",
+    "lifecycleScriptsEnabled": false,
+    "userConfig": "new empty isolated npmrc",
+    "globalConfig": "new empty isolated npmrc",
+    "npmCache": "isolated temporary cache",
+    "repositoryPackageChanged": false,
+    "repositoryLockChanged": false
+  },
+  "verificationEnvironment": {
+    "home": "new empty temporary directory",
+    "cwd": "new empty temporary workspace",
+    "inheritedCredentials": false,
+    "environment": "allowlist: PATH, HOME, NO_COLOR"
+  },
+  "apiChecks": [
+    {
+      "name": "query_input_and_options",
+      "passed": true,
+      "observed": "query accepts AsyncIterable<SDKUserMessage> and options?: Options",
+      "source": "sdk.d.ts",
+      "line": 3245
+    },
+    {
+      "name": "query_async_iteration",
+      "passed": true,
+      "observed": "returned Query is an asynchronous generator",
+      "source": "sdk.d.ts",
+      "line": 2844
+    },
+    {
+      "name": "options_environment",
+      "passed": true,
+      "observed": "Options.env accepts string or undefined values",
+      "source": "sdk.d.ts",
+      "line": 1659
+    },
+    {
+      "name": "options_can_use_tool",
+      "passed": true,
+      "observed": "CanUseTool returns Promise<PermissionResult | null>",
+      "source": "sdk.d.ts",
+      "line": 301
+    },
+    {
+      "name": "permission_metadata",
+      "passed": true,
+      "observed": "CanUseTool metadata includes requestId and toolUseID",
+      "source": "sdk.d.ts",
+      "line": 285
+    },
+    {
+      "name": "permission_denial",
+      "passed": true,
+      "observed": "deny result accepts message and optional toolUseID",
+      "source": "sdk.d.ts",
+      "line": 2512
+    },
+    {
+      "name": "manual_permission_mode",
+      "passed": true,
+      "observed": "permissionMode: 'default' is supported",
+      "source": "sdk.d.ts",
+      "line": 2482
+    },
+    {
+      "name": "permission_bypass_flag",
+      "passed": true,
+      "observed": "allowDangerouslySkipPermissions: false is supported",
+      "source": "sdk.d.ts",
+      "line": 2004
+    },
+    {
+      "name": "stream_partial_messages",
+      "passed": true,
+      "observed": "includePartialMessages: true is supported",
+      "source": "sdk.d.ts",
+      "line": 1860
+    },
+    {
+      "name": "cwd_model_resume",
+      "passed": true,
+      "observed": "Options cwd, model and resume are optional strings",
+      "source": "sdk.d.ts",
+      "line": 2085
+    },
+    {
+      "name": "interrupt",
+      "passed": true,
+      "observed": "interrupt returns an optional receipt; adapter preserves it",
+      "source": "sdk.d.ts",
+      "line": 2858
+    },
+    {
+      "name": "close",
+      "passed": true,
+      "observed": "Query.close is synchronous; Promise.resolve in adapter accepts it",
+      "source": "sdk.d.ts",
+      "line": 3241
+    },
+    {
+      "name": "user_message",
+      "passed": true,
+      "observed": "queued input fields match SDKUserMessage; session_id is optional",
+      "source": "sdk.d.ts",
+      "line": 6216
+    }
+  ],
+  "importSucceeded": true,
+  "queryExportType": "function",
+  "queryInvocations": 0,
+  "sdkQueryCreated": false,
+  "providerProcessStartupAttempts": 0,
+  "providerProcessesStarted": 0,
+  "promptCalls": 0,
+  "modelInvocations": 0,
+  "adapterOpen": {
+    "provider": "claude",
+    "status": "ready",
+    "sessionId": null,
+    "turnId": null,
+    "submissionId": null,
+    "capabilities": {
+      "create": true,
+      "resume": true,
+      "send": true,
+      "observe": true,
+      "interrupt": true,
+      "close": true,
+      "steer": false,
+      "fork": false,
+      "approvals": false
+    }
+  },
+  "adapterClose": {
+    "provider": "claude",
+    "status": "closed",
+    "sessionId": null,
+    "turnId": null,
+    "submissionId": null,
+    "capabilities": {
+      "create": true,
+      "resume": true,
+      "send": true,
+      "observe": true,
+      "interrupt": true,
+      "close": true,
+      "steer": false,
+      "fork": false,
+      "approvals": false
+    }
+  },
+  "events": [
+    {
+      "type": "status",
+      "provider": "claude",
+      "sessionId": null,
+      "turnId": null,
+      "submissionId": null,
+      "status": "ready",
+      "initialized": false
+    },
+    {
+      "type": "status",
+      "provider": "claude",
+      "sessionId": null,
+      "turnId": null,
+      "submissionId": null,
+      "status": "closing"
+    },
+    {
+      "type": "status",
+      "provider": "claude",
+      "sessionId": null,
+      "turnId": null,
+      "submissionId": null,
+      "status": "closed"
+    }
+  ],
+  "initializedSessionObserved": false,
+  "runtimeHandshakePerformed": false,
+  "notes": [
+    "The injected query wrapper delegates to the actual official SDK query export; it was never invoked.",
+    "Ready means the adapter validated the query function; it does not mean an initialized Claude provider session.",
+    "client_composed:true is supported; its documented semantics skip slash-command and file-mention dispatch and the turn-start attachment pass, including nested CLAUDE.md/rules/skill/tool-list context."
+  ],
+  "limitations": [
+    "No query() invocation, provider process, prompt, credentials, runtime handshake, or model call was exercised.",
+    "AsyncIterable input, env, canUseTool, permissionMode, interrupt and close compatibility are based on the installed official type declarations; their provider runtime behavior was not exercised.",
+    "Resume was type-checked only; no real session was created or resumed.",
+    "This is SDK import and API-contract evidence, not end-to-end model or business acceptance."
+  ],
+  "success": true
+}

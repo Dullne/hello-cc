@@ -1,0 +1,7 @@
+# Install this package as a dsh bundle, or use hcc dsh setup --mode cordis.
+- insert:
+    - id: hello-cc-dsh-cordis
+      name: '@logicseek/hello-cc/lib/integrations/dsh-cordis.mjs'
+      config:
+        maxContextChars: 16000
+        maxToolChars: 16000

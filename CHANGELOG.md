@@ -16,6 +16,199 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.1
+
+### Summary
+
+hello-cc 1.1.0-rc.1 brings project and session navigation, structured
+conversations, recoverable split panes, and bounded rendering to the Web
+workbench. It also brings HCC-owned Codex, Claude and DeepSeek Harness workers
+into the same task, message, handoff and result-review workflow, with explicit
+permissions and delivery receipts. This release is intended for the npm
+`preview` dist-tag and a GitHub prerelease.
+
+### Highlights
+
+- Switch between English, Chinese or the system language; choose system,
+  light or dark interface and terminal themes, comfortable or compact spacing,
+  terminal font size and focus mode. Settings apply without replacing active
+  terminal connections or discarding drafts, and remain reachable on mobile.
+- Search sessions by name, task, provider, path or command; combine keywords
+  and provider/activity filters. Project changes clear old session state
+  immediately and ignore delayed responses from the previous project.
+- Read Codex conversations by turn with focused user, assistant, command,
+  file-change and status cards. Preserve reading position, drafts, expanded
+  details and keyboard focus during updates. Keep approvals visible
+  independently of the conversation page.
+- Use the keyboard command palette for project, session and workbench
+  navigation. Search the current terminal scrollback locally with match counts,
+  previous/next navigation, case sensitivity and whole-word matching. The search
+  addon is served locally.
+- Restore a project-specific two-pane workspace with horizontal or vertical
+  layout, adjustable proportions and a saved secondary session. Each pane
+  retains its own connection and draft; viewing the same session twice leaves
+  the secondary pane read-only until an explicit control handoff.
+- Page long Codex timelines and large output segments while keeping all
+  retained content accessible. Copy the complete original text, including
+  content outside the visible segment. Preserve Unicode characters, scroll
+  anchors, tool expansion and drafts across streaming updates.
+- Coalesce Codex text-delta notifications within a bounded 50 ms window while
+  updating internal state immediately. Approvals, completion, errors and
+  connection changes publish promptly. Unchanged native snapshots avoid
+  redundant broadcasts without skipping ownership checks.
+- Manage owned native workers through `hcc native`: Codex App Server, the
+  optional Claude Agent SDK and DeepSeek Harness ACP share HCC coordination
+  while retaining their provider-specific lifecycle and session identity. Web
+  can discover and control an existing native worker without creating a second
+  provider process.
+- Distinguish queued, submitted, provider-accepted, completed, failed and
+  uncertain delivery states. Uncertain submissions are not automatically
+  replayed; runtime restarts preserve the uncertainty needed to avoid duplicate
+  work.
+- Handle supported Codex permission requests, questions and common MCP form
+  fields from Web or the local CLI. Claude responses approve the original tool
+  input once, and ACP approval selects a provider-offered one-time option.
+  Responses remain bound to the current worker, session, turn, request and
+  controller.
+- Give hosted executors a temporary MCP capability scoped to the project,
+  database, peer and live runtime. Coordination tools support tasks, inbox,
+  messages, handoff, owned locks and local result records. Executor shutdown
+  revokes the capability without rewriting global provider configuration.
+- Review local command results, explicitly submitted evidence and manual
+  acceptance records with separate local-validation, publication and
+  business-acceptance categories. A completed model turn or successful command
+  does not automatically complete an HCC task.
+- Include DeepSeek Harness hooks, the Cordis bundle and owned ACP workers,
+  with identity-bound crash recovery and retryable cleanup after temporary
+  database failures.
+- Use macOS `kern.bootsessionuuid` for the boot component of process identity
+  instead of wall-clock boot time. Clock adjustments no longer make the same
+  process appear replaced, while a different boot UUID still identifies a
+  reboot. Missing or malformed boot identity remains unknown.
+- Publish private-state binding manifests atomically, reject legacy-state
+  takeover during interrupted initialization, and recheck the project identity
+  before reading, writing or clearing its runtime state. A reused directory
+  path does not silently inherit the previous project's private state.
+- Validate existing SQLite files without opening and closing an additional
+  descriptor, preserving locks held by another SQLite connection in the same
+  process. File ownership, permissions, identity and sidecar checks remain in
+  place.
+
+### Compatibility Notes
+
+- Projects under shared or writable ancestors use per-user private state.
+  Existing legacy state in those projects requires an explicit offline
+  `migrate-state --offline --yes` after stopping all writers; it is not silently
+  copied or discarded. Back up both the private store and its authority marker
+  before manual recovery of a replaced project directory.
+- Node.js 24 or newer is required. Linux and macOS are supported host
+  environments; Windows users use WSL. Native Windows shells are outside the
+  supported host contract.
+- Browser-controllable terminals require tmux where documented. `node-pty`
+  remains pinned to `1.2.0-beta.15`; the terminal search addon is pinned to
+  `0.16.0`.
+- Native workers require an installed and authenticated provider. Claude's
+  Agent SDK remains optional and is loaded when a Claude worker starts; HCC
+  does not install it automatically. DeepSeek Harness integration targets
+  `0.2.0-rc.2`.
+- Closing a browser page does not stop a hosted executor. An independent
+  native runtime also survives Web-runtime shutdown; explicitly closing its
+  worker terminates that worker. Web-owned App Server executors remain owned
+  by their Web runtime.
+- Saved-session resume creates a newly owned provider connection and requires
+  the prior owner to be confirmed stopped. It does not migrate an arbitrary
+  live TUI or desktop process, and uncertain owners remain protected.
+- Existing schema v7, Runtime API v2 and provider authentication boundaries
+  continue to apply. Browser control handoff never approves a provider operation
+  by itself. Persisted macOS identities using the older boot-token format remain
+  unknown across the format transition, rather than being treated as confirmed
+  dead.
+
+### Validation
+
+Feature-specific records cover controlled browser interactions, real PTY/tmux
+behavior, provider protocols and selected authenticated model workflows. Each
+record applies to its recorded inputs and scope. The final release record
+identifies the frozen package, platform installations and checks that apply to
+this combined candidate; performance samples are controlled observations, not
+production capacity or long-term memory guarantees.
+
+Publication readback, registry installation, employee-device acceptance and
+genuine business acceptance remain distinct evidence categories. No result in
+one category automatically establishes another.
+
+## 1.0.2-dsh.3
+
+### Summary
+
+This preview keeps the DeepSeek Harness integration introduced in `1.0.2-dsh.2`
+and fixes session cleanup when a temporary database failure interrupts shutdown.
+It remains an npm `dsh` preview and a GitHub prerelease.
+
+### Highlights
+
+- Revoking a Cordis Agent immediately blocks its tools while allowing database
+  retirement to retry after storage becomes available again.
+- Preserve failed cleanup records across plugin reloads. Recovery requires the
+  exact disposed Agent, provider session, and project; active owners cannot be
+  replaced based on another Agent's disposal event.
+- Retain the pinned Harness `0.2.0-rc.2`, Node.js 24+, and Linux/macOS/WSL support
+  boundaries. Every candidate has independent package and acceptance receipts.
+
+## 1.0.2-dsh.2
+
+### Summary
+
+This preview integrates DeepSeek Harness sessions with the hello-cc task,
+message, lock, and handoff services. It adds project hooks, an installed Cordis
+bundle, and owned ACP workers, including session recovery and explicit approval
+handling. The preview is intended for the `dsh` npm dist-tag and a GitHub
+prerelease; publication and business acceptance are separate delivery gates.
+
+### Highlights
+
+- `hcc dsh setup`, `status`, and `web` manage project hooks or a Cordis overlay.
+  Setup verifies its managed files before migrating paths from a source checkout
+  to an installed package and preserves user-edited configuration.
+- The Cordis bundle exposes collaboration tools using each Agent's complete
+  provider session ID and project root. Inbox acknowledgements follow the
+  committed model context; simultaneous sessions retain separate ownership.
+- A resumed Cordis session can reclaim ownership after a crashed owner only
+  when complete process identity evidence confirms that owner is dead. Live or
+  uncertain owners, competing transports, and changed bindings remain protected.
+- Native ACP workers use a dedicated `dsh --profile acp` process with scoped MCP
+  tools. Queue admission and completed delivery are distinct; close, resume,
+  interruption, and approval responses retain the owning session boundary.
+- ACP approval requests correlate tool-call IDs with their tool input, including
+  out-of-order updates. Requests with missing or truncated context cannot be
+  accepted; rejection remains available.
+- Release tooling derives GitHub prerelease status from the version and exposes
+  it during dry runs, so preview releases do not receive stable release status.
+
+### Compatibility Notes
+
+- Node.js 24 or newer and matching DeepSeek Harness `0.2.0-rc.2` runtime packages
+  are required. The Cordis integration checks the actual Agent, AgentLoop, Tools,
+  and Sessions package versions before loading.
+- Supported host environments are Linux and macOS; Windows users must use WSL.
+  Native Windows shells are not supported. The existing macOS arm64 acceptance
+  results do not establish Linux, WSL, or other-device acceptance for this preview.
+- Choose one injection method per Harness process: profile bundle or project
+  overlay. Harness manages profile bundle installation; `setup --mode off`
+  disables a managed project overlay.
+- Existing schema v7 and Runtime API v2 boundaries still apply. Real model
+  acceptance requires a provider route that permits Harness; a route restricted
+  to an official client remains restricted.
+
+### Validation
+
+Earlier local macOS arm64 candidates completed official plugin installation and
+removal, real Cordis collaboration calls, ACP session lifecycle and approval
+denial, and an isolated order-report workflow. Those dated receipts belong to
+their recorded candidate hashes. This version requires its own frozen-package
+installation receipt and release checks before publication. Other-device
+installation and genuine business signoff remain separate, incomplete gates.
+
 ## 1.0.1
 
 ### Summary

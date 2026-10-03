@@ -1,0 +1,333 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { randomUUID } from 'node:crypto';
+import { UI_TRANSLATIONS } from '../lib/web/ui-i18n.mjs';
+import { codexHistoryScript } from '../lib/web/ui-history.mjs';
+import { reviewPanelScript } from '../lib/web/ui-review.mjs';
+import { nativePanelScript } from '../lib/web/ui-native.mjs';
+
+const settle = () => new Promise(resolve => setImmediate(resolve));
+function fixture(script, type = 'app-server') {
+  const elements = new Map(), storage = new Map(), requests = [], opened = [], listeners = new Map();
+  const selection = { active: 'a', projectRoot: '/project-a', actionToken: 'token-a', epoch: 1,
+    canControl: true, session: { id: 'a', peer_id: 'peer-a', type, task: { id: 7 } }, sessions: [] };
+  function node() {
+    return { value: '', checked: false, textContent: '', hidden: false, disabled: false, dataset: {}, listeners: new Map(), buttons: [],
+      addEventListener(name, listener) { this.listeners.set(name, listener); },
+      querySelectorAll(selector) {
+        if (selector === 'button[data-response]') return this.buttons.filter(button => button.dataset.response !== undefined);
+        if (selector === '[data-interaction-field]') return [];
+        return this.buttons;
+      },
+      async emit(name, event = {}) { return this.listeners.get(name)?.(event); } };
+  }
+  function element(id) {
+    if (!elements.has(id)) {
+      const value = node();
+      Object.defineProperty(value, 'innerHTML', { get() { return this.html || ''; }, set(html) {
+        this.html = html;
+        this.buttons = [...html.matchAll(/<button([^>]*)>/g)].map(match => {
+          const button = node();
+          for (const [, name, content] of match[1].matchAll(/data-(thread|response|decision|truncated|request-key)="([^"]+)"/g)) {
+            button.dataset[name.replace(/-([a-z])/g, (_, char) => char.toUpperCase())] = content.replaceAll('&quot;', '"');
+          }
+          return button;
+        });
+      } });
+      elements.set(id, value);
+    }
+    return elements.get(id);
+  }
+  element('historyDialog').hidden = true; element('reviewDialog').hidden = true;
+  const bridge = {
+    esc: value => String(value).replace(/[&<>"']/g, character => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[character])),
+    tr: (key, fallback = '') => UI_TRANSLATIONS.en[key] || fallback || key,
+    api(path, options) {
+      let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      requests.push({ path, options, resolve, reject }); return promise;
+    },
+    async refreshSessions() {}, openManaged(id) { opened.push(id); },
+    openDialog(dialog) { dialog.hidden = false; }, closeDialog(dialog) { dialog.hidden = true; }
+  };
+  for (const key of Object.keys(selection)) Object.defineProperty(bridge, key, { get: () => selection[key] });
+  const window = { hccHandoff: bridge, hccUi: { safeGet:key=>storage.get(key), safeSet:(key,value)=>storage.set(key,value) },
+    addEventListener(name, listener) { listeners.set(name, listener); } };
+  vm.runInNewContext(script(), { window, document: { getElementById: element }, crypto: { randomUUID }, confirm: () => true });
+  const click = id => element(id).emit('click');
+  const fill = (id, value) => { element(id).value = value; return element(id).emit('input'); };
+  return { element, selection, window, storage, requests, opened, click, fill, listeners };
+}
+
+async function historyReady(f, id = 'thread-a') {
+  f.window.hccHistory.open();
+  f.requests.at(-1).resolve({ threads: [{ id, preview: '<script>saved</script>' }], nextCursor: null }); await settle();
+  const selecting = f.element('historyThreads').buttons[0].emit('click');
+  f.requests.at(-1).resolve({ thread: { id, turns: [{ status: 'completed', items: [{ type:'agentMessage', text:'saved result' }] }] } });
+  await selecting;
+}
+
+test('history pagination merges thread IDs and never inserts provider HTML', async () => {
+  const f = fixture(codexHistoryScript); f.window.hccHistory.open();
+  f.requests[0].resolve({ threads:[{ id:'thread-a', preview:'<img src=x>' }], nextCursor:'cursor +' }); await settle();
+  assert.match(f.element('historyThreads').innerHTML, /&lt;img src=x&gt;/);
+  const more = f.click('historyMore'); assert.match(f.requests[1].path, /cursor=cursor%20%2B&root=%2Fproject-a/);
+  f.requests[1].resolve({ threads:[{ id:'thread-a' },{ id:'thread-b' }], nextCursor:null }); await more;
+  assert.equal(f.element('historyThreads').buttons.length, 2); assert.equal(f.element('historyMore').hidden, true);
+});
+
+test('late history lists and thread reads cannot overwrite a newly opened project', async () => {
+  const f = fixture(codexHistoryScript); f.window.hccHistory.open();
+  f.selection.projectRoot = '/project-b'; f.window.hccHistory.open();
+  f.requests[1].resolve({ threads:[{ id:'thread-b' }] }); await settle();
+  f.requests[0].resolve({ threads:[{ id:'stale-a' }] }); await settle();
+  assert.match(f.element('historyThreads').innerHTML, /thread-b/); assert.doesNotMatch(f.element('historyThreads').innerHTML, /stale-a/);
+  const reading = f.element('historyThreads').buttons[0].emit('click');
+  f.selection.projectRoot = '/project-c'; f.window.hccHistory.open();
+  f.requests[3].resolve({ threads:[] }); await settle();
+  f.requests[2].resolve({ thread:{ id:'thread-b', turns:[{ items:[{ text:'stale output' }] }] } }); await reading;
+  assert.doesNotMatch(f.element('historyContent').innerHTML, /stale output/);
+});
+
+test('resume and fork require explicit confirmation and use distinct API contracts', async () => {
+  const f = fixture(codexHistoryScript); await historyReady(f);
+  await f.click('historyResume'); assert.equal(f.requests.length, 2);
+  f.element('historyConfirmed').checked = true; await f.element('historyConfirmed').emit('change');
+  const resume = f.click('historyResume');
+  assert.deepEqual(JSON.parse(f.requests[2].options.body), { kind:'codex',transport:'app-server',mode:'resume',resume:'thread-a',handoffConfirmed:true });
+  f.requests[2].resolve({ session:{ id:'resumed' } }); await resume; assert.deepEqual(f.opened,['resumed']);
+  await historyReady(f); f.element('historyConfirmed').checked = true;
+  const fork = f.click('historyFork'); assert.deepEqual(JSON.parse(f.requests.at(-1).options.body),{confirmed:true});
+  f.requests.at(-1).reject(new Error('network failed')); await fork;
+  f.window.hccHistory.sync(); assert.equal(f.requests.length,6,'failed creation is never automatically retried');
+});
+
+test('forking a live source uses its current control epoch and observers get a takeover hint', async () => {
+  const f = fixture(codexHistoryScript); await historyReady(f);
+  f.selection.sessions = [{ id:'a',status:'running',binding:{provider:'codex',provider_session_id:'thread-a'} }];
+  f.element('historyConfirmed').checked = true; f.selection.canControl = false; f.window.hccHistory.sync();
+  assert.equal(f.element('historyFork').disabled,true); assert.match(f.element('historyNotice').textContent,/take browser control/);
+  await f.click('historyFork'); assert.equal(f.requests.length,2);
+  f.selection.canControl = true; f.selection.actionToken = 'new-token'; f.selection.epoch = 3; f.window.hccHistory.sync();
+  assert.equal(f.element('historyResume').disabled,true);
+  const fork = f.click('historyFork'); assert.deepEqual(JSON.parse(f.requests[2].options.body),{confirmed:true,actionToken:'new-token',epoch:3});
+  f.requests[2].resolve({session:{id:'forked'}}); await fork;
+});
+
+async function reviewReady(f) {
+  f.window.hccReview.open(); f.requests.at(-1).resolve({ current_task:{id:7,title:'Review task',owner:'peer-a'},results:[],summary:{} }); await settle();
+}
+function fillReview(f, title = 'Tests passed') {
+  f.fill('verificationTitle', title); f.fill('verificationDetails','Local checks complete; publication pending');
+  f.fill('verificationEvidence','/tmp/test-output.txt'); f.fill('verificationStatus','passed');
+  f.element('verificationForm').emit('input');
+}
+
+test('result evidence writes bind project, task owner and the current browser lease', async () => {
+  const f = fixture(reviewPanelScript); await reviewReady(f); fillReview(f);
+  f.selection.canControl = false; f.window.hccReview.sync(); assert.equal(f.element('verificationSave').disabled,true);
+  f.selection.canControl = true; f.selection.actionToken='takeover'; f.selection.epoch=5;
+  const saving = f.element('verificationForm').emit('submit',{preventDefault(){}});
+  assert.match(f.requests[1].path,/sessions\/a\/results\?root=%2Fproject-a/);
+  assert.deepEqual(JSON.parse(f.requests[1].options.body),{actionToken:'takeover',epoch:5,taskId:7,stage:'local',status:'passed',title:'Tests passed',details:'Local checks complete; publication pending',evidence:['/tmp/test-output.txt']});
+  f.requests[1].reject(new Error('owner changed')); await saving;
+  assert.match(f.element('reviewNotice').textContent,/owner changed/); assert.equal(f.element('verificationTitle').value,'Tests passed');
+});
+
+test('late result acknowledgements clear only unchanged drafts from the original task', async () => {
+  const f = fixture(reviewPanelScript); await reviewReady(f); fillReview(f);
+  const saving = f.element('verificationForm').emit('submit',{preventDefault(){}});
+  f.selection.active='b'; f.selection.projectRoot='/project-b'; f.selection.session={id:'b',peer_id:'peer-b',type:'native',task:{id:9}};
+  f.window.hccReview.open(); f.requests[2].resolve({current_task:{id:9,title:'Other task',owner:'peer-b'},results:[],summary:{}}); await settle();
+  fillReview(f,'Second task evidence');
+  f.requests[1].resolve({result:{id:1}}); await saving;
+  assert.equal(f.element('verificationTitle').value,'Second task evidence');
+  assert.equal(JSON.parse(f.storage.get('hcc.reviewDraft:["/project-b","b",9]')).verificationTitle,'Second task evidence');
+  assert.equal(f.requests.length,3,'old save cannot start a read on the new task');
+});
+
+test('results remain read only without the task owner and distinguish manual source in summaries', async () => {
+  const f = fixture(reviewPanelScript); f.window.hccReview.open();
+  f.requests[0].resolve({current_task:{id:7,owner:'other'},results:[{title:'<script>evidence</script>',stage:'business',status:'passed',source:'user'}],summary:{business:{status:'passed',source:'user'}}}); await settle();
+  assert.equal(f.element('verificationSave').disabled,true);
+  assert.match(f.element('reviewSummary').innerHTML,/Business acceptance: Passed · Manually recorded evidence/);
+  assert.match(f.element('reviewRecords').innerHTML,/&lt;script&gt;evidence&lt;\/script&gt;/);
+});
+
+test('a current task change immediately fences a stale evidence form', async () => {
+  const f = fixture(reviewPanelScript); await reviewReady(f); fillReview(f);
+  f.selection.session = { ...f.selection.session, task:{id:8} }; f.window.hccReview.sync();
+  assert.equal(f.element('verificationSave').disabled,true);
+  await f.element('verificationForm').emit('submit',{preventDefault(){}});
+  assert.equal(f.requests.length,1);
+});
+
+const nativeState = (extra={}) => ({peer:'peer-a',root:'/project-a',provider:'codex',sessionId:'native-thread',status:'idle',connected:true,generation:1,owner:'worker-a',capabilities:{send:true,interrupt:true},events:[],deliveries:[],...extra});
+
+test('native queue receipt clears only its original draft and uses lease credentials once', async () => {
+  const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState()); f.fill('nativeDraft','send once');
+  const sending=f.click('nativeSend'), body=JSON.parse(f.requests[0].options.body);
+  assert.equal(body.action_token,'token-a'); assert.equal(body.epoch,1); assert.match(body.submissionId,/^s_/);
+  await f.click('nativeSend'); assert.equal(f.requests.length,1);
+  f.fill('nativeDraft','new edits');
+  f.requests[0].resolve({receipt:{submission_id:body.submissionId,message_id:11,state:'queued'}}); await sending;
+  assert.equal(f.element('nativeDraft').value,'new edits'); assert.equal(JSON.parse([...f.storage.values()][0]).pending,null);
+  assert.match(f.element('nativeNotice').textContent,/HCC queue, awaiting executor receipt/);
+});
+
+test('uncertain native submission reconciles durable receipt without resending', async () => {
+  const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState()); f.fill('nativeDraft','retained');
+  const sending=f.click('nativeSend'), id=JSON.parse(f.requests[0].options.body).submissionId;
+  f.requests[0].reject(new Error('admission uncertain')); await sending;
+  assert.equal(f.element('nativeDraft').value,'retained'); f.window.hccNative.sync(); await f.click('nativeSend'); assert.equal(f.requests.length,1);
+  const reading=f.click('nativeRead'); f.requests[1].resolve({state:nativeState({deliveries:[{submission_id:id,message_id:12,state:'uncertain'}],quarantined:true})}); await reading;
+  assert.equal(f.element('nativeDraft').value,''); assert.equal(f.requests.length,2); assert.equal(f.element('nativeSend').disabled,true);
+  assert.match(f.element('nativeReceipts').innerHTML,/Receipt uncertain/);
+});
+
+test('native generation and owner changes reset stop consent and reject stale reads and events', async () => {
+  const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState());
+  f.element('nativeCloseConfirmed').checked=true; await f.element('nativeCloseConfirmed').emit('change');
+  const reading=f.click('nativeRead');
+  f.window.hccNative.render(nativeState({generation:2,owner:'worker-b',events:[{id:2,payload:{type:'output',text:'current'}}]}));
+  assert.equal(f.element('nativeCloseConfirmed').checked,false); assert.equal(f.element('nativeClose').disabled,true);
+  f.requests[0].resolve({state:nativeState({events:[{id:1,payload:{type:'output',text:'stale'}}]})}); await reading;
+  f.window.hccNative.render(nativeState({events:[{id:1,payload:{type:'output',text:'stale'}}]}));
+  assert.match(f.element('nativeEvents').innerHTML,/current/); assert.doesNotMatch(f.element('nativeEvents').innerHTML,/stale/);
+});
+
+test('late native admission receipt cannot clear a different project draft', async () => {
+  const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState()); f.fill('nativeDraft','same message');
+  const sending=f.click('nativeSend'), id=JSON.parse(f.requests[0].options.body).submissionId;
+  f.selection.active='b'; f.selection.projectRoot='/project-b'; f.selection.session={id:'b',peer_id:'peer-b',type:'native'};
+  f.window.hccNative.render(nativeState({root:'/project-b',peer:'peer-b'})); f.fill('nativeDraft','same message');
+  f.requests[0].resolve({receipt:{submission_id:id,message_id:13,state:'queued'}}); await sending;
+  assert.equal(f.element('nativeDraft').value,'same message'); assert.equal(f.requests.length,1);
+  assert.equal(JSON.parse(f.storage.get('hcc.nativeDraft:["/project-b","b"]')).text,'same message');
+});
+
+test('native send respects observer, connection, quarantine and provider capabilities', () => {
+  const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState({connected:false})); f.fill('nativeDraft','message'); assert.equal(f.element('nativeSend').disabled,true);
+  f.window.hccNative.render(nativeState({capabilities:{send:false}})); assert.equal(f.element('nativeSend').disabled,true);
+  f.selection.canControl=false; f.window.hccNative.render(nativeState()); assert.equal(f.element('nativeSend').disabled,true);
+  f.selection.canControl=true; f.window.hccNative.sync(); assert.equal(f.element('nativeSend').disabled,false);
+});
+
+const nativeStringState = (extra = {}) => nativeState({ generation: 'generation-a', owner: 'worker-a', ...extra });
+const approval = id => ({ requestId: id, executorId: 'worker-a', sessionId: 'native-thread', turnId: 'turn-live',
+  kind: 'approval', method: 'item/commandExecution/requestApproval', params: { command: 'echo ' + id } });
+
+test('late native send receipts acknowledge the draft without replacing newer streamed approvals or delivery stages', async () => {
+  const f = fixture(nativePanelScript, 'native'), initial = nativeStringState();
+  f.window.hccNative.render(initial); f.fill('nativeDraft', 'send once');
+  const sending = f.click('nativeSend'), id = JSON.parse(f.requests[0].options.body).submissionId;
+  f.window.hccNative.render(nativeStringState({ status: 'working', pendingApprovals: [approval('new-approval')],
+    deliveries: [{ submission_id: id, message_id: 12, state: 'completed' }] }));
+  f.requests[0].resolve({ receipt: { submission_id: id, message_id: 12, state: 'queued' },
+    state: nativeStringState({ deliveries: [{ submission_id: id, message_id: 12, state: 'queued' }] }) });
+  await sending;
+  assert.match(f.element('nativeApprovals').innerHTML, /echo new-approval/);
+  assert.match(f.element('nativeReceipts').innerHTML, new RegExp(UI_TRANSLATIONS.en['native.delivery.completed']));
+  assert.equal(f.element('nativeDraft').value, '');
+  assert.equal(JSON.parse([...f.storage.values()][0]).pending, null);
+});
+
+test('native receipt reconciliation survives A-B-A before the new snapshot and preserves edits made after returning', async () => {
+  for (const edited of [false, true]) {
+    const f = fixture(nativePanelScript, 'native');
+    f.window.hccNative.render(nativeStringState()); f.fill('nativeDraft', 'submitted text');
+    const sending = f.click('nativeSend'), id = JSON.parse(f.requests[0].options.body).submissionId;
+    f.selection.active = 'b'; f.selection.session = { id: 'b', peer_id: 'peer-b', type: 'native' }; f.window.hccNative.sync();
+    f.selection.active = 'a'; f.selection.session = { id: 'a', peer_id: 'peer-a', type: 'native' }; f.window.hccNative.sync();
+    if (edited) f.fill('nativeDraft', 'edits made after returning');
+    f.requests[0].resolve({ receipt: { submission_id: id, message_id: 15, state: 'queued' }, state: nativeStringState() }); await sending;
+    const stored = JSON.parse(f.storage.get('hcc.nativeDraft:["/project-a","a"]'));
+    assert.equal(stored.pending, null);
+    assert.equal(stored.text, edited ? 'edits made after returning' : '');
+    assert.equal(f.element('nativeDraft').value, stored.text);
+    assert.equal(f.element('nativeReviewPending').hidden, true);
+    f.window.hccNative.render(nativeStringState({ deliveries: [{ submission_id: id, message_id: 15, state: 'completed' }] }));
+    if (!edited) f.fill('nativeDraft', 'next message');
+    assert.equal(f.element('nativeSend').disabled, false, 'a reconciled submission must not keep the next draft blocked');
+    assert.equal(JSON.parse(f.storage.get('hcc.nativeDraft:["/project-a","a"]')).pending, null, 'editing must not revive the old pending marker');
+  }
+});
+
+test('late native approval responses retain the next streamed request and bind the decision to the current lease', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('original')] }));
+  f.selection.actionToken = 'takeover-token'; f.selection.epoch = 7; f.window.hccNative.sync();
+  const responding = f.element('nativeApprovals').buttons[0].emit('click');
+  assert.deepEqual(JSON.parse(f.requests[0].options.body), { executorId: 'worker-a', sessionId: 'native-thread',
+    turnId: 'turn-live', requestId: 'original', decision: 'accept', action_token: 'takeover-token', epoch: 7 });
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('next-request')] }));
+  f.requests[0].resolve({ state: nativeStringState({ pendingApprovals: [] }) }); await responding;
+  assert.match(f.element('nativeApprovals').innerHTML, /echo next-request/);
+  assert.doesNotMatch(f.element('nativeApprovals').innerHTML, /echo original/);
+});
+
+test('a late send transport error does not mark an already acknowledged native delivery uncertain', async () => {
+  const f = fixture(nativePanelScript, 'native'); f.window.hccNative.render(nativeStringState()); f.fill('nativeDraft', 'send once');
+  const sending = f.click('nativeSend'), id = JSON.parse(f.requests[0].options.body).submissionId;
+  f.window.hccNative.render(nativeStringState({ deliveries: [{ submission_id: id, message_id: 13, state: 'completed' }] }));
+  f.requests[0].reject(new Error('late transport failure')); await sending;
+  assert.equal(JSON.parse([...f.storage.values()][0]).pending, null);
+  assert.equal(f.element('nativeDraft').value, '');
+  assert.doesNotMatch(f.element('nativeNotice').textContent, /late transport failure|unconfirmed|uncertain/i);
+});
+
+test('a resolved native request is not replaced by the error from its superseded response', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('original')] }));
+  const responding = f.element('nativeApprovals').buttons[0].emit('click');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('next-request')] }));
+  f.requests[0].reject(new Error('late old approval failure')); await responding;
+  assert.match(f.element('nativeApprovals').innerHTML, /echo next-request/);
+  assert.doesNotMatch(f.element('nativeNotice').textContent, /late old approval failure/);
+});
+
+test('a failed native response still reports its error while that exact request remains pending', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('original')] }));
+  const responding = f.element('nativeApprovals').buttons[0].emit('click');
+  f.window.hccNative.render(nativeStringState({ events: [{ id: 1, payload: { type: 'output', text: 'unrelated progress' } }], pendingApprovals: [approval('original')] }));
+  f.requests[0].reject(new Error('response was not admitted')); await responding;
+  assert.match(f.element('nativeNotice').textContent, /response was not admitted/);
+  assert.match(f.element('nativeApprovals').innerHTML, /echo original/);
+  assert.equal(f.element('nativeApprovals').buttons[0].disabled, false, 'the current controller can retry the still-pending request');
+});
+
+test('retrying a native response clears the previous error without replaying the request', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('original')] }));
+  const failed = f.element('nativeApprovals').buttons[0].emit('click');
+  f.requests[0].reject(new Error('Invalid value for MCP field: count')); await failed;
+  assert.match(f.element('nativeNotice').textContent, /Invalid value/);
+  assert.equal(f.requests.length, 1);
+  const retried = f.element('nativeApprovals').buttons[0].emit('click');
+  assert.equal(f.element('nativeNotice').textContent, '');
+  assert.equal(f.requests.length, 2);
+  assert.equal(JSON.parse(f.requests[1].options.body).requestId, 'original');
+  f.window.hccNative.render(nativeStringState({ status: 'idle', pendingApprovals: [],
+    events: [{ id: 1, payload: { type: 'completed', text: 'form completed' } }] }));
+  f.requests[1].resolve({ state: nativeStringState({ pendingApprovals: [approval('original')] }) }); await retried;
+  assert.equal(f.element('nativeNotice').textContent, '');
+  assert.equal(f.element('nativeApprovals').buttons.length, 0, 'late response must not revive a completed request');
+  assert.match(f.element('nativeEvents').innerHTML, /form completed/);
+  assert.equal(f.requests.length, 2, 'a completed request is never automatically retried');
+});
+
+test('native preference redraws keep valid send and response snapshots eligible', async () => {
+  for (const operation of ['send', 'respond']) {
+    const f = fixture(nativePanelScript, 'native');
+    f.window.hccNative.render(nativeStringState({ pendingApprovals: operation === 'respond' ? [approval('original')] : [] }));
+    if (operation === 'send') f.fill('nativeDraft', 'send once');
+    const pending = operation === 'send' ? f.click('nativeSend') : f.element('nativeApprovals').buttons[0].emit('click');
+    f.window.hccUi.language = 'zh'; f.listeners.get('hcc:preferences')();
+    const submitted = JSON.parse(f.requests[0].options.body);
+    f.requests[0].resolve({ receipt: { submission_id: submitted.submissionId, message_id: 14 },
+      state: nativeStringState({ pendingApprovals: [approval('fresh-response')] }) });
+    await pending;
+    assert.match(f.element('nativeApprovals').innerHTML, /echo fresh-response/, operation + ' response was wrongly ignored after a local redraw');
+  }
+});

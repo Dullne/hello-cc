@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "startedAt": "2026-10-02T12:36:01.970Z",
+  "completedAt": "2026-10-02T12:36:56.907Z",
+  "scope": "isolated real authenticated native runtime and shared HCC bus",
+  "node": "v24.19.0",
+  "authenticatedCalls": true,
+  "isolatedTestProject": true,
+  "authentication": "caller provider route, private temporary provider state",
+  "providers": {
+    "codex": {
+      "status": "passed",
+      "version": "codex-cli 0.144.6",
+      "prompts": 3,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "steer": true,
+        "interrupt": true,
+        "close": true,
+        "fork": false,
+        "approvals": true,
+        "userInput": true,
+        "mcp": true
+      },
+      "sessionId": "01a0fc9d-5da7-7652-b4c4-b4a749e9cd84",
+      "lifecycleChecks": "not exercised"
+    },
+    "claude": {
+      "status": "passed",
+      "sdk": {
+        "version": "0.3.287",
+        "entrySha256": "21fbc4b359e517a370524dd6e25c40c5eab40368eb122491530ac4233021925d",
+        "dependencyResolution": "explicit external SDK entry injection",
+        "executableSource": "SDK default bundled CLI"
+      },
+      "prompts": 3,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "interrupt": true,
+        "close": true,
+        "steer": false,
+        "fork": false,
+        "approvals": true,
+        "mcp": true
+      },
+      "sessionId": null,
+      "lifecycleChecks": "not exercised"
+    },
+    "dsh": {
+      "status": "passed",
+      "version": "0.2.0-rc.2",
+      "prompts": 3,
+      "capabilities": {
+        "create": true,
+        "resume": true,
+        "send": true,
+        "observe": true,
+        "steer": false,
+        "interrupt": true,
+        "close": true,
+        "fork": false,
+        "approvals": true,
+        "mcp": true
+      },
+      "sessionId": "b98981a4-7de7-43fe-ba0a-d845ad3858fa",
+      "lifecycleChecks": "not exercised"
+    }
+  },
+  "checks": [
+    {
+      "name": "Web: discovers real native workers and preserves their provider binding",
+      "passed": true
+    },
+    {
+      "name": "codex -> claude: actual scoped MCP send, model reply, reply consumption, no loop",
+      "passed": true,
+      "requestId": 2,
+      "replyId": 3
+    },
+    {
+      "name": "claude -> dsh: actual scoped MCP send, model reply, reply consumption, no loop",
+      "passed": true,
+      "requestId": 6,
+      "replyId": 8
+    },
+    {
+      "name": "dsh -> codex: actual scoped MCP send, model reply, reply consumption, no loop",
+      "passed": true,
+      "requestId": 10,
+      "replyId": 12
+    },
+    {
+      "name": "Web: closing the bridge preserves live native workers",
+      "passed": true
+    }
+  ],
+  "communications": {
+    "status": "passed",
+    "pairs": [
+      {
+        "fromProvider": "codex",
+        "toProvider": "claude",
+        "sentByModel": true,
+        "requestId": 2,
+        "replyId": 3,
+        "replyConsumed": true,
+        "noReplyLoop": true
+      },
+      {
+        "fromProvider": "claude",
+        "toProvider": "dsh",
+        "sentByModel": true,
+        "requestId": 6,
+        "replyId": 8,
+        "replyConsumed": true,
+        "noReplyLoop": true
+      },
+      {
+        "fromProvider": "dsh",
+        "toProvider": "codex",
+        "sentByModel": true,
+        "requestId": 10,
+        "replyId": 12,
+        "replyConsumed": true,
+        "noReplyLoop": true
+      }
+    ],
+    "mcpApprovalProtocolObserved": "mcpServer/elicitation/request",
+    "mcpApprovalResponse": {
+      "action": "accept",
+      "content": {}
+    },
+    "approvalPersistenceGranted": false
+  },
+  "sourceFiles": {
+    "lib/integrations/codex-interactions.mjs": "609f3bae0aa3adf19d128d7537ddb34644e0ca5653c94c7b31a5eb36a74988e4",
+    "lib/integrations/native/claude.mjs": "d62d106d8125a31662c40123d6f255433e6957e3deab182af5ab89252c915df5",
+    "lib/integrations/native/codex.mjs": "527b725991900f2bdd7c5e555a2e45f7f090a2a56fe70aae59248bfb0e8fca4d",
+    "lib/integrations/native/dsh-acp.mjs": "6b60cd8c1ccc4fb205fc58bceaf22e65ba3ba5f86d54e74d67ce6dad1f0bf2df",
+    "lib/integrations/native/index.mjs": "ae6726349ff1a55ffcd1a926e5a5459373a76e2545f622e0b4fbfd641e0f1cc5",
+    "lib/integrations/native/interactions.mjs": "0ceda44c5a6711673a9e5fc1d96c9778bf56d9ccf8a63f1437191ea9e251e0ea",
+    "lib/integrations/native/jsonrpc.mjs": "42d9cc5d8f992c8726a3861cf7fcdedc58925615616a3bed1a71d499b819a8b4",
+    "lib/mcp/scope.mjs": "71f4ade7705d3db6a493340f4321cb447584e10ccb05ee3d86edbf50f28542ca",
+    "lib/mcp/stdio.mjs": "b473796486c15e9d55cbc67b8ca6bdd21dbce989fbbcd548ee9c0143d02ebb35",
+    "lib/mcp/tools.mjs": "56913d1a2c5857aeca638e56a8aa3da2c1ed116abe7d58c40ec2e1f80a2b2c06",
+    "lib/process/identity.mjs": "64e9b802005883a51668fb0f45df5a38167d0eec1c08cb2de6faee2bbbd29431",
+    "lib/runtime/native/client.mjs": "592bd0ca2d40bc0bd52544fd2f173f620ee5fc4f9a92d30c9b37aa3be8946a9e",
+    "lib/runtime/native/service.mjs": "b4ba6945197c610701f3387adf1ccbc5dc09e2328dd3be9f6bc0b9f29f48a2ea",
+    "lib/runtime/native/store.mjs": "b0dd9a5285b2746a2a0c661ca04dd7f8fa94ffc316e1347406ad90a11f836af1",
+    "lib/web/codex-app-server.mjs": "409dad5f7100b8026a2f556f6c4dad53cb9c4d29fff510fe16b3db43d1ad2203",
+    "lib/web/native-sessions.mjs": "5f21d5c984913857c67df5e42b5c33e7e5171b4f0f5646ea4e79134531ad0963"
+  },
+  "sourceUnchangedDuringRun": true,
+  "fullSourceManifestSha256": "11b57bfda31c42b6857dabdef3356dfcde7852120c1b8a1f4ff8b2e31ec822b9",
+  "cleanup": {
+    "runtimeStopped": true,
+    "temporaryCredentialsRemoved": true
+  },
+  "limitations": [
+    "The acceptance harness calls the same native service/adapters with an isolated environment factory; this does not prove CLI default dependency resolution or packaged distribution.",
+    "No existing TUI/Desktop session, published build or business task acceptance was exercised.",
+    "Real command/file approval denial was not exercised in this communication-only run; Codex MCP tool confirmation was exercised once without persistent authorization. The independent lifecycle receipt covers command approval denial."
+  ],
+  "provenance": {
+    "harness": "scripts/native-live-acceptance.mjs",
+    "environmentFactoryInjected": true,
+    "repositoryDefaultClaudeSdkResolutionVerified": false,
+    "publishedPackageVerified": false,
+    "fullBrowserUiVerified": false,
+    "scopeClarification": "Permission scope wording distinguishes the observed MCP confirmation from the separate command/file denial probe; measured checks and source snapshots are unchanged."
+  }
+}

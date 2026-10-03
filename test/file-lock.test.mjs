@@ -197,6 +197,7 @@ test('registry update callback uses only its locked canonical path', () => {
 test('same root with a different resolved DB updates inside the throttle window', async (t) => {
   const root = sandbox(t);
   const home = path.join(root, 'home');
+  fs.mkdirSync(home, { mode: 0o700 });
   const projectRoot = path.join(root, 'project');
   fs.mkdirSync(projectRoot, { recursive: true });
   const savedHome = process.env.HOME;
@@ -368,6 +369,7 @@ test('project activity throttles repeated root and DB writes but tries a DB chan
 test('real root and symlink alias share one canonical record and DB changes bypass throttling', async (t) => {
   const root = sandbox(t);
   const home = path.join(root, 'home');
+  fs.mkdirSync(home, { mode: 0o700 });
   const projectRoot = path.join(root, 'project');
   const projectAlias = path.join(root, 'project-alias');
   fs.mkdirSync(projectRoot, { recursive: true });
@@ -441,6 +443,7 @@ test('read canonicalizes and deduplicates stored real-root and symlink-alias rec
 test('canonical dedupe keeps the newest valid record independent of input order', async (t) => {
   const root = sandbox(t);
   const home = path.join(root, 'home');
+  fs.mkdirSync(home, { mode: 0o700 });
   const projectRoot = path.join(root, 'project');
   const aliasA = path.join(root, 'alias-a');
   const aliasB = path.join(root, 'alias-b');
@@ -476,6 +479,7 @@ test('canonical dedupe keeps the newest valid record independent of input order'
 test('canonical dedupe has an order-independent deterministic tie break', async (t) => {
   const root = sandbox(t);
   const home = path.join(root, 'home');
+  fs.mkdirSync(home, { mode: 0o700 });
   const projectRoot = path.join(root, 'project');
   const aliasA = path.join(root, 'alias-a');
   const aliasB = path.join(root, 'alias-b');
@@ -694,6 +698,7 @@ test('rejects a root whose filesystem identity changes during canonicalization',
 test('keeps distinct lexical fallbacks for missing legacy roots', async (t) => {
   const root = sandbox(t);
   const home = path.join(root, 'home');
+  fs.mkdirSync(home, { mode: 0o700 });
   const missingA = path.join(root, 'missing', 'a');
   const missingB = path.join(root, 'missing', 'b');
   const savedHome = process.env.HOME;

@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-02",
+  "implementation": "HCC-owned native workers over provider-specific adapters with shared mesh bus",
+  "delivery": "local workspace implementation; not committed or published",
+  "runtime": "Node.js 24.19.0 on macOS",
+  "native_tests": {
+    "tests": 103,
+    "pass": 103,
+    "fail": 0,
+    "skipped": 0
+  },
+  "workspace_unit_tests": {
+    "tests": 650,
+    "pass": 649,
+    "fail": 0,
+    "skipped": 1
+  },
+  "unit_skip_reason": "Linux proc pseudo-file case is not applicable on macOS",
+  "regression": {
+    "result": "passed",
+    "stages": 13,
+    "marker": "FULL_REGRESSION_OK"
+  },
+  "factory_audit": {
+    "result": "passed",
+    "modules": 55,
+    "free_identifiers": 0
+  },
+  "diff_whitespace_check": "passed",
+  "provider_evidence": [
+    {
+      "provider": "codex",
+      "version": "0.144.6",
+      "receipt": "2026-10-02-native-codex-protocol.json",
+      "scope": "isolated protocol initialize/thread start/owned close; no prompt"
+    },
+    {
+      "provider": "dsh",
+      "version": "0.2.0-rc.2",
+      "receipt": "2026-10-02-native-dsh-protocol.json",
+      "scope": "isolated ACP initialize/new/cancel notification/close; no prompt"
+    },
+    {
+      "provider": "claude",
+      "version": "agent-sdk 0.3.287",
+      "receipt": "2026-10-02-native-claude-sdk.json",
+      "scope": "official SDK import and API contract, lazy adapter open/close; no provider query or handshake"
+    }
+  ],
+  "model_prompts_sent": 0,
+  "unverified": [
+    "real model tasks and replies",
+    "real provider resume and active-turn interruption",
+    "real provider permission request handling"
+  ],
+  "not_implemented": [
+    "attach existing TUI/Desktop sessions",
+    "native worker chat in Web UI",
+    "cross-provider access to private agent mailbox/SendMessage tools",
+    "interactive approval responder"
+  ],
+  "source_sha256": {
+    "lib/cli/commands/native.mjs": "95864e1592e091da3b487246a15c0f9515f85aa8faea91ad4eb6ad1ce3c89472",
+    "lib/integrations/native/claude.mjs": "322a531fa6099a3b3d923f867af16512ea6d3d6ddb147ac91808489d985ed02a",
+    "lib/integrations/native/codex.mjs": "ef491005c407e58158d21543d93e680688b6afe7a1c6a90236b622fcd1531158",
+    "lib/integrations/native/dsh-acp.mjs": "f609ae6733cbb44f34cc92dd39f2f1e900a8ad3d31ce9ed1974951534e096267",
+    "lib/integrations/native/index.mjs": "ae6726349ff1a55ffcd1a926e5a5459373a76e2545f622e0b4fbfd641e0f1cc5",
+    "lib/integrations/native/jsonrpc.mjs": "56b1c9d0854e34e55defc5be7e7294fe15db40054dd93f0c8f120db3338a28e2",
+    "lib/runtime/native/client.mjs": "592bd0ca2d40bc0bd52544fd2f173f620ee5fc4f9a92d30c9b37aa3be8946a9e",
+    "lib/runtime/native/service.mjs": "21c13aa51b8ce679c0addbc731a27a260f5212eec92dec69faf3768e25a9ecaa",
+    "lib/runtime/native/store.mjs": "b0dd9a5285b2746a2a0c661ca04dd7f8fa94ffc316e1347406ad90a11f836af1"
+  }
+}

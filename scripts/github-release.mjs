@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { packageRoot, readPackageJson } from '../lib/release/package-meta.mjs';
 import {
+  isPrereleaseVersion,
   normalizeVersion,
   releaseSection,
   repoFromPackage,
@@ -106,7 +107,7 @@ async function main() {
     name: tag,
     body,
     draft: false,
-    prerelease: false
+    prerelease: isPrereleaseVersion(version)
   };
 
   if (opts.dryRun) {
@@ -116,6 +117,7 @@ async function main() {
       repo,
       tag,
       name: payload.name,
+      prerelease: payload.prerelease,
       body_length: body.length,
       body_preview: body.split(/\r?\n/).slice(0, 8).join('\n')
     }, null, 2));
