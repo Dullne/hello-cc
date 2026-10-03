@@ -60,9 +60,40 @@ jobs:
         run: npm run release:check
 
       - name: Regression test
+        id: regression
         run: |
           set -o pipefail
           npm test 2>&1 | tee "$RUNNER_TEMP/hcc-regression.log"
+
+      - name: Annotate failed Node tests
+        if: failure() && steps.regression.outcome == 'failure'
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const log = path.join(process.env.RUNNER_TEMP, 'hcc-regression.log');
+          const escape = value => value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+          let summary = 'npm test failed; inspect the uploaded regression log for details.';
+          if (fs.existsSync(log)) {
+            const file = fs.openSync(log, 'r');
+            try {
+              const size = fs.fstatSync(file).size;
+              const bytes = Buffer.alloc(Math.min(size, 256 * 1024));
+              fs.readSync(file, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
+              const lines = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
+              // Publish only test names, source locations and result counts;
+              // raw error objects, command arguments and environment stay out.
+              const selected = lines.filter(line =>
+                (/^\s*(?:✖|not ok\s+\d+(?:\s+-)?)(?:\s|$)/.test(line) && !/failing tests:/.test(line)) ||
+                /^test at test\/[A-Za-z0-9_./-]+:\d+:\d+$/.test(line) ||
+                /^(?:#|ℹ) (?:tests|pass|fail|cancelled|skipped|todo|duration_ms) \d/.test(line)
+              ).map(line => line.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 350));
+              const details = [...new Set(selected)].slice(-24).join('\n').slice(0, 6000);
+              if (details) summary += '\n' + details;
+            } finally { fs.closeSync(file); }
+          }
+          process.stdout.write('::error title=Regression test failure::' + escape(summary) + '\n');
+          NODE
 
       - name: Verify isolated different-UID filesystem behavior on Linux
         if: runner.os == 'Linux'

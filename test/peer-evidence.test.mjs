@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -874,13 +875,30 @@ test('tmux binding GC final section blocks a concurrent writer through commit', 
   }
 });
 
+async function isolatedReplacementTmux(t) {
+  const { runTmux: run } = await import('../lib/tmux.mjs');
+  const socket = `hcc-peer-evidence-${process.pid}-${randomUUID()}`;
+  const runTmux = (args, options) => run(['-L', socket, '-f', '/dev/null', ...args], options);
+  t.after(() => { try { runTmux(['kill-server']); } catch {} });
+  // Replacing the only session otherwise races the server's last-session
+  // shutdown. Keep this private server alive through the identity comparison.
+  runTmux(['new-session', '-d', '-s', 'keeper', 'sleep', '120']);
+  return {
+    runTmux,
+    tmuxHasSession(session) {
+      try { runTmux(['has-session', '-t', session]); return true; }
+      catch { return false; }
+    }
+  };
+}
+
 test('conditional tmux kill leaves a replacement created after prevalidation alive', async (t) => {
   if (spawnSync('tmux', ['-V'], { stdio: 'ignore' }).status !== 0) {
     t.skip('tmux unavailable');
     return;
   }
   const tmuxSafety = await import('../lib/core/peers/tmux-safety.mjs');
-  const { runTmux } = await import('../lib/tmux.mjs');
+  const { runTmux } = await isolatedReplacementTmux(t);
   assert.equal(typeof tmuxSafety.conditionalTmuxKill, 'function');
   const session = `hcc-conditional-test-${process.pid}`;
   try {
@@ -899,6 +917,7 @@ test('conditional tmux kill leaves a replacement created after prevalidation ali
       beforeConditional: () => {
         runTmux(['kill-session', '-t', session]);
         runTmux(['new-session', '-d', '-s', session, 'sleep', '120']);
+        assert.notEqual(runTmux(['display-message', '-p', '-t', session, '#{session_id}']).trim(), stored.session_id);
       }
     }), (error) => error?.code === 'TMUX_CONDITIONAL_KILL_MISMATCH');
     assert.equal(runTmux(['has-session', '-t', session]), '');
@@ -913,7 +932,7 @@ test('conditional tmux rename leaves a replacement created after prevalidation u
     return;
   }
   const tmuxSafety = await import('../lib/core/peers/tmux-safety.mjs');
-  const { runTmux, tmuxHasSession } = await import('../lib/tmux.mjs');
+  const { runTmux, tmuxHasSession } = await isolatedReplacementTmux(t);
   const session = `hcc-conditional-rename-${process.pid}`;
   const parked = `${session}-old`;
   try {
@@ -933,6 +952,7 @@ test('conditional tmux rename leaves a replacement created after prevalidation u
       beforeConditional: () => {
         runTmux(['kill-session', '-t', session]);
         runTmux(['new-session', '-d', '-s', session, 'sleep', '120']);
+        assert.notEqual(runTmux(['display-message', '-p', '-t', session, '#{session_id}']).trim(), stored.session_id);
       }
     }), (error) => error?.code === 'TMUX_CONDITIONAL_RENAME_MISMATCH');
     assert.equal(tmuxHasSession(session), true);

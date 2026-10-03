@@ -171,6 +171,29 @@ try {
   page.on('pageerror', error => evidence.pageErrors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') evidence.consoleErrors.push(message.text()); });
   await page.goto('http://127.0.0.1:' + port + '/?token=' + env.HCC_WEB_TOKEN);
+  await page.waitForFunction(() => Boolean(window.hccNative?.render));
+  await page.evaluate(() => {
+    const original = window.hccNative.render;
+    const observations = window.__hccNativeAcceptanceObservations = [];
+    // Observe the public WebSocket/bridge render entry without changing its
+    // arguments, return value or errors. Lexical HTTP read/render calls are not
+    // covered; failure diagnostics label their separate explicit GET below.
+    window.hccNative.render = function (value) {
+      try { return original.apply(this, arguments); }
+      finally {
+        try {
+          const bridge = window.hccHandoff, requests = value?.pendingApprovals || [];
+          observations.push({ source: 'public-render', at: Date.now(), active: bridge?.active,
+            connected: Boolean(value?.connected), status: value?.status || null, errorCode: value?.error?.code || null,
+            hasSessionId: Boolean(value?.sessionId), hasOwner: Boolean(value?.owner), hasGeneration: Boolean(value?.generation),
+            peerMatchesActive: value?.peer === bridge?.session?.peer_id || value?.peer === bridge?.active,
+            ownerMatchesExecutor: Boolean(value?.owner && value.owner === bridge?.session?.executor_id),
+            pendingCount: requests.length, pendingKinds: [...new Set(requests.map(request => request.kind))] });
+          if (observations.length > 40) observations.shift();
+        } catch { /* Diagnostics cannot affect the original render. */ }
+      }
+    };
+  });
   async function state(peer) { return api('GET', '/workers/' + peer + '/state'); }
   async function finish(peer, submission) {
     return until(async () => {
@@ -298,8 +321,33 @@ try {
 } catch (error) {
   evidence.error = error.message; process.exitCode = 1; console.error('REAL_INTERACTION_ACCEPTANCE_FAILED: ' + error.message);
   if (browser) for (const context of browser.contexts()) for (const page of context.pages()) {
-    try { evidence.failureView = await page.evaluate(() => ({ active: window.hccHandoff?.active, canControl: window.hccHandoff?.canControl, sessions: window.hccHandoff?.sessions?.map(value => ({ id: value.id, type: value.type, status: value.status })), notice: document.getElementById('nativeNotice')?.textContent, handoff: document.getElementById('handoffController')?.textContent }));
+    try { evidence.failureView = await page.evaluate(() => ({ active: window.hccHandoff?.active, canControl: window.hccHandoff?.canControl, sessions: window.hccHandoff?.sessions?.map(value => ({ id: value.id, type: value.type, status: value.status })), notice: document.getElementById('nativeNotice')?.textContent, handoff: document.getElementById('handoffController')?.textContent,
+        nativeStatusBeforeDiagnosticRead: document.getElementById('nativeStatus')?.textContent,
+        approvalCardsBeforeDiagnosticRead: document.querySelectorAll('#nativeApprovals .codex-approval').length,
+        nativeObservations: window.__hccNativeAcceptanceObservations || [] }));
       const file = path.join(directory, 'failure.png'); await page.screenshot({ path: file }); evidence.screenshots.push(file);
+      const peer = evidence.failureView.active;
+      if (providers.some(provider => peer === 'live-' + provider)) {
+        try {
+          const native = await api('GET', '/workers/' + encodeURIComponent(peer) + '/state');
+          const requests = native.snapshot?.pendingApprovals || [];
+          evidence.failureNativeBackend = { source: 'native-service-read-after-failure', status: native.snapshot?.status,
+            hasSessionId: Boolean(native.snapshot?.sessionId), hasOwner: Boolean(native.owner), hasGeneration: Boolean(native.generation),
+            pendingCount: requests.length, pendingKinds: [...new Set(requests.map(request => request.kind))] };
+          evidence.failureWebRead = await page.evaluate(async expected => {
+            try {
+              const bridge = window.hccHandoff;
+              const response = await bridge.api('/api/sessions/' + encodeURIComponent(bridge.active) + '/native/state?root=' + encodeURIComponent(bridge.projectRoot));
+              const state = response.state || response, requests = state.pendingApprovals || [];
+              return { source: 'explicit-web-read-after-failure-may-refresh-state', connected: Boolean(state.connected),
+                status: state.status || null, errorCode: state.error?.code || null, hasSessionId: Boolean(state.sessionId),
+                ownerMatchesNative: state.owner === expected.owner, generationMatchesNative: state.generation === expected.generation,
+                sessionMatchesNative: state.sessionId === expected.sessionId,
+                pendingCount: requests.length, pendingKinds: [...new Set(requests.map(request => request.kind))] };
+            } catch (error) { return { source: 'explicit-web-read-after-failure-may-refresh-state', errorCode: error.code || null }; }
+          }, { owner: native.owner, generation: native.generation, sessionId: native.snapshot?.sessionId });
+        } catch (error) { evidence.failureNativeBackend = { errorCode: error.code || null }; }
+      }
     } catch {}
   }
 } finally {

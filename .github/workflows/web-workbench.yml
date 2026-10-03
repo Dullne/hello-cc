@@ -13,8 +13,6 @@ jobs:
   browser-and-installed-package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      HCC_WEB_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/hcc-web-workbench
     steps:
       - uses: actions/checkout@v5
         with:
@@ -23,6 +21,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Set acceptance output directory
+        run: echo "HCC_WEB_ACCEPTANCE_OUTPUT=$RUNNER_TEMP/hcc-web-workbench" >> "$GITHUB_ENV"
       - name: Install tmux
         run: |
           sudo apt-get update

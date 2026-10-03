@@ -126,6 +126,30 @@ jobs:
           process.exitCode = result.status ?? 1;
           NODE
 
+      - name: Report bounded installation failure details
+        if: failure()
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { redactSecrets } from './lib/shared/redact.mjs';
+          const evidence = path.join(process.env.HCC_DSH_ACCEPTANCE_ROOT, 'evidence');
+          const receiptFile = path.join(evidence, 'installed', 'dsh-installed-receipt.json');
+          if (fs.existsSync(receiptFile)) {
+            const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+            const text = JSON.stringify(redactSecrets({ failure: receipt.failure, completedChecks: receipt.checks?.length })).slice(-6000);
+            console.log('::error title=Installed Harness failure::' + text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A'));
+          }
+          for (const name of ['official-install.log', 'installed-acceptance.log']) {
+            const file = path.join(evidence, name);
+            if (!fs.existsSync(file)) continue;
+            const text = redactSecrets(fs.readFileSync(file, 'utf8').split('\n').slice(-60).join('\n')).slice(-6000);
+            const escaped = text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+            console.log(`::error title=${name}::${escaped}`);
+          }
+          NODE
+
       - name: Record workflow outcome
         if: always()
         shell: bash
