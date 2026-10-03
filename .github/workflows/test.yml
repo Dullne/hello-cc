@@ -48,6 +48,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Create a private home for runtime tests
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const home = fs.mkdtempSync('/tmp/hcc-test-home-');
+          fs.chmodSync(home, 0o700);
+          fs.appendFileSync(process.env.GITHUB_ENV, 'HCC_TEST_HOME=' + fs.realpathSync(home) + '\n');
+          NODE
+
       - name: Verify install and PTY contract
         run: |
           node --test test/release-contract.test.mjs
@@ -63,7 +72,7 @@ jobs:
         id: regression
         run: |
           set -o pipefail
-          npm test 2>&1 | tee "$RUNNER_TEMP/hcc-regression.log"
+          HOME="$HCC_TEST_HOME" npm test 2>&1 | tee "$RUNNER_TEMP/hcc-regression.log"
 
       - name: Annotate failed Node tests
         if: failure() && steps.regression.outcome == 'failure'

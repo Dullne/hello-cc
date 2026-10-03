@@ -42,7 +42,16 @@ jobs:
     steps:
       - name: Set isolated acceptance directory
         shell: bash
-        run: echo "HCC_DSH_ACCEPTANCE_ROOT=$RUNNER_TEMP/hcc-dsh-acceptance" >> "$GITHUB_ENV"
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          // Runner work directories can have ancestry owned by a different
+          // service UID. Keep private HOME/bootstrap state under sticky /tmp.
+          const directory = fs.mkdtempSync('/tmp/hcc-dsh-acceptance-');
+          fs.chmodSync(directory, 0o700);
+          const root = fs.realpathSync(directory);
+          fs.appendFileSync(process.env.GITHUB_ENV, `HCC_DSH_ACCEPTANCE_ROOT=${root}\n`);
+          NODE
 
       - name: Checkout selected revision
         uses: actions/checkout@v5
@@ -183,6 +192,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dsh-acceptance-${{ steps.package.outputs.mode || 'unprepared' }}-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hcc-dsh-acceptance/evidence/
+          path: ${{ env.HCC_DSH_ACCEPTANCE_ROOT }}/evidence/
           if-no-files-found: error
           retention-days: 14
