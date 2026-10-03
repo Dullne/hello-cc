@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
-const currentRelease = '1.0.1';
+const currentRelease = '1.0.2';
 const nodePtyVersion = '1.2.0-beta.15';
 
 const englishDocs = ['README.md', 'docs/README.md', 'docs/commands.md', 'docs/guide.md'];

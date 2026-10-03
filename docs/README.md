@@ -17,6 +17,10 @@ authenticated selection of any existing server directory are accepted risks.
   workflow, stable peer identity, and environment behavior.
 - [Command Reference](commands.md): compact list of public commands and the
   intended use of each command group.
+- [DeepSeek Harness](dsh.md): project setup, hooks/Cordis collaboration, ACP workers,
+  installable bundles, and session routing boundaries.
+- [Native Workers](native.md): owned background workers, provider adapters,
+  delivery receipts, permission handling, and resume boundaries.
 - [Changelog](../CHANGELOG.md): release notes for published versions.
 - Release notes: run `npm run release:check` and
   `npm run release:github:dry-run` before publishing. Pushing a `v*` tag runs
@@ -26,6 +30,11 @@ authenticated selection of any existing server directory are accepted risks.
 
 ## Design And Implementation
 
+- DeepSeek Harness integration plan (Chinese) (source checkout: `docs/plans/2026-10-02-dsh-integration.md`): implementation stages, module contracts, and completion gates.
+- DeepSeek Harness acceptance (Chinese) (source checkout: `docs/verification/2026-10-02-dsh-cordis-native.md`): real models, bundle loading, regression and browser evidence.
+
+- [Web task handoff (Chinese)](web-handoff.zh-CN.md): browser control, draft recovery, persistent detachment, and opt-in Codex App Server sessions.
+- [Executor-scoped MCP](mcp.md): project-bound coordination tools, ownership checks and local result evidence.
 - [Design Notes](design.md): product boundary, project boundary, capability
   levels, coordination semantics, and provider-session binding.
 - [Implementation Notes](implementation.md): architecture, protocol, command

@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - master
+      - codex/dsh-stable-source
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   regression:
@@ -20,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v5

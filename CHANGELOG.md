@@ -16,6 +16,111 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.0.2
+
+### Summary
+
+DeepSeek Harness now joins hello-cc through project hooks, a Cordis collaboration
+bundle, and owned ACP workers. This release promotes the runtime verified in
+`1.0.2-dsh.3` to the normal npm `latest` channel. Runtime code is unchanged from
+that candidate; version metadata and release documentation identify this release.
+
+### Highlights
+
+- Harness Agents use their exact session and project identity for task, message,
+  lock, result, and handoff operations. Context acknowledgements follow committed
+  model input, and permission decisions retain the Harness policy chain.
+- Owned ACP workers support queued prompts, scoped MCP tools, approvals,
+  interruption, session resume, and shutdown through the CLI and Web interface.
+- Managed project configuration migrates verified paths from source checkouts to
+  installed packages while preserving user edits.
+- Cordis sessions recover after a verified owner process exits; transient
+  database failures during retirement remain retryable while old tool authority
+  is revoked immediately.
+- Node.js 24+ and official Harness `0.2.0-rc.2` are required. Supported hosts are
+  macOS and Linux; Windows uses WSL. Native Windows shells are not supported.
+
+### Validation
+
+The byte-identical preview runtime passed macOS real-model installation checks
+(11), Linux container installation and deterministic collaboration checks (8 + 7),
+and frozen-package recovery tests (17). Its registry download and all 216
+installed files matched the candidate. This stable package receives independent
+release, installation, and registry readback checks. Other-device and genuine
+business acceptance remain separate stages.
+
+## 1.0.2-dsh.3
+
+### Summary
+
+This preview keeps the DeepSeek Harness integration introduced in `1.0.2-dsh.2`
+and fixes session cleanup when a temporary database failure interrupts shutdown.
+It remains an npm `dsh` preview and a GitHub prerelease.
+
+### Highlights
+
+- Revoking a Cordis Agent immediately blocks its tools while allowing database
+  retirement to retry after storage becomes available again.
+- Preserve failed cleanup records across plugin reloads. Recovery requires the
+  exact disposed Agent, provider session, and project; active owners cannot be
+  replaced based on another Agent's disposal event.
+- Retain the pinned Harness `0.2.0-rc.2`, Node.js 24+, and Linux/macOS/WSL support
+  boundaries. Every candidate has independent package and acceptance receipts.
+
+## 1.0.2-dsh.2
+
+### Summary
+
+This preview integrates DeepSeek Harness sessions with the hello-cc task,
+message, lock, and handoff services. It adds project hooks, an installed Cordis
+bundle, and owned ACP workers, including session recovery and explicit approval
+handling. The preview is intended for the `dsh` npm dist-tag and a GitHub
+prerelease; publication and business acceptance are separate delivery gates.
+
+### Highlights
+
+- `hcc dsh setup`, `status`, and `web` manage project hooks or a Cordis overlay.
+  Setup verifies its managed files before migrating paths from a source checkout
+  to an installed package and preserves user-edited configuration.
+- The Cordis bundle exposes collaboration tools using each Agent's complete
+  provider session ID and project root. Inbox acknowledgements follow the
+  committed model context; simultaneous sessions retain separate ownership.
+- A resumed Cordis session can reclaim ownership after a crashed owner only
+  when complete process identity evidence confirms that owner is dead. Live or
+  uncertain owners, competing transports, and changed bindings remain protected.
+- Native ACP workers use a dedicated `dsh --profile acp` process with scoped MCP
+  tools. Queue admission and completed delivery are distinct; close, resume,
+  interruption, and approval responses retain the owning session boundary.
+- ACP approval requests correlate tool-call IDs with their tool input, including
+  out-of-order updates. Requests with missing or truncated context cannot be
+  accepted; rejection remains available.
+- Release tooling derives GitHub prerelease status from the version and exposes
+  it during dry runs, so preview releases do not receive stable release status.
+
+### Compatibility Notes
+
+- Node.js 24 or newer and matching DeepSeek Harness `0.2.0-rc.2` runtime packages
+  are required. The Cordis integration checks the actual Agent, AgentLoop, Tools,
+  and Sessions package versions before loading.
+- Supported host environments are Linux and macOS; Windows users must use WSL.
+  Native Windows shells are not supported. The existing macOS arm64 acceptance
+  results do not establish Linux, WSL, or other-device acceptance for this preview.
+- Choose one injection method per Harness process: profile bundle or project
+  overlay. Harness manages profile bundle installation; `setup --mode off`
+  disables a managed project overlay.
+- Existing schema v7 and Runtime API v2 boundaries still apply. Real model
+  acceptance requires a provider route that permits Harness; a route restricted
+  to an official client remains restricted.
+
+### Validation
+
+Earlier local macOS arm64 candidates completed official plugin installation and
+removal, real Cordis collaboration calls, ACP session lifecycle and approval
+denial, and an isolated order-report workflow. Those dated receipts belong to
+their recorded candidate hashes. This version requires its own frozen-package
+installation receipt and release checks before publication. Other-device
+installation and genuine business signoff remain separate, incomplete gates.
+
 ## 1.0.1
 
 ### Summary

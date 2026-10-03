@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { intOpt, positiveSafeIntOpt } from '../lib/cli-args.mjs';
+import { intOpt, positiveSafeIntOpt, splitGlobalArgs } from '../lib/cli-args.mjs';
+
+test('global options never consume provider arguments after the forwarding boundary', () => {
+  const args = ['--root', '/project', 'dsh', 'web', '--', '--json', '--root=/provider', '--db', 'provider.db', '--port', '3081'];
+  assert.deepEqual(splitGlobalArgs(args), {
+    global: { json: false, root: '/project', db: null },
+    rest: ['dsh', 'web', '--', '--json', '--root=/provider', '--db', 'provider.db', '--port', '3081']
+  });
+  assert.deepEqual(splitGlobalArgs(['run', '--json', '--peer', 'p', '--', 'node', '--json']), {
+    global: { json: true, root: null, db: null },
+    rest: ['run', '--peer', 'p', '--', 'node', '--json']
+  });
+});
 
 test('integer options accept only exact safe integer values', () => {
   assert.equal(intOpt({ value: '12' }, 'value'), 12);

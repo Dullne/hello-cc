@@ -21,6 +21,24 @@ hcc uninstall [--purge --yes]
 hooks, shims, and the shell PATH entry; add `--purge --yes` only when you also want to remove the
 current project's `.hello-cc` data and guidance blocks.
 
+## Read-only Diagnostics
+
+```text
+hcc doctor [--codex] [--json]
+```
+
+By default, doctor only checks project database integrity and schema compatibility;
+corruption or an unsupported schema returns a nonzero exit code. `--codex` additionally
+runs bounded `codex --version` and `codex app-server --help` probes in temporary
+HOME/CODEX_HOME directories and removes their startup files. Hook checks read the
+original Codex home's `hooks.json` and existing project hook invocation events. Help
+advertises startup arguments; it does not prove a protocol handshake or model availability.
+Hook configuration, historical invocation, stdout delivery, and provider acceptance
+are separate facts. No explicit stdout receipt is recorded, so delivery, acceptance,
+and trust remain `unknown`. Diagnostics never start a model/session, execute hooks, or
+change accounts, trust, or shims. Unknown optional diagnostics do not fail a healthy
+database. JSON adds `data.codex`; the default report remains unchanged.
+
 ## Start And Stop
 
 ```text
@@ -38,6 +56,41 @@ explicit token, `HCC_RUNTIME_CA` to trust a private HTTPS Runtime API CA, and
 want coordination without the Web console or shims. Provider shims only join
 projects with a local `.hello-cc/runtime.json` from `hcc web`; they do not use a
 global runtime to manage arbitrary directories.
+
+## Native Workers
+
+```text
+hcc native up
+hcc native start --peer NAME --provider codex|claude|dsh [--cwd DIR] [--model MODEL] [--binary PATH] [--resume last]
+hcc native send --peer NAME --body TEXT [--from NAME] [--task ID]
+hcc native status
+hcc native deliveries [--peer NAME]
+hcc native events --peer NAME [--after ID]
+hcc native requests --peer NAME
+hcc native respond --peer NAME --request ID --decision accept|decline|cancel [--response-file JSON]
+hcc native interrupt --peer NAME [--turn ID]
+hcc native close --peer NAME
+hcc native down
+```
+
+These commands manage HCC-owned background workers through Codex app-server,
+the optional Claude Agent SDK, or dsh ACP. A successful send queues a message;
+inspect delivery receipts for submission, acceptance, and completion. Only saved
+sessions owned by the same HCC peer/provider can resume. Existing TUI/Desktop
+sessions keep their own transport. Hosted permission requests and questions wait
+for an explicit Web or local CLI response bound to the current worker/session/turn.
+See [Native Workers](native.md) for response-file examples, SDK installation, receipt meanings,
+and current integration boundaries.
+
+## DeepSeek Harness
+
+```text
+hcc dsh setup [--mode hooks|cordis|off]
+hcc dsh status [--dsh-bin PATH]
+hcc dsh web [--mode hooks|cordis|off] [--dsh-bin PATH] [--dsh-home PATH] -- [dsh arguments]
+```
+
+Use `@deepseek-ai/dsh@0.2.0-rc.2` and Node.js 24+. Setup defaults to hooks on first use; `--mode cordis` provides native `hcc_*` tools and ACK after context commit, while `--mode off` disables overlay injection. Later calls retain the saved mode. Status checks content and the executable without model calls. Harness flags follow `--`. Harness Web owns its conversations; use native commands above for HCC-owned workers. See the [integration guide](dsh.md) for routing, bundles and real-model acceptance.
 
 ## Peers And Status
 

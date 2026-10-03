@@ -119,6 +119,37 @@ function stripCommentsAndStrings(source) {
 function collectBindings(stripped, factoryStart) {
   const bound = new Set();
   const body = stripped;
+  // Split variable declarations only at top-level commas: initializer object
+  // keys, calls and array values must never be mistaken for declared names.
+  for (const m of body.matchAll(/\b(?:const|let|var)\s+/g)) {
+    let start = m.index + m[0].length;
+    let depth = 0;
+    for (let i = start; i < body.length; i += 1) {
+      const ch = body[i];
+      if ('([{'.includes(ch)) depth += 1;
+      if (')]}'.includes(ch)) {
+        if (depth === 0) break;
+        depth -= 1;
+      }
+      if (depth === 0 && (ch === ',' || ch === ';')) {
+        for (const leaf of parameterBindings(body.slice(start, i).split('=')[0])) bound.add(leaf);
+        start = i + 1;
+        if (ch === ';') break;
+      }
+      if (depth === 0 && /^\s+(?:of|in)\s/.test(body.slice(i))) {
+        for (const leaf of parameterBindings(body.slice(start, i))) bound.add(leaf);
+        break;
+      }
+    }
+  }
+  for (const m of body.matchAll(/\bfunction\s+[A-Za-z_$][\w$]*\s*\(/g)) {
+    const parameters = balancedContents(body, m.index + m[0].length - 1, '(', ')');
+    for (const leaf of parameterBindings(parameters)) bound.add(leaf);
+  }
+  for (const m of body.matchAll(/\b(?:const|let|var)\s*\{/g)) {
+    const declaration = balancedContents(body, m.index + m[0].length - 1, '{', '}');
+    for (const leaf of parameterBindings(declaration)) bound.add(leaf);
+  }
 
   // imports (whole file)
   for (const m of body.matchAll(/import\s+(?:\*\s+as\s+)?([A-Za-z_$][\w$]*)/g)) bound.add(m[1]);
@@ -141,10 +172,17 @@ function collectBindings(stripped, factoryStart) {
   // function declarations + their parameters
   for (const m of body.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(([^)]*)\)/g)) {
     if (m[1]) bound.add(m[1]);
-    for (const p of m[2].split(',')) {
-      const name = p.trim().split(/[=\s]/)[0].replace(/^\.\.\./, '');
-      for (const leaf of destructLeaves(name)) bound.add(leaf);
-    }
+    for (const leaf of parameterBindings(m[2])) bound.add(leaf);
+  }
+  // Object/class methods and destructured options are ordinary local bindings.
+  // Keep this scanner conservative, like its file-wide declaration collection.
+  for (const m of body.matchAll(/(?:^|[\n,{])\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(/g)) {
+    if (['if', 'while', 'switch', 'catch', 'for'].includes(m[1])) continue;
+    const start = m.index + m[0].length - 1;
+    const parameters = balancedContents(body, start, '(', ')');
+    if (!/^\s*\{/.test(body.slice(start + parameters.length + 2))) continue;
+    bound.add(m[1]);
+    for (const leaf of parameterBindings(parameters)) bound.add(leaf);
   }
   // const/let/var with destructuring or plain names
   for (const m of body.matchAll(/(?:^|[^.\w$])(?:const|let|var)\s+([A-Za-z_$][\w$]*|\{[^}]*\})\s*[=;]/g)) {
@@ -161,9 +199,7 @@ function collectBindings(stripped, factoryStart) {
   }
   // arrow function parameters: (a, b) => / single a =>
   for (const m of body.matchAll(/\(\s*([^()]*?)\s*\)\s*=>/g)) {
-    for (const p of m[1].split(',')) {
-      for (const leaf of destructLeaves(p.trim().split(/[=\s]/)[0].replace(/^\.\.\./, ''))) bound.add(leaf);
-    }
+    for (const leaf of parameterBindings(m[1])) bound.add(leaf);
   }
   for (const m of body.matchAll(/(?:^|[^.\w$])([A-Za-z_$][\w$]*)\s*=>/g)) bound.add(m[1]);
   // object literal shorthand keys are uses of bindings, but `{ name }` in a
@@ -186,8 +222,29 @@ function destructLeaves(fragment) {
   return leaves;
 }
 
+function parameterBindings(parameters) {
+  const result = [];
+  // Default expressions are not bindings; after literal stripping their
+  // identifiers still belong to existing imports or declarations.
+  for (const piece of parameters.replace(/[{}\[\]]/g, '').split(',')) {
+    const declaration = piece.split('=')[0].trim();
+    const name = declaration.split(':').pop()?.trim().replace(/^\.\.\./, '');
+    if (name && /^[A-Za-z_$][\w$]*$/.test(name)) result.push(name);
+  }
+  return result;
+}
+
+function balancedContents(source, start, open, close) {
+  let depth = 0;
+  for (let i = start; i < source.length; i += 1) {
+    if (source[i] === open) depth += 1;
+    if (source[i] === close && --depth === 0) return source.slice(start + 1, i);
+  }
+  return '';
+}
+
 const JS_GLOBALS = new Set(('globalThis global console process require module exports Buffer URL URLSearchParams'
-  + ' Array Object String Number Boolean Math JSON Date Promise Symbol BigInt Map Set WeakMap WeakSet'
+  + ' Array Object String Number Boolean Math JSON Date Promise Symbol BigInt Map Set WeakMap WeakSet Proxy Reflect'
   + ' RegExp Error TypeError RangeError SyntaxError ReferenceError EvalError URIError AggregateError'
   + ' parseInt parseFloat isNaN isFinite encodeURIComponent decodeURIComponent'
   + ' undefined NaN Infinity setTimeout setInterval clearTimeout setImmediate clearImmediate queueMicrotask'
@@ -244,6 +301,8 @@ const KNOWN_FALSE_POSITIVES = {
   'lib/cli/commands/doctor.mjs': ['connectReadOnly', 'k', 'v', 'wal'],
   'lib/cli/commands/gc.mjs': ['add', 'apply', 'dry', 'entries', 'gcCutoff', 'id', 'lock', 'run', 'to', 'yes'],
   'lib/cli/commands/install.mjs': ['cc', 'n'],
+  // Literal query key in a nested template interpolation; opts.peer is bound.
+  'lib/cli/commands/native.mjs': ['peer'],
   'lib/cli/commands/peer.mjs': ['pid'],
   'lib/cli/commands/task.mjs': ['child'],
   'lib/cli/commands/team.mjs': ['assignee', 'count', 'owner', 'status'],

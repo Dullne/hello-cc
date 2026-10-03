@@ -1,0 +1,247 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "1.0.2",
+  "packageRuntimeUnchanged": true,
+  "diagnosticScope": "Entire later candidate test snapshot against the frozen published runtime; not the source archive gating scope.",
+  "total": 870,
+  "passed": 834,
+  "failed": 35,
+  "skipped": 1,
+  "skipReason": "Linux proc-filesystem check on macOS",
+  "failures": [
+    {
+      "file": "test/cli-lifecycle-pid.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "register and join retain the claude provider PID",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "register and join retain the codex provider PID",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "Linux provider executable outranks inherited provider environment on the tool shell",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "macOS provider executable outranks a tool shell command mentioning its path",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/codex-app-server.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "streaming notifications coalesce while direct snapshots retain every text fragment",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "continuous text updates cannot postpone the bounded publish interval",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "approval and completion publish immediately with pending text and cancel trailing stream updates",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/codex-sessions.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "new structured session persists a real peer, thread binding, and executor receipt",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "session listing uses the pinned executor identity without copying retained conversation state",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/integration-hooks-regression.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "reinstall moves stale owned hooks, quotes the active path, and preserves mixed groups",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "invalid JSON is reported and never replaced by hook install or uninstall",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "ordinary hooks honor HCC_DB and an explicit CLI database under HCC_ROOT",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "prompt shell commands preserve special characters in every argument",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/provider-peer-identity.test.mjs",
+      "existsInBaseline": true,
+      "failedTests": [
+        {
+          "name": "discovery uses the hook/shim peer identity for full provider session names",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/task-results.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "automatic commands and diff use a live turn task scope; historical reads never invent test acceptance",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-native-sessions.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "unchanged native polling sends one initial full snapshot and keeps explicit reads independent",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "native metadata, approvals and receipts broadcast changes without advancing the provider event cursor",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "identical polls still validate the binding and retire a replaced owner",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "repeated disconnects stay quiet, recovery broadcasts, and identical retirement state still revokes clients",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-peer-actions.test.mjs",
+      "existsInBaseline": true,
+      "failedTests": [
+        {
+          "name": "Web re-register preserves a managed peer identity unless a PID is explicitly supplied",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "Web lock actions preserve a colliding logical resource (scoped first)",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "Web lock actions preserve a colliding logical resource (literal first)",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-request-boundary.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "test/web-request-boundary.test.mjs",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-startup-race.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "concurrent web starts converge on one healthy background runtime",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-terminal-assets.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "test/web-terminal-assets.test.mjs",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-ui-codex.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "huge diffs render a bounded section and copy the complete original diff",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "text sections expose every character without splitting surrogate pairs or trusting markup",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "long messages explicitly use bounded plain-text sections and preserve complete source for copying",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "an unchanged visible section still copies and opens the latest hidden output after a same-length update",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "section position survives output updates, preference changes, session switches and unchanged-cache hits",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "oversized approval fields and raw parameters remain fully readable and backend truncation still blocks approval",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-ui-interactions.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "native ACP preview shows the bounded operation, escapes inputs and retains complete collapsed details",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "native approval remains disabled for missing ACP context or absent one-time permission",
+          "existsByExactTitle": false
+        },
+        {
+          "name": "native operation details stay expanded across refresh and are forgotten after the decision",
+          "existsByExactTitle": false
+        }
+      ]
+    },
+    {
+      "file": "test/web-ui-terminal-command.test.mjs",
+      "existsInBaseline": false,
+      "failedTests": [
+        {
+          "name": "terminal menu quotes peer and registration arguments as single shell words",
+          "existsByExactTitle": false
+        }
+      ]
+    }
+  ],
+  "interpretation": "All failed assertions were absent from the original Git baseline. Some expect later implementation features and some document inherited behavior gaps. Their failure is retained as a limitation, not claimed fixed by this archive or its scoped CI.",
+  "baselineComparison": {
+    "total": 386,
+    "passed": 384,
+    "failed": 1,
+    "skipped": 1,
+    "failure": "Old terminal-input buffering source assertion; the published implementation uses handoffStore acknowledgements and uncertain-delivery fencing, covered by the candidate web-session-security replacement test."
+  },
+  "fullRegressionSteps": 13,
+  "regressionPassed": true
+}

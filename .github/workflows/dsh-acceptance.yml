@@ -1,0 +1,193 @@
+name: DeepSeek Harness package acceptance
+
+on:
+  push:
+    branches:
+      - codex/dsh-stable-source
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installed-acceptance:
+    name: Installed Harness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+
+    steps:
+      - name: Set isolated acceptance directory
+        shell: bash
+        run: echo "HCC_DSH_ACCEPTANCE_ROOT=$RUNNER_TEMP/hcc-dsh-acceptance" >> "$GITHUB_ENV"
+
+      - name: Checkout selected revision
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Freeze checkout package and record provenance
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import assert from 'node:assert/strict';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          for (const name of ['home', 'official', 'candidate', 'unpacked', 'evidence']) {
+            fs.mkdirSync(path.join(root, name), { recursive: true, mode: 0o700 });
+          }
+          const env = { ...process.env, HOME: path.join(root, 'home'),
+            DSH_HOME: path.join(root, 'home', 'dsh'),
+            NPM_CONFIG_CACHE: path.join(root, 'npm-cache'),
+            NPM_CONFIG_USERCONFIG: path.join(root, 'home', '.npmrc') };
+          for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
+          const packed = execFileSync('npm', ['pack', '--ignore-scripts', '--json',
+            '--pack-destination', path.join(root, 'candidate')], { env, encoding: 'utf8' });
+          const metadata = JSON.parse(packed)[0];
+          const tarball = path.join(root, 'candidate', metadata.filename);
+          execFileSync('tar', ['-xzf', tarball, '-C', path.join(root, 'unpacked')], { env });
+          const published = JSON.parse(fs.readFileSync('docs/verification/dsh-1.0.2-package.json', 'utf8'));
+          let publishedContentMatch = null;
+          if (metadata.version === published.version) {
+            assert.deepEqual(metadata.files.map(file => file.path).sort(), Object.keys(published.files).sort(),
+              'The 1.0.2 package file set must match the published artifact');
+            for (const [file, expected] of Object.entries(published.files)) {
+              assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'unpacked', 'package', file))).digest('hex'),
+                expected, `Published file differs: ${file}`);
+            }
+            publishedContentMatch = true;
+          }
+          const receipt = {
+            schemaVersion: 1, createdAt: new Date().toISOString(),
+            revision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+            platform: { os: process.platform, architecture: process.arch, node: process.version },
+            harness: '0.2.0-rc.2', pnpm: '12.8.1',
+            publishedContentMatch,
+            package: { name: metadata.name, version: metadata.version, filename: metadata.filename,
+              fileCount: metadata.files.length,
+              sha256: createHash('sha256').update(fs.readFileSync(tarball)).digest('hex') },
+            validation: 'CI runner installation without model calls; not device or business acceptance'
+          };
+          fs.writeFileSync(path.join(root, 'evidence', 'package-provenance.json'), JSON.stringify(receipt, null, 2) + '\n');
+          fs.writeFileSync(path.join(root, 'candidate.json'), JSON.stringify({ tarball }));
+          fs.writeFileSync(path.join(root, 'official', 'package.json'), JSON.stringify({
+            name: 'hcc-isolated-dsh-acceptance', private: true, version: '0.0.0'
+          }));
+          console.log(JSON.stringify(receipt, null, 2));
+          NODE
+
+      - name: Install pinned official Harness and pnpm
+        id: install
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/official-install.log"
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const env = { ...process.env, HOME: path.join(root, 'home'),
+            DSH_HOME: path.join(root, 'home', 'dsh'),
+            NPM_CONFIG_CACHE: path.join(root, 'npm-cache'),
+            NPM_CONFIG_USERCONFIG: path.join(root, 'home', '.npmrc') };
+          for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
+          const result = spawnSync('npm', ['install', '--prefix', path.join(root, 'official'),
+            '--save-exact', '--no-audit', '--no-fund', '--fetch-retries=1', '--fetch-timeout=120000',
+            '@deepseek-ai/dsh@0.2.0-rc.2', 'pnpm@12.8.1'], { env, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          if (result.status === 0) {
+            const versions = {};
+            for (const [name, expected] of [['@deepseek-ai/dsh', '0.2.0-rc.2'], ['pnpm', '12.8.1']]) {
+              const manifest = JSON.parse(fs.readFileSync(path.join(root, 'official', 'node_modules', name, 'package.json')));
+              assert.equal(manifest.version, expected, `Unexpected installed ${name} version`);
+              versions[name] = manifest.version;
+            }
+            fs.writeFileSync(path.join(root, 'evidence', 'official-versions.json'), JSON.stringify(versions, null, 2) + '\n');
+            console.log(JSON.stringify(versions));
+          }
+          NODE
+
+      - name: Verify frozen package with the installed public CLI
+        id: acceptance
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/installed-acceptance.log"
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const official = path.join(root, 'official');
+          const unpacked = path.join(root, 'unpacked', 'package');
+          const { tarball } = JSON.parse(fs.readFileSync(path.join(root, 'candidate.json')));
+          const env = { ...process.env, HOME: path.join(root, 'home'),
+            DSH_HOME: path.join(root, 'home', 'dsh'),
+            NPM_CONFIG_CACHE: path.join(root, 'npm-cache'),
+            NPM_CONFIG_USERCONFIG: path.join(root, 'home', '.npmrc'),
+            PATH: [path.dirname(process.execPath), path.join(official, 'node_modules', '.bin'),
+              process.env.PATH || ''].join(path.delimiter) };
+          for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
+          // Run the script from the frozen package so its source-hash checks
+          // compare against that artifact, independent of checkout changes.
+          const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-installed-acceptance.mjs'),
+            official, '--tarball', tarball, '--output-dir', path.join(root, 'evidence', 'installed'),
+            '--npm-cache', path.join(root, 'npm-cache'), '--pnpm-store', path.join(root, 'pnpm-store')],
+            { cwd: unpacked, env, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
+      - name: Record workflow outcome
+        if: always()
+        shell: bash
+        env:
+          HCC_PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          HCC_INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          HCC_ACCEPTANCE_OUTCOME: ${{ steps.acceptance.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const evidence = path.join(process.env.HCC_DSH_ACCEPTANCE_ROOT, 'evidence');
+          fs.mkdirSync(evidence, { recursive: true });
+          fs.writeFileSync(path.join(evidence, 'workflow-outcome.json'), JSON.stringify({
+            completedAt: new Date().toISOString(),
+            platform: { os: process.platform, architecture: process.arch, node: process.version },
+            package: process.env.HCC_PACKAGE_OUTCOME,
+            officialInstall: process.env.HCC_INSTALL_OUTCOME,
+            installedAcceptance: process.env.HCC_ACCEPTANCE_OUTCOME,
+            modelCallsRequested: false, npmPublicationRequested: false,
+            scope: 'CI runner only; no employee-device or genuine business acceptance'
+          }, null, 2) + '\n');
+          NODE
+
+      - name: Upload platform receipt and acceptance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-acceptance-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hcc-dsh-acceptance/evidence/
+          if-no-files-found: error
+          retention-days: 14

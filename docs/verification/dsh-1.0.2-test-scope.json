@@ -1,0 +1,713 @@
+{
+  "createdAt": "2026-10-03T11:34:35.090Z",
+  "baseline": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+  "priorDiagnostic": {
+    "log": "dsh-1.0.2-later-snapshot-diagnostics.json",
+    "tests": 870,
+    "passed": 834,
+    "failed": 35,
+    "skipped": 1,
+    "status": "Preserved unresolved diagnostic results; this selection does not claim all snapshot tests pass."
+  },
+  "policy": "All original baseline tests/fixtures; published cli-args and web-session-security assertions; DSH/native/MCP and selected collaboration tests; release version metadata only.",
+  "includedFiles": 62,
+  "excludedFiles": 25,
+  "records": [
+    {
+      "file": "test/auto-gc-missing-buffer.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "1b05ab73e8ae1c5316a3701d2155478f7d725332f0551a2b9b0f5303c49adf32",
+      "selectedSha256": "1b05ab73e8ae1c5316a3701d2155478f7d725332f0551a2b9b0f5303c49adf32"
+    },
+    {
+      "file": "test/buffer-directory-lease.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "40d1f0369cda4452c087762b413ab707c1a4fa8dd7bb8dead46bbf7251a273df",
+      "selectedSha256": "40d1f0369cda4452c087762b413ab707c1a4fa8dd7bb8dead46bbf7251a273df"
+    },
+    {
+      "file": "test/buffer-evidence.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "b8f97b2d021950f98bf7351be0795a5eb82f57348e4108b6c556f7b660ff94a0",
+      "selectedSha256": "b8f97b2d021950f98bf7351be0795a5eb82f57348e4108b6c556f7b660ff94a0"
+    },
+    {
+      "file": "test/buffer-gc-protocol.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "4721868fe7be9a8940a1c3d12533804265627bfaee07dbc9bdd3e9f221867006",
+      "selectedSha256": "4721868fe7be9a8940a1c3d12533804265627bfaee07dbc9bdd3e9f221867006"
+    },
+    {
+      "file": "test/buffer-gc-startup-order.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "08accfd64095efecfbc2d124eb036bc0113203ecd510d9153e9bd75b6ef05c4d",
+      "selectedSha256": "08accfd64095efecfbc2d124eb036bc0113203ecd510d9153e9bd75b6ef05c4d"
+    },
+    {
+      "file": "test/buffer-gc.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "255efc21f855a048b416db60295e02b9135619215b6655d6574bde3cc2c93f94",
+      "selectedSha256": "255efc21f855a048b416db60295e02b9135619215b6655d6574bde3cc2c93f94"
+    },
+    {
+      "file": "test/cli-args.test.mjs",
+      "included": true,
+      "reason": "Candidate assertion for behavior present in the frozen published package: argument forwarding or ACK/uncertain-input security contract.",
+      "source": "imported-tests backup",
+      "backupSha256": "647d312c98f61206e2b56c34363bac62e8c26ef15a66084509816b94af22de88",
+      "selectedSha256": "647d312c98f61206e2b56c34363bac62e8c26ef15a66084509816b94af22de88"
+    },
+    {
+      "file": "test/cli-lifecycle-pid.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "97e0e7135fbaaccb6e239fdf58325c764e57d8eea8e484c8891e95450e490a6b",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/cli-lock-protection.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "ee1414954f34bb0034f3841b07e77c19504050c8323f966485a04c3d2114a8c6",
+      "selectedSha256": "ee1414954f34bb0034f3841b07e77c19504050c8323f966485a04c3d2114a8c6"
+    },
+    {
+      "file": "test/clock-safety.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "1942309ee8c10a940faddf53ad2e0e6dfc647870a3ec9deca920f7e316851669",
+      "selectedSha256": "1942309ee8c10a940faddf53ad2e0e6dfc647870a3ec9deca920f7e316851669"
+    },
+    {
+      "file": "test/codex-app-server.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "5d2e0b60c41567fb96a314786358a491e6a9627181c5f7771150ec28c2cf428f",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/codex-interactions.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "80c22df45ead0ff504729f5344c90999c83c45db86ef122e84a32340aa3816e5",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/codex-sessions.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "88822734aeab030e75ec156e53891b2704b6907e28d79e0208a2e844305fe9f3",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/control-lease.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "4340aad3c8574e79674aefec915acbb01c2d1f9089307a7ccdcdd969a9cdceaf",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/doctor-codex.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "97f7e72c7bd730d4ef218f26a089b93fc619755a56e0c9181ceae8f7869f77ac",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/down-runtime-pointer.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "3142a0067d8a28109a90fa090721f717c6816c3e27ff7ba188ac98bf36db62bd",
+      "selectedSha256": "3142a0067d8a28109a90fa090721f717c6816c3e27ff7ba188ac98bf36db62bd"
+    },
+    {
+      "file": "test/down-waits-for-exit.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "fad56f986edf510a8c95c4b49a5eecc817aad772de09232d3749151153fd283c",
+      "selectedSha256": "fad56f986edf510a8c95c4b49a5eecc817aad772de09232d3749151153fd283c"
+    },
+    {
+      "file": "test/dsh-collaboration.test.mjs",
+      "included": true,
+      "reason": "Saved retirement repair test matching exact published Cordis ownership recovery implementation.",
+      "source": "imported-tests backup",
+      "backupSha256": "2ec380ee58690e0d8afc6bc2e9498b66c52647550f4780a4a940d41f78b825e9",
+      "selectedSha256": "2ec380ee58690e0d8afc6bc2e9498b66c52647550f4780a4a940d41f78b825e9"
+    },
+    {
+      "file": "test/dsh-context-commands.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "5ac348f87daaec3cced29f788339576b7affd17870d637844343cd92935de323",
+      "selectedSha256": "5ac348f87daaec3cced29f788339576b7affd17870d637844343cd92935de323"
+    },
+    {
+      "file": "test/dsh-cordis.test.mjs",
+      "included": true,
+      "reason": "Saved retirement repair test matching exact published Cordis ownership recovery implementation.",
+      "source": "imported-tests backup",
+      "backupSha256": "c8a6abb800aafa3c8a0167351bf90cbedca6b9b513d869a395f7595c53d95e39",
+      "selectedSha256": "c8a6abb800aafa3c8a0167351bf90cbedca6b9b513d869a395f7595c53d95e39"
+    },
+    {
+      "file": "test/dsh-integration.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "e05ed7802ed2e4ff286d0da1e12696e29ea0ad8ced705a0e206e2b1780ffa412",
+      "selectedSha256": "e05ed7802ed2e4ff286d0da1e12696e29ea0ad8ced705a0e206e2b1780ffa412"
+    },
+    {
+      "file": "test/dsh-peer-hooks.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "1458d2e609ae3dddb21786de2211ab7626cc511bce04839994c288daaccb2aae",
+      "selectedSha256": "1458d2e609ae3dddb21786de2211ab7626cc511bce04839994c288daaccb2aae"
+    },
+    {
+      "file": "test/dsh-runtime-boundary.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "dcdf54d69c31cbedee1c0ffe51846b47d70f06d8dcfb0fc9a4410180cc16fc19",
+      "selectedSha256": "dcdf54d69c31cbedee1c0ffe51846b47d70f06d8dcfb0fc9a4410180cc16fc19"
+    },
+    {
+      "file": "test/dsh-tmux-attach-boundary.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "87779e59ff3ddd13281b69d6711d6fa4085221aac414761663f92d8f26968dc9",
+      "selectedSha256": "87779e59ff3ddd13281b69d6711d6fa4085221aac414761663f92d8f26968dc9"
+    },
+    {
+      "file": "test/dsh-web-boundary.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "e2393626e0a96519e830d1922f15520c24c1084c1108f0e0dcb2883daf82c2a3",
+      "selectedSha256": "e2393626e0a96519e830d1922f15520c24c1084c1108f0e0dcb2883daf82c2a3"
+    },
+    {
+      "file": "test/fatal-shutdown.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "25781bfdc88888385a45b2a0d919d6299beba704fc55e79db4c40fd968781923",
+      "selectedSha256": "25781bfdc88888385a45b2a0d919d6299beba704fc55e79db4c40fd968781923"
+    },
+    {
+      "file": "test/file-lock.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "e69cfe896ba0bb0da3bef821a875ee71d0dfc3fa98ab947619f11e415f2e2824",
+      "selectedSha256": "e69cfe896ba0bb0da3bef821a875ee71d0dfc3fa98ab947619f11e415f2e2824"
+    },
+    {
+      "file": "test/fixtures/buffer-gc-drift-loader.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "c3d387511288327f6830b48bb8ada0ec1c8a4f340ae14896e751f3c990eb288b",
+      "selectedSha256": "c3d387511288327f6830b48bb8ada0ec1c8a4f340ae14896e751f3c990eb288b"
+    },
+    {
+      "file": "test/fixtures/gc-grace-race-loader.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "c25b05659f0cfaef4a3b6d03fdce27b366b73b50c7906a8fd716841e6b5468cb",
+      "selectedSha256": "c25b05659f0cfaef4a3b6d03fdce27b366b73b50c7906a8fd716841e6b5468cb"
+    },
+    {
+      "file": "test/free-identifiers-options.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "6ffcbd7afe73cf0fd774851d93628528a7890d728b0b16edc3507b33b09a662c",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/gc-plan.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "2ced0673bfe1b10d0fe7073f7b92234e64bafa2354bac3e51dc8a7bc0bbd8b8c",
+      "selectedSha256": "2ced0673bfe1b10d0fe7073f7b92234e64bafa2354bac3e51dc8a7bc0bbd8b8c"
+    },
+    {
+      "file": "test/hook-delivery.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "9568674e994a3f3fe5933abedb89eb0087d948b3af1cb295e1713dfb6470d309",
+      "selectedSha256": "9568674e994a3f3fe5933abedb89eb0087d948b3af1cb295e1713dfb6470d309"
+    },
+    {
+      "file": "test/hook-owner.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "b0abf5a6fbfeac93b1b35cae687ee6b70f657333309b7e4029bb185e04bc6ad2",
+      "selectedSha256": "b0abf5a6fbfeac93b1b35cae687ee6b70f657333309b7e4029bb185e04bc6ad2"
+    },
+    {
+      "file": "test/integration-hooks-regression.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "e5bb9db8d36830aeabf93e361a4c64ced795b84437dcd6b17e914b130eb2ec76",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/lease-renewal.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "47f76ed536df16d42ebfe958f6a6778f691e4f33bf51d781c21007298b11b398",
+      "selectedSha256": "47f76ed536df16d42ebfe958f6a6778f691e4f33bf51d781c21007298b11b398"
+    },
+    {
+      "file": "test/manual-gc-local-integration.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "e538487086b609fa84751345eb43aea5439b1692f1668dbd3a5a6a7ecf499923",
+      "selectedSha256": "e538487086b609fa84751345eb43aea5439b1692f1668dbd3a5a6a7ecf499923"
+    },
+    {
+      "file": "test/manual-gc-runtime-pointer-integration.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "1fae1e126606456f365e8906825ee8a0e9f6c797537b239d6d763c6fc476139f",
+      "selectedSha256": "1fae1e126606456f365e8906825ee8a0e9f6c797537b239d6d763c6fc476139f"
+    },
+    {
+      "file": "test/manual-gc-runtime-timeout.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "cc78d17df28e8dbcb1096bf64a860e1ad409e63e6f48c7baaa3ab511a628eaf7",
+      "selectedSha256": "cc78d17df28e8dbcb1096bf64a860e1ad409e63e6f48c7baaa3ab511a628eaf7"
+    },
+    {
+      "file": "test/native-claude.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "b257a846af5b7aa9f3f9c375781462e65dbe552fbb226ed192182b373267e6ff",
+      "selectedSha256": "b257a846af5b7aa9f3f9c375781462e65dbe552fbb226ed192182b373267e6ff"
+    },
+    {
+      "file": "test/native-cli.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "b2996d9b681e660e85f4a21af9d463f92412a3e85ce71f586cad742b2573a676",
+      "selectedSha256": "b2996d9b681e660e85f4a21af9d463f92412a3e85ce71f586cad742b2573a676"
+    },
+    {
+      "file": "test/native-client.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "84ccd04f627f4bcf7c31e5cfbc5adbaed69bd99eafad4676b7b865afcb0663d6",
+      "selectedSha256": "84ccd04f627f4bcf7c31e5cfbc5adbaed69bd99eafad4676b7b865afcb0663d6"
+    },
+    {
+      "file": "test/native-codex.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "931e398917cbc2bfbe156cc0be0aa343ba4037bd34db5864c78a444fa301dab5",
+      "selectedSha256": "931e398917cbc2bfbe156cc0be0aa343ba4037bd34db5864c78a444fa301dab5"
+    },
+    {
+      "file": "test/native-dsh-acp.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "24c961c34f1ea78a9f45086e98e41e2387bf072eea6cbb73049cde4f027e9018",
+      "selectedSha256": "24c961c34f1ea78a9f45086e98e41e2387bf072eea6cbb73049cde4f027e9018"
+    },
+    {
+      "file": "test/native-hook-isolation.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "b08b4f44dedfd3630ade3ceddd5cdc03484396c0529cf51c2a4489960b78d81a",
+      "selectedSha256": "b08b4f44dedfd3630ade3ceddd5cdc03484396c0529cf51c2a4489960b78d81a"
+    },
+    {
+      "file": "test/native-jsonrpc.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "b9249264165a635304836ec480e0c8f0f81c22d297f91be120efa6d460324c0c",
+      "selectedSha256": "b9249264165a635304836ec480e0c8f0f81c22d297f91be120efa6d460324c0c"
+    },
+    {
+      "file": "test/native-runtime.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "f4f1be68174172d72d4366b2366342f3be7cf1080af3425b39524feef74aa13f",
+      "selectedSha256": "f4f1be68174172d72d4366b2366342f3be7cf1080af3425b39524feef74aa13f"
+    },
+    {
+      "file": "test/native-store.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "42c587ef27a74520cdb0e3d98d6136a56707b6be2002dec6c3904f9c76a24997",
+      "selectedSha256": "42c587ef27a74520cdb0e3d98d6136a56707b6be2002dec6c3904f9c76a24997"
+    },
+    {
+      "file": "test/peer-evidence.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "9fbbf0bd5635b480071a8be73da2f4ba133decf55d1f6ebf1df47cd53bf711ad",
+      "selectedSha256": "9fbbf0bd5635b480071a8be73da2f4ba133decf55d1f6ebf1df47cd53bf711ad"
+    },
+    {
+      "file": "test/process-identity.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "1c5b74ce40442fb93cb50e4442ed46ecb3121f3752ca947f54513d86d80baecc",
+      "selectedSha256": "1c5b74ce40442fb93cb50e4442ed46ecb3121f3752ca947f54513d86d80baecc"
+    },
+    {
+      "file": "test/project-path.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "0cb09baac933c9f2cce9494bc1a971e3330a76839cc2268a3fce0c33d4e4da11",
+      "selectedSha256": "0cb09baac933c9f2cce9494bc1a971e3330a76839cc2268a3fce0c33d4e4da11"
+    },
+    {
+      "file": "test/provider-peer-identity.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "df558e0f51416a15fbbf90d5ce23935e28564409c2df16c654a1d3570e8ebb9f",
+      "selectedSha256": "8e6552060e845059e5d2700e3cdfb51db2b5d0a2a62cc6f59d3c6f5236584977"
+    },
+    {
+      "file": "test/pty-lifecycle.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "02a7f6c34ea6f1b58e5cedcaacb23de128b193fa01f148613556624d3847b6fa",
+      "selectedSha256": "02a7f6c34ea6f1b58e5cedcaacb23de128b193fa01f148613556624d3847b6fa"
+    },
+    {
+      "file": "test/redact.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "0610e728da2373dd4487e5f1441fb19feb15a95ebf2c48e6d0fb6735b9d96fe5",
+      "selectedSha256": "0610e728da2373dd4487e5f1441fb19feb15a95ebf2c48e6d0fb6735b9d96fe5"
+    },
+    {
+      "file": "test/regression-runtime-isolation.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "b81d8020ebee184228b0b5e896aba4e2663382a556c17445d5d8d34a60696422",
+      "selectedSha256": "b81d8020ebee184228b0b5e896aba4e2663382a556c17445d5d8d34a60696422"
+    },
+    {
+      "file": "test/release-contract.test.mjs",
+      "included": true,
+      "reason": "Baseline release contract; currentRelease metadata aligned to published 1.0.2.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "22fe8551af7ed5ae95f474db45973bbdf51914f9ab4a25cc41f44f742f1a8934",
+      "selectedSha256": "22fe8551af7ed5ae95f474db45973bbdf51914f9ab4a25cc41f44f742f1a8934"
+    },
+    {
+      "file": "test/run-ownership.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "2623fb47244246f49a43bf23499aabe2b6acfe2666760f5d5679dc390280d2e5",
+      "selectedSha256": "2623fb47244246f49a43bf23499aabe2b6acfe2666760f5d5679dc390280d2e5"
+    },
+    {
+      "file": "test/runtime-client.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "4745d7364b14cddebea1e7fd3c87b7264eb691a10e14d98624a4211a3ff00872",
+      "selectedSha256": "4745d7364b14cddebea1e7fd3c87b7264eb691a10e14d98624a4211a3ff00872"
+    },
+    {
+      "file": "test/runtime-mutation-timeout.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "580f005c36d8ae3dce2f1916e9e59729c2d246bb00f90abbcb8fdae47b753e47",
+      "selectedSha256": "580f005c36d8ae3dce2f1916e9e59729c2d246bb00f90abbcb8fdae47b753e47"
+    },
+    {
+      "file": "test/runtime-pointer-evidence.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "cddbb6aea8172b950a2b896985742994b4925552f577e5249f1450a43643a1fa",
+      "selectedSha256": "cddbb6aea8172b950a2b896985742994b4925552f577e5249f1450a43643a1fa"
+    },
+    {
+      "file": "test/schema-v7.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "876baec6e8a768216294e7bd541772366ef314956770a577b17d4131bbe42664",
+      "selectedSha256": "876baec6e8a768216294e7bd541772366ef314956770a577b17d4131bbe42664"
+    },
+    {
+      "file": "test/scoped-mcp.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "faa4812dc0f9573b3c7d3166b921ca296dc6c2bcdd0b939764155b69674dcc3e",
+      "selectedSha256": "faa4812dc0f9573b3c7d3166b921ca296dc6c2bcdd0b939764155b69674dcc3e"
+    },
+    {
+      "file": "test/session-launch.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "4a5c97b7636ee4daaf8aca5e5a7180455df03e50c8bdbcd6a770a47a8e014ad3",
+      "selectedSha256": "4a5c97b7636ee4daaf8aca5e5a7180455df03e50c8bdbcd6a770a47a8e014ad3"
+    },
+    {
+      "file": "test/socket-file-lock.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "8efa15be52a3d836f1955a1b5c4df6de13b0fa5dceb47105d971f65c0e68180a",
+      "selectedSha256": "463ad179e4361eff8a9997c34666ea60ea3e2be1a468c2f07d246c7a7308fcb3"
+    },
+    {
+      "file": "test/task-results.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "22da39f521ece6765320363b2b9e8a0eecdc777f8e5b71478fb3c731ba2941d3",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/tmux-install.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "209da3c70637d781f2dfbfb649b51cc29da39ce0913393aee7e09bbfd679154d",
+      "selectedSha256": "209da3c70637d781f2dfbfb649b51cc29da39ce0913393aee7e09bbfd679154d"
+    },
+    {
+      "file": "test/web-adoption-state.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "1a8dff4739d7606f95584a27382337259f8fe54e40b5a318e4e21c0647893ca1",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-api-version.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "e553d86d6b063f9214600d5150d741692ccd11806ba0a8dcac996475673a7074",
+      "selectedSha256": "e553d86d6b063f9214600d5150d741692ccd11806ba0a8dcac996475673a7074"
+    },
+    {
+      "file": "test/web-control-boundaries.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "82e5729dfe74bcd86700a474d3fed13fa469f204e2f595c1a56348802fdf9d7d",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-native-sessions.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "7dd8938d1ad88835983bcc4d71137f0b7c2e55706b5e5384af835f53cf7a97f9",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-peer-actions.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "de4c67a9ae15870c477c1fd3f5a3baa1f03a50079fa0f195fc3508e7818f3b7f",
+      "selectedSha256": "b07228f585685c6ab936a73a2815ae87f6f94c55c1f2a8ba6569f9414f603c2e"
+    },
+    {
+      "file": "test/web-request-boundary.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "ca192ada28999149234db8ed29662bf05671a30257a3e88563b15d36910dea9f",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-session-security.test.mjs",
+      "included": true,
+      "reason": "Candidate assertion for behavior present in the frozen published package: argument forwarding or ACK/uncertain-input security contract.",
+      "source": "imported-tests backup",
+      "backupSha256": "3c890b2b1c75f57041c11dc5680f41c8fdb5172cdb70b40de036ba384141b1e0",
+      "selectedSha256": "3c890b2b1c75f57041c11dc5680f41c8fdb5172cdb70b40de036ba384141b1e0"
+    },
+    {
+      "file": "test/web-startup-race.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "f95cca2e2f3b081b77b9d2649a05d39ba0160739e834f7513a1cd624d3752574",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-startup-timeout.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "d4c3e98ccf6788c01a76dcff0fbd046bfdb764d1d71a9f2c422248a808ddf70a",
+      "selectedSha256": "d4c3e98ccf6788c01a76dcff0fbd046bfdb764d1d71a9f2c422248a808ddf70a"
+    },
+    {
+      "file": "test/web-structured-routes.test.mjs",
+      "included": true,
+      "reason": "Selected DSH/shared native/MCP and collaboration integration contract included in stable 1.0.2.",
+      "source": "imported-tests backup",
+      "backupSha256": "40a4d7595a2c6b2f9c5a587a6f7275f6a77c1d02c8ca15f4fd11dfa601b90ca5",
+      "selectedSha256": "40a4d7595a2c6b2f9c5a587a6f7275f6a77c1d02c8ca15f4fd11dfa601b90ca5"
+    },
+    {
+      "file": "test/web-terminal-assets.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "72ea8d9dc72601bfdbdb556d7c0df313bb1cb96a70cec5306e0bb598300ee83e",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-tls.test.mjs",
+      "included": true,
+      "reason": "Original f4b9a6d baseline test or fixture preserved unchanged.",
+      "source": "f4b9a6d9945f2d311ca7940c429d6feed0dcb49b",
+      "backupSha256": "6467aef9a03704d18db6275dcf89fd777f5b962f22a94c9e0b7d35de74016843",
+      "selectedSha256": "6467aef9a03704d18db6275dcf89fd777f5b962f22a94c9e0b7d35de74016843"
+    },
+    {
+      "file": "test/web-ui-auxiliary.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "aae052588cf80a938e0b0a4e12aff04b985579f66a1abc82cd9be4cb99fdea3e",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-codex.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "98f8272a2aee332a7a2eb51119f9d8d9a1b7bb09f7fbe84552312ee099a74961",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-handoff.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "0347e6f0276f20eab88bdc5c29045dc63505da331edf244aee8f679884ecbb26",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-interactions.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "29102cf745e7d94b18779e04de4d608ad6331c14b6838242c6966653038b0918",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-preferences.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "1199ceb7dd52364f2dddd18f2139f3e43b222097318dacbcb4c7a90ff5bf9c40",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-search.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "2fd8363d32d794e9bd7be4bb9704f4429d1fbce070897ab9bf662b120e74c576",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-session-display.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "d30870d75b6e75ed32bec0fcb9419c5d541565f4fd8652726d0ab8d8c3d48aee",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-terminal-command.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "25c6c3de42f8c055383c0299cc26bd764a36774b72f2c9ab761052f7af0f9bd7",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-ui-workspace.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "45fda7d1a8a4ed59b71923d4088b752837c0c3ec5ffacee36994192e569ec666",
+      "selectedSha256": null
+    },
+    {
+      "file": "test/web-workspace-security.test.mjs",
+      "included": false,
+      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "source": "imported-tests backup",
+      "backupSha256": "0b26ad82992cfb1533dcf65089ba4981ed1154dbbe6eef44aca35808e1836f53",
+      "selectedSha256": null
+    }
+  ]
+}

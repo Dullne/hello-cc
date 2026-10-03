@@ -14,6 +14,10 @@ provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime 
 - [用户指南](guide.zh-CN.md)：安装、启动、Web 控制台、协作语义、工作流、稳定
   peer 身份和环境变量行为。
 - [命令参考](commands.zh-CN.md)：公共命令的紧凑清单，以及每组命令的用途。
+- [DeepSeek Harness 接入](dsh.zh-CN.md)：项目配置、hooks/Cordis 协作、ACP worker、
+  可安装 bundle 与会话路由边界。
+- [Native 后台 worker](native.zh-CN.md)：后台 worker 所有权、provider adapter、
+  投递回执、权限处理和 resume 边界。
 - [更新日志](../CHANGELOG.md)：已发布版本的 release notes。
 - 发行说明：发布前运行 `npm run release:check` 和
   `npm run release:github:dry-run`。推送 `v*` tag 会触发
@@ -23,6 +27,11 @@ provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime 
 
 ## 设计和实现
 
+- DeepSeek Harness 接入计划 (源码目录: `docs/plans/2026-10-02-dsh-integration.md`)：三个实现阶段、模块契约与完成门槛。
+- DeepSeek Harness 验收 (源码目录: `docs/verification/2026-10-02-dsh-cordis-native.md`)：真实模型、包加载、回归与浏览器证据。
+
+- [Web 接手本地任务](web-handoff.zh-CN.md)：控制租约、草稿恢复、暂停接管、Codex App Server 与历史交接边界。
+- [MCP 协作工具](mcp.zh-CN.md)：固定项目、peer 与执行器身份的任务、消息、锁和结果证据工具。
 - [设计说明](design.md)：产品边界、项目边界、能力层级、协作语义和 provider
   session 绑定。
 - [实现说明](implementation.md)：架构、协议、命令面、技术栈、shim 行为和实现计划。

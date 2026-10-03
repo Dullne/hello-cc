@@ -19,6 +19,21 @@ hcc uninstall [--purge --yes]
 只有在确定也要删除当前项目的 `.hello-cc` 数据和指导块时，才加
 `--purge --yes`。
 
+## 只读诊断
+
+```text
+hcc doctor [--codex] [--json]
+```
+
+默认只检查项目数据库完整性和 schema 兼容性；损坏或不支持的 schema 返回非零退出码。
+加 `--codex` 才执行有时限和输出大小限制的 `codex --version`、`codex app-server --help`，
+两个探测使用临时 HOME/CODEX_HOME 并清理启动文件；hooks 检查读取原 Codex home 的
+`hooks.json` 并查看本项目已有 hook 调用事件。help 只能证明
+启动参数被声明，不能证明协议握手或模型可用；hook 配置存在、历史调用记录、stdout 投递
+和 provider 接收分别报告。当前无明确 stdout 回执，投递、接收和 trust 均保持 `unknown`。
+诊断不启动模型或会话、不执行 hooks，不修改账号、信任或 shim；可选诊断未知不会使健康
+数据库返回失败。`--json` 在现有报告中增加 `data.codex`，默认报告结构不变。
+
 ## 启动和停止
 
 ```text
@@ -35,6 +50,39 @@ runtime 生成 URL token。用 `--local` 可只绑定 `127.0.0.1`，用 `--token
 只想使用本地协作、不需要 Web 或 shims 时，再使用 `hcc up`。provider shim 只会加入
 已经由 `hcc web` 生成本地 `.hello-cc/runtime.json` 的项目，不会使用全局 runtime
 去管理任意目录。
+
+## Native 后台 worker
+
+```text
+hcc native up
+hcc native start --peer NAME --provider codex|claude|dsh [--cwd DIR] [--model MODEL] [--binary PATH] [--resume last]
+hcc native send --peer NAME --body TEXT [--from NAME] [--task ID]
+hcc native status
+hcc native deliveries [--peer NAME]
+hcc native events --peer NAME [--after ID]
+hcc native requests --peer NAME
+hcc native respond --peer NAME --request ID --decision accept|decline|cancel [--response-file JSON]
+hcc native interrupt --peer NAME [--turn ID]
+hcc native close --peer NAME
+hcc native down
+```
+
+这些命令通过 Codex app-server、可选 Claude Agent SDK 或 dsh ACP 管理 HCC 持有的
+后台 worker。send 成功只代表消息入队，需要查看投递回执区分提交、接受和完成。
+resume 只允许同一个 HCC peer/provider 持有的保存会话；已有 TUI/桌面会话继续使用
+原 transport。托管权限请求与问题等待当前 Web 控制窗口或本地 CLI 明确应答，
+并检查当前 worker/session/turn 身份。响应文件示例、SDK 安装、回执和接入边界见
+[Native 后台 worker](native.zh-CN.md)。
+
+## DeepSeek Harness
+
+```text
+hcc dsh setup [--mode hooks|cordis|off]
+hcc dsh status [--dsh-bin PATH]
+hcc dsh web [--mode hooks|cordis|off] [--dsh-bin PATH] [--dsh-home PATH] -- [dsh arguments]
+```
+
+验证基线为 `@deepseek-ai/dsh@0.2.0-rc.2`、Node.js 24+。Setup 生成项目局部配置，首次默认 hooks；`--mode cordis` 提供原生 `hcc_*` 工具和提交后 ACK，`--mode off` 关闭 overlay 注入，以后不带模式会沿用保存的选择。Status 校验文件与可执行文件，不调用模型。Harness 参数放在 `--` 后。Harness Web 会话通过自身界面交互；HCC 托管会话使用上方 native 命令控制。路由、bundle 和真实模型验收见[接入指南](dsh.zh-CN.md)。
 
 ## Peers 和状态
 

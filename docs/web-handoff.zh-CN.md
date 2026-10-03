@@ -1,0 +1,53 @@
+# Web 继续本地任务
+
+项目仍以 CLI/tmux 作为默认接入。它适合继续已经托管的本地 Codex/Claude/shell：Web 打开同一个 pane，不另起执行器。
+
+运行 `hcc web` 后选择已有会话。选中项和未发送草稿按项目保存于当前浏览器；刷新会恢复原位置。第一个 Web 连接取得控制，其他窗口可观察，点击“接管浏览器控制”后才可写入。服务端检查控制 epoch，旧窗口不能继续输入、改变终端尺寸、修改该 peer 或处理审批。本地 tmux client 仍可直接输入，Web 会显示其连接状态。
+
+终端草稿“发送 + Enter”收到回执，只代表运行时已接受字节。若连接中断或没有回执，草稿保留且不自动重发；先核对终端再决定是否补发。浏览器存储不可用时退回内存，关闭浏览器后未必保留。
+
+关闭页面或“释放控制”不会终止本地执行器。“暂停 Web 接管”使 tmux 保持运行，并保存暂停状态，自动发现和 runtime 重启不会立即重新接入。需要恢复时显式连接已有终端，例如 `hcc peer attach codex-a --pane %1`。暂停不是释放 task owner 或项目锁。选择终止 tmux 的复选框才会同时结束它；PTY 和 App Server 的“终止执行器”会结束对应子进程。
+
+## Codex 结构化界面
+
+新建会话时选择 Codex，再把“Codex 接入方式”切换为“结构化 App Server（显式启用）”。需要本地已安装且支持 App Server 的 `codex`，登录和模型环境来自启动 hello-cc 的进程。hello-cc 不自动登录、不更改信任配置、不探测未公开的 TUI 内部 endpoint。
+
+可先运行 `hcc doctor --codex --json` 查看只读诊断。它分别报告已安装版本、CLI help 声明的 App Server 启动参数、hooks 配置与项目中的 hook 调用记录；这些事实不等于完整 RPC 能力、hooks 已受信任、stdout 投递成功或模型已接收。版本/help 探测使用独立临时 HOME/CODEX_HOME 并清理，防止 Codex 启动文件触碰用户目录；hooks 配置仍从原路径只读检查。没有充分回执的状态显示 `unknown`，不会自动触发 hook 或修改 trust。普通 `hcc doctor` 仍只检查数据库。
+
+结构化界面提供消息、当前 turn 状态、追加指令、轮次中断、计划、差异和人工交互。命令/文件审批以及空表单 MCP 工具确认由当前控制窗口明确批准本次或拒绝。文件与网络权限可逐项勾选，并明确选择本轮或会话有效期；只能授予原请求的子集。问题支持选项、其他/自由输入和敏感答案，需逐题明确填写。接管控制本身不会批准工具。
+
+表单输入与焦点会跨状态刷新保留，直接答案不写入 HCC 状态、事件、回执或浏览器存储。原 turn 完成、中断成功、provider 解决请求或执行器关闭后，请求卡片失效；旧控制窗口不能用过期 epoch 应答。参数被截断时只能拒绝或取消。任意 MCP 表单字段、URL 登录、动态工具及账号 token 刷新尚未接入。
+
+运行中发消息使用 steer；空闲时开始新 turn。中断当前轮与终止执行器是不同操作。turn 完成不自动把 hcc task 标记为验收完成。
+
+要恢复一个旧 Codex thread，先停止旧执行器，选择 resume 并填写真实 thread ID，再勾选交接确认。后端仍会验证旧 owner 状态；活跃或证据不明时拒绝恢复。不能把它当作正在运行的 CLI 任务无缝迁移。原 thread 已绑定 hcc peer 时，保留原 peer/task 身份；正在运行的命令和未持久化事件不会迁移。
+
+提交先持久记录 submission ID。重复 ID、断线和超时不会触发自动重发。若读取历史仍不能明确确认接收结果，界面阻止新 turn；停止旧执行器后再恢复保存的 thread。历史清理保留用于去重的最小提交记录。
+
+关闭浏览器后 App Server 仍由 hello-cc runtime 管理；停止 runtime 会关闭它。新 runtime 不会自动重启 App Server 或重放未确认消息，可以从已保存 thread 显式恢复。
+
+## 本地 native worker 接手
+
+先用 `hcc native start --peer codex-worker --provider codex` 启动后台任务，再打开 Web 的同一项目。Web 自动发现实际仍由 native runtime 持有的 worker，显示其原 peer/session、事件和投递回执；发送、中断和明确关闭都通过原 runtime 执行，不新建 provider 子进程。Claude/dsh worker 也走这条路径，按实际能力显示中断操作。
+
+发送成功先显示队列回执；执行器接收、运行和完成分别使用实际投递状态。断线或不确定结果保留 submission ID，刷新不会重放消息。native runtime 重启或 worker 被替换时，旧 Web 视图及其控制凭证失效，重新发现当前 worker 后才能操作。
+
+关页面或停止 Web runtime 不会停止独立 native runtime/worker。界面的“终止执行器”才会明确关闭该 worker。Codex native worker 提供同一套权限与问题表单，并在会话内显式启用相应的实验工具开关；Claude 通过 SDK 工具 callback 批准原始输入本次执行，dsh ACP 只选择 provider 提供的 allow_once。所有请求均绑定当前执行器/session/turn，不自动批准。
+
+回到本地后，用 `hcc native requests --peer codex-worker` 查看待处理请求，再用 `hcc native respond --peer codex-worker --request REQUEST_ID --decision accept|decline|cancel` 应答。权限或问题答复通过 `--response-file JSON` 提交，格式见 [Native 指南](native.zh-CN.md#会话所有权hooks-和权限)。
+
+## 历史、协作工具与结果审阅
+
+项目栏“Codex 历史”可分页浏览当前项目已保存的 thread，读取上下文，再显式恢复或分叉。恢复仍要求旧执行器已确认停止；分叉生成新的 thread/peer，原任务 owner 不变。有正在托管的源会话时，分叉也必须取得该会话的浏览器控制。历史读取不会启动模型 turn。
+
+Web 专用 Codex App Server，以及由 HCC 托管的 Codex/Claude/dsh native worker，自动接入 [项目与 peer 受限的 MCP 协作工具](mcp.zh-CN.md)。配置只传给对应执行器或 worker，不写全局 provider 配置；关闭 worker 前撤销其临时权限。模型可查询任务与 inbox、领取任务、发送消息、写 handoff、获取/释放自己的资源锁和记录本地证据；不替用户执行发布或业务验收。
+
+会话栏“结果审阅”汇总结构化 command 的退出码与输出、turn 差异、模型通过 MCP 提交的本地证据，以及人工添加的验收记录。命令退出成功仅说明该命令成功；人工填写“通过”必须附证据引用。界面分别展示本地验证、发布部署、业务验收，并注明记录来源。turn 完成、测试记录或人工验收均不自动改变 hcc task 状态。记录保存于项目数据库 events 中，`gc --history` 保留结果审计记录和最小提交去重凭据。
+
+## 验收边界
+
+本地验证包含真实 SQLite/HTTP、模拟交互请求、隔离 tmux 与桌面/手机浏览器。安装版 Codex 0.144.6 的协议验收另行覆盖 initialize、thread/start/list、10 个 MCP 工具发现和实际 `hcc_state` 读回；此协议检查不调用模型，可用 `node scripts/web-handoff-installed-acceptance.mjs` 重现。
+
+真实模型验收已在隔离项目和 Codex home 中完成“本地 → Web → 本地”三段文件任务，全程保持原 Codex 进程和 thread；关闭 Web runtime 后仍可继续。可用 `scripts/web-native-model-acceptance.mjs` 在明确需要真实模型调用时重现。三种 provider 的真实生命周期、模型 MCP 发信、回复/ACK 和无回复循环另有独立回执。交互表单另有 11 项模拟 provider 浏览器检查。真实 Codex 已经完成“提问 → Web 答复 → 指定文件权限 → 本轮授权 → 写入所选答案 → 后续请求拒绝 → 本地继续”的验收；默认加载的 Claude SDK 已完成真实 Write 工具批准、拒绝和本地续接。dsh 的真实权限弹窗尚无本轮浏览器验收。完整结果与运行条件见 本地验收记录 (源码目录: `docs/verification/2026-10-02-web-local-task-handoff.md`)。
+
+任意未托管 TUI/普通终端的活动执行器迁移、私有 daemon endpoint、任意协议版本的完整兼容矩阵，以及发布安装和真实业务验收仍在本次证据范围之外。
