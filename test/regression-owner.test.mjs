@@ -109,6 +109,51 @@ test('diagnostics retain down code and safe context without stdout, message bodi
   assert.doesNotMatch(JSON.stringify(detail), /boot:original|startToken/);
 });
 
+test('fixture down reads the real CLI JSON error channel without exposing stderr', t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-down-channel-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const home = path.join(scratch, 'home');
+  const root = path.join(scratch, 'project');
+  fs.mkdirSync(home, { mode: 0o700 });
+  fs.mkdirSync(root, { mode: 0o700 });
+  const result = spawnSync(process.execPath, [path.resolve(import.meta.dirname, '../bin/hcc.mjs'),
+    '--root', root, '--json', 'down'], {
+    encoding: 'utf8', timeout: 5000,
+    env: { HOME: home, PATH: process.env.PATH, SHELL: '/bin/bash', NODE_NO_WARNINGS: '1' }
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(JSON.parse(result.stderr).error.code, 'RUNTIME_NOT_RUNNING');
+  const diagnostic = fixtureDownResult(result);
+  assert.equal(diagnostic.code, 'RUNTIME_NOT_RUNNING');
+  assert.equal(diagnostic.source, 'stderr');
+  assert.equal(diagnostic.status, 1);
+  assert.equal('stderr' in diagnostic, false);
+});
+
+test('fixture down extracts bounded warning-prefixed JSON and ignores private output fields', () => {
+  const failure = JSON.stringify({ ok: false, error: {
+    code: 'RUNTIME_STOP_TIMEOUT', pid: owner.pid, timeoutMs: 5000, elapsedMs: 5001,
+    message: 'PRIVATE_OUTPUT', token: 'PRIVATE_OUTPUT', state: 'PRIVATE_OUTPUT'
+  } }, null, 2);
+  for (const prefix of ['', '(node:123) ExperimentalWarning: PRIVATE_OUTPUT\n' +
+    '(Use `node --trace-warnings ...` to show where the warning was created)\n']) {
+    const diagnostic = fixtureDownResult({ status: 1, stdout: '', stderr: prefix + failure });
+    assert.equal(diagnostic.code, 'RUNTIME_STOP_TIMEOUT');
+    assert.equal(diagnostic.source, 'stderr');
+    assert.deepEqual(diagnostic.extra, { pid: owner.pid, elapsedMs: 5001, timeoutMs: 5000 });
+    assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_OUTPUT|ExperimentalWarning|message/);
+  }
+  for (const stderr of ['arbitrary private prefix\n' + failure,
+    '(node:123) ExperimentalWarning: ' + 'x'.repeat(65536) + '\n' + failure,
+    '{"ok":false,"error":', '{"ok":true,"error":{"code":"RUNTIME_STOP_TIMEOUT"}}']) {
+    const diagnostic = fixtureDownResult({ status: 1, stdout: '', stderr });
+    assert.equal(diagnostic.code, null);
+    assert.deepEqual(diagnostic.extra, {});
+    assert.doesNotMatch(JSON.stringify(diagnostic), /arbitrary private prefix|ExperimentalWarning/);
+  }
+});
+
 test('structured fixture failures use independently captured frames without multiline message content', () => {
   const privateMessage = 'failure heading\nPRIVATE_FIXTURE_BODY\nmore private message text';
   const owned = fixtureFailureError(privateMessage);

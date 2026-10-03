@@ -164,9 +164,35 @@ export async function waitForFixtureOwnerExit(owner, timeoutMs, {
   }
 }
 
+function fixtureCliFailurePayload(output) {
+  if (typeof output !== 'string' || Buffer.byteLength(output) > 64 * 1024) return null;
+  const text = output.trim();
+  const parse = value => {
+    try {
+      const payload = JSON.parse(value);
+      return payload?.ok === false && payload.error && typeof payload.error === 'object' &&
+        !Array.isArray(payload.error) ? payload : null;
+    } catch { return null; }
+  };
+  const direct = parse(text);
+  if (direct) return direct;
+  // Node can precede the CLI's multiline JSON with a warning and its trace
+  // hint. Accept only a small recognizable prefix, never arbitrary log text.
+  const jsonStart = text.lastIndexOf('\n{');
+  if (jsonStart < 0 || jsonStart > 4096) return null;
+  const prefix = text.slice(0, jsonStart).split('\n').map(line => line.trim()).filter(Boolean);
+  if (prefix.length > 8 || !prefix.every(line =>
+    /^\(node:\d+\) (?:\[[A-Z][A-Z0-9_]*\] )?(?:[A-Za-z]+Warning|Warning):/.test(line) ||
+    /^\(Use `node --trace-(?:warnings|deprecation) \.\.\.` to show where the warning was created\)$/.test(line))) return null;
+  return parse(text.slice(jsonStart + 1));
+}
+
 export function fixtureDownResult(result) {
-  let payload = null;
-  try { payload = JSON.parse(result.stdout || ''); } catch {}
+  // --json failures are written with console.error; stdout is retained as a
+  // compatibility fallback for fixtures. Raw output never enters diagnostics.
+  const stderrFailure = fixtureCliFailurePayload(result.stderr);
+  const stdoutFailure = fixtureCliFailurePayload(result.stdout);
+  const payload = stderrFailure || stdoutFailure;
   const extra = payload?.error?.extra || payload?.error || {};
   const code = payload?.error?.code || result.error?.code;
   const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
@@ -174,6 +200,9 @@ export function fixtureDownResult(result) {
     status: Number.isSafeInteger(result.status) ? result.status : null,
     signal: /^SIG[A-Z0-9]{1,12}$/.test(result.signal || '') ? result.signal : null,
     code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(code) ? code : null,
+    source: stderrFailure ? 'stderr' : stdoutFailure ? 'stdout' : result.error?.code ? 'spawn' : null,
+    stdoutBytes: typeof result.stdout === 'string' ? Buffer.byteLength(result.stdout) : 0,
+    stderrBytes: typeof result.stderr === 'string' ? Buffer.byteLength(result.stderr) : 0,
     extra: Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
       Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]]))
   };

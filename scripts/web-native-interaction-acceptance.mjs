@@ -23,6 +23,7 @@ import { readNativePointer } from '../lib/runtime/native/store.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
 import { resolveDshBinary, createDshEnvironment } from '../lib/integrations/dsh.mjs';
 import { checkDshRuntime, DSH_CORDIS_VERSION } from '../lib/integrations/dsh-cordis.mjs';
+import { interactionCompletionDiagnostics } from './web-native-interaction-diagnostics.mjs';
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
@@ -55,7 +56,7 @@ function sourceHashes() {
     if (fs.statSync(file).isDirectory()) for (const child of fs.readdirSync(file).sort()) walk(path.join(name, child));
     else result[name] = digest(file);
   }
-  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-native-interaction-acceptance.mjs']) walk(name);
+  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-native-interaction-acceptance.mjs', 'scripts/web-native-interaction-diagnostics.mjs']) walk(name);
   return result;
 }
 const evidence = { startedAt: new Date().toISOString(), directory, sourceFiles: sourceHashes(), providers: {}, checks: [], screenshots: [], pageErrors: [], consoleErrors: [], completed: false,
@@ -88,6 +89,7 @@ async function until(predicate, label, timeout = 180000) {
   throw new Error('Timed out: ' + label);
 }
 let service, browser, runtimeStarted = false;
+const answeredApprovals = new Map();
 try {
   assert.ok(fs.existsSync(tmux), 'tmux must be installed');
   assert.ok(process.env.HCC_ACCEPTANCE_PLAYWRIGHT, 'Set HCC_ACCEPTANCE_PLAYWRIGHT');
@@ -195,9 +197,16 @@ try {
     };
   });
   async function state(peer) { return api('GET', '/workers/' + peer + '/state'); }
-  async function finish(peer, submission) {
+  async function finish(peer, submission, answeredRequest = null) {
+    if (answeredRequest) answeredApprovals.set(peer, { request: answeredRequest, submission });
     return until(async () => {
       const value = await state(peer), delivery = value.deliveries.find(row => row.submission_id === submission);
+      if (answeredRequest && value.snapshot.pendingApprovals?.some(request => request.requestId !== answeredRequest.requestId)) {
+        const diagnostic = interactionCompletionDiagnostics(value, { answeredRequest, submissionId: submission,
+          ownedTargets: [{ role: 'allowed', path: dshAllowed }, { role: 'denied', path: dshDenied }] });
+        evidence.additionalApproval = diagnostic;
+        throw new Error(peer + ' requested a different pending approval after the prior answer; bounded metadata saved');
+      }
       if (['failed', 'uncertain'].includes(delivery?.state)) throw new Error(peer + ' delivery ended as ' + delivery.state);
       if (delivery?.state === 'completed') { evidence.modelInferenceCalled = true; return value; }
       return false;
@@ -297,7 +306,7 @@ try {
       await shot('dsh-real-permission-mobile');
       check('dsh operation summary and persistent details render on desktop and 390px mobile');
       await page.setViewportSize({ width: 1440, height: 1000 });
-      await page.locator('#nativeApprovals button[data-decision="accept"]').click(); await finish(peer, delivery.submission_id);
+      await page.locator('#nativeApprovals button[data-decision="accept"]').click(); await finish(peer, delivery.submission_id, request);
       assert.equal(fs.readFileSync(allowed, 'utf8').trim(), 'DSH_APPROVED_OK');
       assert.equal((await state(peer)).snapshot.sessionId, result.sessionId);
       check('dsh real ACP write approval returns to the original model turn');
@@ -306,7 +315,7 @@ try {
       assert.equal(refusal.sessionId, result.sessionId); assert.equal(refusal.params.toolCall.rawInput.file_path, denied);
       result.refusal = { method: refusal.method, requestId: refusal.requestId, sessionId: refusal.sessionId, turnId: refusal.turnId, target: denied };
       await page.locator('#nativeApprovals button[data-decision="decline"]').waitFor({ timeout: 15000 }); await shot('dsh-real-permission-decline');
-      await page.locator('#nativeApprovals button[data-decision="decline"]').click(); await finish(peer, declined.submission_id);
+      await page.locator('#nativeApprovals button[data-decision="decline"]').click(); await finish(peer, declined.submission_id, refusal);
       assert.equal(fs.existsSync(denied), false); check('dsh model respects a declined real ACP write operation');
     }
     await page.locator('#releaseControlBtn').click(); await page.waitForFunction(() => !window.hccHandoff.canControl);
@@ -334,6 +343,12 @@ try {
           evidence.failureNativeBackend = { source: 'native-service-read-after-failure', status: native.snapshot?.status,
             hasSessionId: Boolean(native.snapshot?.sessionId), hasOwner: Boolean(native.owner), hasGeneration: Boolean(native.generation),
             pendingCount: requests.length, pendingKinds: [...new Set(requests.map(request => request.kind))] };
+          const answered = answeredApprovals.get(peer);
+          evidence.failureCompletion = interactionCompletionDiagnostics(native, {
+            answeredRequest: answered?.request, submissionId: answered?.submission,
+            ownedTargets: [{ role: 'allowed', path: path.join(outside, peer.slice('live-'.length) + '-allowed.txt') },
+              { role: 'denied', path: path.join(directory, peer.slice('live-'.length) + '-denied', 'must-not-exist.txt') }],
+          });
           evidence.failureWebRead = await page.evaluate(async expected => {
             try {
               const bridge = window.hccHandoff;
