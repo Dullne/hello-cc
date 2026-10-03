@@ -66,7 +66,12 @@ lines.on('line', (line) => {
     if (!turn.fast) result(frame.id, { turn: { id: turn.id, status: 'inProgress' } });
     notify('turn/started', { threadId, turn: { id: turn.id, status: 'inProgress' } });
     if (text.includes('hold-open')) return;
-    if (text.includes('approval-check')) {
+    if (text.includes('mcp-form-check')) {
+      const id = 'fake-mcp-form-' + (++requestCount);
+      approvals.set(id, turn); turn.pending++;
+      write({ id, method: 'mcpServer/elicitation/request', params: { threadId, turnId: turn.id, serverName: 'form-fixture', mode: 'form', message: 'Project preferences',
+        requestedSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, count: { type: 'integer', minimum: 1 } }, required: ['enabled', 'count'] } } });
+    } else if (text.includes('approval-check')) {
       for (const method of ['item/commandExecution/requestApproval',
         'item/fileChange/requestApproval', 'item/permissions/requestApproval']) {
         const id = 'fake-approval-' + (++requestCount);
@@ -99,6 +104,7 @@ function fixture(t) {
   const dbPath = path.join(root, '.hello-cc', 'mesh.db');
   const pointer = path.join(root, '.hello-cc', 'native', 'runtime.json');
   const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home,
+    NODE_NO_WARNINGS: '1',
     FAKE_CODEX_LOG: traceFile, HCC_RUNTIME_URL: '', NO_COLOR: '1' };
   const processes = new Map();
   const trace = () => fs.existsSync(traceFile) ? fs.readFileSync(traceFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
@@ -198,7 +204,7 @@ test('native CLI help, lifecycle and saved resume use only the owned stdio proce
   const started = f.trace().find((row) => row.kind === 'started');
   assert.equal(started.home, f.home);
   assert.equal(started.root, fs.realpathSync(f.root));
-  assert.equal(started.db, f.dbPath);
+  assert.equal(started.db, fs.realpathSync(f.dbPath));
   assert.equal(started.peer, 'native-worker');
   assert.deepEqual(started.args, ['app-server', '--stdio']);
   const frames = f.trace().filter((row) => row.kind === 'frame').map((row) => row.frame);
@@ -308,4 +314,22 @@ test('native down closes an active owned worker without fabricating a reply or a
     assert.equal(db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(message.message_id).state, 'uncertain');
     assert.equal(db.prepare('SELECT status FROM workers WHERE peer=?').get('native-worker').status, 'closed');
   } finally { db.close(); }
+});
+
+
+test('native CLI response files carry validated MCP content through the owning executor', { skip: process.platform === 'win32' }, async (t) => {
+  const f = fixture(t); f.start();
+  const message = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'mcp-form-check');
+  const [request] = await f.wait(() => f.run('native', 'requests', '--peer', 'native-worker'), value => value.length === 1, 'MCP form request');
+  const file = path.join(f.home, 'form-response.json');
+  fs.writeFileSync(file, JSON.stringify({ content: { enabled: 'false', count: 2 } }), { mode: 0o600 });
+  f.fail('INTERACTION_RESPONSE_INVALID', 'native', 'respond', '--peer', 'native-worker', '--request', String(request.requestId), '--decision', 'accept', '--response-file', file);
+  assert.equal(f.run('native', 'requests', '--peer', 'native-worker').length, 1);
+  fs.writeFileSync(file, JSON.stringify({ content: { enabled: false, count: 2 } }), { mode: 0o600 });
+  const receipt = f.run('native', 'respond', '--peer', 'native-worker', '--request', String(request.requestId), '--decision', 'accept', '--response-file', file);
+  assert.equal(receipt.status, 'submitted');
+  assert.equal((await f.waitDelivery(message.message_id)).state, 'completed');
+  assert.deepEqual(f.trace().find(row => row.frame?.id === request.requestId && row.frame.result).frame.result, { action: 'accept', content: { enabled: false, count: 2 } });
+  assert.equal(JSON.stringify(f.run('native', 'events', '--peer', 'native-worker')).includes('"content"'), false);
+  f.run('native', 'down'); await f.waitStopped();
 });

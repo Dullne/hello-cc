@@ -18,6 +18,7 @@ import {
 } from '../lib/runtime/state.mjs';
 import { runtimeHttpRequest } from '../lib/web/runtime.mjs';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
+const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 
 test('reads Runtime API v2 from the HTTP header', () => {
   assert.equal(API_VERSION, 2);
@@ -82,9 +83,10 @@ test('forces one Runtime API v2 header regardless of caller casing', () => {
 });
 
 test('browser API and terminal WebSocket clients advertise Runtime API v2', () => {
-  const html = webIndexHtml({ nonce: 'test-api-version-nonce' });
+  assert.match(webIndexHtml({ nonce: 'test-api-version-nonce' }), /type="module" src="\/assets\/web\/browser\/core\.mjs"/);
+  const html = browserCore;
   assert.match(html, /'X-HCC-API-Version': String\(runtimeApiVersion\)/);
-  assert.match(html, /requestQuery\(\{ api_version: runtimeApiVersion \}\)/);
+  assert.match(html, /requestQuery\(\{ api_version: runtimeApiVersion, state_sync: 1 \}\)/);
 });
 
 test('runtime clients send v2 and probes reject legacy runtime metadata', async (t) => {

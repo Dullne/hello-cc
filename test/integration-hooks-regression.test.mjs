@@ -225,6 +225,30 @@ test('ordinary hooks honor HCC_DB and an explicit CLI database under HCC_ROOT', 
   }
 });
 
+test('ordinary hooks preserve explicit database precedence through a project symlink alias', (t) => {
+  if (process.platform === 'win32') return t.skip('directory symlink permissions vary on Windows');
+  const f = fixture(t);
+  const root = path.join(f.sandbox, 'project');
+  const alias = path.join(f.sandbox, 'project-alias');
+  fs.mkdirSync(root);
+  fs.symlinkSync(root, alias, 'dir');
+  const cliDb = path.join(root, '.hello-cc', 'explicit.db');
+  const envDb = path.join(root, '.hello-cc', 'environment.db');
+  const run = spawnSync(process.execPath, [hccBin, '--root', alias, '--db', cliDb, 'hook', 'SessionStart'], {
+    cwd: alias, encoding: 'utf8', timeout: 10_000,
+    input: JSON.stringify({ cwd: root, session_id: 'alias-db-session' }),
+    env: { ...process.env, HOME: f.home, HCC_ROOT: alias, HCC_DB: envDb,
+      HCC_PEER: 'alias-db-peer', HCC_NATIVE_OWNER: '' }
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(fs.existsSync(cliDb), true, 'canonical and alias roots must share the CLI database selection');
+  assert.equal(fs.existsSync(envDb), false, 'HCC_DB must not override an explicit CLI database');
+  assert.equal(fs.existsSync(path.join(root, '.hello-cc', 'mesh.db')), false);
+  const db = new DatabaseSync(cliDb, { readOnly: true });
+  try { assert.deepEqual(db.prepare('SELECT id FROM peers').all().map(row => row.id), ['alias-db-peer']); }
+  finally { db.close(); }
+});
+
 test('prompt shell commands preserve special characters in every argument', async (t) => {
   const f = fixture(t);
   const marker = path.join(f.sandbox, 'should-not-exist');

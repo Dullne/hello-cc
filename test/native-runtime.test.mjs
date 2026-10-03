@@ -13,6 +13,7 @@ import { createEventHelpers } from '../lib/db/events.mjs';
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import { createMessageStore } from '../lib/core/coordination/messages.mjs';
+import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { readNativePointer, writeNativePointer, createNativeStore } from '../lib/runtime/native/store.mjs';
@@ -25,7 +26,8 @@ async function until(fn) {
   while (Date.now() < end) { if (await fn()) return; await delay(10); }
   assert.fail('condition did not become true');
 }
-async function fixture(t, config = {}, launch = startNativeService) {
+async function fixture(t, config = {}, serviceOptions = {}, launch = startNativeService) {
+  if (typeof serviceOptions === 'function') { launch = serviceOptions; serviceOptions = {}; }
   const root = await createNativeTestRoot('hcc-native-runtime-');
   const ctx = {root,dbPath:path.join(root,'.hello-cc','mesh.db')};
   fs.mkdirSync(path.dirname(ctx.dbPath));
@@ -55,7 +57,7 @@ async function fixture(t, config = {}, launch = startNativeService) {
     adapters.set(peer,adapter);
     if(local.factoryGate) await local.factoryGate.promise;
     return adapter;
-  }};
+  }, ...serviceOptions};
   let service;
   t.after(async()=>{ try { await service?.shutdown(); } finally { inspect.close(); fs.rmSync(root,{recursive:true,force:true}); } });
   service = await launch(ctx,deps,options);
@@ -200,6 +202,61 @@ test('failed owned close retains runtime ownership and reports incomplete shutdo
     await assert.rejects(startNativeService(f.ctx,f.deps),{code:'NATIVE_RUNTIME_IN_USE'});
   } finally { console.error=warn;configuration.a.closeError=null; }
   await f.service.shutdown();assert.equal(readNativePointer(f.ctx),null);
+});
+
+test('Codex close failure retains service ownership until an explicit close and down retry succeeds', async (t) => {
+  let blocked = true;
+  let closeAttempts = 0;
+  const rpc = {
+    async start() {},
+    async notify() {},
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/start') return { thread: { id: 'owned-codex-thread', turns: [] } };
+      assert.fail(`unexpected RPC method: ${method}`);
+    },
+    async close() {
+      closeAttempts++;
+      if (blocked) throw Object.assign(new Error('process termination is not confirmed'), {
+        code: 'NATIVE_CLOSE_FAILED', extra: { uncertain: true, cause: 'EPERM' }
+      });
+    }
+  };
+  const f = await fixture(t, {}, {
+    adapterFactory: (provider, options) => {
+      assert.equal(provider, 'codex');
+      return createCodexAdapter({ ...options, rpcFactory: () => rpc });
+    }
+  });
+  await f.start('codex-owned');
+  const pointer = readNativePointer(f.ctx);
+  const binding = f.inspect.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('codex-owned');
+  const warn = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(f.api('POST', '/close', { peer: 'codex-owned' }), { code: 'NATIVE_CLOSE_FAILED' });
+    await assert.rejects(f.service.shutdown(), { code: 'NATIVE_SHUTDOWN_INCOMPLETE' });
+    assert.equal(readNativePointer(f.ctx).generation, pointer.generation);
+    const status = await f.api('GET', '/status');
+    assert.equal(status.stopping, true);
+    assert.equal(status.shutdown_error.code, 'NATIVE_CLOSE_FAILED');
+    assert.equal(status.workers[0].owned, true);
+    assert.equal(status.workers[0].status, 'uncertain');
+    assert.deepEqual(f.inspect.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('codex-owned'), binding);
+    await assert.rejects(startNativeService(f.ctx, f.deps), { code: 'NATIVE_RUNTIME_IN_USE' });
+  } finally {
+    blocked = false;
+    console.error = warn;
+  }
+  const attemptsBeforeRetry = closeAttempts;
+  assert.deepEqual(await f.api('POST', '/close', { peer: 'codex-owned' }), { peer: 'codex-owned', status: 'closed' });
+  assert.ok(closeAttempts > attemptsBeforeRetry, 'retry must reach the owned transport again');
+  assert.equal((await f.api('GET', '/status')).workers[0].owned, false);
+  assert.deepEqual(await f.api('POST', '/down', {}), { stopping: true });
+  await f.service.shutdown();
+  assert.equal(readNativePointer(f.ctx), null);
+  await f.restart();
+  assert.notEqual(readNativePointer(f.ctx).generation, pointer.generation);
 });
 
 test('native workers consume reply context without generating automatic reply loops',async(t)=>{

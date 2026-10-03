@@ -538,6 +538,7 @@ for (const lastCandidateOccupied of [false, true]) {
     assert.equal(callbackRan, true);
     assert.equal(Boolean(Atomics.load(closeStarted, 1)), lastCandidateOccupied);
     assert.equal(error?.code, 'ERR_FILE_LOCK_RELEASE_FAILED');
+    worker.ref();
     assert.equal(await workerExit, 0);
   });
 }

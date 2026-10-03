@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -37,11 +38,11 @@ async function fixture(t, configuration = {}) {
   const adapters = new Map(), created = [], bridges = [];
   const options = { pollMs: 60000, adapterFactory: async (provider, options) => {
     const peer = options.env.HCC_PEER;
-    const state = { provider, status: 'new', sessionId: null, turnId: null,
+    const state = { provider, status: 'new', sessionId: null, turnId: null, executorId: options.executorId,
       capabilities: { send: true, resume: true, interrupt: true, close: true } };
-    const adapter = { state, sent: [], interrupted: [], closed: 0,
+    const adapter = { state, options, sent: [], interrupted: [], closed: 0,
       capabilities: state.capabilities, snapshot: () => structuredClone(state),
-      async open(input) { state.sessionId = input.sessionId || (configuration[peer]?.unknownSession ? null : 'session-' + peer);
+      async open(input) { this.openInput = input; state.sessionId = input.sessionId || (configuration[peer]?.unknownSession ? null : 'session-' + peer);
         state.status = 'idle'; return this.snapshot(); },
       async send(input) { this.sent.push(input); this.active = input; state.status = 'running'; state.turnId = 'turn-' + peer;
         return { status: 'queued', turnId: state.turnId }; },
@@ -57,12 +58,12 @@ async function fixture(t, configuration = {}) {
   let service = await startNativeService(ctx, deps, options);
   const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: 3000 });
   const key = (project, id) => project.root + '\0' + id;
-  function bridge(nativeApi = nativeRequest, sessions = new Map()) {
+  function bridge(nativeApi = nativeRequest, sessions = new Map(), options = {}) {
     const broadcasts = [], closedClients = [];
     const manager = createNativeSessions({ sessions, sessionKey: key, connectWebProject: connect,
       addEvent: events.addEvent, nativeApi,
       broadcast: (session, payload) => broadcasts.push({ session, payload }),
-      closeSessionClients: (session) => { closedClients.push(session); session.clients.clear(); session.actionTokens.clear(); } });
+      closeSessionClients: (session) => { closedClients.push(session); session.clients.clear(); session.actionTokens.clear(); }, ...options });
     bridges.push(manager);
     return { ...manager, sessions, broadcasts, closedClients,
       session: (peer = 'a') => sessions.get(key(ctx, peer)) };
@@ -78,6 +79,138 @@ async function fixture(t, configuration = {}) {
     receipts: () => mesh.prepare("SELECT type,payload FROM events WHERE type LIKE 'native.web.submission.%' ORDER BY id").all()
       .map((row) => ({ ...row, payload: JSON.parse(row.payload) })) };
 }
+
+test('Web creates each native provider through the existing daemon and opens the same owned worker', async t => {
+  const f = await fixture(t), web = f.bridge();
+  const cwd = path.join(f.ctx.root, 'subproject'); fs.mkdirSync(cwd);
+  for (const kind of ['codex', 'claude', 'dsh']) {
+    const session = await web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind, id: `new-${kind}`,
+      ...(kind === 'claude' ? {} : { cwd: 'subproject', model: 'provider-model' }) });
+    assert.equal(session.type, 'native'); assert.equal(session.kind, kind);
+    assert.equal(session.nativeIdentity.owner, f.adapters.get(session.id).state.executorId);
+    assert.equal(session.cwd, kind === 'claude' ? f.ctx.root : cwd);
+    assert.equal(f.adapters.get(session.id).openInput.model, kind === 'claude' ? undefined : 'provider-model');
+    assert.equal(f.adapters.get(session.id).openInput.sessionId, undefined);
+    assert.equal(session.adapter, undefined);
+  }
+  assert.equal(f.created.length, 3);
+  web.closeNativeBridge();
+  assert.ok((await f.api('GET', '/status')).workers.every(worker => worker.owned));
+  assert.ok(f.created.every(adapter => adapter.closed === 0));
+});
+
+test('Web native creation rejects ambiguous inputs, foreign paths and existing owners before launching', async t => {
+  const f = await fixture(t);
+  let launches = 0;
+  const web = f.bridge(nativeRequest, new Map(), { ensureRuntime: async () => { launches++; } });
+  const base = { projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'new-worker' };
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-outside-')));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  fs.symlinkSync(outside, path.join(f.ctx.root, 'outside'), process.platform === 'win32' ? 'junction' : 'dir');
+  fs.writeFileSync(path.join(f.ctx.root, 'ordinary-file'), 'not a directory');
+  for (const change of [{ kind: 'shell' }, { id: 'all' }, { id: '' }, { id: '../escape' }, { id: null },
+    { model: '' }, { model: 1 }, { model: 'x'.repeat(257) }, { cwd: '' }, { cwd: null }, { cwd: 'missing' },
+    { cwd: 'ordinary-file' }, { mode: 'new' }, { resume: 'last' }, { force: false },
+    { binary: 'codex' }, { env: {} }, { command: 'codex' }, { backend: 'native' }, { db: outside }]) {
+    await assert.rejects(web.startNativeSession({ ...base, ...change }), { code: 'BAD_REQUEST' });
+  }
+  for (const cwd of [outside, 'outside', '..']) {
+    await assert.rejects(web.startNativeSession({ ...base, cwd }), { code: 'PROJECT_PATH_FORBIDDEN' });
+  }
+  await f.start('new-worker');
+  const binding = f.mesh.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('new-worker');
+  await assert.rejects(web.startNativeSession(base), { code: 'NATIVE_PEER_IN_USE' });
+  assert.deepEqual(f.mesh.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('new-worker'), binding);
+  assert.equal(launches, 0); assert.equal(f.created.length, 1);
+});
+
+test('Web native creation reserves explicit names and gives concurrent unnamed requests distinct stable peers', async t => {
+  const f = await fixture(t);
+  let ready;
+  const gate = new Promise(resolve => { ready = resolve; });
+  const web = f.bridge(nativeRequest, new Map(), { ensureRuntime: () => gate });
+  const base = { projectCtx: f.ctx, transport: 'native', kind: 'codex' };
+  const first = web.startNativeSession({ ...base, id: 'reserved' });
+  await assert.rejects(web.startNativeSession({ ...base, id: 'reserved' }), { code: 'NATIVE_WORKER_EXISTS' });
+  const anonymous = Array.from({ length: 4 }, () => web.startNativeSession(base));
+  ready();
+  const created = await Promise.all([first, ...anonymous]);
+  assert.equal(new Set(created.map(session => session.id)).size, 5);
+  assert.equal(f.created.length, 5);
+  for (const session of created) assert.equal(session.nativeSnapshot().peer, session.id);
+});
+
+test('created native worker survives a failed first Web read and recovers by its original peer without another create', async t => {
+  const f = await fixture(t); let createCalls = 0, failRead = true;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    if (method === 'POST' && route === '/workers') createCalls++;
+    if (failRead && route.includes('/state')) throw Object.assign(new Error('lost first read'), { code: 'NATIVE_RUNTIME_OFFLINE' });
+    return nativeRequest(ctx, method, route, body, options);
+  });
+  let peer;
+  await assert.rejects(web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex' }), error => {
+    assert.equal(error.code, 'NATIVE_WORKER_DISCOVERY_FAILED'); assert.equal(error.extra.created, true);
+    peer = error.extra.peer; assert.ok(peer); assert.match(error.message, /do not create a replacement/); return true;
+  });
+  assert.equal(createCalls, 1); assert.equal(f.adapters.get(peer).closed, 0);
+  failRead = false;
+  await web.discoverNativeSessions(f.ctx);
+  assert.equal(web.session(peer).id, peer);
+  assert.equal(createCalls, 1); assert.equal(f.created.length, 1);
+});
+
+test('an uncertain native create reports its stable peer and never automatically replays admission', async t => {
+  const f = await fixture(t); let createCalls = 0;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const result = await nativeRequest(ctx, method, route, body, options);
+    if (method === 'POST' && route === '/workers') {
+      createCalls++;
+      throw Object.assign(new Error('response lost'), { code: 'NATIVE_CLIENT_TIMEOUT', extra: { uncertain: true } });
+    }
+    return result;
+  });
+  let peer;
+  await assert.rejects(web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'claude' }), error => {
+    assert.equal(error.code, 'NATIVE_CREATE_UNCONFIRMED'); assert.equal(error.extra.uncertain, true);
+    peer = error.extra.peer; return Boolean(peer);
+  });
+  await web.discoverNativeSessions(f.ctx);
+  assert.equal(web.session(peer).kind, 'claude');
+  assert.equal(createCalls, 1); assert.equal(f.created.length, 1);
+});
+
+test('native creation rechecks its project directory after awaiting daemon startup', async t => {
+  const f = await fixture(t);
+  const cwd = path.join(f.ctx.root, 'work'); fs.mkdirSync(cwd);
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-moved-')));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  const web = f.bridge(nativeRequest, new Map(), { ensureRuntime: async () => {
+    fs.renameSync(cwd, path.join(f.ctx.root, 'original-work'));
+    fs.symlinkSync(outside, cwd, process.platform === 'win32' ? 'junction' : 'dir');
+  } });
+  await assert.rejects(web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', cwd }),
+    { code: 'PROJECT_PATH_FORBIDDEN' });
+  assert.equal(f.created.length, 0);
+});
+
+test('a stale discovery list cannot retire a worker created while its status read was in flight', async t => {
+  const f = await fixture(t);
+  let release, observed;
+  const gate = new Promise(resolve => { release = resolve; });
+  const statusRead = new Promise(resolve => { observed = resolve; });
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const result = await nativeRequest(ctx, method, route, body, options);
+    if (route === '/status') { observed(); await gate; }
+    return result;
+  });
+  const scan = web.discoverNativeSessions(f.ctx);
+  await statusRead;
+  const session = await web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'new-during-scan' });
+  release(); await scan;
+  assert.equal(web.session(session.id), session);
+  assert.equal(session.nativeRetired, undefined);
+  assert.equal(session.status, 'running'); assert.equal(web.closedClients.length, 0);
+});
 
 test('Web discovers only actual native workers, reuses their binding, and creates no executor', async (t) => {
   const f = await fixture(t); await f.start();
@@ -246,6 +379,10 @@ test('native metadata, approvals and receipts broadcast changes without advancin
   overlay = { snapshot: { capabilities: { interrupt: true, send: false } } };
   await web.pollNativeSessions();
   assert.equal(web.broadcasts.length, previous, 'object property order is not a semantic state change');
+  const metrics = { source: 'provider/tokenUsage', scope: 'session', inputTokens: 42, outputTokens: 7, observedAt: 123 };
+  const metadata = { model: 'reported-model', permissionMode: 'default', commands: [] };
+  await change({ snapshot: { metrics, runtimeMetadata: metadata } }, state => { assert.deepEqual(state.metrics, metrics); assert.deepEqual(state.runtimeMetadata, metadata); });
+  await change({ snapshot: { metrics: null, runtimeMetadata: null } }, state => { assert.equal(state.metrics, null); assert.equal(state.runtimeMetadata, null); });
   await change({ closing: true }, state => assert.equal(state.closing, true));
   await change({ quarantined: true }, state => assert.equal(state.quarantined, true));
   await change({ active_delivery: { message_id: 1, submission_id: 'submission', turn_id: 'turn-one' } }, state => assert.equal(state.turnId, 'turn-one'));
@@ -471,4 +608,45 @@ test('a missing active session or another transport cannot use the lazy Claude r
   adapter.state.status = 'ready';
   f.mesh.prepare("UPDATE peer_bindings SET runtime_target='another-owner' WHERE peer='a'").run();
   assert.equal((await bridge.discoverNativeSessions(f.ctx)).length, 0);
+});
+
+
+test('Web reads account state from the independent native executor using its exact owner/session identity', async t => {
+  const f=await fixture(t); await f.start();
+  const adapter=f.adapters.get('a'); adapter.capabilities.accountRead=true;
+  let reads=0; adapter.readAccount=async()=>{reads++;adapter.state.account={status:'ready',authentication:'providerManaged',rateLimits:{status:'notApplicable',buckets:[]}};};
+  const calls=[], web=f.bridge((ctx,method,route,body,options)=>{calls.push({method,route});return nativeRequest(ctx,method,route,body,options);});
+  await web.discoverNativeSessions(f.ctx); const session=web.session(), identity=session.nativeIdentity;
+  const before=f.mesh.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('a');
+  const result=await web.nativeAction(session,'account',{...identity,authorizeMutation(){throw new Error('read must not ask for control');}});
+  assert.equal(result.account.authentication,'providerManaged'); assert.equal(reads,1);
+  assert.equal(result.owner,identity.owner); assert.equal(result.sessionId,identity.sessionId);
+  assert.ok(calls.every(c=>c.method==='GET')); assert.equal(f.created.length,1); assert.equal(adapter.sent.length,0);
+  assert.deepEqual(f.mesh.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('a'),before);
+});
+
+test('stale and unsupported native account reads are refused before requesting provider account data', async t => {
+  const f=await fixture(t); await f.start(); const adapter=f.adapters.get('a');
+  let reads=0; adapter.readAccount=async()=>{reads++;};
+  const web=f.bridge(); await web.discoverNativeSessions(f.ctx); const session=web.session(),identity=session.nativeIdentity;
+  await assert.rejects(web.nativeAction(session,'account',{...identity}),{code:'NATIVE_CAPABILITY_UNSUPPORTED'});
+  adapter.capabilities.accountRead=true; await web.nativeAction(session,'read');
+  for(const patch of [{owner:'old-owner'},{generation:'old-generation'},{sessionId:'old-thread'}]) {
+    await assert.rejects(web.nativeAction(session,'account',{...identity,...patch}),{code:'NATIVE_OWNER_CHANGED'});
+    const query=new URLSearchParams({...identity,...patch});
+    await assert.rejects(f.api('GET','/workers/a/account?'+query),{code:'NATIVE_OWNER_CHANGED'});
+  }
+  await assert.rejects(f.api('GET','/workers/a/account'),{code:'BAD_ARGS'});
+  assert.equal(reads,0); assert.equal(session.nativeRetired,undefined);
+});
+
+test('native account read rechecks binding ownership after the provider response', async t => {
+  const f=await fixture(t); await f.start(); const adapter=f.adapters.get('a'); adapter.capabilities.accountRead=true;
+  let finish,called; const requested=new Promise(resolve=>{called=resolve;});
+  adapter.readAccount=()=>new Promise(resolve=>{finish=resolve;called();});
+  const web=f.bridge(); await web.discoverNativeSessions(f.ctx); const session=web.session();
+  const reading=web.nativeAction(session,'account',{...session.nativeIdentity}); await requested;
+  f.mesh.prepare('UPDATE peer_bindings SET runtime_target=? WHERE peer=?').run('replaced-owner','a');
+  finish(); await assert.rejects(reading,{code:'NATIVE_PEER_IN_USE'});
+  assert.equal(f.mesh.prepare('SELECT runtime_target FROM peer_bindings WHERE peer=?').get('a').runtime_target,'replaced-owner');
 });

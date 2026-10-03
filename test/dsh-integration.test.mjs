@@ -26,7 +26,8 @@ function temporary(label) {
 function context(root) { return { root, cwd: root, json: false }; }
 function configure(root, options = {}) { return ensureDshIntegration(context(root), { hccBin, ...options }); }
 function inspect(root, options = {}) { return inspectDshIntegration(context(root), { hccBin, ...options }); }
-function assertConflict(fn) { assert.throws(fn, (error) => error.code === 'DSH_CONFIG_CONFLICT'); }
+function assertConflict(fn) { assert.throws(fn, (error) =>
+  ['DSH_CONFIG_CONFLICT', 'PROJECT_PATH_FORBIDDEN'].includes(error.code)); }
 
 test('setup writes verified project-local hooks and overlay, then remains idempotent', () => {
   const root = temporary('setup');

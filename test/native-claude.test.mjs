@@ -91,10 +91,49 @@ function result(input, fields = {}) {
   };
 }
 
+test('native Claude forwards usage only for the owned result and keeps absent totals unknown', async () => {
+  const sdk=fakeSdk(), events=[];
+  const adapter=createClaudeAdapter({query:sdk.query,cwd:process.cwd(),onEvent:event=>events.push(event)});
+  try {
+    await adapter.open();await adapter.send({text:'task'});await until(()=>sdk.received.length===1 && adapter.snapshot().sessionId);
+    sdk.emit(result(sdk.received[0],{parent_tool_use_id:'child',usage:{input_tokens:999},duration_ms:999}));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(adapter.snapshot().metrics,null);
+    const turnId=adapter.snapshot().turnId;
+    sdk.emit(result(sdk.received[0],{usage:{input_tokens:12,output_tokens:4,cache_read_input_tokens:2},duration_ms:30}));
+    await until(()=>adapter.snapshot().metrics);
+    assert.equal(adapter.snapshot().metrics.turnId,turnId);
+    assert.equal(adapter.snapshot().metrics.inputTokens,12);
+    assert.equal(adapter.snapshot().metrics.totalTokens,undefined);
+    assert.equal(adapter.snapshot().metrics.durationMs,30);
+    assert.equal(events.filter(event=>event.type==='usage').length,1);
+  } finally {await adapter.close();}
+});
+
+test('Claude refuses SDK query creation when its selected directory was rebound after open', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-claude-path-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const original = path.join(base, 'original');
+  const replacement = path.join(base, 'replacement');
+  const selected = path.join(base, 'selected');
+  fs.mkdirSync(original);
+  fs.mkdirSync(replacement);
+  fs.symlinkSync(original, selected, 'dir');
+  const sdk = fakeSdk();
+  const adapter = createClaudeAdapter({ cwd: selected, query: sdk.query });
+  try {
+    await adapter.open();
+    fs.unlinkSync(selected);
+    fs.symlinkSync(replacement, selected, 'dir');
+    await assert.rejects(adapter.send({ text: 'do not submit' }), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(sdk.calls, 0);
+  } finally { await adapter.close(); }
+});
+
 test('Claude adapter keeps one SDK stream across asynchronous turns and waits for init', async () => {
   const sdk = fakeSdk({ pauseInput: true });
   const events = [];
-  const adapter = createClaudeAdapter({ query: sdk.query, cwd: '/fake/project', onEvent: (event) => events.push(event) });
+  const adapter = createClaudeAdapter({ query: sdk.query, cwd: process.cwd(), onEvent: (event) => events.push(event) });
   assert.equal(adapter.capabilities.steer, false);
   const opened = await adapter.open({ sessionId: 'claude-session', model: 'claude-test' });
   assert.equal(opened.sessionId, null);
@@ -524,7 +563,7 @@ async function isolatedDefaultSdk(t, moduleSource) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const installed = path.join(directory, 'hcc'), project = path.join(directory, 'project');
   const base = fileURLToPath(new URL('../lib/', import.meta.url));
-  for (const name of ['integrations/native/claude.mjs', 'integrations/native/interactions.mjs']) {
+  for (const name of ['integrations/native/claude.mjs', 'integrations/native/interactions.mjs', 'integrations/native/telemetry.mjs', 'integrations/mcp-url-elicitation.mjs', 'process/selected-cwd-identity.mjs']) {
     const target = path.join(installed, 'lib', name); fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(base, name), target);
   }

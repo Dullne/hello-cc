@@ -217,7 +217,7 @@ test('runtime pointer cleanup requires the exact current pid', (t) => {
   });
 
   for (const pointer of [projectPointer, globalPointer]) {
-    fs.writeFileSync(pointer, JSON.stringify({ base_url: 'http://127.0.0.1:1' }));
+    fs.writeFileSync(pointer, JSON.stringify({ base_url: 'http://127.0.0.1:1' }), { mode: 0o600 });
   }
   clearRuntime({ root }, process.pid);
   assert.equal(fs.existsSync(projectPointer), true, 'missing-pid project pointer was deleted');

@@ -17,7 +17,7 @@ async function fixture(t, authMode = 'loopback') {
   const lease = createControlLease();
   const controller = lease.connect(session, 'controller');
   lease.connect(session, 'observer');
-  const writes = [], changes = [];
+  const writes = [], changes = [], reads = [];
   const assertWrite = (s, input) => {
     try { lease.assertControl(s, input.action_token, input.epoch); }
     catch (error) { throw new CliError(error.code, error.message); }
@@ -31,7 +31,13 @@ async function fixture(t, authMode = 'loopback') {
     writeSessionInput: (_s, data) => writes.push(data), detachTmuxSession: () => changes.push('detach'),
     attachTmuxSession: () => { changes.push('attach'); return session; },
     startSession: () => { changes.push('start'); return session; },
-    codexAction: async (_s, action) => { changes.push(action); return { ok: true }; },
+    codexAction: async (s, action, input) => {
+      if (action === 'account') {
+        if (input.executorId !== s.adapter.snapshot().executorId) throw new CliError('CODEX_EXECUTOR_MISMATCH', 'Wrong executor');
+        reads.push(input); return { status: 'ready', authentication: 'providerManaged' };
+      }
+      changes.push(action); return { ok: true };
+    },
     shutdown: () => changes.push('runtime stop'),
     webErrorStatus: err => err.code === 'BAD_REQUEST' ? 400 : err.code === 'RUNTIME_ADMIN_REQUIRED' ? 403 : 409
   });
@@ -44,7 +50,11 @@ async function fixture(t, authMode = 'loopback') {
         Origin: 'http://127.0.0.1:' + server.address().port }, body: JSON.stringify(body)
     }); return { status: response.status, body: await response.json() };
   };
-  return { db, session, lease, controller, writes, changes, post };
+  const get = async route => {
+    const response = await fetch('http://127.0.0.1:' + server.address().port + route, { headers: { 'X-HCC-API-Version': '2' } });
+    return { status: response.status, body: await response.json() };
+  };
+  return { db, session, lease, controller, writes, changes, reads, get, post };
 }
 
 test('observer cannot inject, resize via attach, stop, or recreate an existing session through HTTP', async t => {
@@ -113,4 +123,22 @@ test('direct and planned history GC preserve the latest pause and submission ded
     assert.equal(adoptionPaused(db, { peer: 'peer', pane: '%1', pid: 123 }), true);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE type = 'codex.submission.pending'").get().n, 1);
   } finally { db.close(); }
+});
+
+
+test('authenticated Web observers can read current Codex account state but cannot invoke login or token operations', async t => {
+  const f=await fixture(t,'cookie'); f.session.type='app-server';
+  f.session.adapter={snapshot:()=>({executorId:'executor-a'})};
+  for(const executorId of ['', 'old-executor']) {
+    const result=await f.get('/api/sessions/codex-a/codex/account?executorId='+executorId);
+    assert.equal(result.status,409); assert.equal(result.body.error.code,'CODEX_EXECUTOR_MISMATCH');
+  }
+  const result=await f.get('/api/sessions/codex-a/codex/account?executorId=executor-a');
+  assert.equal(result.status,200); assert.equal(result.body.account.authentication,'providerManaged');
+  assert.equal(result.body.executorId,'executor-a'); assert.equal(f.reads.length,1);
+  for(const action of ['account','login','logout','refreshToken']) {
+    const attempt=await f.post('/api/sessions/codex-a/codex/'+action,{action_token:'controller',epoch:f.controller.epoch});
+    assert.equal(attempt.status,400);
+  }
+  assert.deepEqual(f.changes,[]); assert.deepEqual(f.writes,[]);
 });

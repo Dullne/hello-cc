@@ -70,6 +70,78 @@ test('native writers tighten existing owned state and database while reads remai
   assert.equal(fs.existsSync(`${dbPath}-shm`), true);
 });
 
+test('opening a second native store never raw-opens an active SQLite database inode', (t) => {
+  const f = fixture(t);
+  const first = f.store();
+  first.saveWorker({ peer: 'worker', provider: 'codex', cwd: f.ctx.root, status: 'ready' });
+  const dbPath = nativePaths(f.ctx).db;
+  const originalOpen = fs.openSync;
+  fs.openSync = function checkedOpen(file, ...args) {
+    if (typeof file === 'string' && path.resolve(file) === dbPath) {
+      throw new Error('raw open of an active SQLite database');
+    }
+    return originalOpen.call(this, file, ...args);
+  };
+  try {
+    const second = f.store();
+    assert.equal(second.worker('worker')?.provider, 'codex');
+  } finally {
+    fs.openSync = originalOpen;
+  }
+});
+
+test('native store closes its connection when schema initialization fails', (t) => {
+  const f = fixture(t);
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalClose = DatabaseSync.prototype.close;
+  const failure = new Error('injected native schema failure');
+  let opened = null;
+  let closed = false;
+  DatabaseSync.prototype.exec = function failInitialSchema(sql) {
+    if (String(sql).startsWith('PRAGMA journal_mode = WAL')) {
+      opened = this;
+      throw failure;
+    }
+    return originalExec.call(this, sql);
+  };
+  DatabaseSync.prototype.close = function recordClose() {
+    if (this === opened) closed = true;
+    return originalClose.call(this);
+  };
+  try {
+    assert.throws(() => createNativeStore(f.ctx), error => error === failure);
+    assert.ok(opened);
+    assert.equal(closed, true);
+    assert.equal(opened.isOpen, false);
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.close = originalClose;
+  }
+});
+
+test('native paths allow a SQLite sidecar to retire during inspection', (t) => {
+  const f = fixture(t);
+  const paths = nativePaths(f.ctx, { create: true });
+  const sidecar = `${paths.db}-shm`;
+  fs.writeFileSync(sidecar, 'temporary', { mode: 0o600 });
+  const originalStat = fs.lstatSync;
+  let retired = false;
+  fs.lstatSync = function retireSidecar(file, ...args) {
+    const stat = originalStat.call(this, file, ...args);
+    if (file === sidecar && !retired) {
+      retired = true;
+      fs.unlinkSync(sidecar);
+    }
+    return stat;
+  };
+  try {
+    assert.equal(nativePaths(f.ctx)?.db, paths.db);
+    assert.equal(retired, true);
+  } finally {
+    fs.lstatSync = originalStat;
+  }
+});
+
 for (const parent of ['.hello-cc', path.join('.hello-cc', 'native')]) {
   for (const dangling of [false, true]) {
     test(`native paths refuse ${dangling ? 'dangling' : 'existing'} directory symlink at ${parent}`, (t) => {
@@ -125,10 +197,10 @@ test('native pointer rejects malformed envelopes and mismatched project identiti
     ['wrong generation type', JSON.stringify(f.pointer({ generation: 7 }))]
   ];
   for (const [name, content] of candidates) {
-    fs.writeFileSync(paths.pointer, content);
+    fs.writeFileSync(paths.pointer, content, { mode: 0o600 });
     assert.throws(() => readNativePointer(f.ctx), { code: 'NATIVE_STATE_INVALID' }, name);
   }
-  fs.writeFileSync(paths.pointer, 'x'.repeat(16385));
+  fs.writeFileSync(paths.pointer, 'x'.repeat(16385), { mode: 0o600 });
   assert.throws(() => readNativePointer(f.ctx), { code: 'NATIVE_STATE_UNSAFE' });
 });
 

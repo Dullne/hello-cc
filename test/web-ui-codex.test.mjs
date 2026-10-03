@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { codexPanelHtml, codexPanelScript } from '../lib/web/ui-codex.mjs';
 
 function fixture() {
-  const elements = new Map(), storage = new Map(), requests = [], copied = [], windowListeners = new Map();
+  const elements = new Map(), storage = new Map(), requests = [], accountRequests = [], copied = [], windowListeners = new Map();
   let virtualSequence = 0;
   const metrics = { escaped: 0 };
   const selection = { active: 'a', projectRoot: '/project-a', actionToken: 'token-a', epoch: 1, canControl: true, draftScope: '' };
@@ -14,12 +14,14 @@ function fixture() {
     scrollTop: 0, scrollLeft: 0, scrollHeight: 2000, clientHeight: 500, attributes: new Map(),
     getBoundingClientRect() { return { top: 0, bottom: 0 }; },
     focus() {},
+    showModal() { this.open=true; }, close() { this.open=false; },
     setAttribute(name, value) { this.attributes.set(name, value); },
     querySelectorAll(selector) {
       if (selector.startsWith('details')) return this.details;
       if (selector === '[data-card-key]') return [];
       if (selector === 'button[data-approval]') return this.buttons.filter(button => button.dataset.approval !== undefined);
       if (selector === 'button[data-copy]') return this.buttons.filter(button => button.dataset.copy !== undefined);
+      if (selector === 'button[data-codex-event]') return this.buttons.filter(button => button.dataset.codexEvent !== undefined);
       if (selector === 'button[data-segment]') return this.buttons.filter(button => button.dataset.segment !== undefined);
       if (selector === 'pre[data-code-page]') return this.codeNodes || [];
       return this.buttons;
@@ -42,7 +44,7 @@ function fixture() {
           this.html = value;
           this.buttons = [...value.matchAll(/<button([^>]*)>/g)].map(match => {
             const button = makeNode();
-            for (const [, name, content] of match[1].matchAll(/data-(approval|decision|copy|request-key|segment|segment-action|truncated)="([^"]+)"/g)) {
+            for (const [, name, content] of match[1].matchAll(/data-(approval|decision|copy|codex-event|request-key|segment|segment-action|truncated)="([^"]+)"/g)) {
               button.dataset[name.replace(/-([a-z])/g, (_, char) => char.toUpperCase())] = content.replaceAll('&quot;', '"');
             }
             button.disabled = /(?:^|\s)disabled(?:\s|$)/.test(match[1]);
@@ -79,7 +81,7 @@ function fixture() {
     esc: text => { metrics.escaped += 1; return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }, api(path, options) {
       let resolve, reject;
       const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-      requests.push({ path, options, resolve, reject }); return promise;
+      (path.includes('/codex/account?') ? accountRequests : requests).push({ path, options, resolve, reject }); return promise;
     } };
   for (const name of Object.keys(selection)) Object.defineProperty(bridge, name, { get: () => selection[name] });
   const window = { hccHandoff: bridge, hccUi: { language: 'en', safeGet: key => storage.get(key), safeSet: (key, value) => storage.set(key, value) },
@@ -89,7 +91,7 @@ function fixture() {
   const render = (id = selection.active) => window.hccCodex.render({ status: 'ready', threadId: 'thread-' + id, threads: [{ id: 'thread-' + id, turns: [] }], pendingApprovals: [] });
   const fill = text => { element('codexDraft').value = text; element('codexDraft').listeners.get('input')(); };
   const click = id => element(id).listeners.get('click')();
-  return { element, storage, requests, selection, window, windowListeners, copied, render, fill, click, metrics };
+  return { element, storage, requests, accountRequests, selection, window, windowListeners, copied, render, fill, click, metrics };
 }
 
 test('late submission receipt clears only its original project/session draft', async () => {
@@ -482,6 +484,23 @@ function singleItemState(item, extra = {}) {
   return { status: 'ready', threadId: 'thread-a', threads: [{ id: 'thread-a', turns: [{ id: 'large-turn', status: 'completed', items: [item] }] }], pendingApprovals: [], ...extra };
 }
 
+test('Codex retained-item search combines kind/turn/query and event details preserve the complete reported item', async () => {
+  const f=fixture(), item={id:'command',type:'commandExecution',command:'npm test',status:'failed',exitCode:2,aggregatedOutput:'missing package'};
+  f.window.hccCodex.render(singleItemState(item));
+  f.element('codexTraceQuery').value='missing npm';f.element('codexTraceKind').value='failed';f.element('codexTraceTurn').value='large-turn';
+  f.element('codexTraceQuery').listeners.get('input')();
+  assert.match(f.element('codexTraceCount').textContent,/1 \/ 1/);
+  f.element('codexTimeline').buttons.find(button=>button.dataset.codexEvent).click();
+  assert.equal(f.element('codexEventDialog').open,true);
+  assert.deepEqual(JSON.parse(f.element('codexEventSource').value),{threadId:'thread-a',turnId:'large-turn',item});
+  await f.click('codexEventCopy');assert.equal(f.copied.at(-1),f.element('codexEventSource').value);
+  f.click('codexEventClose');assert.equal(f.element('codexEventDialog').open,false);
+  f.element('codexTraceKind').value='files';f.element('codexTraceKind').listeners.get('change')();
+  assert.match(f.element('codexTraceCount').textContent,/0 \/ 1/);
+  f.click('codexTraceClear');assert.match(f.element('codexTimeline').innerHTML,/npm test/);
+  f.selection.active='b';f.render();assert.equal(f.element('codexEventSource').value,'');
+});
+
 function visibleSegment(wrapper) {
   return wrapper.body.innerHTML.match(/<pre tabindex="0" data-code-page="\d+"><code>([\s\S]*)<\/code><\/pre>/)[1]
     .replace(/<span class="[^"]*">/g, '').replaceAll('</span>', '')
@@ -614,4 +633,81 @@ test('oversized approval fields and raw parameters remain fully readable and bac
   assert.equal(f.copied[0], command);
   assert.deepEqual(JSON.parse(f.copied[1]), { command });
   assert.equal(f.requests.length, 0);
+});
+
+
+test('account reads work for observers and bind response rendering to the same executor visit', async () => {
+  const f=fixture(); f.selection.canControl=false;
+  const state={status:'ready',executorId:'exec-a',threadId:'thread-a',threads:[],pendingApprovals:[]};
+  f.window.hccCodex.render(state);
+  assert.equal(f.accountRequests.length,1); assert.equal(f.accountRequests[0].options,undefined);
+  assert.match(f.accountRequests[0].path,/executorId=exec-a/);
+  assert.equal(f.element('codexSend').disabled,true);
+  f.selection.active='b'; f.window.hccCodex.sync();
+  f.selection.active='a'; f.window.hccCodex.sync();
+  f.accountRequests[0].resolve({executorId:'exec-a',account:{status:'ready',authentication:'authenticated',type:'chatgpt',planType:'pro'}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.doesNotMatch(f.element('codexAccountSummary').textContent,/Signed in/);
+  assert.equal(f.requests.length,0); assert.equal(f.storage.size,0);
+});
+
+test('account panel caches unchanged state and allows observer refresh without mutating a turn', async () => {
+  const f=fixture(); f.selection.canControl=false;
+  const state={status:'ready',executorId:'exec-a',threads:[],pendingApprovals:[],account:{status:'ready',authentication:'providerManaged',rateLimits:{status:'notApplicable',buckets:[]}}};
+  f.window.hccCodex.render(state);
+  f.accountRequests[0].resolve({executorId:'exec-a',account:state.account}); await new Promise(resolve=>setImmediate(resolve));
+  const writes=f.element('codexAccountLimits').writes, escapes=f.metrics.escaped;
+  f.window.hccCodex.render({...state});
+  assert.equal(f.element('codexAccountLimits').writes,writes); assert.equal(f.metrics.escaped,escapes);
+  const refresh=f.click('codexAccountRead'); assert.equal(f.accountRequests.length,2);
+  f.accountRequests[1].resolve({executorId:'exec-a',account:state.account}); await refresh;
+  assert.equal(f.requests.length,0); assert.match(f.element('codexAccountSummary').textContent,/Provider-managed/);
+});
+
+
+test('a replacement Codex executor can read its account while the previous executor read is pending', async () => {
+  for (const outcome of ['resolve', 'reject']) {
+    const f = fixture(), original = { status: 'ready', executorId: 'exec-a', threads: [], pendingApprovals: [] };
+    f.window.hccCodex.render(original);
+    f.window.hccCodex.render({ ...original, executorId: 'exec-b' });
+    assert.equal(f.accountRequests.length, 2, 'replacement starts its own read immediately');
+    assert.match(f.accountRequests[1].path, /executorId=exec-b/);
+    if (outcome === 'resolve') f.accountRequests[0].resolve({ executorId: 'exec-a', account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'pro' } });
+    else f.accountRequests[0].reject(new Error('obsolete account read failed'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.element('codexAccountRead').disabled, true, 'old completion must not clear the new pending read');
+    assert.doesNotMatch(f.element('codexAccountSummary').textContent, /Signed in/);
+    assert.doesNotMatch(f.element('codexSubmission').textContent, /obsolete/);
+    f.accountRequests[1].resolve({ executorId: 'exec-b', account: { status: 'ready', authentication: 'providerManaged', rateLimits: { status: 'notApplicable', buckets: [] } } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.element('codexAccountRead').disabled, false);
+    assert.match(f.element('codexAccountSummary').textContent, /Provider-managed/);
+    assert.equal(f.requests.length, 0); assert.equal(f.storage.size, 0);
+  }
+});
+
+test('an obsolete account error cannot overwrite newer streamed Codex account state', async () => {
+  const f = fixture(), original = { status: 'ready', executorId: 'exec-a', threads: [], pendingApprovals: [] };
+  f.window.hccCodex.render(original);
+  f.window.hccCodex.render({ ...original, account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'plus' } });
+  f.accountRequests[0].reject(new Error('obsolete account read failed'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(f.element('codexAccountSummary').textContent, /Signed in/);
+  assert.doesNotMatch(f.element('codexSubmission').textContent, /obsolete/);
+  assert.equal(f.element('codexAccountRead').disabled, false);
+});
+
+test('returning to Codex permits refresh after an earlier visit account read completes', async () => {
+  const f = fixture(), original = { status: 'ready', executorId: 'exec-a', threads: [], pendingApprovals: [] };
+  f.window.hccCodex.render(original);
+  f.selection.active = 'b'; f.window.hccCodex.sync();
+  f.selection.active = 'a'; f.window.hccCodex.sync(); f.window.hccCodex.render(original);
+  f.accountRequests[0].resolve({ executorId: 'exec-a', account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'pro' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(f.element('codexAccountSummary').textContent, /Signed in/);
+  assert.equal(f.element('codexAccountRead').disabled, false);
+  const reading = f.click('codexAccountRead');
+  f.accountRequests[1].resolve({ executorId: 'exec-a', account: { status: 'ready', authentication: 'required' } }); await reading;
+  assert.match(f.element('codexAccountSummary').textContent, /sign-in required/i);
+  assert.equal(f.requests.length, 0); assert.equal(f.storage.size, 0);
 });

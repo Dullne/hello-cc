@@ -21,6 +21,7 @@ import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 
+if (!process.argv.includes('--run-live')) { console.log('Usage: node scripts/web-native-model-acceptance.mjs --run-live; requires existing Codex account, tmux and HCC_ACCEPTANCE_PLAYWRIGHT. Three bounded local/Web/local file turns.'); process.exit(0); }
 const repo = fileURLToPath(new URL('..', import.meta.url)), cli = path.join(repo, 'bin/hcc.mjs');
 const originalHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const protectedFiles = ['config.toml', 'auth.json'].map(name => path.join(originalHome, name)).filter(file => fs.existsSync(file));
@@ -30,21 +31,32 @@ const source = fs.readFileSync(path.join(originalHome, 'config.toml'), 'utf8');
 const provider = JSON.parse(source.match(/^model_provider\s*=\s*(".*")\s*$/m)?.[1] || '"openai"');
 const model = JSON.parse(source.match(/^model\s*=\s*(".*")\s*$/m)?.[1] || 'null');
 const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-live-handoff-')));
-const root = path.join(directory, 'project'), home = path.join(directory, 'codex-home'), bin = path.join(directory, 'bin');
-for (const folder of [root, home, bin, path.join(root, '.hello-cc')]) fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+fs.chmodSync(directory, 0o700);
+const root = path.join(directory, 'project'), home = path.join(directory, 'codex-home'), bin = path.join(directory, 'bin'), taskHome = path.join(directory, 'user-home');
+for (const folder of [root, home, bin, taskHome, path.join(root, '.hello-cc')]) fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
 const sections = source.split(/(?=^\[)/m), headings = ['model_providers.' + provider, 'model_providers."' + provider + '"'];
 const config = ['model', 'model_provider', 'model_reasoning_effort'].map(key => source.match(new RegExp('^' + key + '\\s*=.*$', 'm'))?.[0]).filter(Boolean);
 for (const section of sections.slice(1)) {
   const heading = /^\[([^\]]+)\]/.exec(section)?.[1];
   if (headings.some(prefix => heading === prefix || heading?.startsWith(prefix + '.'))) config.push(section);
 }
-fs.writeFileSync(path.join(home, 'config.toml'), config.join('\n') + '\n', { mode: 0o600 });
+const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+let authIndex = 0;
+const isolatedConfig = config.join('\n').split('\n').map(line => {
+  const match = /^(\s*command\s*=\s*)("(?:[^"\\]|\\.)*"|'[^']*')(\s*(?:#.*)?)$/.exec(line);
+  if (!match) return line;
+  const original = match[2].startsWith('"') ? JSON.parse(match[2]) : match[2].slice(1, -1);
+  const wrapper = path.join(bin, 'credential-command-' + ++authIndex);
+  fs.writeFileSync(wrapper, '#!/bin/sh\nexport HOME=' + quote(os.homedir()) + '\nexec ' + quote(original) + ' "$@"\n', { mode: 0o700 });
+  return match[1] + JSON.stringify(wrapper) + match[3];
+}).join('\n');
+fs.writeFileSync(path.join(home, 'config.toml'), isolatedConfig + '\n', { mode: 0o600 });
 if (fs.existsSync(path.join(originalHome, 'auth.json'))) fs.writeFileSync(path.join(home, 'auth.json'), fs.readFileSync(path.join(originalHome, 'auth.json')), { mode: 0o600 });
 const socket = 'hcc-live-' + randomUUID(), tmux = process.env.HCC_ACCEPTANCE_TMUX || '/opt/homebrew/bin/tmux';
 assert.ok(fs.existsSync(tmux), 'Set HCC_ACCEPTANCE_TMUX to the installed tmux executable');
-fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\nexec ' + JSON.stringify(tmux) + ' -L ' + JSON.stringify(socket) + ' "$@"\n', { mode: 0o700 });
+fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\nexec ' + quote(tmux) + ' -L ' + quote(socket) + ' "$@"\n', { mode: 0o700 });
 const env = { ...process.env, PATH: bin + ':' + path.dirname(process.execPath) + ':' + process.env.PATH,
-  CODEX_HOME: home, HCC_SHIM_ENSURED: '1', HCC_SHIM_NO_ATTACH: '1', HCC_NO_AUTO_INSTALL_TMUX: '1', HCC_WEB_TOKEN: randomUUID() };
+  HOME: taskHome, CODEX_HOME: home, HCC_SHIM_ENSURED: '1', HCC_SHIM_NO_ATTACH: '1', HCC_NO_AUTO_INSTALL_TMUX: '1', HCC_WEB_TOKEN: randomUUID() };
 for (const key of Object.keys(env)) if (key.startsWith('HCC_') && !['HCC_WEB_TOKEN','HCC_NO_AUTO_INSTALL_TMUX','HCC_SHIM_ENSURED','HCC_SHIM_NO_ATTACH'].includes(key)) delete env[key];
 function hcc(...args) {
   const result = spawnSync(process.execPath, [cli, '--root', root, ...args], { cwd: root, env, encoding: 'utf8', timeout: 30000 });
@@ -58,6 +70,8 @@ fs.writeFileSync(path.join(root, 'input.json'), JSON.stringify({ value: 41 }));
 const events = createEventHelpers(), bindings = createPeerBindingStore(events), peers = createPeerHelpers({ ...events, now: () => Math.floor(Date.now() / 1000) });
 const deps = { ...events, ...bindings, ...peers, ...createMessageStore(events), connect, detectBranch: () => '',
   liveProcessIdentity: pid => inspectProcessIdentity(pid).identity };
+const sourceHashes = () => Object.fromEntries(fs.readdirSync(path.join(repo, 'lib'), { recursive: true }).filter(name => fs.statSync(path.join(repo, 'lib', name)).isFile()).sort().map(name => ['lib/' + name, hash(path.join(repo, 'lib', name))]));
+const frozenSources = sourceHashes();
 const evidence = { model, directory, stages: [], pageErrors: [], consoleErrors: [], screenshots: [], modelInferenceCalled: true,
   browser: 'Browser plugin not available; isolated Chrome and Playwright', completed: false };
 let service, runtimeStarted = false, browser, child;
@@ -120,7 +134,8 @@ try {
   assert.equal(evidence.pageErrors.length, 0); assert.equal(evidence.consoleErrors.length, 0);
   const mcpEvents = final.events.filter(event => event.payload?.type === 'item' && event.payload.item?.type === 'mcpToolCall');
   evidence.mcpToolEvents = mcpEvents.length;
-  evidence.completed = true; console.log('LIVE_LOCAL_WEB_LOCAL_OK');
+  assert.deepEqual(sourceHashes(), frozenSources, 'Implementation must remain unchanged during acceptance');
+  evidence.sourceFiles = frozenSources; evidence.completed = true; console.log('LIVE_LOCAL_WEB_LOCAL_OK');
 } catch (error) {
   evidence.error = error.message;
   process.exitCode = 1; console.error('LIVE_HANDOFF_FAILED: ' + error.message);
@@ -133,6 +148,6 @@ try {
   evidence.protectedConfigUnchanged = protectedHashes.every(([file, original]) => fs.existsSync(file) && hash(file) === original);
   if (!evidence.protectedConfigUnchanged) { process.exitCode = 1; evidence.completed = false; }
   fs.writeFileSync(path.join(directory, 'evidence.json'), JSON.stringify(evidence, null, 2));
-  for (const folder of [root, home, bin]) fs.rmSync(folder, { recursive: true, force: true });
+  for (const folder of [root, home, bin, taskHome]) fs.rmSync(folder, { recursive: true, force: true });
   console.log(JSON.stringify({ evidence: path.join(directory, 'evidence.json'), completed: evidence.completed, protectedConfigUnchanged: evidence.protectedConfigUnchanged }));
 }

@@ -6,8 +6,20 @@ on:
       - master
       - codex/dsh-stable-source
       - codex/dsh-stable-fixes
+      - 'codex/web-workbench-*'
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Verify a checkout candidate or the matching immutable release archive'
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - candidate
 
 permissions:
   contents: read
@@ -25,6 +37,7 @@ jobs:
           - macos-latest
     env:
       DSH_TELEMETRY_DISABLED: '1'
+      HCC_DSH_DISPATCH_MODE: ${{ inputs.mode }}
 
     steps:
       - name: Set isolated acceptance directory
@@ -44,76 +57,9 @@ jobs:
       - name: Pin npm packaging version
         run: npm install --global npm@11.17.0 --no-audit --no-fund
 
-      - name: Freeze checkout package and record provenance
+      - name: Freeze selected package and record candidate or release provenance
         id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';
-          import path from 'node:path';
-          import { createHash } from 'node:crypto';
-          import { execFileSync } from 'node:child_process';
-          import assert from 'node:assert/strict';
-          process.on('uncaughtException', error => {
-            const details = String(error.stack || error.message || error)
-              .replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
-            console.error(`::error::${details}`);
-            process.exit(1);
-          });
-          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
-          for (const name of ['home', 'official', 'candidate', 'unpacked', 'evidence']) {
-            fs.mkdirSync(path.join(root, name), { recursive: true, mode: 0o700 });
-          }
-          const env = { ...process.env, HOME: path.join(root, 'home'),
-            DSH_HOME: path.join(root, 'home', 'dsh'),
-            NPM_CONFIG_CACHE: path.join(root, 'npm-cache'),
-            NPM_CONFIG_USERCONFIG: path.join(root, 'home', '.npmrc') };
-          for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
-          const packed = execFileSync('npm', ['pack', '--ignore-scripts', '--json',
-            '--pack-destination', path.join(root, 'candidate')], { env, encoding: 'utf8' });
-          const metadata = JSON.parse(packed)[0];
-          const tarball = path.join(root, 'candidate', metadata.filename);
-          execFileSync('tar', ['-xzf', tarball, '-C', path.join(root, 'unpacked')], { env });
-          const manifestPath = `docs/verification/dsh-${metadata.version}-package.json`;
-          const frozen = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-          assert.equal(metadata.version, frozen.version, 'Frozen manifest version must match');
-          assert.deepEqual(metadata.files.map(file => file.path).sort(), Object.keys(frozen.files).sort(),
-            'The package file set must match the frozen release artifact');
-          for (const [file, expected] of Object.entries(frozen.files)) {
-            assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'unpacked', 'package', file))).digest('hex'),
-              expected, `Frozen release file differs: ${file}`);
-          }
-          for (const file of metadata.files) {
-            assert.equal(file.mode, frozen.fileModes[file.path], `Package mode differs: ${file.path}`);
-          }
-          const repackedSha256 = createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
-          const frozenArtifact = path.join('docs', 'verification', frozen.filename);
-          assert.equal(createHash('sha256').update(fs.readFileSync(frozenArtifact)).digest('hex'), frozen.sha256,
-            'Stored release artifact must match its frozen digest');
-          // Compression may differ across Node distributions. Install the exact
-          // stored release artifact after proving the checkout has its contents.
-          fs.copyFileSync(frozenArtifact, tarball);
-          const frozenContentMatch = true;
-          const receipt = {
-            schemaVersion: 1, createdAt: new Date().toISOString(),
-            revision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
-            platform: { os: process.platform, architecture: process.arch, node: process.version },
-            harness: '0.2.0-rc.2', pnpm: '12.8.1',
-            npm: execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(),
-            frozenManifest: manifestPath, frozenContentMatch, repackedSha256,
-            package: { name: metadata.name, version: metadata.version, filename: metadata.filename,
-              fileCount: metadata.files.length,
-              sha256: createHash('sha256').update(fs.readFileSync(tarball)).digest('hex') },
-            validation: 'CI runner installation without model calls; not device or business acceptance'
-          };
-          fs.writeFileSync(path.join(root, 'evidence', 'package-provenance.json'), JSON.stringify(receipt, null, 2) + '\n');
-          fs.writeFileSync(path.join(root, 'candidate.json'), JSON.stringify({ tarball }));
-          fs.writeFileSync(path.join(root, 'official', 'package.json'), JSON.stringify({
-            name: 'hcc-isolated-dsh-acceptance', private: true, version: '0.0.0'
-          }));
-          console.log(JSON.stringify(receipt, null, 2));
-          NODE
+        run: node scripts/dsh-package-provenance.mjs
 
       - name: Install pinned official Harness and pnpm
         id: install
@@ -149,7 +95,7 @@ jobs:
           }
           NODE
 
-      - name: Verify frozen package with the installed public CLI
+      - name: Verify selected package with the installed public CLI
         id: acceptance
         timeout-minutes: 30
         shell: bash
@@ -170,8 +116,8 @@ jobs:
             PATH: [path.dirname(process.execPath), path.join(official, 'node_modules', '.bin'),
               process.env.PATH || ''].join(path.delimiter) };
           for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
-          // Run the script from the frozen package so its source-hash checks
-          // compare against that artifact, independent of checkout changes.
+          // Both the script and its source-hash baseline come from the selected
+          // candidate or immutable release, exactly matching the installed tgz.
           const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-installed-acceptance.mjs'),
             official, '--tarball', tarball, '--output-dir', path.join(root, 'evidence', 'installed'),
             '--npm-cache', path.join(root, 'npm-cache'), '--pnpm-store', path.join(root, 'pnpm-store')],
@@ -185,6 +131,8 @@ jobs:
         shell: bash
         env:
           HCC_PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          HCC_ACCEPTANCE_MODE: ${{ steps.package.outputs.mode }}
+          HCC_ACCEPTANCE_TARGET: ${{ steps.package.outputs.acceptanceTarget }}
           HCC_INSTALL_OUTCOME: ${{ steps.install.outcome }}
           HCC_ACCEPTANCE_OUTCOME: ${{ steps.acceptance.outcome }}
         run: |
@@ -197,6 +145,8 @@ jobs:
             completedAt: new Date().toISOString(),
             platform: { os: process.platform, architecture: process.arch, node: process.version },
             package: process.env.HCC_PACKAGE_OUTCOME,
+            acceptanceMode: process.env.HCC_ACCEPTANCE_MODE || null,
+            acceptanceTarget: process.env.HCC_ACCEPTANCE_TARGET || null,
             officialInstall: process.env.HCC_INSTALL_OUTCOME,
             installedAcceptance: process.env.HCC_ACCEPTANCE_OUTCOME,
             modelCallsRequested: false, npmPublicationRequested: false,
@@ -208,7 +158,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-acceptance-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dsh-acceptance-${{ steps.package.outputs.mode || 'unprepared' }}-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hcc-dsh-acceptance/evidence/
           if-no-files-found: error
           retention-days: 14

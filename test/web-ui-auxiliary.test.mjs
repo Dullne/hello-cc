@@ -53,7 +53,7 @@ function fixture(script, type = 'app-server') {
   for (const key of Object.keys(selection)) Object.defineProperty(bridge, key, { get: () => selection[key] });
   const window = { hccHandoff: bridge, hccUi: { safeGet:key=>storage.get(key), safeSet:(key,value)=>storage.set(key,value) },
     addEventListener(name, listener) { listeners.set(name, listener); } };
-  vm.runInNewContext(script(), { window, document: { getElementById: element }, crypto: { randomUUID }, confirm: () => true });
+  vm.runInNewContext(script(), { window, document: { getElementById: element }, crypto: { randomUUID }, URLSearchParams, confirm: () => true });
   const click = id => element(id).emit('click');
   const fill = (id, value) => { element(id).value = value; return element(id).emit('input'); };
   return { element, selection, window, storage, requests, opened, click, fill, listeners };
@@ -163,6 +163,19 @@ test('a current task change immediately fences a stale evidence form', async () 
 });
 
 const nativeState = (extra={}) => ({peer:'peer-a',root:'/project-a',provider:'codex',sessionId:'native-thread',status:'idle',connected:true,generation:1,owner:'worker-a',capabilities:{send:true,interrupt:true},events:[],deliveries:[],...extra});
+
+test('native output updates retain unchanged approval controls and their handlers use the current lease', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  const pendingApprovals = [{ requestId: 'approval', executorId: 'worker-a', sessionId: 'native-thread', turnId: 'turn', kind: 'command', params: { command: 'pwd' } }];
+  f.window.hccNative.render(nativeState({ executorId: 'worker-a', pendingApprovals }));
+  const original = f.element('nativeApprovals').buttons[0];
+  f.window.hccNative.render(nativeState({ executorId: 'worker-a', pendingApprovals, events: [{ id: 1, payload: { type: 'message', text: 'Live output' } }] }));
+  assert.equal(f.element('nativeApprovals').buttons[0], original, 'streamed text must not replace the pending form DOM');
+  f.selection.epoch = 5;
+  const answering = original.emit('click');
+  assert.equal(JSON.parse(f.requests[0].options.body).epoch, 5);
+  f.requests[0].resolve({ state: nativeState() }); await answering;
+});
 
 test('native queue receipt clears only its original draft and uses lease credentials once', async () => {
   const f=fixture(nativePanelScript,'native'); f.window.hccNative.render(nativeState()); f.fill('nativeDraft','send once');
@@ -297,6 +310,26 @@ test('a failed native response still reports its error while that exact request 
   assert.equal(f.element('nativeApprovals').buttons[0].disabled, false, 'the current controller can retry the still-pending request');
 });
 
+test('retrying a native response clears the previous error without replaying the request', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState({ pendingApprovals: [approval('original')] }));
+  const failed = f.element('nativeApprovals').buttons[0].emit('click');
+  f.requests[0].reject(new Error('Invalid value for MCP field: count')); await failed;
+  assert.match(f.element('nativeNotice').textContent, /Invalid value/);
+  assert.equal(f.requests.length, 1);
+  const retried = f.element('nativeApprovals').buttons[0].emit('click');
+  assert.equal(f.element('nativeNotice').textContent, '');
+  assert.equal(f.requests.length, 2);
+  assert.equal(JSON.parse(f.requests[1].options.body).requestId, 'original');
+  f.window.hccNative.render(nativeStringState({ status: 'idle', pendingApprovals: [],
+    events: [{ id: 1, payload: { type: 'completed', text: 'form completed' } }] }));
+  f.requests[1].resolve({ state: nativeStringState({ pendingApprovals: [approval('original')] }) }); await retried;
+  assert.equal(f.element('nativeNotice').textContent, '');
+  assert.equal(f.element('nativeApprovals').buttons.length, 0, 'late response must not revive a completed request');
+  assert.match(f.element('nativeEvents').innerHTML, /form completed/);
+  assert.equal(f.requests.length, 2, 'a completed request is never automatically retried');
+});
+
 test('native preference redraws keep valid send and response snapshots eligible', async () => {
   for (const operation of ['send', 'respond']) {
     const f = fixture(nativePanelScript, 'native');
@@ -310,4 +343,54 @@ test('native preference redraws keep valid send and response snapshots eligible'
     await pending;
     assert.match(f.element('nativeApprovals').innerHTML, /echo fresh-response/, operation + ' response was wrongly ignored after a local redraw');
   }
+});
+
+
+test('a replacement native identity reads its account without waiting for its predecessor', async () => {
+  for (const change of [{ generation: 2 }, { owner: 'worker-b' }, { sessionId: 'new-thread' }]) {
+    for (const outcome of ['resolve', 'reject']) {
+      const f = fixture(nativePanelScript, 'native'), original = nativeState({ capabilities: { send: true, accountRead: true } });
+      f.window.hccNative.render(original);
+      f.window.hccNative.render({ ...original, ...change });
+      assert.equal(f.requests.length, 2, 'every executor identity field scopes a new account read');
+      assert.ok(f.requests[1].path.includes('/native/account?'));
+      assert.equal(f.requests[1].options, undefined);
+      if (outcome === 'resolve') f.requests[0].resolve({ state: { ...original, account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'pro' } } });
+      else f.requests[0].reject(new Error('obsolete native account read failed'));
+      await settle();
+      assert.equal(f.element('nativeAccountRead').disabled, true);
+      assert.doesNotMatch(f.element('nativeAccountSummary').textContent, /Signed in/);
+      assert.doesNotMatch(f.element('nativeNotice').textContent, /obsolete/);
+      f.requests[1].resolve({ state: { ...original, ...change, account: { status: 'ready', authentication: 'providerManaged', rateLimits: { status: 'notApplicable', buckets: [] } } } });
+      await settle();
+      assert.equal(f.element('nativeAccountRead').disabled, false);
+      assert.match(f.element('nativeAccountSummary').textContent, /Provider-managed/);
+      assert.equal(f.storage.size, 0);
+    }
+  }
+});
+
+test('an obsolete native account error does not overwrite a streamed account update', async () => {
+  const f = fixture(nativePanelScript, 'native'), original = nativeState({ capabilities: { accountRead: true } });
+  f.window.hccNative.render(original);
+  f.window.hccNative.render({ ...original, account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'plus' } });
+  f.requests[0].reject(new Error('obsolete native account read failed')); await settle();
+  assert.match(f.element('nativeAccountSummary').textContent, /Signed in/);
+  assert.doesNotMatch(f.element('nativeNotice').textContent, /obsolete/);
+  assert.equal(f.element('nativeAccountRead').disabled, false);
+});
+
+test('returning to native permits account refresh without reviving the previous visit response', async () => {
+  const f = fixture(nativePanelScript, 'native'), original = nativeState({ capabilities: { accountRead: true } });
+  f.window.hccNative.render(original);
+  f.selection.active = 'b'; f.selection.session = { id: 'b', peer_id: 'peer-b', type: 'native' }; f.window.hccNative.sync();
+  f.selection.active = 'a'; f.selection.session = { id: 'a', peer_id: 'peer-a', type: 'native' }; f.window.hccNative.sync(); f.window.hccNative.render(original);
+  f.requests[0].resolve({ state: { ...original, account: { status: 'ready', authentication: 'authenticated', type: 'chatgpt', planType: 'pro' } } });
+  await settle();
+  assert.doesNotMatch(f.element('nativeAccountSummary').textContent, /Signed in/);
+  assert.equal(f.element('nativeAccountRead').disabled, false);
+  const reading = f.click('nativeAccountRead');
+  f.requests[1].resolve({ state: { ...original, account: { status: 'ready', authentication: 'required' } } }); await reading;
+  assert.match(f.element('nativeAccountSummary').textContent, /sign-in required/i);
+  assert.equal(f.requests.length, 2); assert.equal(f.storage.size, 0);
 });

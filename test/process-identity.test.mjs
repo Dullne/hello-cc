@@ -102,7 +102,7 @@ test('returns unknown when macOS start identity changes during inspection', (t) 
   t.mock.method(process, 'kill', () => {});
   let startReads = 0;
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
-    if (command === 'sysctl') return successfulCommand('{ sec = 1, usec = 0 }\n');
+    if (command === 'sysctl') return successfulCommand('26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n');
     if (args.at(-1) === 'lstart=') {
       return successfulCommand(startReads++ === 0
         ? 'Mon Aug  3 06:10:11 2026\n'
@@ -127,7 +127,7 @@ test('collects the same macOS identity under different caller locales', (t) => {
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
     if (command === 'sysctl') {
       return successfulCommand(
-        `{ sec = 100, usec = 42 } ${process.env.TZ}/${process.env.LC_ALL}/${process.env.LANG}\n`
+        '26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n'
       );
     }
     psEnvironments.push(options?.env);
@@ -154,7 +154,7 @@ test('collects the same macOS identity under different caller locales', (t) => {
     const second = withPlatform('darwin', () => inspectProcessIdentity(42));
 
     assert.equal(first.state, 'live');
-    assert.equal(first.identity.startToken, '100:42:Mon Aug  3 06:10:11 2026');
+    assert.equal(first.identity.startToken, 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026');
     assert.deepEqual(second.identity, first.identity);
     assert.equal(psEnvironments.length, 6);
     for (const environment of psEnvironments) {
@@ -173,9 +173,9 @@ test('collects the same macOS identity under different caller locales', (t) => {
   }
 });
 
-test('returns unknown for malformed macOS boot time fields', (t) => {
+test('returns unknown for malformed or unavailable macOS boot session UUID', (t) => {
   t.mock.method(process, 'kill', () => {});
-  const bootOutputs = ['not a boot time\n', '{ sec = 100 } Mon Aug  3 06:10:11 2026\n'];
+  const bootOutputs = ['not a boot UUID\n', '{ sec = 100, usec = 42 } Mon Aug  3 06:10:11 2026\n'];
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
     if (command === 'sysctl') return successfulCommand(bootOutputs.shift());
     if (args.at(-1) === 'lstart=') return successfulCommand('Mon Aug  3 06:10:11 2026\n');
@@ -373,4 +373,43 @@ test('rejects malformed Linux and macOS identity rows', () => {
   assert.equal(parseLinuxStatStartTicks('42 worker) S 1 2 3'), null);
   assert.equal(parsePsStartIdentity('Mon Aug  3 06:10:11 2026 /usr/bin/node app.mjs\n'), null);
   assert.equal(parsePsStartIdentity('\t/usr/bin/node app.mjs\n'), null);
+});
+
+
+test('macOS identity remains stable when wall-clock boot time changes', (t) => {
+  t.mock.method(process, 'kill', () => {});
+  let bootTime = 42;
+  const commands = [];
+  const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
+    commands.push(args.at(-1));
+    if (command === 'sysctl' && args.at(-1) === 'kern.bootsessionuuid') return successfulCommand('26F764BF-DAD6-4F9C-B55D-522470AAF4E8\n');
+    if (command === 'sysctl' && args.at(-1) === 'kern.boottime') return successfulCommand(`{ sec = 100, usec = ${bootTime++} }\n`);
+    if (args.at(-1) === 'lstart=') return successfulCommand('Mon Aug  3 06:10:11 2026\n');
+    if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
+    throw new Error('unexpected identity probe');
+  });
+  syncBuiltinESMExports();
+  try {
+    const first = withPlatform('darwin', () => inspectProcessIdentity(42));
+    bootTime = 900000;
+    const next = withPlatform('darwin', () => inspectProcessIdentity(42));
+    assert.equal(first.state, 'live');
+    assert.deepEqual(next.identity, first.identity);
+    assert.equal(compareProcessIdentity(first.identity, next.identity), 'live');
+    assert.equal(commands.includes('kern.boottime'), false);
+  } finally { spawnMock.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test('stable macOS boot UUID still distinguishes reboot from the same PID and start text', () => {
+  const a = { pid: 42, commandHash: 'a'.repeat(64), startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  const b = { ...a, startToken: 'mac:36f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  assert.equal(compareProcessIdentity(a, b), 'dead');
+});
+
+test('legacy macOS identities remain unresolved across a boot token format transition', () => {
+  const legacy = { pid: 42, commandHash: 'a'.repeat(64), startToken: '100:42:Mon Aug  3 06:10:11 2026' };
+  const current = { ...legacy, startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  assert.equal(compareProcessIdentity(legacy, current), 'unknown');
+  assert.equal(compareProcessIdentity(current, legacy), 'unknown');
+  assert.equal(compareProcessIdentity(legacy, { ...current, pid: 43 }), 'dead');
 });

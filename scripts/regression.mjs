@@ -41,6 +41,7 @@ const managedTmuxSessions = new Set();
 
 const env = {
   ...process.env,
+  NODE_NO_WARNINGS: '1',
   HOME: home,
   PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
   SHELL: '/bin/bash'
@@ -1571,9 +1572,9 @@ function assertHtmlCsp(response, html, label) {
     ? "default-src 'self'; " +
       `script-src 'self' 'nonce-${nonce}'; ` +
       "style-src 'self' 'unsafe-inline'; " +
-      "img-src 'self' data:; " +
+      "img-src 'self' data: blob:; " +
       "connect-src 'self' ws: wss:; " +
-      "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+      "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; frame-src 'self' blob:"
     : '';
   if (!nonce || policy !== expected) {
     fail(`${label} missing complete nonce CSP: ${policy || '(missing)'}`);
@@ -2449,7 +2450,7 @@ async function assertShimIgnoresGlobalRuntime(generateShim) {
       started_at: Math.floor(Date.now() / 1000),
       global_runtime: true
     };
-    fs.writeFileSync(path.join(fakeHome, '.hello-cc', 'runtime.json'), JSON.stringify(globalRuntime, null, 2));
+    fs.writeFileSync(path.join(fakeHome, '.hello-cc', 'runtime.json'), JSON.stringify(globalRuntime, null, 2), { mode: 0o600 });
 
     const hccWrapper = path.join(testDir, 'hcc-wrapper');
     fs.writeFileSync(hccWrapper, `#!/usr/bin/env bash\nexec ${sh(process.execPath)} ${sh(hccBin)} "$@"\n`, { mode: 0o755 });
@@ -4419,15 +4420,23 @@ async function multiProjectWebWorkflow() {
   }
 
   const htmlResponse = await fetch(currentRuntimeUrl('/'));
-  const html = await htmlResponse.text();
-  const startForm = html.match(/<form\b[^>]*\bid="startForm"[^>]*>[\s\S]*?<\/form>/)?.[0];
-  if (!startForm) fail('web form missing startForm');
-  // Approval details may display the working directory. The simplified launch
-  // form must still derive it from the selected project instead of an input.
-  if (startForm.includes('Working directory') || /<input\b[^>]*(?:id|name)="(?:cwd|workdir)"/.test(startForm)) {
-    fail('web launch form still exposes Working directory');
+  const pageHtml = await htmlResponse.text();
+  if (!pageHtml.includes('type="module" src="/assets/web/browser/core.mjs"')) fail('web page missing ESM bootstrap');
+  const moduleSources = [];
+  for (const asset of ['browser/core.mjs', 'ui-agent-start.mjs']) {
+    const response = await runtimeFetch('/assets/web/' + asset);
+    if (!response.ok || !response.headers.get('content-type')?.includes('javascript')) fail('web ESM asset did not load: ' + asset);
+    moduleSources.push(await response.text());
   }
-  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input', 'commandbar', 'lineInput', 'Send text to active terminal']) {
+  const html = pageHtml + '\n' + moduleSources.join('\n');
+  const startFormHtml = html.match(/<form\b[^>]*\bid="startForm"[^>]*>[\s\S]*?<\/form>/)?.[0];
+  if (!startFormHtml) fail('web form missing simplified session form');
+  // A current-directory label in an approval or session details is valid;
+  // obsolete creation inputs must be checked inside the creation form.
+  for (const forbidden of ['Alias optional', 'Role tag', 'Command<input']) {
+    if (startFormHtml.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
+  }
+  for (const forbidden of ['commandbar', 'lineInput', 'Send text to active terminal']) {
     if (html.includes(forbidden)) fail(`web form still exposes ${forbidden}`);
   }
   for (const expected of [
@@ -4435,6 +4444,7 @@ async function multiProjectWebWorkflow() {
     'id="projectPath"',
     'id="addProjectBtn"',
     'id="startForm"',
+    'id="agentCwd"',
     'id="kind"',
     'id="sessionKindFilter"',
     'id="sessions"'
@@ -4478,7 +4488,7 @@ async function multiProjectWebWorkflow() {
       !html.includes("fetch('/logout', { method: 'POST', headers })")) {
     fail('web UI missing logout control or session revocation request');
   }
-  if (!html.includes('id="startMode"') || !html.includes('id="resumeArg"') || !html.includes('syncStartModeOptions') || !html.includes("mode === 'resume'")) {
+  if (!html.includes('id="startMode"') || !html.includes('id="resumeArg"') || !html.includes('syncStartModeOptions') || !html.includes("mode.value === 'resume'")) {
     fail('web form missing provider resume controls');
   }
   for (const expected of [
@@ -5545,7 +5555,7 @@ async function bufferGcArbitrationWorkflow() {
 
   const liveId = `gc-live-external-${testId}`;
   const liveFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${liveId}.${suffix}`));
-  for (const file of liveFiles.slice(0, 3)) fs.writeFileSync(file, file.endsWith('.out') ? 'live\n' : '');
+  for (const file of liveFiles.slice(0, 3)) fs.writeFileSync(file, file.endsWith('.out') ? 'live\n' : '', { mode: 0o600 });
   const identity = inspectProcessIdentity(process.pid).identity;
   fs.writeFileSync(liveFiles[3], JSON.stringify({
     id: liveId,
@@ -5559,7 +5569,7 @@ async function bufferGcArbitrationWorkflow() {
     wrapper_identity: identity,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
     return (data.sessions || []).some((session) => session.id === liveId);
@@ -5568,8 +5578,8 @@ async function bufferGcArbitrationWorkflow() {
 
   const legacyId = `gc-legacy-${testId}`;
   const legacyFiles = ['out', 'in', 'resize', 'meta'].map((suffix) => path.join(rootBufs, `${legacyId}.${suffix}`));
-  for (const file of legacyFiles.slice(0, 3)) fs.writeFileSync(file, '');
-  fs.writeFileSync(legacyFiles[3], JSON.stringify({ id: legacyId, pid: process.pid, wrapper_pid: process.pid }));
+  for (const file of legacyFiles.slice(0, 3)) fs.writeFileSync(file, '', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[3], JSON.stringify({ id: legacyId, pid: process.pid, wrapper_pid: process.pid }), { mode: 0o600 });
   for (const file of legacyFiles) fs.utimesSync(file, oldTime, oldTime);
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
@@ -5579,7 +5589,7 @@ async function bufferGcArbitrationWorkflow() {
   const siblingLiveId = `gc-sibling-external-${testId}`;
   const siblingLiveFiles = ['out', 'in', 'resize', 'meta']
     .map((suffix) => path.join(siblingBufs, `${siblingLiveId}.${suffix}`));
-  for (const file of siblingLiveFiles.slice(0, 3)) fs.writeFileSync(file, '');
+  for (const file of siblingLiveFiles.slice(0, 3)) fs.writeFileSync(file, '', { mode: 0o600 });
   fs.writeFileSync(siblingLiveFiles[3], JSON.stringify({
     id: siblingLiveId,
     kind: 'shell',
@@ -5592,7 +5602,7 @@ async function bufferGcArbitrationWorkflow() {
     wrapper_identity: identity,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root: secondProjectRoot })).json();
     return (data.sessions || []).some((session) => session.id === siblingLiveId);
@@ -5891,7 +5901,7 @@ async function bufferGcArbitrationWorkflow() {
         base_url: server?.baseUrl || 'http://127.0.0.1:1',
         token: 'regression-token'
       };
-      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify(pointer));
+      fs.writeFileSync(path.join(isolatedRoot, '.hello-cc', 'runtime.json'), JSON.stringify(pointer), { mode: 0o600 });
       const gc = run(process.execPath, [hccBin, '--root', isolatedRoot, '--json', 'gc', '--older-than', '0', '--yes'], { env: isolatedEnv });
       const payload = JSON.parse(gc);
       if (!fs.existsSync(orphan) || Number(payload.data?.deferred_buf_files || 0) < 1) {
@@ -6632,7 +6642,7 @@ async function syntaxAndHelp() {
   const integrationShimScriptSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'), 'utf8');
   const shellPathSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shell-path.mjs'), 'utf8');
   const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
-  const webUiTemplateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'ui-template.mjs'), 'utf8');
+  const webUiTemplateSource = ['ui-template.mjs', 'browser/core.mjs'].map(name => fs.readFileSync(path.join(repoRoot, 'lib', 'web', name), 'utf8')).join('\n');
   const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
   // cmdWeb moved whole to lib/web/runtime-main.mjs; subsystem modules extend it
   const cmdWebSource = [
@@ -6696,8 +6706,8 @@ async function syntaxAndHelp() {
     'sameResolvedPath(global.root, ctx.root)',
     'sameResolvedPath(global.db, ctx.dbPath)',
     'async function stopOrphanWebRuntimes(',
-    'await stopOrphanWebRuntimes(ctx, existing.pid || null);',
-    'await stopOrphanWebRuntimes(ctx);'
+    'await stopOrphanWebRuntimes(boundCtx, existing.pid || null);',
+    'await stopOrphanWebRuntimes(boundCtx);'
   ]) {
     if (!webStartupSource.includes(expected)) fail(`web startup guard missing: ${expected}`);
   }
@@ -7064,7 +7074,7 @@ async function syntaxAndHelp() {
       !hccSource.includes("} from '../web/http.mjs'") ||
       !hccSource.includes("import * as webUiTemplate from '../web/ui-template.mjs'") ||
       !hccSource.includes('const VERSION = PACKAGE_META.version') ||
-      !hccSource.includes('writeGuidanceForRoot(ctx.root)')) {
+      !hccSource.includes('writeGuidanceForRoot(ctx.root, { expectedSnapshot: ctx.initialRootIdentity })')) {
     fail('CLI still has duplicated package metadata, cli args, DB schema helpers, CLI runtime helpers, coordination state helpers, format helpers, runtime paths/state helpers, runtime client helpers, project context helpers, handoff helpers, timeline helpers, task liveness helpers, automation helpers, state render helpers, help text helpers, message store helpers, task store helpers, task CLI helpers, session launch helpers, provider command helpers, peer binding helpers, tmux helpers, lock helpers, team planning helpers, peer identity helpers, project registry helpers, web runtime/HTTP/UI helpers, or guidance wiring');
   }
   for (const expected of [
@@ -7552,7 +7562,7 @@ async function syntaxAndHelp() {
       fail('runtime state clearRuntime did not remove the reused-pid global pointer');
     }
 
-    fs.writeFileSync(globalRuntimeFile, '{bad');
+    fs.writeFileSync(globalRuntimeFile, '{bad', { mode: 0o600 });
     if (runtimeState.readGlobalRuntimeFile() !== null) {
       fail('runtime state readGlobalRuntimeFile did not reject invalid JSON');
     }
@@ -9500,7 +9510,7 @@ async function syntaxAndHelp() {
     process.env.HOME = tlsHome;
     const webTls = await import(path.join(repoRoot, 'lib', 'web', 'tls.mjs'));
     tlsCredentials = webTls.ensureSelfSignedCert();
-    const tlsDir = path.join(tlsHome, '.hello-cc', 'tls');
+    const tlsDir = path.join(fs.realpathSync(tlsHome), '.hello-cc', 'tls');
     const currentPointerPath = path.join(tlsDir, 'current.json');
     const currentGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
     const generationNames = {
@@ -9536,27 +9546,28 @@ async function syntaxAndHelp() {
     }
     const originalTlsCert = tlsCredentials.cert;
     const originalTlsCertPath = tlsCredentials.certPath;
-    const originalReadFileSync = fs.readFileSync;
-    let pointerReads = 0;
+    const originalLstatSync = fs.lstatSync;
+    let pointerChecks = 0;
     let pointerSwitchedBeforeDelete = false;
-    fs.readFileSync = (file, ...args) => {
+    fs.lstatSync = (file, ...args) => {
       if (path.resolve(String(file)) === path.resolve(currentPointerPath)) {
-        pointerReads += 1;
-        // Read 1 validates the old current; read 2 starts cleanup; read 3 is
-        // the deletion-time TOCTOU guard for the stale switched-current row.
-        if (pointerReads === 3) {
+        pointerChecks += 1;
+        // The private reader lstat-checks before and after each descriptor
+        // read. Checks 1-2 validate the old current; 3-4 start cleanup; check
+        // 5 is the deletion-time guard for the stale switched-current row.
+        if (pointerChecks === 5) {
           const nextPointerPath = path.join(tlsDir, `.current-regression-${testId}.tmp`);
           fs.writeFileSync(nextPointerPath, `${JSON.stringify({ generation: generationNames.switchedCurrent })}\n`, { mode: 0o600 });
           fs.renameSync(nextPointerPath, currentPointerPath);
           pointerSwitchedBeforeDelete = true;
         }
       }
-      return originalReadFileSync(file, ...args);
+      return originalLstatSync(file, ...args);
     };
     try {
       tlsCredentials = webTls.ensureSelfSignedCert();
     } finally {
-      fs.readFileSync = originalReadFileSync;
+      fs.lstatSync = originalLstatSync;
     }
     const publishedGeneration = JSON.parse(fs.readFileSync(currentPointerPath, 'utf8')).generation;
     const remainingGenerations = fs.readdirSync(tlsDir, { withFileTypes: true })
@@ -9572,14 +9583,14 @@ async function syntaxAndHelp() {
     ].sort();
     if (tlsCredentials.cert !== originalTlsCert ||
         tlsCredentials.certPath !== originalTlsCertPath ||
-        !pointerSwitchedBeforeDelete || pointerReads < 4 ||
+        !pointerSwitchedBeforeDelete || pointerChecks < 6 ||
         publishedGeneration !== generationNames.switchedCurrent ||
         !fs.existsSync(path.join(tlsDir, generationNames.initialCurrent, '.published')) ||
         !fs.existsSync(path.join(tlsDir, generationNames.switchedCurrent, '.published')) ||
         !fs.existsSync(path.join(tlsDir, generationNames.activeCreating, '.creating')) ||
         fs.existsSync(path.join(tlsDir, generationNames.deadCreating)) ||
         JSON.stringify(remainingGenerations) !== JSON.stringify(expectedRemainingGenerations)) {
-      fail(`TLS generation cleanup violated current/previous/candidate lifecycle protection:\n${JSON.stringify({ generationNames, pointerReads, pointerSwitchedBeforeDelete, publishedGeneration, remainingGenerations }, null, 2)}`);
+      fail(`TLS generation cleanup violated current/previous/candidate lifecycle protection:\n${JSON.stringify({ generationNames, pointerChecks, pointerSwitchedBeforeDelete, publishedGeneration, remainingGenerations }, null, 2)}`);
     }
   } finally {
     if (savedTlsHome === undefined) delete process.env.HOME;
@@ -10140,9 +10151,9 @@ async function processEvidenceWorkflow() {
   const legacyProcess = spawn('sleep', ['30'], { stdio: 'ignore' });
   const legacyFiles = ['out', 'in', 'resize', 'meta']
     .map((suffix) => path.join(externalDir, `${legacyExternalId}.${suffix}`));
-  fs.writeFileSync(legacyFiles[0], 'legacy external\n');
-  fs.writeFileSync(legacyFiles[1], '');
-  fs.writeFileSync(legacyFiles[2], '');
+  fs.writeFileSync(legacyFiles[0], 'legacy external\n', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[1], '', { mode: 0o600 });
+  fs.writeFileSync(legacyFiles[2], '', { mode: 0o600 });
   fs.writeFileSync(legacyFiles[3], JSON.stringify({
     id: legacyExternalId,
     kind: 'shell',
@@ -10153,7 +10164,7 @@ async function processEvidenceWorkflow() {
     wrapper_pid: legacyProcess.pid,
     cols: 120,
     rows: 40
-  }));
+  }), { mode: 0o600 });
   await waitFor(async () => {
     const data = await (await runtimeFetch('/api/sessions', {}, { root })).json();
     return (data.sessions || []).some((session) => session.id === legacyExternalId);

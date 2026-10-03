@@ -48,6 +48,29 @@ npm install --no-save --package-lock=false @anthropic-ai/claude-agent-sdk@0.3.28
 已有独立回执 (源码目录: `docs/verification/2026-10-02-native-web-claude-default-sdk.json`)，不代表
 发布包或员工设备已完成安装验收。
 
+## 从 Web 新建
+
+运行 `hcc web`，选择项目，再点击“新建 Agent”。Codex、Claude 和 DeepSeek Harness
+默认使用“后台 Agent”，创建 native worker 并按需启动或复用该项目的独立 native
+runtime。无需先运行 `hcc native start`；上述 provider 安装和认证要求仍然适用。
+
+工作目录默认所选项目根目录，也可指定项目内的子目录；worker 继续共享所选项目的
+HCC 任务和消息总线。要在根目录之外工作，先选择或添加相应项目。“模型（可选）”
+留空时使用 provider 当前配置，填写时需使用该 provider 支持的模型值；“名称（可选）”
+留空时自动生成 peer 名称。
+
+此 Web 入口只新建 native 会话，native resume 继续通过 CLI 使用。“高级选项”保留
+终端 CLI、Codex App Server 及各自原有的历史恢复操作。Shell 使用终端，DeepSeek
+Harness 使用后台 worker。
+
+创建后在同一 Web 会话内发送提示、查看投递回执或处理审批。创建 worker 不代表模型
+任务已经完成。关闭页面或停止 Web 都保留独立 native runtime 和 worker；不再需要时
+明确关闭 worker。下方带日期的既有验收记录不代表这个新建入口已通过真实模型或发布
+验收。详细操作见 [Web 指南](web-handoff.zh-CN.md)。
+
+顶部“文件”可只读浏览项目文件与生成产物，无需创建 worker。预览不会上传文件给模型；
+类型、大小和静态 HTML 的限制见 [文件与产物预览](web-handoff.zh-CN.md#浏览文件与产物)。
+
 ## CLI 使用
 
 在需要共享状态的项目目录中运行，或使用已有全局 `--root`、`--db` 指定项目和数据库。
@@ -80,7 +103,7 @@ hcc msg inbox --peer coordinator
 | `hcc native deliveries` | 可选 `--peer NAME`，查看投递回执 |
 | `hcc native events` | 必须 `--peer NAME`；可选 `--after ID`，查看有界事件历史 |
 | `hcc native requests` | 必须 `--peer NAME`；查看与该执行器、会话、turn 绑定的待处理请求 |
-| `hcc native respond` | 必须 `--peer NAME --request ID --decision accept\|decline\|cancel`；权限子集或问题答案通过 `--response-file JSON` 提交 |
+| `hcc native respond` | 必须 `--peer NAME --request ID --decision accept\|decline\|cancel`；权限子集、问题答案或 MCP 表单内容通过 `--response-file JSON` 提交 |
 | `hcc native interrupt` | 必须 `--peer NAME`；可选 `--turn ID`，请求中断活动 turn |
 | `hcc native close` | 必须 `--peer NAME`，关闭该 worker 持有的连接或进程 |
 | `hcc native down` | 请求关闭 worker 和停止 runtime，返回停止请求回执 |
@@ -147,11 +170,15 @@ ID。观察窗口不能应答，控制权切换后旧窗口的 epoch 失效。
 
 | Provider | 已接入的人工交互 |
 | --- | --- |
-| Codex | 命令/文件审批、所请求文件与网络权限的子集、明确的 turn/session 有效期、选项/自由输入/敏感问题，以及单次空表单 MCP 工具确认 |
+| Codex | 命令/文件审批、所请求文件与网络权限的子集、明确的 turn/session 有效期、选项/自由输入/敏感问题，以及单次空表单 MCP 工具确认与常用 MCP 表单字段 |
 | Claude | SDK 工具权限 callback，批准原始输入本次执行，不改写工具参数 |
 | dsh ACP | 选择 provider 提供的 `allow_once`，不自动选择 `allow_always` |
 
 rc.2 的 ACP 审批可能只携带工具 ID。适配器会关联同一 session/turn 的工具更新以展示操作输入；等待后仍缺输入或输入被截断时可以拒绝，允许会返回 `NATIVE_APPROVAL_CONTEXT_MISSING`。实际安装与拒绝证明见 dsh 验收 (源码目录: `docs/verification/2026-10-02-dsh-cordis-native.md`)。
+
+Native 审批卡片先显示工具、命令或文件路径和内容预览，并明确本次授权范围。
+完整操作详情可以展开，状态刷新保留展开状态；ACP 缺少操作输入或单次批准选项
+时禁用批准按钮，仍可拒绝。长内容预览会明确提示缩短，完整参数继续可查看。
 
 Codex 交互会话在 thread start/resume 的私有配置中显式开启
 `features.default_mode_request_user_input` 和 `features.request_permissions_tool`，
@@ -184,19 +211,33 @@ hcc native respond --peer codex-reviewer --request REQUEST_ID --decision accept 
 hcc native respond --peer codex-reviewer --request REQUEST_ID --decision cancel
 ```
 
-响应文件只允许 `permissions`、`scope`、`answers`。不能添加原请求没有的路径或
+响应文件只允许 `permissions`、`scope`、`answers`、`content`；MCP 表单用 `content` 对象提交原字段名和类型，例如 `{"content":{"project":"demo","count":2,"enabled":false}}`。不能添加原请求没有的路径或
 网络权限；授予文件权限时必须保留原请求的 deny 条目。所有问题都需明确回答；
 请求参数被截断时，只能拒绝或取消。动态工具与账号 token 刷新尚未接入。
 
 Codex MCP 工具审批使用 `mcpServer/elicitation/request`，与命令/文件审批的返回结构
 不同。HCC 对显式 MCP 工具确认提交单次 action/content，不写入 session/always 授权。
-任意表单字段和 URL 身份认证尚不支持批准，可明确拒绝或取消。
+标准 `form` 模式支持字符串、数值/整数、布尔值、单选和字符串枚举多选，包含标题、说明、默认建议值、必填项、长度/数值/选择数量范围及常用邮箱/URI/date/date-time 格式校验。可选字段只在勾选填写后发送；布尔值需明确选择是或否。字段数量上限 50、单字段选项上限 100、字符串上限 8192 个 UTF-16 单元，表单结构与应答内容各限 65536 字符。
+
+Web 刷新执行状态时在页面内存中保留填写内容；提交、请求消失或切换会话后清除，不写入浏览器存储、HCC 事件或投递回执。页面整体重载不会恢复这些答复。此约束针对 HCC 的交互应答路径；provider 自身记录及模型输出继续按其原有行为处理。服务端重复校验内容，审批继续绑定原 executor/session/turn/request；错误输入保留请求供修正。嵌套对象、任意数组、未知约束和 OpenAI 扩展表单模式仍不可批准，页面显示原因并提供拒绝/取消。此能力未改变动态工具或 token 刷新的接入边界。
+
+带原 thread/turn 标识的 MCP `url` 请求现在可在 Web 打开授权页面。界面显示 MCP 服务和目标域名，当前控制者明确点击后先保留空白标签页；原执行器接受同一个请求后才跳转，过期或被拒绝的请求会关闭空白页。弹窗被拦截时保留待处理请求，允许弹窗后可重试。仅允许 HTTPS 或 loopback HTTP，拒绝带用户名/密码的 URL、其他协议、缺少 elicitation 标识或被截断的请求；拒绝/取消始终可用。新标签页不保留 opener 或 referrer。loopback 地址需在执行器所在电脑的浏览器访问，HCC 不把本地授权回调代理到另一台设备。
+
+打开只回传 `{ "action": "accept" }`，不代表身份认证完成。需在外部页面完成操作，再返回查看原任务的 provider 结果。HCC 不推测授权完成事件，也不在表单中收集凭证；授权 URL、设备码消息、elicitation 标识和元数据仅存在于实时待处理请求，不留在 HCC 交互事件或浏览器存储中。provider 自身日志/历史和外部授权浏览器仍按各自规则处理。账号登录、token 刷新、`openai/userVerification` 与外部授权完成 API 属于独立的未接入能力。
+
+浏览器复现：设置 `HCC_ACCEPTANCE_PLAYWRIGHT` 指向 Playwright 模块，再执行 `node scripts/web-mcp-form-acceptance.mjs --run-browser`；`HCC_ACCEPTANCE_CHROME` 可指定 Chrome 路径。该脚本用模拟 provider、真实 HTTP/SQLite/native runtime 和隔离浏览器，不调用模型。表单验收见 `docs/verification/2026-10-02-mcp-form-web-validation.md`。
+
+真实模型与浏览器验收使用 `node scripts/web-mcp-form-live-acceptance.mjs --run-live`，同样需要设置 `HCC_ACCEPTANCE_PLAYWRIGHT`，可选 `HCC_ACCEPTANCE_CHROME`、`HCC_ACCEPTANCE_TMUX`、`--codex-bin PATH` 与 `--output NEW_FILE`。默认只打印帮助；显式运行会使用当前模型和账号的额度。脚本让安装版 Codex 调用隔离 stdio MCP 工具，通过实际 Web 操作完成工具确认、字段填写和提交，核对原类型答复、模型文件落盘，以及 Web 关闭后原 native 执行器继续执行；另覆盖 Web-owned App Server 路径，没有注入模型输出或 App Server 请求。
+
+此验收分别隔离 HCC 的用户目录、Codex home、项目、tmux socket 和浏览器 profile。已配置的外部认证辅助程序可在原用户目录下只读运行，以保持当前账号的正常凭据获取；不更改原 provider、模型、登录状态或原配置。回执记录源码摘要、实际检查、清理结果及原配置/认证/shell 配置摘要核对，`--output` 必须使用新路径，既有回执不会覆盖。验收工具日志只包含合成表单值，直接答复不应被误当成真实业务数据。
+
 
 ## 当前边界
 
 - 尚未实现接管或 attach 已有 Codex/Claude/dsh TUI、桌面会话；这些会话继续使用原
   transport。
-- Web 可发现并控制同一项目的现有 native worker，提供消息、回执、中断和明确关闭。
+- Web 可新建 Codex、Claude、dsh native worker，也可发现并控制同一项目的现有 worker，
+  提供消息、回执、中断和明确关闭。Web 新建入口暂不提供 native resume，恢复使用 CLI。
   关闭页面或 Web runtime 保留独立 native worker；支持与当前执行器、turn 绑定的人工应答。
   使用方式见 [Web 继续本地任务](web-handoff.zh-CN.md#本地-native-worker-接手)。
 - Codex、Claude 和 dsh native worker 自动获得项目与 peer 受限的 HCC MCP；
@@ -246,8 +287,82 @@ Web 验证覆盖服务与 bridge 控制接口，尚不等于完整浏览器操�
 
 
 真实模型与浏览器人工交互可使用 `scripts/web-native-interaction-acceptance.mjs`。
-默认只显示帮助；`--run-live --provider codex|claude|all` 才调用模型。
+默认只显示帮助；`--run-live --provider codex|claude|dsh|all` 才调用模型。
 设置 `HCC_ACCEPTANCE_PLAYWRIGHT`，以及按需设置 `HCC_ACCEPTANCE_CHROME`。
 `--claude-package DIR` 可将已经安装的 SDK 包链接到隔离 worker 项目，由默认加载器
 解析，不注入 query 函数。脚本验证明确批准与拒绝、原会话续接，退出后关闭测试
 进程并清理临时 provider home；使用现有认证和调用额度。它不连接现有用户会话。
+
+`--provider dsh --dsh-bin /absolute/path/to/dsh` 使用已安装的公开 launcher 和现有
+`DEEPSEEK_API_KEY`。脚本在私有 ACP profile 中通过公开 `tools/pre-execute` 策略
+让两个指定验收文件的写入请求审批；审批请求来自真实模型工具调用，不注入 ACP 请求。
+验证批准后写入、拒绝后文件不存在、释放 Web 控制后原 session 本地续接，另检查
+桌面和 390px 手机审批卡片。真实结果见 dsh Web 交互回执 (源码目录: `docs/verification/2026-10-02-native-web-dsh-final-snapshot-interactions.json`)。
+
+
+## 安装包验收
+
+`scripts/native-installed-acceptance.mjs` 对已经安装的 HCC 包执行验收，通过公开
+`hcc native` 命令启动 daemon 和三个 provider。先把本地包与可选的 Claude SDK
+安装在同一个独立 npm prefix；脚本使用 SDK 默认包解析，不注入 adapter 或 query
+函数。不加 `--run-live` 只显示帮助，不调用模型。
+
+```sh
+npm install --prefix /absolute/path/to/acceptance-prefix \
+  /absolute/path/to/hello-cc.tgz @anthropic-ai/claude-agent-sdk
+
+HCC_ACCEPTANCE_PLAYWRIGHT=file:///absolute/path/to/playwright/index.mjs \
+HCC_ACCEPTANCE_CHROME=/absolute/path/to/chrome \
+node /absolute/path/to/acceptance-prefix/node_modules/@logicseek/hello-cc/scripts/native-installed-acceptance.mjs \
+  --run-live --codex-bin /absolute/path/to/codex \
+  --dsh-bin /absolute/path/to/dsh --archive /absolute/path/to/hello-cc.tgz \
+  --browser --task --output /absolute/path/to/receipt.json
+```
+
+验收覆盖三个已安装 provider 的关联回复与 ACK、重复提交、连续上下文、owned
+close/resume、中断，以及一次明确拒绝 Codex 越界写入审批。先通过人工控制入口给每个 worker 授权限定任务，再由模型通过 MCP 沿
+`Codex → Claude → dsh → Codex` 发消息并消费回复。浏览器检查 SDK 默认加载、
+明确批准文件写入、桌面和手机渲染、释放控制权，以及关闭 Web 后原会话本地续接。
+`--task` 增加独立文件协作样例：Codex 实现金额计算，通过五个合同测试，再通过
+模型发出的交接消息让 Claude 写出审查文件。这个样例与生产业务的用户验收分开。
+
+脚本使用现有认证和调用额度。HCC 全局 HOME、provider home、tmux server 和项目
+使用私有验收目录；复制到私有配置中的 Codex 凭据命令，仅在读取现有凭据时保留
+原 HOME，原配置保持不变。退出后清理自有进程与临时凭据。回执记录包 SHA-256、
+provider 版本、源码摘要、浏览器证据和清理结果；脚本不会发布 npm 包或部署到
+员工设备。
+
+通过已认证的 native CLI/Web 控制入口提交的任务，持久记录为人工请求；共享 HCC
+消息总线送达的内容保持 peer 消息身份，即使发送方自称 `web` 或 `shell`。旧回执
+迁移后仍按 peer 消息处理。来源区分不授予工具权限，写入等受控操作仍需审批。
+委派文件任务时，先由用户明确授权接收 agent 的限定任务，再发送 peer 交接。
+
+## 有界稳定性验收
+
+安装包验收可加 `--stability`，在基础生命周期和跨 provider 通信之后运行持续负载：
+
+```sh
+node /absolute/path/to/acceptance-prefix/node_modules/@logicseek/hello-cc/scripts/native-installed-acceptance.mjs \
+  --run-live --codex-bin /absolute/path/to/codex --dsh-bin /absolute/path/to/dsh \
+  --archive /absolute/path/to/hello-cc.tgz --stability \
+  --stability-cycles 6 --stability-burst 2 --stability-idle-ms 30000 \
+  --stability-resume-every 2 --output /absolute/path/to/stability-receipt.json
+```
+
+三个 provider 同时工作，每轮先向各 worker 排队投递整组消息。每条要求模型从
+历史中回忆原始随机标记和上一条消息的票据，验证串行处理顺序与上下文保留。
+每轮还重复提交同一提交 ID，核对只产生一条回复与一个 ACK；定期关闭并恢复
+worker，在中点正常重启自有 daemon，再验证原 session 和历史。空闲窗口继续
+检查控制接口、pending 请求与会话身份。结束时核对持久投递、数据库完整性、
+事件保留上限与无回复循环。回执保留每条实际回复、失败状态和自有进程内存
+采样，不自动重放失败任务，也不把同轮重新尝试改写为成功。
+
+默认 6 轮、每 worker 每轮 2 条、每轮空闲观察 30 秒、每 2 轮恢复。参数限制为
+1–24 轮、1–4 条、0–300000 毫秒和 1–24 轮恢复间隔；这些选项必须与
+`--stability` 一起使用。这是有界真实模型负载验收，不能代替 24 小时 soak、
+并发容量测量或内存泄漏证明。DSH 单次恢复成功也不能单独解释历史恢复波动。
+
+`--stability-only` 与 `--stability` 一起使用时，只建立三个真实会话并运行稳定性
+负载，跳过基础中断、命令审批和模型 MCP 通信场景；回执明确标记该范围。
+适合已有独立生命周期/交互回执时单独补做持续负载，不能把跳过项算作通过。
+发生任一错误时，脚本在关闭自有 worker 前保存会话快照、最近投递和事件。

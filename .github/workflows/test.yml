@@ -6,6 +6,7 @@ on:
       - master
       - codex/dsh-stable-source
       - codex/dsh-stable-fixes
+      - codex/web-workbench-*
   pull_request:
 
 permissions:
@@ -59,4 +60,19 @@ jobs:
         run: npm run release:check
 
       - name: Regression test
-        run: npm test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/hcc-regression.log"
+
+      - name: Verify isolated different-UID filesystem behavior on Linux
+        if: runner.os == 'Linux'
+        run: sudo "$(command -v node)" --test test/pinned-cwd-cross-uid.test.mjs
+
+      - name: Upload regression log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hcc-regression.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -50,11 +50,14 @@ async function fixture(t, hooks = {}) {
     connect, detectBranch: () => '', liveProcessIdentity: () => inspectProcessIdentity(process.pid).identity }, {
     pollMs: 60000,
     adapterFactory: async (provider, options) => {
+      await hooks.beforeNativeAdapter?.(provider, options);
       const peer = options.env.HCC_PEER;
       const state = { provider, status: 'idle', sessionId: 'session-' + peer, turnId: null,
         executorId: options.executorId, pendingApprovals: [], capabilities: { send: true, resume: true, interrupt: true, close: true, approvals: true } };
       const adapter = { capabilities: state.capabilities, state, sent: [], interrupts: [], closed: 0,
-        snapshot: () => structuredClone(state), async open() { return this.snapshot(); },
+        snapshot: () => structuredClone(state), async open(input) {
+          await hooks.nativeOpen?.({ provider, peer, ...input }); return this.snapshot();
+        },
         async send(input) { this.sent.push(input); state.status = 'running'; state.turnId = 'turn-' + peer;
           return { status: 'queued', turnId: state.turnId }; },
         async interrupt(input) { this.interrupts.push(input); return { status: 'interrupt_requested' }; },
@@ -132,9 +135,9 @@ async function fixture(t, hooks = {}) {
   const server = http.createServer(handleWebRequest);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = 'http://127.0.0.1:' + server.address().port;
-  const request = async (route, input) => {
+  const request = async (route, input, headers = {}) => {
     const response = await fetch(base + route, { method: input === undefined ? 'GET' : 'POST',
-      headers: { 'X-HCC-API-Version': '2', Origin: base, 'Content-Type': 'application/json' },
+      headers: { 'X-HCC-API-Version': '2', Origin: base, 'Content-Type': 'application/json', ...headers },
       ...(input === undefined ? {} : { body: JSON.stringify(input) }) });
     return { status: response.status, body: await response.json() };
   };
@@ -163,6 +166,92 @@ async function fixture(t, hooks = {}) {
     pendingCount() { return db.prepare("SELECT COUNT(*) n FROM events WHERE type='native.web.submission.pending'").get().n; }
   };
 }
+
+test('POST sessions creates and returns each native provider view without terminal or Web-owned executor startup', async t => {
+  const f = await fixture(t);
+  fs.mkdirSync(path.join(f.ctx.root, 'child'));
+  for (const kind of ['codex', 'claude', 'dsh']) {
+    const response = await f.request('/api/sessions', { transport: 'native', kind, id: `web-${kind}`, cwd: 'child', model: 'selected-model' });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.deepEqual(response.body.session, { id: `web-${kind}`, type: 'native', peerId: `web-${kind}`, threadId: `session-web-${kind}` });
+    const call = f.nativePosts.at(-1);
+    assert.equal(call.route, '/workers');
+    assert.deepEqual(call.body, { peer: `web-${kind}`, provider: kind, cwd: path.join(f.ctx.root, 'child'), model: 'selected-model' });
+  }
+  assert.equal(f.nativePosts.length, 3); assert.equal(f.codexAdapters.length, 0); assert.equal(f.ptySpawns.length, 0);
+  const listed = await f.request('/api/sessions');
+  assert.equal(listed.body.sessions.length, 3);
+});
+
+test('native initialization failures retain their error code and give actionable guidance for the saved peer', async t => {
+  const f = await fixture(t, {
+    beforeNativeAdapter(provider) {
+      if (provider === 'dsh') throw new CliError('NATIVE_BINARY_MISSING', 'dsh executable was not found');
+    },
+    nativeOpen({ model }) {
+      if (model === 'unavailable-model') throw new CliError('NATIVE_UNSUPPORTED_MODEL', 'The selected model is unavailable');
+    }
+  });
+  for (const failure of [
+    { kind: 'codex', model: 'unavailable-model', code: 'NATIVE_UNSUPPORTED_MODEL', detail: 'The selected model is unavailable' },
+    { kind: 'dsh', id: 'missing-binary', code: 'NATIVE_BINARY_MISSING', detail: 'dsh executable was not found' }
+  ]) {
+    const response = await f.request('/api/sessions', { transport: 'native', kind: failure.kind,
+      ...(failure.id ? { id: failure.id } : {}), ...(failure.model ? { model: failure.model } : {}) });
+    const peer = f.nativePosts.at(-1).body.peer;
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, failure.code);
+    assert.ok(response.body.error.message.startsWith(failure.detail));
+    assert.ok(response.body.error.message.includes(`Peer ${peer} is still reserved`));
+    assert.match(response.body.error.message, /hcc native status/);
+    assert.match(response.body.error.message, /choose a new Agent name to retry/);
+    const binding = f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(peer);
+    assert.equal(binding.transport, 'native');
+    const saved = (await f.api('GET', '/status')).workers.find(worker => worker.peer === peer);
+    assert.equal(saved.status, 'error'); assert.equal(saved.owned, false);
+    const sameName = await f.request('/api/sessions', { transport: 'native', kind: failure.kind, id: peer });
+    assert.equal(sameName.body.error.code, 'NATIVE_PEER_IN_USE');
+    assert.deepEqual(f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(peer), binding);
+  }
+  const retried = await f.request('/api/sessions', { transport: 'native', kind: 'codex', id: 'corrected-model', model: 'available-model' });
+  assert.equal(retried.status, 200);
+  assert.equal(retried.body.session.id, 'corrected-model');
+});
+
+test('native creation HTTP contract rejects injection, ambiguous transports and cross-origin writes', async t => {
+  const f = await fixture(t);
+  const base = { transport: 'native', kind: 'codex' };
+  for (const input of [null, [], { ...base, binary: 'custom-codex' }, { ...base, env: {} },
+    { ...base, command: 'anything' }, { ...base, resume: 'last' }, { ...base, force: false },
+    { ...base, backend: 'app-server' }, { transport: 'app-server', backend: 'native', kind: 'codex' },
+    { backend: 'native', kind: 'codex' }, { ...base, projectCtx: f.ctx }]) {
+    const rejected = await f.request('/api/sessions', input);
+    assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.error.code, 'BAD_REQUEST');
+  }
+  const crossOrigin = await f.request('/api/sessions', base, { Origin: 'https://different.example' });
+  assert.equal(crossOrigin.status, 403); assert.equal(crossOrigin.body.error.code, 'CSRF_ORIGIN');
+  assert.equal(f.nativePosts.length, 0); assert.equal(f.codexAdapters.length, 0); assert.equal(f.ptySpawns.length, 0);
+});
+
+test('native create HTTP preserves an occupied peer and exposes recovery identity after admitted creation loses its view', async t => {
+  const f = await fixture(t), original = await f.nativeSession('occupied');
+  const binding = f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('occupied');
+  const duplicate = await f.request('/api/sessions', { transport: 'native', kind: 'codex', id: 'occupied' });
+  assert.equal(duplicate.status, 409); assert.equal(duplicate.body.error.code, 'NATIVE_PEER_IN_USE');
+  assert.deepEqual(f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('occupied'), binding);
+  assert.equal(original.nativeIdentity.owner, binding.runtime_target);
+  f.setNativeReadHook(() => { throw new CliError('NATIVE_RUNTIME_OFFLINE', 'fixture first read failed'); });
+  const created = await f.request('/api/sessions', { transport: 'native', kind: 'dsh' });
+  assert.equal(created.status, 409); assert.equal(created.body.error.code, 'NATIVE_WORKER_DISCOVERY_FAILED');
+  const { peer, provider, created: admitted } = created.body.error.extra;
+  assert.equal(provider, 'dsh'); assert.equal(admitted, true); assert.ok(peer);
+  assert.equal(f.nativePosts.filter(call => call.route === '/workers').length, 1);
+  f.setNativeReadHook(null);
+  const listed = await f.request('/api/sessions');
+  assert.ok(listed.body.sessions.some(session => session.id === peer && session.type === 'native'));
+  assert.equal(f.nativeAdapters.get(peer).closed, 0);
+});
 
 test('native HTTP reads actual state; observers cannot mutate a worker, inject terminal input, or write acceptance', async t => {
   const f = await fixture(t), session = await f.nativeSession(); f.task(session.peerId);

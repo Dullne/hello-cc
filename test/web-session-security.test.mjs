@@ -11,6 +11,7 @@ import {
   requestOriginMatches
 } from '../lib/web/http.mjs';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
+const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccSource = fs.readFileSync(path.join(repoRoot, 'bin', 'hcc.mjs'), 'utf8');
@@ -44,6 +45,7 @@ test('one shared constant-time comparator protects per-connection action tokens'
   assert.match(actionResolver, /socket\?\.readyState === WebSocket\.OPEN/);
 
   const socketInput = sourceBetween("ws.on('message', (raw) => {", "ws.on('close', () => {");
+  assert.match(socketInput, /assertSessionProjectUnchanged\(\)/);
   assert.match(socketInput, /tokenMatches\(msg\.action_token, connectionActionToken\)/);
   assert.doesNotMatch(socketInput, /session\.actionToken/);
 });
@@ -63,7 +65,7 @@ test('terminal sockets mint and revoke independent write tokens', () => {
 });
 
 test('browser receives connection tokens from snapshots, fences input, and never replays uncertain input', () => {
-  const html = webIndexHtml({ nonce: 'test-session-nonce' });
+  const html = webIndexHtml({ nonce: 'test-session-nonce' }) + browserCore;
   assert.match(html, /const sessionActionTokens = new Map\(\);/);
   assert.match(html, /sessionActionTokens\.set\(id, msg\.action_token\)/);
   assert.doesNotMatch(html, /pendingTerminalInput|flushPendingTerminalInput/);
@@ -77,7 +79,7 @@ test('browser receives connection tokens from snapshots, fences input, and never
 });
 
 test('browser logout revokes the cookie session', () => {
-  const html = webIndexHtml({ nonce: 'test-session-nonce' });
+  const html = webIndexHtml({ nonce: 'test-session-nonce' }) + browserCore;
   assert.match(html, /id="logoutBtn"/);
   assert.match(html, /fetch\('\/logout', \{ method: 'POST', headers \}\)/);
   assert.match(html, /sessionStorage\.removeItem\('hcc_logged_out'\)/);

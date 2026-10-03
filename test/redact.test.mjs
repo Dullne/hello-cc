@@ -98,7 +98,7 @@ function inlineScripts(html) {
 test('index and login HTML nonce every inline script under the complete CSP', () => {
   const nonce = 'unit-test-nonce-0123456789';
   const policy = contentSecurityPolicy(nonce);
-  const expected = "default-src 'self'; script-src 'self' 'nonce-unit-test-nonce-0123456789'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+  const expected = "default-src 'self'; script-src 'self' 'nonce-unit-test-nonce-0123456789'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; frame-src 'self' blob:";
   assert.equal(policy, expected);
   assert.doesNotMatch(policy.match(/script-src[^;]*/)?.[0] || '', /'unsafe-inline'/);
 

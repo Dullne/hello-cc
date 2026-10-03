@@ -115,6 +115,16 @@ test('framing exception requires an explicit boolean and retains nonce validatio
   assert.equal(headers['Content-Security-Policy'], "frame-ancestors 'none'");
 });
 
+test('local file previews permit blob frames only in the main workspace and keep active objects disabled', () => {
+  const nonce = 'file-preview-policy-test-nonce';
+  const policy = contentSecurityPolicy(nonce);
+  assert.match(policy, /frame-src 'self' blob:(?:;|$)/);
+  assert.match(policy, /img-src 'self' data: blob:;/);
+  assert.match(policy, /object-src 'none';/);
+  assert.match(policy, /base-uri 'none';/);
+  assert.match(contentSecurityPolicy(nonce, { pane: true }), /frame-src 'none'(?:;|$)/);
+});
+
 function nativeBrowser(storage, draftScope = '') {
   const nodes = new Map(), requests = [];
   const element = id => {

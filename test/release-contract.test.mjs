@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isPrereleaseVersion } from '../lib/release/release-notes.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
@@ -12,6 +13,42 @@ const nodePtyVersion = '1.2.0-beta.15';
 
 const englishDocs = ['README.md', 'docs/README.md', 'docs/commands.md', 'docs/guide.md'];
 const chineseDocs = ['README.zh-CN.md', 'docs/README.zh-CN.md', 'docs/commands.zh-CN.md', 'docs/guide.zh-CN.md'];
+
+test('release classification distinguishes prerelease identifiers from build metadata', () => {
+  for (const version of ['1.0.1', 'v1.0.1', '1.0.2+build-preview.1']) {
+    assert.equal(isPrereleaseVersion(version), false, version);
+  }
+  for (const version of ['1.0.2-dsh.2', 'v1.0.2-dsh.2', '1.0.2-0', '1.0.2-rc.2+build.1']) {
+    assert.equal(isPrereleaseVersion(version), true, version);
+  }
+  for (const version of ['1.0', '01.0.2', '1.0.2-', '1.0.2-01', '1.0.2-rc..2']) {
+    assert.throws(() => isPrereleaseVersion(version), /Invalid release version/, version);
+  }
+});
+
+test('GitHub release dry runs expose stable and dsh preview publication status without credentials', () => {
+  for (const [version, prerelease] of [['1.0.1', false], ['1.0.2-dsh.2', true], ['1.0.2-dsh.3', true]]) {
+    const output = execFileSync(process.execPath, [path.join(repoRoot, 'scripts/github-release.mjs'),
+      '--dry-run', '--version', version], {
+      cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GH_TOKEN: '', GITHUB_TOKEN: '' }
+    });
+    const payload = JSON.parse(output);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.dry_run, true);
+    assert.equal(payload.tag, `v${version}`);
+    assert.equal(payload.prerelease, prerelease);
+    assert.ok(payload.body_length > 0);
+    assert.match(payload.body_preview, new RegExp(`^## ${version.replaceAll('.', '\\.')}`));
+  }
+});
+
+test('npm documentation filtering excludes internal plans and verification receipts', () => {
+  const rules = read('docs/.npmignore').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  for (const directory of ['superpowers/', 'plans/', 'verification/']) {
+    assert.ok(rules.includes(directory), `internal ${directory} must not enter the published package`);
+  }
+  assert.ok(!rules.includes('*') && !rules.includes('*.md'), 'public Markdown documentation must remain available');
+});
 
 test('current release metadata and Docker verification contract stay pinned', () => {
   const pkg = JSON.parse(read('package.json'));

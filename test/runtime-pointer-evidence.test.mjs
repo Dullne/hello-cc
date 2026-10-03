@@ -56,6 +56,22 @@ test('alive and recent unknown runtime pointers fail closed, while unknown is bo
   }), { state: 'dead', reclaimable: true });
 });
 
+test('legacy macOS runtime pointers retain unknown evidence across the boot token format transition', () => {
+  const legacy = { ...stored, startToken: '100:42:Mon Aug  3 06:10:11 2026' };
+  const current = { ...stored, startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  for (const [saved, observed] of [[legacy, current], [current, legacy]]) {
+    for (const ageMs of [0, RUNTIME_POINTER_UNKNOWN_GRACE_MS - 1, RUNTIME_POINTER_UNKNOWN_GRACE_MS]) {
+      assert.deepEqual(classifyRuntimePointer({ pid: saved.pid, process_identity: saved }, {
+        inspect: () => ({ state: 'live', identity: observed }), ageMs
+      }), { state: 'unknown', reclaimable: ageMs >= RUNTIME_POINTER_UNKNOWN_GRACE_MS });
+    }
+  }
+  assert.deepEqual(classifyRuntimePointer({ pid: current.pid, process_identity: current }, {
+    inspect: () => ({ state: 'live', identity: { ...current,
+      startToken: 'mac:36f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' } })
+  }), { state: 'dead', reclaimable: true }, 'confirmed boot identity mismatches remain dead');
+});
+
 test('ambiguous duplicate runtime identity fields are unknown to destructive cleanup', () => {
   assert.deepEqual(classifyRuntimePointer({
     pid: stored.pid,
@@ -223,4 +239,29 @@ test('strict pointer reclamation distinguishes confirmed dead from old unknown e
   ]);
   assert.equal(fs.existsSync(dead.file), false);
   assert.equal(fs.existsSync(unknown.file), true);
+});
+
+test('strict reclamation preserves a legacy macOS runtime pointer until its process is confirmed dead', (t) => {
+  const legacy = { ...stored, startToken: '100:42:Mon Aug  3 06:10:11 2026' };
+  const current = { ...stored, startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  const pointer = tempPointer(t, { pid: legacy.pid, process_identity: legacy });
+  const saved = fs.readFileSync(pointer.file, 'utf8'), reclaimed = [];
+  const options = { nowMs: () => pointer.timestampMs + RUNTIME_POINTER_UNKNOWN_GRACE_MS * 2,
+    reclaimUnknown: false, onReclaim: value => reclaimed.push(value) };
+  const unknown = reclaimRuntimePointerFiles([pointer.file], {
+    ...options, inspect: () => ({ state: 'live', identity: current })
+  });
+  assert.equal(unknown.blocked, true); assert.equal(unknown.reclaimed, 0);
+  assert.deepEqual(unknown.outcomes.map(({ state, action }) => ({ state, action })), [
+    { state: 'unknown', action: 'blocked' }
+  ]);
+  assert.equal(fs.readFileSync(pointer.file, 'utf8'), saved);
+  assert.equal(reclaimed.length, 0, 'no reclamation side effect runs for ambiguous live identity');
+
+  const dead = reclaimRuntimePointerFiles([pointer.file], {
+    ...options, inspect: () => ({ state: 'dead', identity: null })
+  });
+  assert.equal(dead.blocked, false); assert.equal(dead.reclaimed, 1);
+  assert.equal(fs.existsSync(pointer.file), false);
+  assert.equal(reclaimed.length, 1); assert.equal(reclaimed[0].state, 'dead');
 });

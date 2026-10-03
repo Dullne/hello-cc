@@ -31,6 +31,7 @@ function fixture(t) {
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
   const env = {
     ...process.env,
+    NODE_NO_WARNINGS: '1',
     HOME: home,
     HCC_RUNTIME_URL: '',
     HCC_PEER: 'server-inherited-peer',

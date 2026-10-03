@@ -1,13 +1,13 @@
+import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
+const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 import { UI_TRANSLATIONS } from '../lib/web/ui-i18n.mjs';
 
-// Exercise the same inline renderer the browser receives, without booting a
-// terminal/runtime or reaching the user's project registry.
-const shippedSource = [...webIndexHtml({ nonce:'session-display-test-nonce' }).matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)]
-  .map(match => match[1]).find(source => source.includes('function renderSections()'));
+// Exercise the shipped ESM renderer without booting a terminal/runtime.
+const shippedSource = browserCore;
 function shippedFunction(name) {
   const start = shippedSource.indexOf('    function ' + name + '(');
   assert.ok(start >= 0, 'Shipped UI must provide ' + name);
@@ -18,7 +18,10 @@ function shippedFunction(name) {
 function fixture() {
   const elements = new Map(), opened = [];
   function node(dataset = {}) {
+    let content = '';
     return { dataset, listeners:new Map(), open:false, scrollTop:17,
+      get textContent() { return content; }, set textContent(value) { content = String(value); },
+      get innerHTML() { return content; }, set innerHTML(value) { content = String(value); },
       addEventListener(name, listener) { this.listeners.set(name, listener); },
       focus() {}, getAttribute() { return null; } };
   }
@@ -40,23 +43,23 @@ function fixture() {
   }});
   elements.set('sessions',box);
   const state = { active:'managed-a',activeDetected:null,activeType:'managed',sessionSearchQuery:'',sessionStatusFilter:'all',sessionKindFilter:'all',showStaleDetected:true,
-    lastStateNow:100,activePeerTtl:30,lang:'en',
+    lastStateNow:100,activePeerTtl:30,lang:'en',currentProject:'/project <qa>/src',
     sessions:[{id:'managed-a',peer_id:'peer-a',kind:'codex',status:'running',type:'tmux',cwd:'/project <qa>/src',command:'codex --resume "thread-qa" <untrusted>',task:{title:'Continue local work'},binding:{provider:'codex',provider_session_id:'thread-qa',runtime_target:'pane:%42'}}],
     detected:[{id:'detected-a',kind:'claude',status:'idle',age_sec:2,worktree:'/detected <qa>',command:'claude <untrusted>'},
       {id:'stale-b',kind:'codex',status:'running',age_sec:60,cwd:'/stale'},{id:'dsh-c',kind:'dsh',provider:'dsh',transport:'hook',status:'idle',age_sec:2,cwd:'/dsh'}]
   };
   const context = vm.createContext({...state, window:{},
     document:{activeElement:null,getElementById(id) { if(!elements.has(id))elements.set(id,node());return elements.get(id); }},
-    tr:(key,fallback='')=>UI_TRANSLATIONS.en[key]||fallback||key,
+    tr:(key,fallback='')=>UI_TRANSLATIONS[context.lang][key]||fallback||key,
     hccUi:{safeSet(){}},preserveFocus:()=>()=>{},kindMatches:()=>true,
     connectManaged:id=>opened.push({type:'managed',id}),connectDetected:id=>opened.push({type:'detected',id})
   });
-  const functions=['esc','badgeClass','fmtAge','sessionPeerId','sessionBinding','sessionRuntimeTarget','sessionProvider','sessionProviderSessionValue','statusText',
-    'peerIsActive','dshCoordinationPeer','detectedPeerCanStop','peerStateView','sessionMatchesSearch','sessionDetailsHtml','renderSections'];
+  const functions=['esc','badgeClass','fmtAge','sessionPeerId','sessionDisplayTitle','sessionBinding','sessionRuntimeTarget','sessionProvider','sessionProviderSessionValue','statusText',
+    'peerIsActive','dshCoordinationPeer','detectedPeerCanStop','peerStateView','sessionMatchesSearch','sessionDetailsHtml','renderSections','renderActiveSession','clearSessionIdentity','renderDetectedHeader'];
   vm.runInContext(functions.map(shippedFunction).join('\n'),context);
   const render=()=>vm.runInContext('renderSections()',context);
   render();
-  return {box,context,opened,render};
+  return {box,context,opened,render,elements};
 }
 
 test('managed disclosure renders runtime, provider history, command and directory while the title stays readable',()=>{
@@ -97,4 +100,82 @@ test('polling preserves expanded identity disclosures and the session list readi
   const f=fixture();f.box.details.find(detail=>detail.dataset.detailKey==='managed:managed-a').open=true;f.box.scrollTop=89;f.render();
   assert.equal(f.box.details.find(detail=>detail.dataset.detailKey==='managed:managed-a').open,true);
   assert.equal(f.box.scrollTop,89);
+});
+
+test('header and sidebar prioritize the current task while technical identity stays in the disclosure',()=>{
+  const f=fixture();
+  Object.assign(f.context.sessions[0],{name:'Older session name',task:{id:21,title:'Review the current task',status:'claimed'}});
+  f.render();
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'Review the current task');
+  assert.match(f.box.innerHTML,/<strong>Review the current task<\/strong>/);
+  assert.equal(f.elements.get('activeMeta').textContent,'codex · #21 · claimed');
+  assert.doesNotMatch(f.elements.get('activeMeta').textContent,/thread-qa|pane:%42|untrusted/);
+  const identity=f.elements.get('activeIdentity').innerHTML;
+  assert.match(identity,/<dt>runtime<\/dt><dd>pane:%42<\/dd>/i);
+  assert.match(identity,/<dt>provider session<\/dt><dd>codex:thread-qa<\/dd>/i);
+  assert.match(identity,/&lt;untrusted&gt;/);
+  assert.doesNotMatch(identity,/<untrusted>|<qa>/);
+  assert.equal(f.elements.get('activeDetails').open,false);
+});
+
+test('header falls back through session name, peer and runtime ID without inventing provider history',()=>{
+  const f=fixture(), session=f.context.sessions[0];
+  session.task=null;session.name='Named session';
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'Named session');
+  delete session.name;
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'peer-a');
+  delete session.peer_id;
+  session.binding={provider:'codex'};
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'managed-a');
+  assert.match(f.elements.get('activeIdentity').innerHTML,/<dt>provider session<\/dt><dd>codex:unknown<\/dd>/i);
+  assert.equal(f.elements.get('activeTask').textContent,'');
+  assert.equal(f.elements.get('activeTask').hidden,true);
+});
+
+test('identity stays open when polling the same session and resets across sessions and projects',()=>{
+  const f=fixture();
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  const details=f.elements.get('activeDetails');details.open=true;
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.equal(details.open,true);
+  f.context.next={id:'managed-b',peer_id:'peer-b',kind:'claude'};
+  vm.runInContext('renderActiveSession(next)',f.context);
+  assert.equal(details.open,false);
+  assert.doesNotMatch(f.elements.get('activeIdentity').innerHTML,/thread-qa|pane:%42|untrusted/);
+  assert.equal(f.elements.get('activeTask').textContent,'');
+  details.open=true;f.context.currentProject='/another-project';
+  vm.runInContext('renderActiveSession(next)',f.context);
+  assert.equal(details.open,false);
+});
+
+test('switching to detected or unavailable identity clears the previous managed task and details',()=>{
+  const f=fixture();
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  f.elements.get('activeDetails').open=true;
+  f.context.activeDetected='detected-a';
+  vm.runInContext('renderDetectedHeader(detected[0])',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'detected-a');
+  assert.match(f.elements.get('activeMeta').textContent,/claude.*Detected/i);
+  assert.equal(f.elements.get('activeDetails').open,false);
+  assert.equal(f.elements.get('activeDetails').dataset.subject,undefined);
+  assert.equal(f.elements.get('activeIdentity').innerHTML,'');
+  assert.equal(f.elements.get('activeTask').textContent,'');
+  assert.equal(f.elements.get('activeTask').hidden,true);
+  vm.runInContext('renderActiveSession({id: active})',f.context);
+  assert.equal(f.elements.get('activeTitle').textContent,'managed-a');
+  assert.doesNotMatch(f.elements.get('activeIdentity').innerHTML,/thread-qa|pane:%42|untrusted/);
+  vm.runInContext('clearSessionIdentity()',f.context);
+  assert.equal(f.elements.get('activeIdentity').innerHTML,'');
+});
+
+test('header identity labels follow the selected language without changing the provider identity',()=>{
+  const f=fixture();f.context.lang='zh';
+  f.context.sessions[0].binding={provider:'codex'};
+  vm.runInContext('renderActiveSession(sessions[0])',f.context);
+  assert.match(f.elements.get('activeIdentity').innerHTML,/<dt>提供方会话<\/dt><dd>codex:未知<\/dd>/);
+  assert.doesNotMatch(f.elements.get('activeTask').textContent,/undefined/);
 });

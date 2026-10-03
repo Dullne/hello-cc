@@ -3,9 +3,13 @@ import { codexInteractiveConfig } from '../lib/integrations/codex-interactions.m
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { createCodexAppServer } from '../lib/web/codex-app-server.mjs';
 
+const TEST_CWD = process.cwd();
 const thread = (id = 'thread-1', extra = {}) => ({ id, status: { type: 'idle' }, turns: [], cwd: '/project', ...extra });
 const turn = (id = 'turn-1', extra = {}) => ({ id, status: 'inProgress', items: [], ...extra });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -58,7 +62,7 @@ function fakeServer(t, { onRequest, ...options } = {}) {
     }
   });
   const adapter = createCodexAppServer({
-    cwd: '/project',
+    cwd: TEST_CWD,
     onChange: (state, event) => changes.push({ state, event }),
     spawnProcess: (...args) => { launches.push(args); return process; },
     ...options
@@ -108,7 +112,7 @@ test('thread lifecycle keeps official responses and pins requested thread identi
   const result = await s.adapter.startThread({ model: 'test-model' });
   assert.equal(result.thread.id, 'thread-1');
   assert.deepEqual(s.calls.find((call) => call.method === 'thread/start').params, {
-    cwd: '/project', sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user', model: 'test-model', config: codexInteractiveConfig()
+    cwd: TEST_CWD, sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user', model: 'test-model', config: codexInteractiveConfig()
   });
   await s.adapter.resumeThread('thread-2', { threadId: 'wrong' });
   await s.adapter.readThread('thread-2', { threadId: 'wrong', includeTurns: false });
@@ -117,6 +121,40 @@ test('thread lifecycle keeps official responses and pins requested thread identi
   assert.equal(s.calls.find((call) => call.method === 'thread/read').params.includeTurns, false);
   assert.equal(s.adapter.snapshot().threadId, 'thread-2');
   assert.equal(s.adapter.snapshot().threads.length, 2);
+});
+
+test('App Server refuses thread path handoffs after the selected directory is rebound', async t => {
+  for (const method of ['thread/start', 'thread/resume', 'thread/fork']) {
+    await t.test(method, async subtest => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-path-'));
+      subtest.after(() => fs.rmSync(base, { recursive: true, force: true }));
+      const original = path.join(base, 'original');
+      const replacement = path.join(base, 'replacement');
+      const selected = path.join(base, 'selected');
+      fs.mkdirSync(original);
+      fs.mkdirSync(replacement);
+      fs.symlinkSync(original, selected, 'dir');
+      const s = fakeServer(subtest, { cwd: selected });
+      try {
+        await s.adapter.initialize();
+        fs.unlinkSync(selected);
+        fs.symlinkSync(replacement, selected, 'dir');
+        const submit = method === 'thread/start' ? () => s.adapter.startThread()
+          : method === 'thread/resume' ? () => s.adapter.resumeThread('owned-thread')
+            : () => s.adapter.forkThread('owned-thread');
+        await assert.rejects(submit(), { code: 'PROJECT_PATH_CHANGED' });
+        assert.equal(s.calls.some(call => call.method === method), false);
+      } finally { await s.adapter.close(); }
+    });
+  }
+});
+
+test('App Server keeps the selected cwd when callers supply a different thread cwd', async t => {
+  const s = fakeServer(t);
+  await s.adapter.startThread({ cwd: '/different-root' });
+  assert.equal(s.calls.find(call => call.method === 'thread/start').params.cwd, TEST_CWD);
+  await s.adapter.resumeThread('thread-2', { cwd: '/different-root' });
+  assert.equal(s.calls.find(call => call.method === 'thread/resume').params.cwd, TEST_CWD);
 });
 
 test('fragmented JSONL and UTF-8 produce item, plan, diff and completion state', async (t) => {
@@ -186,6 +224,35 @@ test('continuous text updates cannot postpone the bounded publish interval', asy
   }
   assert.equal(s.changes.length, 4);
   assert.deepEqual(s.changes.map(change => change.state.threads[0].turns[0].items[0].text.length), [5, 10, 15, 20]);
+});
+
+test('internal borrowed change views retain history identity and include every dirty text item in a batch', async t => {
+  const updates = [];
+  const s = fakeServer(t, { changeView: true, onChange: (state, event, metadata) => updates.push({ state, event, metadata }) });
+  await running(s); t.mock.timers.enable({ apis: ['setTimeout'] }); updates.length = 0;
+  for (const itemId of ['one', 'two']) s.send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId, delta: itemId } });
+  const isolated = s.adapter.snapshot(); t.mock.timers.tick(50);
+  const first = updates.at(-1); assert.equal(first.metadata.textOnly, true); assert.equal(first.metadata.textItems.length, 2);
+  s.send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'one', delta: '-more' } });
+  t.mock.timers.tick(50);
+  assert.equal(first.state.threads[0], updates.at(-1).state.threads[0], 'internal observations borrow stable history rather than cloning it');
+  assert.equal(isolated.threads[0].turns[0].items[0].text, 'one', 'public snapshots stay isolated');
+  assert.ok(updates.at(-1).state.updateSequence > isolated.updateSequence);
+});
+
+test('provider token usage and runtime metadata are scoped facts and never imply context occupancy', async t => {
+  const s = fakeServer(t, { onRequest(message, { reply }) {
+    if (message.method === 'thread/start') { reply(message, { thread: thread(), model: 'fixture-model', approvalPolicy: 'on-request' }); return true; }
+  } });
+  await s.adapter.startThread();
+  assert.deepEqual(s.adapter.snapshot().runtimeMetadata, { model: 'fixture-model', permissionMode: 'on-request' });
+  assert.equal(Object.hasOwn(s.adapter.snapshot(), 'metrics'), false);
+  s.send({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', tokenUsage: { total: { inputTokens: 80, outputTokens: 20, cachedInputTokens: 30, totalTokens: 100 }, modelContextWindow: 200000 } } });
+  const usage = s.adapter.snapshot().metrics;
+  assert.equal(usage.totalTokens, 100); assert.equal(usage.scope, 'session'); assert.equal(usage.contextWindow, 200000);
+  assert.equal(Object.hasOwn(usage, 'contextTokens'), false); assert.equal(Object.hasOwn(usage, 'durationMs'), false);
+  s.send({ method: 'thread/tokenUsage/updated', params: { threadId: 'foreign-thread', tokenUsage: { total: { totalTokens: 99999 } } } });
+  assert.equal(s.adapter.snapshot().metrics.totalTokens, 100);
 });
 
 test('approval and completion publish immediately with pending text and cancel trailing stream updates', async (t) => {
@@ -547,4 +614,68 @@ test('Web interactive Codex enables request tools without granting permissions',
   }
   assert.deepEqual(privateConfig, { mcp_servers: { scoped: { command: '/node' } } });
   assert.equal(params.config['features.request_permissions_tool'], false);
+});
+
+test('Web App Server MCP forms retain the exact RPC identity, reject invalid content and avoid response persistence', async (t) => {
+  const s = fakeServer(t); await running(s);
+  s.send({ id: 0, method: 'mcpServer/elicitation/request', params: { threadId: 'thread-1', turnId: 'turn-1', serverName: 'form-server', mode: 'form',
+    message: 'Project settings', requestedSchema: { type: 'object', properties: { note: { type: 'string', minLength: 3 }, enabled: { type: 'boolean' } }, required: ['note', 'enabled'] } } });
+  const request = s.adapter.snapshot().pendingApprovals[0];
+  assert.deepEqual(s.adapter.snapshot().threads[0].status.activeFlags, ['waitingOnUserInput']);
+  await assert.rejects(s.adapter.approve({ ...request, decision: 'accept', content: { note: 'x', enabled: false } }));
+  await assert.rejects(s.adapter.approve({ ...request, turnId: 'stale', decision: 'accept', content: { note: 'private-mcp-value', enabled: false } }));
+  assert.equal(s.calls.some(call => call.id === 0), false);
+  const receipt = await s.adapter.approve({ ...request, decision: 'accept', content: { note: 'private-mcp-value', enabled: false } });
+  assert.deepEqual(s.calls.find(call => call.id === 0), { id: 0, result: { action: 'accept', content: { note: 'private-mcp-value', enabled: false } } });
+  assert.equal(JSON.stringify({ receipt, state: s.adapter.snapshot(), changes: s.changes }).includes('private-mcp-value'), false);
+  await assert.rejects(s.adapter.approve({ ...request, decision: 'accept', content: { note: 'repeated', enabled: true } }), { code: 'CODEX_APPROVAL_MISMATCH' });
+});
+
+test('Web-owned URL flow retains RPC zero without persisting its link or confusing acceptance with task completion', async t => {
+  const s = fakeServer(t); await running(s);
+  s.send({ id: 0, method: 'mcpServer/elicitation/request', params: { threadId: 'thread-1', turnId: 'turn-1', mode: 'url', serverName: 'url-server',
+    elicitationId: 'private-flow', url: 'https://auth.example/device?code=private-url-code', message: 'private-device-code', _meta: { flow: 'private-metadata' } } });
+  const pending = s.adapter.snapshot().pendingApprovals[0];
+  assert.equal(pending.params.url.includes('private-url-code'), true);
+  assert.equal(JSON.stringify(s.adapter.snapshot().events).includes('private-url-code'), false);
+  assert.equal(JSON.stringify(s.adapter.snapshot().events).includes('private-device-code'), false);
+  await assert.rejects(s.adapter.approve({ ...pending, decision: 'accept', content: {} }));
+  await assert.rejects(s.adapter.approve({ ...pending, executorId: 'stale-worker', decision: 'accept' }));
+  assert.equal(s.calls.some(call => call.id === 0), false);
+  const receipt = await s.adapter.approve({ ...pending, decision: 'accept' });
+  assert.deepEqual(s.calls.find(call => call.id === 0), { id: 0, result: { action: 'accept' } });
+  assert.equal(receipt.status, 'submitted');
+  assert.equal(s.adapter.snapshot().turnId, 'turn-1');
+  assert.equal(s.adapter.snapshot().pendingApprovals.length, 0);
+  const history = JSON.stringify({ receipt, state: s.adapter.snapshot(), events: s.changes.map(change => change.event) });
+  for (const secret of ['private-flow', 'private-url-code', 'private-device-code', 'private-metadata']) assert.equal(history.includes(secret), false);
+  await assert.rejects(s.adapter.approve({ ...pending, decision: 'accept' }), { code: 'CODEX_APPROVAL_MISMATCH' });
+});
+
+
+test('Web account projection reads the same busy executor without touching its active turn or exposing credentials', async t => {
+  const f=fakeServer(t,{onRequest(message,{reply}) {
+    if(message.method==='account/read') { reply(message,{requiresOpenaiAuth:true,account:{type:'chatgpt',planType:'plus',email:'private-account@test',accessToken:'private-token'}}); return true; }
+    if(message.method==='account/rateLimits/read') { reply(message,{rateLimits:{primary:{usedPercent:42,windowDurationMins:300}}}); return true; }
+  }});
+  await running(f); const before=f.adapter.snapshot();
+  const value=await f.adapter.readAccount(), after=f.adapter.snapshot();
+  assert.equal(value.authentication,'authenticated'); assert.equal(value.rateLimits.buckets[0].primary.usedPercent,42);
+  assert.equal(after.executorId,before.executorId); assert.equal(after.turnId,before.turnId); assert.equal(f.launches.length,1);
+  assert.deepEqual(f.calls.filter(c=>c.method.startsWith('account/')).map(({method,params})=>({method,params})),[
+    {method:'account/read',params:{refreshToken:false}},{method:'account/rateLimits/read',params:{}}]);
+  assert.doesNotMatch(JSON.stringify(f.changes),/private-account|private-token|accessToken/);
+});
+
+test('account notification and RPC error payloads are never retained in Web events or approvals', async t => {
+  const f=fakeServer(t,{onRequest(message,{send}) {
+    if(message.method==='account/read') { send({id:message.id,error:{code:-32601,message:'secret-auth-error',data:{accessToken:'secret-auth-token'}}}); return true; }
+  }});
+  await f.adapter.startThread(); await f.adapter.readAccount();
+  f.send({method:'account/login/completed',params:{success:true,loginId:'secret-login-id',error:'secret-login-error'}});
+  await tick(); await tick();
+  const value=f.adapter.snapshot(); assert.equal(value.account.status,'unavailable');
+  assert.equal(value.account.reason,'unsupported'); assert.deepEqual(value.pendingApprovals,[]);
+  assert.doesNotMatch(JSON.stringify([value,f.changes]),/secret-|accessToken|loginId/);
+  assert.equal(f.calls.filter(c=>c.method==='thread/start').length,1);
 });

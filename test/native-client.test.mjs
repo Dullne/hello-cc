@@ -4,6 +4,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { writeNativePointer } from '../lib/runtime/native/store.mjs';
 
@@ -126,4 +128,54 @@ test('native client unreachable runtime keeps mutation uncertainty and reports a
   t.after(() => fs.rmSync(missingRoot, { recursive: true, force: true }));
   await assert.rejects(nativeRequest({ root: missingRoot, dbPath: path.join(missingRoot, 'mesh.db') }, 'GET', '/status'),
     { code: 'NATIVE_RUNTIME_OFFLINE' });
+});
+
+
+test('native client keeps reads and writes usable after a synchronous pause outlives a pooled socket', async (t) => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-client-idle-'));
+  const ctx = { root: sandbox, dbPath: path.join(sandbox, '.hello-cc', 'mesh.db') };
+  // The daemon runs independently while the caller is blocked in synchronous
+  // CLI work, so its idle socket can close before the caller processes EOF.
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import http from 'node:http';
+    const counts = { GET: 0, POST: 0 };
+    const server = http.createServer(async (request, response) => {
+      for await (const _chunk of request) {}
+      counts[request.method]++;
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ ok: true, data: { counts } }));
+      setTimeout(() => request.socket.destroy(), 75);
+    });
+    server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({ port: server.address().port })));
+    process.on('SIGTERM', () => { server.closeAllConnections(); server.close(() => process.exit(0)); });
+  `], { stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit');
+      child.kill('SIGTERM');
+      await exited;
+    }
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+  const [ready] = await once(child.stdout, 'data');
+  writeNativePointer(ctx, { root: fs.realpathSync(sandbox), meshDb: ctx.dbPath,
+    port: JSON.parse(ready.toString().trim()).port, token: 'test-local-bearer-'.repeat(4),
+    generation: 'test-client-idle-generation', pid: child.pid });
+  for (const method of ['GET', 'POST']) {
+    await nativeRequest(ctx, 'GET', '/status');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+    const result = await nativeRequest(ctx, method, '/resume-check', method === 'POST' ? { body: 'one submission' } : null);
+    assert.deepEqual(result.counts, method === 'GET' ? { GET: 2, POST: 0 } : { GET: 3, POST: 1 });
+  }
+});
+
+test('native client does not replay an admitted mutation when the connection closes before its receipt', async (t) => {
+  const f = await fixture(t, (request, response) => response.destroy());
+  await assert.rejects(nativeRequest(f.ctx, 'POST', '/send', { body: 'one submission' }), (error) => {
+    assert.equal(error.code, 'NATIVE_RUNTIME_OFFLINE');
+    assert.equal(error.extra.uncertain, true);
+    return true;
+  });
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].method, 'POST');
 });

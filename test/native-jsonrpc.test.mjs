@@ -228,10 +228,10 @@ test('JSON-RPC close handles never-started and failed-spawn transports without w
   const failed = new JsonRpcProcess({ binary: `/nonexistent-hcc-native-${process.pid}` });
   await assert.rejects(failed.start(), { code: 'ENOENT' });
   await failed.close();
-  assert.equal(failed.child.pid, undefined);
+  assert.equal(failed.child?.pid, undefined);
 });
 
-test('JSON-RPC close reports a failed termination signal and retains the same failure', async (t) => {
+test('JSON-RPC close reports signal failures and accepts an observed exit on retry', async (t) => {
   const rpc = await transport(t);
   const originalKill = rpc.child.kill.bind(rpc.child);
   rpc.child.kill = () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); };
@@ -246,9 +246,41 @@ test('JSON-RPC close reports a failed termination signal and retains the same fa
   rpc.child.kill = originalKill;
   originalKill('SIGKILL');
   await until(() => rpc.child.exitCode !== null || rpc.child.signalCode !== null);
-  // The test observes this intentional error; its cleanup must not rethrow it.
-  rpc.close = async () => {};
+  await rpc.close();
+  await assert.rejects(closing, { code: 'NATIVE_CLOSE_FAILED' });
 });
+
+for (const failure of ['signal', 'exit-timeout']) {
+  test(`JSON-RPC close retries a live owned child after ${failure} failure`, async (t) => {
+    const rpc = await transport(t, { closeGraceMs: 20, closeKillTimeoutMs: 20 });
+    await rpc.request('ignore-term');
+    const originalKill = rpc.child.kill.bind(rpc.child);
+    rpc.child.kill = () => {
+      if (failure === 'signal') throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
+      return true; // A successful signal call alone is not an exit receipt.
+    };
+    try {
+      const first = rpc.close();
+      assert.equal(first, rpc.close());
+      await assert.rejects(first, (error) => error.code === 'NATIVE_CLOSE_FAILED' &&
+        error.extra.cause === (failure === 'signal' ? 'EPERM' : 'NATIVE_EXIT_TIMEOUT'));
+      assert.equal(rpc.child.exitCode, null);
+      assert.equal(rpc.child.signalCode, null);
+      await assert.rejects(rpc.request('echo'), { code: 'NATIVE_TRANSPORT_CLOSED' });
+      rpc.child.kill = originalKill;
+      const retry = rpc.close();
+      assert.equal(retry, rpc.close());
+      await retry;
+      assert.equal(rpc.child.signalCode, 'SIGKILL');
+      assert.throws(() => process.kill(rpc.child.pid, 0), { code: 'ESRCH' });
+      await assert.rejects(first, { code: 'NATIVE_CLOSE_FAILED' });
+    } finally {
+      rpc.child.kill = originalKill;
+      if (rpc.child.exitCode === null && rpc.child.signalCode === null) originalKill('SIGKILL');
+      await until(() => rpc.child.exitCode !== null || rpc.child.signalCode !== null);
+    }
+  });
+}
 
 test('JSON-RPC drains stderr larger than pipe capacity without corrupting stdout', async (t) => {
   const notices = [];
@@ -289,8 +321,7 @@ test('JSON-RPC protocol failure observes failed cleanup without fabricating proc
     rpc.child.kill = originalKill;
     originalKill('SIGKILL');
     await until(() => rpc.child.exitCode !== null || rpc.child.signalCode !== null);
-    // The original cleanup failure is intentionally retained for callers.
-    rpc.close = async () => {};
+    await rpc.close();
   }
 });
 

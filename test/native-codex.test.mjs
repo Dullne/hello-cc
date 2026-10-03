@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
+
+const TEST_CWD = process.cwd();
 
 function fixture(handler = () => undefined, options = {}) {
   const events = [];
@@ -23,22 +28,64 @@ function fixture(handler = () => undefined, options = {}) {
     async notify(method, params) { calls.push([method, params]); },
     async close() { closeCount++; }
   };
-  const adapter = createCodexAdapter({ cwd: '/project', env: { PATH: '/bin' },
+  const adapter = createCodexAdapter({ cwd: TEST_CWD, env: { PATH: '/bin' },
     ...options, onEvent: (event) => events.push(event), rpcFactory(config) { callbacks = config; return rpc; } });
   return { adapter, calls, events, rpc, get callbacks() { return callbacks; }, get closeCount() { return closeCount; } };
 }
+
+test('native Codex telemetry stays bound to its own thread and uses reported model and cumulative counters', async () => {
+  const f = fixture(method => method === 'thread/start' ? {thread:{id:'owned-thread',turns:[]},model:'reported-model',approvalPolicy:'on-request'} : undefined);
+  await f.adapter.open({model:'requested-model'});
+  assert.equal(f.adapter.snapshot().runtimeMetadata.model,'reported-model');
+  const usage={total:{inputTokens:20,outputTokens:3,cachedInputTokens:5,totalTokens:23},modelContextWindow:128000};
+  f.callbacks.onNotification('thread/tokenUsage/updated',{threadId:'unowned',turnId:'t',tokenUsage:usage});
+  assert.equal(f.adapter.snapshot().metrics,undefined);
+  const before=f.calls.length;
+  f.callbacks.onNotification('thread/tokenUsage/updated',{threadId:'owned-thread',turnId:'t',tokenUsage:usage});
+  assert.equal(f.adapter.snapshot().metrics.totalTokens,23);
+  assert.equal(f.adapter.snapshot().metrics.scope,'session');
+  assert.equal(f.adapter.snapshot().metrics.contextTokens,undefined);
+  assert.equal(f.events.filter(event=>event.type==='usage').length,1);
+  assert.equal(f.calls.length,before,'observing telemetry must not request inference or change configuration');
+  await f.adapter.close();
+});
 
 test('Codex opens its own stdio app-server with handshake and bounded permissions', async () => {
   const f = fixture();
   assert.equal((await f.adapter.open({ model: 'test-model' })).status, 'idle');
   assert.deepEqual(f.calls, [ ['start'],
     ['initialize', { clientInfo: { name: 'hello_cc', version: '1.0.1' }, capabilities: { experimentalApi: false } }],
-    ['initialized', {}], ['thread/start', { cwd: '/project', model: 'test-model',
+    ['initialized', {}], ['thread/start', { cwd: TEST_CWD, model: 'test-model',
       sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user' }] ]);
   assert.deepEqual(f.callbacks.args, ['app-server', '--stdio']);
   assert.equal(f.callbacks.binary, 'codex');
   assert.equal(f.adapter.capabilities.fork, false);
   await assert.rejects(f.adapter.open(), { code: 'NATIVE_SESSION_ALREADY_OPEN' });
+});
+
+test('native Codex refuses thread start and resume after the selected directory is rebound', async t => {
+  for (const resume of [false, true]) {
+    await t.test(resume ? 'resume' : 'start', async subtest => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-codex-path-'));
+      subtest.after(() => fs.rmSync(base, { recursive: true, force: true }));
+      const original = path.join(base, 'original');
+      const replacement = path.join(base, 'replacement');
+      const selected = path.join(base, 'selected');
+      fs.mkdirSync(original);
+      fs.mkdirSync(replacement);
+      fs.symlinkSync(original, selected, 'dir');
+      const f = fixture(method => {
+        if (method === 'initialize') {
+          fs.unlinkSync(selected);
+          fs.symlinkSync(replacement, selected, 'dir');
+        }
+      }, { cwd: selected });
+      try {
+        await assert.rejects(f.adapter.open(resume ? { sessionId: 'owned-thread' } : {}), { code: 'PROJECT_PATH_CHANGED' });
+        assert.equal(f.calls.some(call => call[0] === (resume ? 'thread/resume' : 'thread/start')), false);
+      } finally { await f.adapter.close(); }
+    });
+  }
 });
 
 test('Codex resumes an explicitly supplied HCC thread through its owned server', async () => {
@@ -168,6 +215,34 @@ test('Codex process exit invalidates sends, and close is idempotent and owned-on
   assert.equal(f.events.length, count);
 });
 
+test('Codex retries failed cleanup without reopening the session or duplicating concurrent teardown', async () => {
+  const f = fixture();
+  await f.adapter.open();
+  const failure = Object.assign(new Error('exit not confirmed'), { code: 'NATIVE_CLOSE_FAILED' });
+  let attempts = 0;
+  let finish;
+  f.rpc.close = () => {
+    attempts++;
+    return attempts === 1 ? Promise.reject(failure) : new Promise((resolve) => { finish = resolve; });
+  };
+  const first = f.adapter.close();
+  assert.equal(first, f.adapter.close());
+  await assert.rejects(first, (error) => error === failure);
+  assert.equal(f.adapter.snapshot().status, 'uncertain');
+  await assert.rejects(f.adapter.send({ text: 'must stay closed' }), { code: 'NATIVE_SESSION_NOT_OPEN' });
+  await assert.rejects(f.adapter.open(), { code: 'NATIVE_SESSION_ALREADY_OPEN' });
+  const retry = f.adapter.close();
+  assert.equal(retry, f.adapter.close());
+  assert.equal(f.adapter.snapshot().status, 'closing');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attempts, 2);
+  finish();
+  assert.equal((await retry).status, 'closed');
+  await f.adapter.close();
+  assert.equal(attempts, 2);
+  await assert.rejects(first, (error) => error === failure);
+});
+
 test('Codex forwards transport protocol and cleanup uncertainty without claiming exit', async () => {
   const f = fixture();
   await f.adapter.open();
@@ -285,4 +360,55 @@ test('native interactive Codex enables request tools without granting permission
   assert.equal(request.approvalsReviewer, 'user');
   assert.equal(Object.hasOwn(request, 'permissions'), false);
   await f.adapter.close();
+});
+
+test('native Codex submits MCP typed form content to the original provider request', async () => {
+  const f = fixture(undefined, { interactive: true }); await f.adapter.open(); await f.adapter.send({ text: 'form' });
+  const response = f.callbacks.onRequest('mcpServer/elicitation/request', { threadId: 'owned-thread', turnId: 'turn-1', mode: 'form',
+    requestedSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, count: { type: 'integer' } }, required: ['enabled', 'count'] } }, 0);
+  const request = f.adapter.snapshot().pendingApprovals[0];
+  assert.throws(() => f.adapter.respond({ ...request, decision: 'accept', content: { enabled: 'false', count: 2 } }));
+  f.adapter.respond({ ...request, decision: 'accept', content: { enabled: false, count: 2 } });
+  assert.deepEqual(await response, { action: 'accept', content: { enabled: false, count: 2 } });
+  await f.adapter.close();
+});
+
+test('native Codex URL flow accepts on the same executor, redacts history and cancels when the turn ends', async () => {
+  const f = fixture(undefined, { interactive: true }); await f.adapter.open(); await f.adapter.send({ text: 'authorize' });
+  const params = { threadId: 'owned-thread', turnId: 'turn-1', mode: 'url', serverName: 'url-server',
+    elicitationId: 'synthetic-url-flow', url: 'https://auth.example?code=private-url-code', message: 'private-device-code' };
+  const response = f.callbacks.onRequest('mcpServer/elicitation/request', params, 0);
+  const pending = f.adapter.snapshot().pendingApprovals[0];
+  assert.equal(pending.requestId, 0);
+  assert.equal(JSON.stringify(f.events).includes('private-url-code'), false);
+  assert.equal(JSON.stringify(f.events).includes('private-device-code'), false);
+  assert.throws(() => f.adapter.respond({ ...pending, executorId: 'stale-executor', decision: 'accept' }));
+  f.adapter.respond({ ...pending, decision: 'accept' });
+  assert.deepEqual(await response, { action: 'accept' });
+  assert.equal(f.adapter.snapshot().pendingApprovals.length, 0);
+  assert.equal(f.adapter.snapshot().turnId, 'turn-1');
+  const late = f.callbacks.onRequest('mcpServer/elicitation/request', params, 1);
+  const expired = f.adapter.snapshot().pendingApprovals[0];
+  f.callbacks.onNotification('turn/completed', { threadId: 'owned-thread', turn: { id: 'turn-1', status: 'completed' } });
+  assert.deepEqual(await late, { action: 'cancel' });
+  assert.throws(() => f.adapter.respond({ ...expired, decision: 'accept' }));
+  await f.adapter.close();
+});
+
+
+test('native Codex account reads stay on the same worker and consume executor-wide notifications safely', async () => {
+  const f=fixture(method=>{
+    if(method==='account/read') return {requiresOpenaiAuth:true,account:{type:'chatgpt',planType:'plus',email:'secret-email',accessToken:'secret-access-token'}};
+    if(method==='account/rateLimits/read') return {rateLimits:{limitId:'codex',primary:{usedPercent:35}}};
+  });
+  await f.adapter.open(); await f.adapter.send({text:'original task'});
+  const before=f.adapter.snapshot();
+  assert.equal(f.adapter.capabilities.accountRead,true);
+  const account=await f.adapter.readAccount(); assert.equal(account.authentication,'authenticated');
+  f.callbacks.onNotification('account/rateLimits/updated',{rateLimits:{limitId:'codex',primary:{usedPercent:75}}});
+  const after=f.adapter.snapshot(); assert.equal(after.account.rateLimits.buckets[0].primary.usedPercent,75);
+  assert.equal(after.turnId,before.turnId); assert.equal(after.sessionId,before.sessionId);
+  assert.doesNotMatch(JSON.stringify([after,f.events]),/secret-email|secret-access-token|accessToken/);
+  assert.deepEqual(f.calls.filter(c=>c[0].startsWith('account/')),[['account/read',{refreshToken:false}],['account/rateLimits/read',{}]]);
+  await f.adapter.close(); await assert.rejects(f.adapter.readAccount(),{code:'NATIVE_SESSION_NOT_OPEN'});
 });

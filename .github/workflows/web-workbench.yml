@@ -1,0 +1,45 @@
+name: Web workbench acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [master, 'codex/web-workbench-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-and-installed-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HCC_WEB_ACCEPTANCE_OUTPUT: ${{ runner.temp }}/hcc-web-workbench
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+      - name: Install locked dependencies and Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Source workbench acceptance without models
+        run: npm run test:web -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/source"
+      - name: Pack, install and exercise the public CLI and browser assets
+        run: npm run test:web:installed -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/installed"
+      - name: Upload screenshots, source hashes and receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-workbench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hcc-web-workbench/
+          if-no-files-found: error
+          retention-days: 14

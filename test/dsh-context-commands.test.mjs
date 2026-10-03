@@ -31,6 +31,7 @@ function fixture(t, projectName = 'project') {
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
   const env = {
     ...process.env,
+    NODE_NO_WARNINGS: '1',
     HOME: home,
     PATH: '/usr/bin:/bin',
     HCC_RUNTIME_URL: '',

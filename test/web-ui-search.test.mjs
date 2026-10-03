@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
@@ -5,6 +6,7 @@ import { filterCommands, shortcutAction, commandPaletteScript } from '../lib/web
 import { terminalFindScript } from '../lib/web/ui-terminal-find.mjs';
 import { UI_TRANSLATIONS } from '../lib/web/ui-i18n.mjs';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
+const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 
 function element() {
   return {hidden:false,value:'',checked:false,disabled:false,tabIndex:0,scrollTop:0,textContent:'',innerHTML:'',attributes:{},listeners:new Map(),
@@ -102,7 +104,7 @@ test('palette ignores composition and shortcuts already handled by another liste
 });
 
 test('dialog Tab loop excludes palette options that use negative tabindex',()=>{
-  const f=environment(),html=webIndexHtml({nonce:'dialog-tab-loop-nonce'});
+  const f=environment(),html=browserCore;
   const source=html.slice(html.indexOf('[settingsDialog, stopDialog, projectDialog, startDialog'),html.indexOf('    function preserveFocus(root)'));
   const close=f.node('commandClose'),input=f.node('commandQuery'),option=f.node('commandOption-0');option.tabIndex=-1;
   f.node('commandDialog').querySelectorAll=()=>[close,input,option];
@@ -142,7 +144,7 @@ test('terminal find invalidates same-query highlight counts and theme colors whe
 });
 
 test('terminal enables the decoration API required by local search highlighting',()=>{
-  assert.match(webIndexHtml({nonce:'terminal-search-nonce'}),/allowProposedApi:\s*true/);
+  assert.match(browserCore,/allowProposedApi:\s*true/);
 });
 
 test('terminal find respects IME, stops pending queries on session changes, and is unavailable for nonterminal views',()=>{

@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createDshAcpAdapter, DSH_ACP_BASELINE_VERSION } from '../lib/integrations/native/dsh-acp.mjs';
+
+const TEST_CWD = process.cwd();
 
 function deferred() {
   let resolve, reject;
@@ -35,7 +40,7 @@ function fixture(overrides = {}) {
     notify(method, params) { calls.push({ method, params, notification: true }); },
     async close() { calls.push({ method: '$close' }); }
   };
-  const adapter = createDshAcpAdapter({ binary: '/test/bin/dsh', cwd: '/workspace/one',
+  const adapter = createDshAcpAdapter({ binary: '/test/bin/dsh', cwd: TEST_CWD,
     ...overrides.adapterOptions, env: { PATH: '/test/bin' }, onEvent: (event) => events.push(event),
     rpcFactory(config) { callbacks = config; return rpc; }
   });
@@ -44,23 +49,62 @@ function fixture(overrides = {}) {
 
 async function flush() { await new Promise((resolve) => setImmediate(resolve)); }
 
+test('ACP usage and command metadata use only the owned session actual advertisements', async () => {
+  const f=fixture();await f.adapter.open();const before=f.calls.length;
+  f.callbacks.onNotification('session/update',{sessionId:'elsewhere',update:{sessionUpdate:'usage_update',used:100,size:128}});
+  assert.equal(f.adapter.snapshot().metrics,null);
+  f.callbacks.onNotification('session/update',{sessionId:'session-own',update:{sessionUpdate:'usage_update',used:10,size:128}});
+  f.callbacks.onNotification('session/update',{sessionId:'session-own',update:{sessionUpdate:'available_commands_update',availableCommands:[{name:'review',description:'Review current changes'}]}});
+  assert.equal(f.adapter.snapshot().metrics.contextTokens,10);assert.equal(f.adapter.snapshot().metrics.totalTokens,undefined);
+  assert.equal(f.adapter.snapshot().runtimeMetadata.commands[0].name,'review');
+  assert.equal(f.adapter.snapshot().runtimeMetadata.permissionMode,undefined);
+  assert.equal(f.calls.length,before);await f.adapter.close();
+});
+
 test('ACP opens an owned runtime and independent workspace/session identities with capability negotiation', async () => {
   const f = fixture();
   assert.equal(f.adapter.capabilities.resume, false);
   const snapshot = await f.adapter.open();
   assert.equal(DSH_ACP_BASELINE_VERSION, '0.2.0-rc.2');
   assert.deepEqual(f.callbacks.args, ['--profile', 'acp']);
-  assert.equal(f.callbacks.cwd, '/workspace/one');
+  assert.equal(f.callbacks.cwd, TEST_CWD);
   assert.equal(snapshot.sessionId, 'session-own');
   assert.equal(snapshot.status, 'idle');
   assert.deepEqual(snapshot.capabilities, {
     create: true, resume: true, send: true, observe: true,
     steer: false, interrupt: true, close: true, fork: false, approvals: false, mcp: false
   });
-  assert.deepEqual(f.calls.find((call) => call.method === 'session/new').params, { cwd: '/workspace/one', mcpServers: [] });
+  assert.deepEqual(f.calls.find((call) => call.method === 'session/new').params, { cwd: TEST_CWD, mcpServers: [] });
   assert.equal(f.events.filter((event) => event.type === 'completed').length, 0, 'an idle opened session is not task completion');
   await assert.rejects(f.adapter.open({ sessionId: 'another' }), { code: 'NATIVE_SESSION_MISMATCH' });
   await f.adapter.close();
+});
+
+test('ACP refuses session creation or prompt after the selected directory is rebound', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-dsh-path-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const original = path.join(base, 'original');
+  const replacement = path.join(base, 'replacement');
+  const selected = path.join(base, 'selected');
+  fs.mkdirSync(original);
+  fs.mkdirSync(replacement);
+  fs.symlinkSync(original, selected, 'dir');
+  const rebind = () => { fs.unlinkSync(selected); fs.symlinkSync(replacement, selected, 'dir'); };
+  const beforeOpen = fixture({ adapterOptions: { cwd: selected }, request(method) {
+    if (method === 'initialize') rebind();
+  } });
+  await assert.rejects(beforeOpen.adapter.open(), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(beforeOpen.calls.some(call => call.method === 'session/new'), false);
+  await beforeOpen.adapter.close();
+
+  fs.unlinkSync(selected);
+  fs.symlinkSync(original, selected, 'dir');
+  const beforePrompt = fixture({ adapterOptions: { cwd: selected } });
+  await beforePrompt.adapter.open();
+  rebind();
+  await assert.rejects(beforePrompt.adapter.send({ text: 'do not submit' }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(beforePrompt.calls.some(call => call.method === 'session/prompt'), false);
+  await beforePrompt.adapter.close();
 });
 
 test('ACP resume is capability gated and does not silently create a replacement session', async () => {
@@ -76,7 +120,7 @@ test('ACP resume is capability gated and does not silently create a replacement 
   const state = await f.adapter.open({ sessionId: 'persisted-id' });
   assert.equal(state.sessionId, 'persisted-id');
   assert.deepEqual(f.calls.find((call) => call.method === 'session/resume').params,
-    { sessionId: 'persisted-id', cwd: '/workspace/one', mcpServers: [] });
+    { sessionId: 'persisted-id', cwd: TEST_CWD, mcpServers: [] });
   await f.adapter.close();
 });
 
@@ -208,6 +252,94 @@ test('ACP close disposes only its addressed session and owned runtime, is idempo
   f.callbacks.onNotification('session/update', { sessionId: 'session-own', update: { sessionUpdate: 'tool_call' } });
   assert.equal(f.events.length, length);
   await other.adapter.close();
+});
+
+test('ACP failed owned runtime cleanup preserves its error and permits only an explicit shared close retry', async () => {
+  const attempts = [deferred(), deferred()];
+  let closeCount = 0;
+  const f = fixture({ request(method) { if (method === 'session/close') return {}; } });
+  f.rpc.close = () => attempts[closeCount++].promise;
+  await f.adapter.open();
+  const receipt = await f.adapter.send({ text: 'still owned', submissionId: 'owned-submission' });
+  const failure = Object.assign(new Error('owned process did not confirm exit'), { code: 'NATIVE_CLOSE_FAILED' });
+  const first = f.adapter.close();
+  assert.equal(f.adapter.close(), first);
+  const rejected = assert.rejects(first, error => error instanceof AggregateError && error.errors[0] === failure);
+  attempts[0].reject(failure);
+  await rejected;
+  assert.equal(f.adapter.snapshot().status, 'failed');
+  assert.equal(f.adapter.snapshot().error.code, 'NATIVE_CLOSE_FAILED');
+  assert.equal(f.adapter.snapshot().error.uncertain, true);
+  assert.equal(f.adapter.snapshot().sessionId, receipt.sessionId);
+  assert.equal(f.adapter.snapshot().turnId, receipt.turnId);
+  assert.equal(f.events.some(event => event.type === 'closed'), false);
+  await assert.rejects(f.adapter.open(), { code: 'NATIVE_ADAPTER_CLOSED' });
+  await assert.rejects(f.adapter.send({ text: 'late' }), { code: 'NATIVE_ADAPTER_CLOSED' });
+  await assert.rejects(f.adapter.interrupt(), { code: 'NATIVE_ADAPTER_CLOSED' });
+  // A delayed prompt response must not hide the failed cleanup or reopen input.
+  f.prompt.resolve({ stopReason: 'end_turn' });
+  await flush();
+  assert.equal(f.adapter.snapshot().status, 'failed');
+  assert.equal(f.adapter.snapshot().error.code, 'NATIVE_CLOSE_FAILED');
+  const retry = f.adapter.close();
+  assert.notEqual(retry, first);
+  assert.equal(f.adapter.close(), retry);
+  await flush();
+  assert.equal(closeCount, 2);
+  assert.equal(f.calls.filter(call => call.method === 'session/close').length, 1, 'do not request a session close on the disposed transport');
+  attempts[1].resolve();
+  await retry;
+  assert.equal(f.adapter.snapshot().status, 'closed');
+  assert.equal(f.adapter.snapshot().turnId, null);
+  assert.equal(f.adapter.snapshot().error.code, 'NATIVE_CLOSE_FAILED', 'retain the earlier cleanup failure');
+  assert.equal(f.calls.filter(call => call.method === '$start').length, 1);
+  await f.adapter.close();
+  assert.equal(closeCount, 2);
+});
+
+test('ACP close preserves a session RPC failure while a confirmed runtime exit makes retry idempotent', async () => {
+  const failure = Object.assign(new Error('session close rejected'), { code: 'NATIVE_RPC_ERROR' });
+  const f = fixture({ request(method) { if (method === 'session/close') return Promise.reject(failure); } });
+  let closeCount = 0;
+  f.rpc.close = async () => { closeCount += 1; f.callbacks.onExit({ code: 0 }); };
+  await f.adapter.open();
+  await assert.rejects(f.adapter.close(), error => error instanceof AggregateError && error.errors[0] === failure);
+  assert.equal(f.adapter.snapshot().status, 'closed');
+  assert.equal(f.adapter.snapshot().error.code, 'NATIVE_RPC_ERROR');
+  assert.equal((await f.adapter.close()).status, 'closed');
+  assert.equal(closeCount, 1);
+  assert.equal(f.calls.filter(call => call.method === 'session/close').length, 1);
+  assert.equal(f.events.filter(event => event.type === 'closed').length, 1);
+  await assert.rejects(f.adapter.open(), { code: 'NATIVE_ADAPTER_CLOSED' });
+});
+
+test('ACP late process exit after failed cleanup is sufficient for retry without reusing its transport', async () => {
+  const f = fixture();
+  const failure = Object.assign(new Error('termination timeout'), { code: 'NATIVE_CLOSE_FAILED' });
+  let closeCount = 0;
+  f.rpc.close = async () => { closeCount += 1; throw failure; };
+  await f.adapter.open();
+  await assert.rejects(f.adapter.close(), error => error instanceof AggregateError && error.errors[0] === failure);
+  assert.equal(f.adapter.snapshot().status, 'failed');
+  f.callbacks.onExit({ code: null, signal: 'SIGKILL' });
+  assert.equal((await f.adapter.close()).status, 'closed');
+  assert.equal(closeCount, 1);
+  assert.equal(f.calls.filter(call => call.method === 'session/close').length, 1);
+  assert.equal(f.adapter.snapshot().error.code, 'NATIVE_CLOSE_FAILED');
+});
+
+test('ACP failed initialization cleanup can retry the owned process without a session RPC or restart', async () => {
+  const failure = Object.assign(new Error('owned child retained'), { code: 'NATIVE_CLOSE_FAILED' });
+  let closeCount = 0;
+  const f = fixture();
+  f.rpc.close = async () => { if (++closeCount === 1) throw failure; };
+  await assert.rejects(f.adapter.open({ model: 'unknown-model' }), error =>
+    error instanceof AggregateError && error.errors[0].code === 'NATIVE_UNSUPPORTED_MODEL' && error.errors[1] === failure);
+  await assert.rejects(f.adapter.open(), { code: 'NATIVE_NOT_OPEN' });
+  assert.equal((await f.adapter.close()).status, 'closed');
+  assert.equal(closeCount, 2);
+  assert.equal(f.calls.some(call => call.method === 'session/close'), false);
+  assert.equal(f.calls.filter(call => call.method === '$start').length, 1);
 });
 
 test('ACP concurrent initialization cannot alias two requested session identities and close drains initialization', async () => {

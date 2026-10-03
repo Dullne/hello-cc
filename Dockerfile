@@ -4,9 +4,10 @@
 FROM node:24
 
 # tmux is required by the regression suite (browser-controllable terminals).
-# build-essential ensures node-pty's native addon can compile.
+# build-essential ensures node-pty's native addon can compile. Native daemon
+# tests start detached children; tini reaps them when the container is PID 1.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tmux build-essential \
+ && apt-get install -y --no-install-recommends tmux build-essential tini \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,4 +29,5 @@ RUN git init \
 
 # Smoke that the CLI loads, then run the full test suite: unit tests
 # (node --test test/*.test.mjs) plus the 13-stage end-to-end regression.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sh", "-c", "node --version && tmux -V && node ./bin/hcc.mjs --help >/dev/null && npm test"]

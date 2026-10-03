@@ -32,7 +32,10 @@
     "test": "npm run test:regression",
     "test:audit": "node ./scripts/check-free-identifiers.mjs",
     "test:unit": "node --test test/*.test.mjs",
-    "test:regression": "node ./scripts/regression.mjs"
+    "test:regression": "node ./scripts/regression.mjs",
+    "test:web": "node ./scripts/web-workbench-acceptance.mjs",
+    "test:web:installed": "node ./scripts/web-workbench-installed-acceptance.mjs",
+    "codex:protocol": "node ./scripts/codex-protocol.mjs"
   },
   "repository": {
     "type": "git",
@@ -67,5 +70,8 @@
     "bundle": {
       "patch": "./lib/integrations/dsh.bundle.yml"
     }
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
   }
 }

@@ -1,11 +1,13 @@
+import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import vm from 'node:vm';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
+const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 
 test('terminal menu quotes peer and registration arguments as single shell words', () => {
-  const html = webIndexHtml({ nonce: 'test-session-nonce' });
+  const html = browserCore;
   const match = html.match(/function terminalShellQuote[\s\S]*?(?=function formatActionResult)/);
   assert.ok(match, 'terminal action functions appear in the generated page');
   const { terminalCommandForAction, terminalShellQuote } = vm.runInNewContext(

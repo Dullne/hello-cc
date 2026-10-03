@@ -85,7 +85,8 @@ test('console and login ship valid scripts with CSP nonces and the shared settin
   const nonce = 'ui-preferences-test-nonce';
   for (const render of [webIndexHtml, webLoginPage]) {
     const scripts = inlineScripts(render({ nonce }));
-    assert.ok(scripts.length >= 2, 'Preferences run before page interaction code');
+    assert.ok(scripts.length >= (render === webIndexHtml ? 1 : 2), 'Preferences run before page interaction code');
+    if (render === webIndexHtml) assert.match(render({ nonce }), /type="module" src="\/assets\/web\/browser\/core\.mjs"/);
     for (const [, attributes, source] of scripts) {
       assert.match(attributes, new RegExp(`\\bnonce="${nonce}"`));
       assert.doesNotThrow(() => new vm.Script(source));

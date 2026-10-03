@@ -12,6 +12,7 @@ import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import { createCodexSessions } from '../lib/web/codex-sessions.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { nextSessionId } from '../lib/web/runtime.mjs';
+import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
 
 function fixture(t, hooks = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-manager-'));
@@ -458,13 +459,15 @@ test('reading state creates no submission or model turn and approval/interrupt s
   assert.equal(f.events().length, before);
   assert.equal(f.calls.filter((call) => call.method === 'startTurn' || call.method === 'steer').length, 0);
   await m.codexAction(session, 'approve', {
-    executorId: 'executor-1', threadId: 'spoofed-thread', turnId: 'turn-1', requestId: 'approval-1', decision: 'accept'
+    executorId: 'executor-1', threadId: 'spoofed-thread', turnId: 'turn-1', requestId: 'approval-1', decision: 'accept', content: { note: 'private-form-note', enabled: false }
   });
   const approval = f.calls.find((call) => call.method === 'approve').input;
   assert.equal(approval.threadId, session.binding.provider_session_id);
   assert.equal(approval.executorId, 'executor-1');
   assert.equal(approval.turnId, 'turn-1');
   assert.equal(approval.requestId, 'approval-1');
+  assert.deepEqual(approval.content, { note: 'private-form-note', enabled: false });
+  assert.equal(JSON.stringify(f.events()).includes('private-form-note'), false);
   await m.codexAction(session, 'interrupt', { threadId: 'spoofed-thread', turnId: 'turn-1' });
   const interrupt = f.calls.find((call) => call.method === 'interrupt');
   assert.equal(interrupt.threadId, session.binding.provider_session_id);
@@ -512,11 +515,74 @@ test('history listing filters foreign cwd and reading reuses a live executor wit
   assert.equal(f.calls.filter(call => call.method === 'resumeThread' || call.method === 'startTurn').length, 0);
 });
 
+test('history listing does not label an old inode executor as managed by a replacement root', async t => {
+  const f = fixture(t, { listThreads: ({ params }) => ({ data: [
+    { id: 'thread-1', cwd: params.cwd }
+  ], nextCursor: null }) });
+  f.ctx.rootIdentity = captureSelectedCwdIdentity(f.ctx.root);
+  const m = f.manager();
+  const oldSession = await f.start(m);
+  const moved = `${f.ctx.root}-moved`;
+  fs.renameSync(f.ctx.root, moved);
+  fs.mkdirSync(f.ctx.root);
+  const replacement = { root: f.ctx.root, dbPath: f.ctx.dbPath,
+    rootIdentity: captureSelectedCwdIdentity(f.ctx.root) };
+  t.after(() => {
+    f.ctx.rootIdentity.release();
+    replacement.rootIdentity.release();
+    fs.rmSync(moved, { recursive: true, force: true });
+  });
+
+  const listed = await m.listCodexThreads(replacement);
+  assert.equal(listed.threads.length, 1);
+  assert.equal(listed.threads[0].managedSessionId, null);
+  assert.equal(oldSession.status, 'running', 'rejecting reuse must not stop the old executor');
+  await assert.rejects(m.codexAction(oldSession, 'read', {}), { code: 'PROJECT_PATH_CHANGED' });
+});
+
+test('history listing reports a root rebound during thread validation instead of an empty result', async t => {
+  let moved;
+  const f = fixture(t, { listThreads: ({ params }) => ({ data: [{
+    id: 'thread-1',
+    get cwd() {
+      fs.renameSync(params.cwd, moved);
+      fs.mkdirSync(params.cwd);
+      return params.cwd;
+    }
+  }], nextCursor: null }) });
+  moved = `${f.ctx.root}-moved`;
+  f.ctx.rootIdentity = captureSelectedCwdIdentity(f.ctx.root);
+  t.after(() => {
+    f.ctx.rootIdentity.release();
+    fs.rmSync(moved, { recursive: true, force: true });
+  });
+
+  await assert.rejects(f.manager().listCodexThreads(f.ctx), { code: 'PROJECT_PATH_CHANGED' });
+});
+
 test('history read without a running adapter closes its temporary executor and rejects foreign cwd', async t => {
   const f = fixture(t, { peekThread: () => ({ cwd: os.tmpdir() }) }), m = f.manager();
   await assert.rejects(m.readCodexThread(f.ctx, 'foreign-history'), { code: 'PROJECT_PATH_FORBIDDEN' });
   assert.equal(f.calls.filter(call => call.method === 'close').length, 1);
   assert.equal(f.calls.filter(call => call.method === 'startThread' || call.method === 'resumeThread' || call.method === 'startTurn').length, 0);
+});
+
+test('Codex history and resume reject a rebound selected project before opening an executor', async t => {
+  const f = fixture(t);
+  const selected = captureSelectedCwdIdentity(f.ctx.root);
+  f.ctx.rootIdentity = selected;
+  t.after(() => selected.release());
+  const moved = `${f.ctx.root}-moved`;
+  t.after(() => fs.rmSync(moved, { recursive: true, force: true }));
+  fs.renameSync(f.ctx.root, moved);
+  fs.mkdirSync(f.ctx.root);
+  const m = f.manager();
+  await assert.rejects(m.listCodexThreads(f.ctx), { code: 'PROJECT_PATH_CHANGED' });
+  await assert.rejects(m.readCodexThread(f.ctx, 'history-only'), { code: 'PROJECT_PATH_CHANGED' });
+  await assert.rejects(m.forkCodexThread(f.ctx, 'history-only', { confirmed: true }), { code: 'PROJECT_PATH_CHANGED' });
+  await assert.rejects(m.startCodexSession({ projectCtx: f.ctx, kind: 'codex', mode: 'resume',
+    resume: 'history-only', handoffConfirmed: true }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(f.adapters.length, 0);
 });
 
 test('fork uses a separate temporary executor, closes it before new resume, and preserves the active source owner', async t => {
@@ -557,4 +623,14 @@ test('resume refuses to migrate a foreign project thread into this project', asy
   const f = fixture(t, { peekThread: () => ({ cwd: os.tmpdir() }) }), m = f.manager();
   await assert.rejects(f.start(m, { mode: 'resume', resume: 'foreign', handoffConfirmed: true }), { code: 'PROJECT_PATH_FORBIDDEN' });
   assert.equal(f.calls.filter(call => call.method === 'resumeThread').length, 0);
+});
+
+
+test('account reads are fenced to the current Web executor and leave task and submission state unchanged', async t => {
+  const f=fixture(t), manager=f.manager(); const session=await manager.startCodexSession({kind:'codex',projectCtx:f.ctx});
+  let reads=0; session.adapter.readAccount=async()=>{reads++;return {status:'ready',authentication:'providerManaged'};};
+  await assert.rejects(manager.codexAction(session,'account',{executorId:'old-executor'}),{code:'CODEX_EXECUTOR_MISMATCH'});
+  const state=await manager.codexAction(session,'account',{executorId:session.executorId});
+  assert.equal(state.authentication,'providerManaged'); assert.equal(reads,1);
+  assert.equal(f.read(db=>db.prepare("SELECT count(*) n FROM events WHERE type LIKE 'codex.submission.%'").get().n),0);
 });

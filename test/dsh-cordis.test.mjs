@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createDshCollaboration } from '../lib/integrations/dsh-collaboration.mjs';
 import { createDshCordisPlugin } from '../lib/integrations/dsh-cordis.mjs';
 import { ensureDshIntegration, inspectDshIntegration } from '../lib/integrations/dsh.mjs';
+import { initSchema } from '../lib/db/schema.mjs';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-cordis-test-home-'));
 const previousHome = process.env.HOME;
@@ -82,7 +83,7 @@ test('Agent tools and context bind raw session IDs to separate projects and peer
 });
 
 test('two concurrent Agents cannot claim one session and a hooks binding prevents double injection', t => {
-  const root = project(t), a = session(t, root, 'same');
+  const root = project(t), a = createDshCollaboration({ sessionId: 'same', cwd: root });
   assert.throws(() => createDshCollaboration({ sessionId: 'same', cwd: root }), { code: 'DSH_COLLABORATION_CONFLICT' });
   const db = new DatabaseSync(a.ctx.dbPath);
   db.prepare("UPDATE peer_bindings SET transport='hook', runtime_target=NULL WHERE peer=?").run(a.peer);
@@ -90,6 +91,7 @@ test('two concurrent Agents cannot claim one session and a hooks binding prevent
   assert.throws(() => a.snapshot(), { code: 'DSH_COLLABORATION_CONFLICT' });
   assert.throws(() => createDshCollaboration({ sessionId: 'same', cwd: root }), { code: 'DSH_COLLABORATION_CONFLICT' });
   // A lost owner must not mark the replacement hook peer exited.
+  assert.throws(() => a.dispose(), { code: 'DSH_COLLABORATION_CONFLICT' });
   assert.throws(() => a.dispose(), { code: 'DSH_COLLABORATION_CONFLICT' });
   assert.equal(read(a, 'SELECT status FROM peers')[0].status, 'idle');
 });
@@ -213,6 +215,44 @@ test('plugin disposal and reloading register one tool catalogue and cannot reuse
   assert.equal((await fresh.catalogue.get('hcc_state').execute({}, { agent, signal })).ok, true);
 });
 
+test('hot reload retries a temporary database conflict only for the same Agent object', async t => {
+  const root = project(t), agent = fakeAgent(root, 'reload/retry'), other = fakeAgent(root, 'reload/retry');
+  let oldState = null;
+  const apply = createDshCordisPlugin({ checkRuntime() {}, createCollaboration(input) {
+    const state = createDshCollaboration(input);
+    if (!oldState) oldState = state;
+    return state;
+  } });
+  const old = fakeContext(); apply(old);
+  await old.emit('agent/created', { agent, signal });
+  const backup = `${oldState.ctx.dbPath}.temporarily-moved`;
+  fs.renameSync(oldState.ctx.dbPath, backup);
+  const temporary = new DatabaseSync(oldState.ctx.dbPath);
+  try { initSchema(temporary); } finally { temporary.close(); }
+  try {
+    assert.throws(() => oldState.dispose(), { code: 'DSH_COLLABORATION_CONFLICT' });
+    await old.dispose();
+    assert.throws(() => oldState.snapshot(), { code: 'DSH_COLLABORATION_CONFLICT' });
+    const stale = await oldState.call('hcc_message_send', { to: oldState.peer, body: 'MUST_NOT_SEND' });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error.code, 'DSH_COLLABORATION_CONFLICT');
+  } finally {
+    fs.unlinkSync(oldState.ctx.dbPath);
+    fs.renameSync(backup, oldState.ctx.dbPath);
+  }
+
+  const reloaded = await import(new URL('../lib/integrations/dsh-cordis.mjs?retirement-hot-reload-test', import.meta.url));
+  assert.notEqual(reloaded.createDshCordisPlugin, createDshCordisPlugin);
+  const fresh = fakeContext(); reloaded.createDshCordisPlugin({ checkRuntime() {} })(fresh);
+  cleanup(t, () => fresh.dispose());
+  await assert.rejects(fresh.emit('agent/created', { agent: other, signal }), { code: 'DSH_COLLABORATION_CONFLICT' });
+  await fresh.emit('agent/created', { agent, signal });
+  assert.equal((await fresh.catalogue.get('hcc_state').execute({}, { agent, signal })).ok, true);
+  await assert.rejects(fresh.emit('agent/created', { agent: other, signal }), { code: 'DSH_COLLABORATION_CONFLICT' });
+  assert.throws(() => oldState.snapshot(), { code: 'DSH_COLLABORATION_CONFLICT' });
+  assert.equal(read(oldState, 'SELECT COUNT(*) AS count FROM messages')[0].count, 0);
+});
+
 test('plugin cleanup failure cannot be recovered from idle, error, or a live PID without exact Agent disposal', async t => {
   const root = project(t), oldAgent = fakeAgent(root, 'retire/proof'), replacement = fakeAgent(root, 'retire/proof');
   let blocked = true, first = null;
@@ -254,9 +294,13 @@ test('a failed exact Agent disposal is retried before a replacement claims its s
   await assert.rejects(old.catalogue.get('hcc_state').execute({}, { agent: oldAgent, signal }), /disposed/);
   await assert.rejects(old.emit('agent/created', { agent: replacement, signal }), { code: 'DSH_COLLABORATION_CONFLICT' });
   blocked = false;
-  const fresh = fakeContext(); apply(fresh); cleanup(t, () => fresh.dispose());
+  const reloaded = await import(new URL('../lib/integrations/dsh-cordis.mjs?retirement-disposed-reload-test', import.meta.url));
+  assert.notEqual(reloaded.createDshCordisPlugin, createDshCordisPlugin);
+  const fresh = fakeContext(); reloaded.createDshCordisPlugin({ checkRuntime() {} })(fresh);
+  cleanup(t, () => fresh.dispose());
   await fresh.emit('agent/created', { agent: replacement, signal });
   assert.equal((await fresh.catalogue.get('hcc_state').execute({}, { agent: replacement, signal })).ok, true);
+  await assert.rejects(fresh.catalogue.get('hcc_state').execute({}, { agent: oldAgent, signal }), /disposed/);
   assert.throws(() => first.snapshot(), { code: 'DSH_COLLABORATION_CONFLICT' });
 });
 

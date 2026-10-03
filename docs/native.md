@@ -54,6 +54,36 @@ real Web approval receipt (source checkout: `docs/verification/2026-10-02-native
 exercises this default project lookup without injecting a query function. It
 does not verify a published package or an employee installation.
 
+## Start from Web
+
+Run `hcc web`, select the project, and choose **New Agent**. Codex, Claude and
+DeepSeek Harness default to **Background Agent**, which creates a native worker
+and starts or reuses the project's independent native runtime. You do not need
+to run `hcc native start` first; the provider requirements above still apply.
+
+The working directory defaults to the selected project root and can be a
+subdirectory within that project. The worker continues to share the selected
+project's HCC task and message bus. Select or add another project to work outside
+that root. **Model (optional)** can stay empty to use the provider's configured
+default; any supplied value must be supported by that provider. **Name (optional)**
+can stay empty for a generated peer name.
+
+This Web entry creates new native sessions only; native resume remains available
+through the CLI. **Advanced options** keeps the terminal CLI and Codex App Server
+paths, including their existing history controls. Shell uses a terminal;
+DeepSeek Harness uses a background worker.
+
+After creation, send prompts and inspect receipts or approvals in the same Web
+session. Creating a worker does not by itself complete a model task. Closing
+the page or stopping Web preserves the independent native runtime and worker;
+explicitly close the worker when it is no longer needed. The dated acceptance
+records below do not establish real-model or release acceptance of this new
+creation entry. See the [Web guide](web-handoff.zh-CN.md).
+
+The **Files** entry browses saved project files and artifacts without creating a
+worker or sending file contents to a model. It provides bounded, read-only text,
+Markdown, image, PDF and static HTML previews; uploads and editing are not included.
+
 ## CLI
 
 Run commands from the project you want the workers to share, or select it with
@@ -87,7 +117,7 @@ or dsh executable. Claude uses the SDK and rejects `--binary`.
 | `hcc native deliveries` | Optional `--peer NAME`; inspect delivery receipts |
 | `hcc native events` | Required `--peer NAME`; optional `--after ID`; inspect a bounded event history |
 | `hcc native requests` | Requires `--peer NAME`; inspect pending requests bound to this executor, session and turn |
-| `hcc native respond` | Requires `--peer NAME --request ID --decision accept\|decline\|cancel`; use `--response-file JSON` for permission subsets or answers |
+| `hcc native respond` | Requires `--peer NAME --request ID --decision accept\|decline\|cancel`; use `--response-file JSON` for permission subsets, answers or MCP form content |
 | `hcc native interrupt` | Required `--peer NAME`; optional `--turn ID`; request interruption of the active turn |
 | `hcc native close` | Required `--peer NAME`; close that worker's owned connection/process |
 | `hcc native down` | Request worker closure and runtime shutdown; returns a stop-request receipt |
@@ -170,11 +200,17 @@ hosted responder retain conservative denial.
 
 | Provider | Hosted interaction |
 | --- | --- |
-| Codex | Command/file approval, requested filesystem/network permission subsets with explicit turn/session duration, questions including freeform/secret input, and one-call empty-form MCP tool approvals |
+| Codex | Command/file approval, requested filesystem/network permission subsets with explicit turn/session duration, questions including freeform/secret input, one-call empty-form MCP tool approvals and common MCP form fields |
 | Claude | SDK tool permission callback; approval grants the original tool input once without rewriting it |
 | dsh ACP | Offered permission choices; approval selects only `allow_once`, never `allow_always` |
 
 rc.2 may send only a tool-call ID in an ACP approval request. The adapter correlates same-session/turn tool updates to show the operation input. Missing or truncated input still allows rejection; acceptance returns `NATIVE_APPROVAL_CONTEXT_MISSING`. See dsh installed acceptance (source checkout: `docs/verification/2026-10-02-dsh-cordis-native.md`).
+
+Native approval cards show the tool, command or target path and a content
+preview before the decision. Full operation details can be expanded and stay
+expanded across state refreshes. ACP approval is disabled when operation input
+or a one-time option is missing; rejection remains available. Shortened
+previews are identified, with complete parameters still available.
 
 Hosted interactive Codex threads explicitly enable
 `features.default_mode_request_user_input` and `features.request_permissions_tool`
@@ -209,21 +245,21 @@ hcc native respond --peer codex-reviewer --request REQUEST_ID --decision accept 
 hcc native respond --peer codex-reviewer --request REQUEST_ID --decision cancel
 ```
 
-Only `permissions`, `scope` and `answers` are accepted in that file. Permissions
+Only `permissions`, `scope`, `answers` and `content` are accepted in that file. For MCP forms, use the original field names and types, for example `{"content":{"project":"demo","count":2,"enabled":false}}`. Permissions
 can narrow the request but cannot add paths or network access; requested deny
 entries must be retained when granting filesystem access. Answer every question
-explicitly. Truncated requests can only be declined or cancelled. Arbitrary MCP
-forms, URL authentication, dynamic tools and account-token refresh requests are
-outside this responder's supported interaction set.
+explicitly. Truncated requests can only be declined or cancelled. Nested schemas, dynamic tools and account-token refresh requests remain unsupported. Correlated MCP `url` requests are supported through the Web authorization entry described below.
 
 ## Current boundaries
 
 - Existing Codex/Claude/dsh terminal sessions remain on their original transport;
   attaching to or taking over an existing TUI/Desktop session is not implemented.
-- Web discovers existing native workers in the same project and exposes messages,
-  delivery receipts, interruption, and explicit closure. Closing the page or Web
-  runtime preserves the independent native worker. Human responses are bound to
-  the current executor and turn. See the [Web handoff guide](web-handoff.zh-CN.md).
+- Web can create Codex, Claude and dsh native workers, and discovers existing
+  workers in the same project. It exposes messages, delivery receipts,
+  interruption, and explicit closure. Web creation currently supports new
+  sessions only; use the CLI for native resume. Closing the page or Web runtime
+  preserves the independent native worker. Human responses are bound to the
+  current executor and turn. See the [Web handoff guide](web-handoff.zh-CN.md).
 - Codex, Claude and dsh native workers receive project- and peer-scoped HCC MCP
   configuration. Writes still require provider permission and HCC ownership checks.
 - Provider-internal `SendMessage`, subagent/team discovery, and Codex delegation
@@ -234,7 +270,8 @@ outside this responder's supported interaction set.
   task's business acceptance.
 - Adapter tests cover protocol and interaction boundaries. The authenticated
   checks below provide separate evidence for model execution and scoped MCP;
-  packaged-client installation and business acceptance remain unverified.
+  the installed-package harness below checks installation separately.
+  Stakeholder acceptance of a production workflow remains a separate step.
 
 
 ## Authenticated acceptance on October 2, 2026
@@ -255,8 +292,20 @@ survival after closing that bridge. These receipts are separate source snapshots
 
 Codex MCP tool approvals use `mcpServer/elicitation/request`. HCC submits the
 official action/content response for explicit tool confirmations without
-persisting session/always authorization. Approving arbitrary form fields or URL
-authentication is unsupported; decline and cancel remain available.
+persisting session/always authorization. Standard `form` requests support strings, numbers/integers, booleans, single-select and string-enum multi-select fields, with titles, descriptions, suggested defaults, required fields, length/numeric/selection limits and common mailbox/URI/date/date-time format checks. Optional fields are sent only when explicitly included, and booleans require a yes/no choice. Limits are 50 fields, 100 options per field, 8192 UTF-16 units per string and 65536 characters each for schema and response content.
+
+Correlated MCP `url` requests display the authorization destination and an **Open authorization page** action. Only the current controller can submit it. HCC reserves a blank tab on the explicit click and navigates after the original executor accepts the exact request; stale requests close the blank tab. Popup blocking leaves the request pending. HTTPS and loopback HTTP are allowed; credentials in the URL, other schemes, missing elicitation identities and truncated requests block acceptance while retaining decline/cancel. The new tab has no opener or referrer. Loopback destinations require a browser on the executor computer; HCC does not proxy local login callbacks to another device.
+
+Opening sends only `{ "action": "accept" }` and is not proof of successful authentication. Complete the external flow, then return to the task and follow the provider result. HCC does not invent a completion event or collect credentials in its form. URLs, device messages, opaque elicitation ids and metadata remain in the live pending request only; HCC interaction events and browser storage do not retain them. Provider-owned logs/history and the destination browser retain their existing behavior. Account login, token refresh, `openai/userVerification` and external-flow completion APIs remain separate unsupported capabilities.
+
+State refresh keeps edits in page memory. Submission, request removal or session changes clear them; a full page reload does not recover answers. HCC browser storage, events and delivery receipts do not retain form responses through the interaction-response path. Provider-owned history and model output retain their existing behavior. The owning server revalidates types and constraints and preserves executor/session/turn/request fencing. Nested objects, unrestricted arrays, unknown constraints and OpenAI extended form modes remain visibly unsupported with decline/cancel available.
+
+To reproduce browser acceptance, set `HCC_ACCEPTANCE_PLAYWRIGHT` to a Playwright module and run `node scripts/web-mcp-form-acceptance.mjs --run-browser`; optionally set `HCC_ACCEPTANCE_CHROME`. This uses simulated providers with the production HTTP/SQLite/native runtime and isolated browsers; it makes no model calls. See the source-checkout report `docs/verification/2026-10-02-mcp-form-web-validation.md`.
+
+Installed-model acceptance uses `node scripts/web-mcp-form-live-acceptance.mjs --run-live` with `HCC_ACCEPTANCE_PLAYWRIGHT`; `HCC_ACCEPTANCE_CHROME`, `HCC_ACCEPTANCE_TMUX`, `--codex-bin PATH` and `--output NEW_FILE` are optional. Without the opt-in flag it only prints help. A live run consumes quota on the currently configured model/account. Installed Codex calls a disposable stdio MCP tool; actual Web interactions accept the tool confirmation and submit the field form. The harness checks typed responses, model-written results, continuation on the same native executor after Web shuts down, and a Web-owned App Server form. It injects neither model output nor App Server requests.
+
+The HCC user directory, Codex home, project, tmux socket and browser profile are disposable. A configured external credential helper can retain its original user home for read-only credential retrieval; the original provider/model, login and configuration remain intact. Receipts include source hashes, checks, cleanup results and original config/auth/shell-config hash checks. Output paths must be new so existing receipts are preserved. Fixture logs contain synthetic form values only.
+
 
 The local validation receipt (source checkout: `docs/verification/2026-10-02-native-live-validation.json`)
 records the unit suite (785 passed, one platform-dependent skip), a 63-module
@@ -286,10 +335,104 @@ acceptance remains a separate check.
 
 For real model and browser interactions, use
 `scripts/web-native-interaction-acceptance.mjs`. It defaults to help; only
-`--run-live --provider codex|claude|all` invokes models. Set
+`--run-live --provider codex|claude|dsh|all` invokes models. Set
 `HCC_ACCEPTANCE_PLAYWRIGHT` and optionally `HCC_ACCEPTANCE_CHROME`.
 `--claude-package DIR` links an installed SDK package into the isolated worker
 project for default resolution, without injecting its query function. The
 harness checks explicit approval and rejection and continuing the original
 session. It uses existing authentication/quota, cleans test provider homes and
 processes, and never attaches to existing user conversations.
+
+
+`--provider dsh --dsh-bin /absolute/path/to/dsh` uses the installed public launcher
+and existing `DEEPSEEK_API_KEY`. The harness adds an official `tools/pre-execute`
+ask policy to a private ACP profile for only two acceptance-owned target files.
+Permission requests come from real model tool calls; no ACP request injection is
+used. It verifies an approved write, absence of a declined target, local return
+to the same session, and desktop and 390px mobile approval controls. See the
+dsh Web interaction receipt (source checkout: `docs/verification/2026-10-02-native-web-dsh-final-snapshot-interactions.json`).
+
+
+## Installed-package acceptance
+
+`scripts/native-installed-acceptance.mjs` tests an already installed HCC archive
+through the public `hcc native` commands. Install the archive and the optional
+Claude SDK into the same isolated npm prefix before running it. The script uses
+the SDK's default package resolver; it does not inject an adapter or query
+function. Running it without `--run-live` prints help and makes no model calls.
+
+```sh
+npm install --prefix /absolute/path/to/acceptance-prefix \
+  /absolute/path/to/hello-cc.tgz @anthropic-ai/claude-agent-sdk
+
+HCC_ACCEPTANCE_PLAYWRIGHT=file:///absolute/path/to/playwright/index.mjs \
+HCC_ACCEPTANCE_CHROME=/absolute/path/to/chrome \
+node /absolute/path/to/acceptance-prefix/node_modules/@logicseek/hello-cc/scripts/native-installed-acceptance.mjs \
+  --run-live --codex-bin /absolute/path/to/codex \
+  --dsh-bin /absolute/path/to/dsh --archive /absolute/path/to/hello-cc.tgz \
+  --browser --task --output /absolute/path/to/receipt.json
+```
+
+The checks cover correlated replies and ACKs, duplicate submission, continuing
+context, owned close/resume and interruption for all three installed providers.
+A separate Codex check explicitly rejects a write outside the allowed sandbox. Each worker first receives a bounded task through the local user controls.
+Models then send messages through MCP along `Codex → Claude → dsh → Codex`. The browser check verifies default SDK
+loading, an explicit approved write, desktop/mobile rendering, released control
+and local continuation of the same session after closing Web. `--task` adds an
+independent file collaboration example: Codex implements invoice arithmetic,
+five contract tests run, and Claude receives the model-authored handoff and
+writes its review. This example is separate from stakeholder acceptance of a
+production workflow.
+
+Existing authentication and provider quota are used. HCC's global HOME, provider
+homes, tmux server and project are private acceptance directories. A copied
+Codex credential command preserves the caller's HOME only while retrieving
+existing credentials; the original configuration is unchanged. Owned processes
+and credential copies are removed on exit. The receipt records the archive
+SHA-256, provider versions, source hashes, browser evidence and cleanup results.
+The script neither publishes npm packages nor deploys to employee devices.
+
+Requests submitted through authenticated native CLI/Web controls are recorded
+as local user requests. Messages arriving through the shared HCC bus remain
+peer coordination data, even if the sender calls itself `web` or `shell`.
+Legacy deliveries retain peer origin during migration. This distinction does
+not grant tool permissions: writes and other gated tools still require approval.
+For delegated file work, first authorize the receiving agent's bounded task,
+then send the peer handoff.
+
+## Bounded stability acceptance
+
+Add `--stability` to installed-package acceptance to run sustained work after
+its lifecycle and cross-provider checks:
+
+```sh
+node /absolute/path/to/acceptance-prefix/node_modules/@logicseek/hello-cc/scripts/native-installed-acceptance.mjs \
+  --run-live --codex-bin /absolute/path/to/codex --dsh-bin /absolute/path/to/dsh \
+  --archive /absolute/path/to/hello-cc.tgz --stability \
+  --stability-cycles 6 --stability-burst 2 --stability-idle-ms 30000 \
+  --stability-resume-every 2 --output /absolute/path/to/stability-receipt.json
+```
+
+All three providers work concurrently. Each worker receives its whole burst
+before the driver waits. Each reply must recall the original random marker
+and the previous ticket from history, checking FIFO execution and retained
+context. Duplicate submission IDs must yield exactly one reply and ACK.
+Periodic worker close/resume and one normal owned-daemon restart preserve the
+original sessions. Idle observation checks the control endpoint, pending
+requests and identity. The final audit checks persisted deliveries, database
+integrity, bounded event retention and absence of reply loops. Receipts retain
+actual replies, failure state and owned-process memory samples. Failed work is
+not replayed automatically or reclassified as successful after a retry.
+
+Defaults are six cycles, two queued messages per worker per cycle, 30 seconds
+of idle observation per cycle, and worker resume every two cycles. Limits are
+1–24 cycles, 1–4 messages, 0–300000 idle milliseconds and a 1–24 cycle resume
+interval. These options require `--stability`. This is bounded authenticated
+work, not a 24-hour soak, capacity benchmark or proof of no memory leak. A
+successful DSH resume alone does not explain earlier context fluctuations.
+
+`--stability-only` requires `--stability`. It bootstraps three real sessions and
+runs stability work while skipping the baseline interruption, command approval
+and model MCP communication scenarios. The receipt records this scope; skipped
+scenarios require separate evidence. On any failure, the driver captures current
+session snapshots, recent deliveries and events before closing owned workers.
