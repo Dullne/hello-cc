@@ -9,9 +9,9 @@
     "skipped": 1,
     "status": "Preserved unresolved diagnostic results; this selection does not claim all snapshot tests pass."
   },
-  "policy": "All original baseline tests/fixtures; published cli-args and web-session-security assertions; DSH/native/MCP and selected collaboration tests; release version metadata only.",
-  "includedFiles": 62,
-  "excludedFiles": 25,
+  "policy": "All original baseline tests/fixtures; published cli-args and web-session-security assertions; DSH/native/MCP and selected collaboration tests; release version metadata only. Required regression-script test dependencies are included.",
+  "includedFiles": 63,
+  "excludedFiles": 24,
   "records": [
     {
       "file": "test/auto-gc-missing-buffer.test.mjs",
@@ -679,11 +679,11 @@
     },
     {
       "file": "test/web-ui-session-display.test.mjs",
-      "included": false,
-      "reason": "Later mixed-snapshot coverage outside the selected stable source contract; original test and diagnostic failures preserved, not claimed resolved.",
+      "included": true,
+      "reason": "Required by the frozen scripts/regression.mjs syntaxAndHelp stage; restored unchanged from the historical candidate to complete the executable test dependency closure.",
       "source": "imported-tests backup",
       "backupSha256": "d30870d75b6e75ed32bec0fcb9419c5d541565f4fd8652726d0ab8d8c3d48aee",
-      "selectedSha256": null
+      "selectedSha256": "d30870d75b6e75ed32bec0fcb9419c5d541565f4fd8652726d0ab8d8c3d48aee"
     },
     {
       "file": "test/web-ui-terminal-command.test.mjs",
@@ -709,5 +709,32 @@
       "backupSha256": "0b26ad82992cfb1533dcf65089ba4981ed1154dbbe6eef44aca35808e1836f53",
       "selectedSha256": null
     }
-  ]
+  ],
+  "updatedAt": "2026-10-03T12:17:03.084Z",
+  "dependencyClosure": {
+    "checkedAt": "2026-10-03T12:17:03.080Z",
+    "entrypoints": [
+      "package.json scripts.test:unit wildcard",
+      "scripts/regression.mjs"
+    ],
+    "method": "Review literal test paths in path.join(repoRoot, test, ...), relative module imports in all selected tests, and grep all .test.mjs references.",
+    "dependencies": [
+      {
+        "source": "scripts/regression.mjs",
+        "target": "test/web-ui-session-display.test.mjs",
+        "exists": true
+      },
+      {
+        "source": "test/manual-gc-local-integration.test.mjs",
+        "target": "test/fixtures/buffer-gc-drift-loader.mjs",
+        "exists": true
+      },
+      {
+        "source": "test/manual-gc-local-integration.test.mjs",
+        "target": "test/fixtures/gc-grace-race-loader.mjs",
+        "exists": true
+      }
+    ],
+    "missing": []
+  }
 }
