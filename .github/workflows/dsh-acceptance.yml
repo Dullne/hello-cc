@@ -84,8 +84,16 @@ jobs:
             assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'unpacked', 'package', file))).digest('hex'),
               expected, `Frozen release file differs: ${file}`);
           }
-          assert.equal(createHash('sha256').update(fs.readFileSync(tarball)).digest('hex'), frozen.sha256,
-            'Packed tarball must match the frozen release artifact');
+          for (const file of metadata.files) {
+            assert.equal(file.mode, frozen.fileModes[file.path], `Package mode differs: ${file.path}`);
+          }
+          const repackedSha256 = createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
+          const frozenArtifact = path.join('docs', 'verification', frozen.filename);
+          assert.equal(createHash('sha256').update(fs.readFileSync(frozenArtifact)).digest('hex'), frozen.sha256,
+            'Stored release artifact must match its frozen digest');
+          // Compression may differ across Node distributions. Install the exact
+          // stored release artifact after proving the checkout has its contents.
+          fs.copyFileSync(frozenArtifact, tarball);
           const frozenContentMatch = true;
           const receipt = {
             schemaVersion: 1, createdAt: new Date().toISOString(),
@@ -93,7 +101,7 @@ jobs:
             platform: { os: process.platform, architecture: process.arch, node: process.version },
             harness: '0.2.0-rc.2', pnpm: '12.8.1',
             npm: execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(),
-            frozenManifest: manifestPath, frozenContentMatch,
+            frozenManifest: manifestPath, frozenContentMatch, repackedSha256,
             package: { name: metadata.name, version: metadata.version, filename: metadata.filename,
               fileCount: metadata.files.length,
               sha256: createHash('sha256').update(fs.readFileSync(tarball)).digest('hex') },
