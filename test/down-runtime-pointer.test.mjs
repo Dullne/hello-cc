@@ -18,8 +18,8 @@ function fixture(t) {
   const root = path.join(sandbox, 'project');
   const home = path.join(sandbox, 'home');
   const state = path.join(root, '.hello-cc');
-  fs.mkdirSync(state, { recursive: true });
-  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(state, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   return { root, home, pointer: path.join(state, 'runtime.json') };
 }
 
@@ -122,7 +122,7 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
         if (req.method !== 'POST' || req.url !== '/api/runtime/stop') { res.writeHead(404); res.end(); return; }
         requests += 1;
         req.resume();
-        if (mode === 'replacement-pointer') fs.writeFileSync(pointer, ${JSON.stringify(JSON.stringify(replacement))});
+        if (mode === 'replacement-pointer') fs.writeFileSync(pointer, ${JSON.stringify(JSON.stringify(replacement))}, { mode: 0o600 });
         else fs.unlinkSync(pointer);
         if (mode === 'normal-response') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); }
         else res.destroy();
@@ -133,7 +133,7 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
       server.listen(0, '127.0.0.1', () => {
         const identity = inspectProcessIdentity(process.pid).identity;
         fs.writeFileSync(pointer, JSON.stringify({ product: 'hello-cc', pid: process.pid,
-          process_identity: identity, base_url: 'http://127.0.0.1:' + server.address().port }));
+          process_identity: identity, base_url: 'http://127.0.0.1:' + server.address().port }), { mode: 0o600 });
         process.send({ ready: true, identity });
       });
     `;
@@ -151,6 +151,7 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
       }
     });
     const [ready] = await once(server, 'message');
+    assert.equal(fs.statSync(state.pointer).mode & 0o777, 0o600, 'fixture publishes a private runtime pointer independently of umask');
     const cli = spawn(process.execPath, [hccBin, '--root', state.root, '--json', 'down'], {
       cwd: state.root, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000
     });
@@ -158,6 +159,8 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
     cli.stdout.on('data', (data) => { stdout += data; });
     cli.stderr.on('data', (data) => { stderr += data; });
     const [exitCode, signal] = await once(cli, 'close');
+    assert.equal(exitCode, mode === 'replacement-pointer' ? 1 : 0, stderr);
+    if (mode === 'replacement-pointer') assert.equal(JSON.parse(stderr).error.code, 'RUNTIME_UNREACHABLE');
     const [serverCode, serverSignal] = await serverExit;
     assert.equal(signal, null);
     assert.equal(serverSignal, null);
@@ -165,11 +168,8 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
     assert.equal(JSON.parse(serverStdout).requests, 1, 'down must not retry the stop request');
     assert.equal(inspectProcessIdentity(ready.identity.pid).state, 'dead');
     if (mode === 'replacement-pointer') {
-      assert.equal(exitCode, 1, stdout);
-      assert.equal(JSON.parse(stderr).error.code, 'RUNTIME_UNREACHABLE');
       assert.deepEqual(JSON.parse(fs.readFileSync(state.pointer, 'utf8')), replacement);
     } else {
-      assert.equal(exitCode, 0, stderr);
       assert.equal(fs.existsSync(state.pointer), false);
       assert.equal(JSON.parse(stdout).ok, true);
     }
