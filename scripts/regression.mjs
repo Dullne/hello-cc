@@ -158,9 +158,50 @@ export async function waitForFixtureOwnerExit(owner, timeoutMs, {
   }
 }
 
+function fixtureErrorPayload(output) {
+  const lines = String(output || '').split(/\r?\n/);
+  let start = null, standalone = false, quoted = false, escaped = false;
+  const stack = [];
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    for (let offset = 0; offset < line.length; offset += 1) {
+      const char = line[offset];
+      if (start === null) {
+        if (char !== '{' && char !== '[') continue;
+        start = lineIndex;
+        standalone = line.slice(0, offset).trim() === '';
+      }
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') quoted = true;
+      else if (char === '{' || char === '[') stack.push(char);
+      else if (char === '}' || char === ']') {
+        if (stack.pop() !== (char === '}' ? '{' : '[')) return null;
+        if (stack.length) continue;
+        // Consume arrays and prefixed JSON blocks as a unit, so their nested
+        // objects can never masquerade as independent CLI error documents.
+        if (standalone && line.slice(offset + 1).trim() === '') {
+          try {
+            const parsed = JSON.parse(lines.slice(start, lineIndex + 1).join('\n'));
+            if (parsed && !Array.isArray(parsed) && parsed.error &&
+                typeof parsed.error === 'object' && !Array.isArray(parsed.error)) return parsed;
+          } catch {}
+        }
+        start = null;
+      }
+    }
+  }
+  return null;
+}
+
 export function fixtureDownResult(result) {
-  let payload = null;
-  try { payload = JSON.parse(result.stdout || ''); } catch {}
+  // Public --json failures share stderr with Node warnings. Accept only whole
+  // independent JSON objects; ordinary output never enters the diagnostic.
+  const payload = fixtureErrorPayload(result.stdout) || fixtureErrorPayload(result.stderr);
   const extra = payload?.error?.extra || payload?.error || {};
   const code = payload?.error?.code || result.error?.code;
   const numeric = ['pid', 'elapsedMs', 'timeoutMs'];

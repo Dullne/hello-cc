@@ -7,6 +7,7 @@ import { observeFixtureOwner, signalFixtureOwner, waitForFixtureOwnerExit,
   fixtureDiagnosticText, fixtureDownResult, fixtureFailureError,
   fixtureFailureDiagnostic, fixtureStopEnvironment } from '../scripts/regression.mjs';
 import { readRuntime } from '../lib/runtime/state.mjs';
+import { formatJson } from '../lib/format.mjs';
 
 const owner = { pid: 12345, startToken: 'boot:original', commandHash: 'a'.repeat(64) };
 const observation = (value, state = 'S') => observeFixtureOwner(owner, {
@@ -81,6 +82,98 @@ test('diagnostics retain down code and safe context without stdout, message bodi
   const detail = observation({ state: 'live', identity: owner });
   assert.equal(detail.birthHash.length, 64);
   assert.doesNotMatch(JSON.stringify(detail), /boot:original|startToken/);
+});
+
+for (const stdout of ['', 'ordinary stdout', formatJson(true, { runtime: 'private-runtime' })]) {
+  test(`down diagnostics extract stderr CliError JSON after ${stdout ? 'non-error' : 'empty'} stdout`, () => {
+    const result = fixtureDownResult({ status: 1, signal: null, stdout,
+      stderr: formatJson(false, {
+        code: 'RUNTIME_UNREACHABLE', pid: owner.pid, elapsedMs: 12, timeoutMs: 8000,
+        message: 'Bearer private-token', token: 'private-token', body: 'private-body',
+        runtime: 'private-runtime', method: 'POST', path: '/api/runtime/stop',
+        errorName: 'private-name', state: 'unknown'
+      }) + '\n'
+    });
+    assert.deepEqual(result, {
+      status: 1, signal: null, code: 'RUNTIME_UNREACHABLE',
+      extra: { pid: owner.pid, elapsedMs: 12, timeoutMs: 8000 }
+    });
+    assert.doesNotMatch(JSON.stringify(result), /private-|Bearer|POST|runtime\/stop|unknown/);
+  });
+}
+
+test('down stderr diagnostics reject malformed output, invalid codes and nonnumeric context', () => {
+  for (const stderr of [
+    'private-body Bearer private-token',
+    'null',
+    JSON.stringify({ error: ['private-body'] }),
+    formatJson(false, { code: 'PRIVATE\nTOKEN', pid: 'private-pid', elapsedMs: -1, timeoutMs: 'private-timeout' })
+  ]) {
+    assert.deepEqual(fixtureDownResult({ status: 1, stdout: '', stderr }), {
+      status: 1, signal: null, code: null, extra: {}
+    });
+  }
+  assert.deepEqual(fixtureDownResult({ status: null, error: { code: 'ENOENT' }, stderr: 'private-body' }), {
+    status: null, signal: null, code: 'ENOENT', extra: {}
+  });
+});
+
+for (const pretty of [true, false]) {
+  test(`down diagnostics read a standalone ${pretty ? 'pretty' : 'single-line'} JSON error around Node warnings`, () => {
+    const error = {
+      code: 'RUNTIME_STOP_TIMEOUT', pid: owner.pid, timeoutMs: 5000,
+      message: 'private-body "quoted" { fake: [private-token] } \\ escaped',
+      private: [{ error: { code: 'PRIVATE_FAKE_CODE' } }], token: 'private-token'
+    };
+    const document = pretty ? formatJson(false, error) : JSON.stringify({ ok: false, error });
+    const warning = '(node:123) ExperimentalWarning: SQLite is an experimental feature\n(Use node --trace-warnings to show where the warning was created)';
+    for (const stderr of [document, `${warning}\n${document}`, `${document}\n${warning}`, `${warning}\n${document}\n${warning}`]) {
+      const result = fixtureDownResult({ status: 1, stdout: '', stderr });
+      assert.deepEqual(result, {
+        status: 1, signal: null, code: 'RUNTIME_STOP_TIMEOUT', extra: { pid: owner.pid, timeoutMs: 5000 }
+      });
+      assert.doesNotMatch(JSON.stringify(result), /private-|PRIVATE_FAKE_CODE|ExperimentalWarning|quoted|escaped/);
+    }
+  });
+}
+
+test('down diagnostics reject nested, prefixed, truncated and malformed JSON error fragments', () => {
+  const document = formatJson(false, { code: 'PRIVATE_FAKE_CODE', token: 'private-token' });
+  for (const stderr of [
+    `private-log ${document}`,
+    `${document} private-log`,
+    `[\n${document}\n]`,
+    `{ "private":\n${document}\n}`,
+    `private-log { "private": [\n${document}\n] }`,
+    `{ "private": [\n${document}`,
+    `{ "private": [\n${document}\n}`, // Mismatched delimiters.
+    '{"error":{"code":"PRIVATE_FAKE_CODE",}}',
+    JSON.stringify({ message: document }),
+    '{"message":"private-body\n' + document + '\n"}'
+  ]) {
+    assert.deepEqual(fixtureDownResult({ status: 1, stdout: '', stderr }), {
+      status: 1, signal: null, code: null, extra: {}
+    });
+  }
+});
+
+test('down diagnostics consume all prefixed containers on a line before accepting a later independent object', () => {
+  const nested = formatJson(false, { code: 'PRIVATE_FAKE_CODE', pid: 99, token: 'private-token' });
+  const actual = formatJson(false, { code: 'RUNTIME_UNREACHABLE', elapsedMs: 12 });
+  for (const prefixed of [
+    `private-log [meta] { "private":\n${nested}\n}`,
+    `private-log {} [meta] [\n${nested}\n]`,
+    `{} { "private":\n${nested}\n}`
+  ]) {
+    assert.deepEqual(fixtureDownResult({ status: 1, stderr: prefixed }), {
+      status: 1, signal: null, code: null, extra: {}
+    });
+    const result = fixtureDownResult({ status: 1, stderr: `${prefixed}\n${actual}` });
+    assert.deepEqual(result, {
+      status: 1, signal: null, code: 'RUNTIME_UNREACHABLE', extra: { elapsedMs: 12 }
+    });
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_FAKE_CODE|private-token|99/);
+  }
 });
 
 test('structured fixture failures use independently captured frames without multiline message content', () => {
