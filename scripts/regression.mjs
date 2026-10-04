@@ -17,7 +17,7 @@ import WebSocket from 'ws';
 import { inspectProcessIdentity, compareProcessIdentity } from '../lib/process/identity.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
-import { readReentryTrace } from './shim-reentry-probe.mjs';
+import { readOwnedReentryOutputAtDeadline, readReentryTrace } from './shim-reentry-probe.mjs';
 import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -1699,19 +1699,30 @@ async function waitForFile(file, expected, label = file) {
   ensureFile(file, expected);
 }
 
-async function waitForFileContent(file, expected, label = file, { diagnostics = null } = {}) {
-  const deadline = Date.now() + 10000;
+async function waitForFileContent(file, expected, label = file, { diagnostics = null, ownedReentryOutput = false } = {}) {
+  const startedAt = Date.now();
+  const deadline = startedAt + 10000;
   let actual = '(missing)';
+  let lastReadAt = null;
   while (Date.now() < deadline) {
     if (fs.existsSync(file)) {
+      lastReadAt = Date.now();
       actual = fs.readFileSync(file, 'utf8').trim();
       if (actual === expected) break;
     }
     await sleep(100);
   }
+  let finalObservation = null;
+  if (actual !== expected && ownedReentryOutput) {
+    finalObservation = readOwnedReentryOutputAtDeadline(file, expected, deadline, Date.now());
+    if (finalObservation.matched) actual = expected;
+  }
   if (actual !== expected) {
     if (diagnostics) {
-      const detail = JSON.stringify(diagnostics());
+      const detail = JSON.stringify({ ...diagnostics(), wait: {
+        started_at_ms: startedAt, deadline_ms: deadline, last_read_at_ms: lastReadAt,
+        final_observation: finalObservation
+      } });
       if (process.env.GITHUB_ACTIONS === 'true') {
         const escaped = detail.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
         process.stderr.write(`::error title=Shim regression diagnostic::${escaped}\n`);
@@ -6484,6 +6495,7 @@ async function shimTmuxWorkflow() {
   const reentryStarted = Date.now();
   hcc(['inject', peer, `printf 'started\\n' > ${sh(reentryStatus)}; HCC_FAKE_STAY_ALIVE=0 HCC_REG_VALUE=shim-third HCC_FAKE_LOG=${sh(reentryProvider)} HCC_REGRESSION_REENTRY_TRACE=${sh(reentryTrace)} HCC_REGRESSION_REENTRY_BIN=${sh(hccBin)} NODE_OPTIONS="\${NODE_OPTIONS:+\${NODE_OPTIONS} }"${sh(`--import=${reentryProbe}`)} ${sh(shim)} --resume shim-regression-session > ${sh(reentryFile)} 2>&1; printf '%s\\n' "$?" >> ${sh(reentryStatus)}`]);
   await waitForFileContent(reentryFile, 'fake-claude --resume shim-regression-session', 'shim tmux pane re-entry', {
+    ownedReentryOutput: true,
     diagnostics: () => {
       // Query only this fixture's pane and fixed event types. Full terminal
       // captures, process arguments, request bodies and environment are excluded.
