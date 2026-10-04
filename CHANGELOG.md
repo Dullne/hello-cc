@@ -16,6 +16,43 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.3
+
+### Summary
+
+This preview integrates the multi-provider Web workbench with project Agent
+settings, retained native history and project file editing. It also includes
+session isolation and recovery fixes, shutdown quiescence and more precise
+regression diagnostics. A new frozen package preserves the earlier rc.2 archive.
+
+### Highlights
+
+- Create Codex, Claude and DeepSeek Harness Agents from the Web workbench; retain
+  project defaults, explicit native-history restore and directory-bound drafts.
+- Upload project files and edit complete UTF-8 text with revision conflicts,
+  preserved drafts and explicit readback after uncertain writes.
+- Scope login cookies by trusted protocol and port so Web instances on different
+  ports do not overwrite each other's login or logout state. Sign in again after
+  upgrading; arbitrary SSH port remapping is not inferred.
+- Keep the native-worker discovery error and refresh guidance when a restore
+  receipt is absent, instead of failing inside the error handler.
+- Stop admitting background work when administrator shutdown is accepted, then
+  start cleanup after the HTTP response finishes or closes; preserve process
+  identity checks, exit deadlines and independently owned workers.
+- Recognize terminal regression markers split across output chunks and submit
+  fixture input once. Isolate regression HTTP connections and test-owned ports.
+- Add bounded CI task-dispatch and HTTP failure diagnostics without recording
+  request bodies, credentials or query parameters, or retrying failed requests.
+
+### Validation
+
+Release checks compare the package file set, per-file hashes and modes with the
+new frozen rc.3 archive. Source tests, browser checks and installed Harness checks
+retain their exact commit and package receipts. The regression transport changes
+isolate test fixtures; they do not establish the root cause of the earlier macOS
+connection reset. Publication, current-device upgrades and real business calls
+require separate evidence.
+
 ## 1.1.0-rc.2
 
 ### Summary
