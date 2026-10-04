@@ -1293,6 +1293,36 @@ test('an uncertain restore is never replayed and the original peer is discoverab
   assert.equal(posts, 1); assert.equal(f.created.length, 2);
 });
 
+for (const missingReceipt of [null, undefined]) {
+  test(`an empty native restore receipt (${missingReceipt}) preserves recovery without another admission`, async t => {
+    const f = await fixture(t); await f.start('a'); await f.api('POST', '/close', { peer: 'a' });
+    let posts = 0;
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      const result = await nativeRequest(ctx, method, route, body, options);
+      if (method === 'POST' && route === '/workers') { posts++; return missingReceipt; }
+      return result;
+    });
+    const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    const input = { owner: saved.owner, sessionId: saved.sessionId, confirmed: true };
+    await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), error => {
+      assert.equal(error.code, 'NATIVE_WORKER_DISCOVERY_FAILED');
+      assert.equal(error.extra.cause, 'NATIVE_RESPONSE_INVALID');
+      assert.equal(error.extra.peer, 'a'); assert.equal(error.extra.provider, 'codex');
+      assert.equal(error.extra.created, true); assert.equal(error.extra.executorId, undefined);
+      assert.match(error.message, /Refresh the Agent list; do not create a replacement/);
+      return true;
+    });
+    assert.equal(posts, 1); assert.equal(f.created.length, 2);
+    assert.equal(f.adapters.get('a').closed, 0);
+    await web.discoverNativeSessions(f.ctx);
+    assert.equal(web.session().id, 'a');
+    assert.equal(web.session().binding.provider_session_id, saved.sessionId);
+    assert.notEqual(web.session().nativeIdentity.owner, saved.owner);
+    await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), { code: 'NATIVE_OWNER_CHANGED' });
+    assert.equal(posts, 1); assert.equal(f.created.length, 2);
+  });
+}
+
 test('resume provider failure preserves its saved identity and refuses another attempt under the stale owner', async t => {
   const configuration = { a: {} }, f = await fixture(t, configuration), web = f.bridge();
   await f.start('a'); await f.api('POST', '/close', { peer: 'a' });
