@@ -32,6 +32,9 @@ The issue was observed during post-release sustained acceptance of 1.0.4.
 - Retain strict process state, start time and zombie checks, with unknown results
   when a stable boot session identifier cannot be read.
 - Keep the existing npm `latest` release channel.
+- Confirm the original local runtime has exited when its stop response is lost,
+  while preserving unknown owners and replacement runtime pointers.
+- Retain structured shutdown error codes when Node warnings share stderr.
 
 ### Validation
 
@@ -39,6 +42,9 @@ Targeted regression tests cover boot identity drift, boot-session changes,
 malformed observations and conservative handling of existing runtime ownership.
 Full source, package, current-device and sustained-run validation are recorded
 separately. The interrupted 1.0.4 sustained run remains a failed attempt.
+The first 1.0.5 candidate passed the current-Mac sustained check; a subsequent
+CI transport timeout exposed the separate stop-confirmation failure. Its
+targeted verification and replacement candidate retain separate evidence.
 
 Existing processes keep the implementation they started with. Quit and reopen
 Harness normally to activate the update. An older active owned runtime should

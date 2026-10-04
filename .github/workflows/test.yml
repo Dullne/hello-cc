@@ -8,6 +8,7 @@ on:
       - codex/dsh-stable-fixes
       - codex/dsh-macos-boot-identity
       - codex/dsh-stop-diagnostics
+      - codex/dsh-stop-confirmation
   pull_request:
 
 permissions:
