@@ -38,6 +38,9 @@ snapshot and shutdown fixes. A local candidate does not establish publication.
   overlaps Agent creation or history restore; discard stale discovery results.
 - Recheck provider initialization before rejecting an older snapshot with no
   session ID, and retain exact project file matches when a wider search times out.
+- Stop admitting background scans as soon as an administrator stop is accepted,
+  and begin cleanup after its HTTP response finishes or closes. Keep existing
+  process identity checks, exit confirmation deadlines and independent workers.
 - Keep the existing terminal/App Server modes, readonly previews and bounded
   reconnect behavior.
 
