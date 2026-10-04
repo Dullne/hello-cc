@@ -120,7 +120,7 @@ test('diagnostics retain down code and safe context without stdout, message bodi
     } } }), stderr: 'private user text Bearer hidden-token' });
   assert.equal(result.code, 'RUNTIME_STOP_TIMEOUT');
   assert.equal(result.extra.pid, owner.pid);
-  assert.deepEqual(result.extra, { pid: owner.pid, timeoutMs: 8000 });
+  assert.deepEqual(result.extra, { pid: owner.pid, timeoutMs: 8000, state: 'unknown' });
   const text = fixtureDiagnosticText({ result, webLog: ['Bearer hidden-token', '{"token":"hidden-token"}',
     '?token=hidden-token', 'known literal private-runtime-token'] }, ['private-runtime-token']);
   assert.doesNotMatch(text, /hidden-token|private-runtime-token|private user text/);
@@ -128,6 +128,24 @@ test('diagnostics retain down code and safe context without stdout, message bodi
   const detail = observation({ state: 'live', identity: owner });
   assert.equal(detail.birthHash.length, 64);
   assert.doesNotMatch(JSON.stringify(detail), /boot:original|startToken/);
+});
+
+test('down diagnostics accept only the process observation state enum', () => {
+  for (const state of ['live', 'dead', 'unknown']) {
+    const result = fixtureDownResult({ status: 1, stderr: formatJson(false, {
+      code: 'RUNTIME_STOP_TIMEOUT', state, message: 'PRIVATE_STATE_MESSAGE'
+    }) });
+    assert.deepEqual(result.extra, { state });
+    assert.doesNotMatch(fixtureDiagnosticText(result), /PRIVATE_STATE_MESSAGE/);
+  }
+  for (const state of ['PRIVATE_STATE_VALUE', 'unknown\nPRIVATE_STATE_VALUE', 'LIVE', '',
+    null, 1, true, ['unknown'], { state: 'unknown', body: 'PRIVATE_STATE_VALUE' }]) {
+    const result = fixtureDownResult({ status: 1, stderr: formatJson(false, {
+      code: 'RUNTIME_STOP_TIMEOUT', state
+    }) });
+    assert.deepEqual(result.extra, {});
+    assert.doesNotMatch(fixtureDiagnosticText(result), /PRIVATE_STATE_VALUE/);
+  }
 });
 
 test('fixture down reads the real CLI JSON error channel without exposing stderr', t => {
@@ -187,9 +205,9 @@ for (const stdout of ['', 'ordinary stdout', formatJson(true, { runtime: 'privat
     assert.deepEqual(result, {
       status: 1, signal: null, code: 'RUNTIME_UNREACHABLE',
       source: 'stderr', stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
-      extra: { pid: owner.pid, elapsedMs: 12, timeoutMs: 8000 }
+      extra: { pid: owner.pid, elapsedMs: 12, timeoutMs: 8000, state: 'unknown' }
     });
-    assert.doesNotMatch(JSON.stringify(result), /private-|Bearer|POST|runtime\/stop|unknown/);
+    assert.doesNotMatch(JSON.stringify(result), /private-|Bearer|POST|runtime\/stop/);
   });
 }
 

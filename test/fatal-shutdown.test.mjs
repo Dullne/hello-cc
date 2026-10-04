@@ -259,7 +259,7 @@ test('Web fatal wiring retains one complete session shutdown path', () => {
     'bufsWatchers.values()',
     'clearInterval(bufsWatcherSyncPoller)',
     'closeSessionClients(session)',
-    'stopTmuxStream(session)',
+    'stopTmuxStream(session, { shutdownDeadline: tmuxShutdownDeadline })',
     'session.pty.kill()',
     'wss.close()',
     'server.close('

@@ -228,8 +228,11 @@ export function fixtureDownResult(result) {
   const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
   return {
     ...diagnostic,
-    extra: Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
-      Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]]))
+    extra: {
+      ...Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
+        Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]])),
+      ...(['live', 'dead', 'unknown'].includes(extra.state) ? { state: extra.state } : {})
+    }
   };
 }
 
