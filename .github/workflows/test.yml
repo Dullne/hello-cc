@@ -94,6 +94,7 @@ jobs:
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
           import path from 'node:path';
+          import { taskDispatchFailureDiagnostics } from './.github/scripts/task-dispatch-diagnostics.mjs';
           const escape = value => value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
           const checks = [
             { name: 'Regression test', outcome: process.env.HCC_REGRESSION_OUTCOME, file: 'hcc-regression.log' },
@@ -108,7 +109,8 @@ jobs:
                 const size = fs.fstatSync(file).size;
                 const bytes = Buffer.alloc(Math.min(size, 256 * 1024));
                 fs.readSync(file, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
-                const lines = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
+                const logText = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+                const lines = logText.split(/\r?\n/);
                 // Publish only test names, source locations and result counts;
                 // raw errors, arguments and env stay out.
                 const selected = lines.filter(line =>
@@ -118,6 +120,11 @@ jobs:
                 ).map(line => line.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 350));
                 const details = [...new Set(selected)].slice(-24).join('\n').slice(0, 6000);
                 if (details) summary += '\n' + details;
+                // Exact dispatch assertion markers opt into a fixed boolean/
+                // enum summary; task text, IDs and the raw JSON stay private.
+                for (const result of taskDispatchFailureDiagnostics(logText)) {
+                  summary += '\nTask dispatch result: ' + JSON.stringify(result);
+                }
               } finally { fs.closeSync(file); }
             }
             process.stdout.write('::error title=' + check.name + ' failure::' + escape(summary) + '\n');
