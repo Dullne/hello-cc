@@ -7153,7 +7153,7 @@ async function syntaxAndHelp() {
   for (const expected of [
     'function listTmuxPanesOnce()',
     'let autoAttachScanInFlight = false;',
-    'if (autoAttachScanInFlight) return;',
+    'if (isStopping() || autoAttachScanInFlight) return;',
     'const paneByPid = new Map();',
     'const attached = attachedTmuxState(ctx, db);',
     'function killOldTmuxForRebind(',
