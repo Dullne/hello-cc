@@ -8,6 +8,7 @@ import {
 } from '../lib/core/coordination/clock-safety.mjs';
 import { runOptimisticEvidenceMutation } from '../lib/core/coordination/optimistic-evidence.mjs';
 import { tx } from '../lib/db/schema.mjs';
+import { resolvePeerEvidence } from '../lib/core/peers/evidence.mjs';
 import { aggregateCleanupFailure } from '../lib/shared/cleanup-error.mjs';
 import {
   CliError,
@@ -133,6 +134,38 @@ function fixtureDb() {
   `);
   return db;
 }
+
+test('expired lock GC defers incompatible live Darwin evidence without claiming live ownership', () => {
+  const db = fixtureDb();
+  try {
+    db.exec(`
+      INSERT INTO peers VALUES ('owner', 'exited', 10, 'legacy', 'command', 1);
+      INSERT INTO peer_bindings VALUES ('owner', 'shell', NULL, 'process', 'old-target', 1);
+      INSERT INTO locks VALUES ('src/a', 'src/a', '*', 'owner', NULL, 'old', 500, 100, 90);
+    `);
+    const current = {
+      pid: 10,
+      startToken: 'darwin:54a2cf47-9cb7-4be8-b9ab-6823a2af4c11:Sun Oct  4 03:00:00 2026',
+      commandHash: 'a'.repeat(64)
+    };
+    const observed = resolvePeerEvidence({ peer: { status: 'exited' }, processes: [{
+      storedIdentity: { ...current, startToken: '1759200000:539676:Sun Oct  4 03:00:00 2026' },
+      current: { state: 'live', identity: current }
+    }] });
+    const planned = captureGcLockSubjects(db, 100_000);
+    const byOwner = new Map([['owner', observed]]);
+    assert.deepEqual(finalizeGcLockSubjects(db, planned, byOwner), {
+      deleted: 0, deferred: 1, live: 0
+    });
+    assert.equal(db.prepare('SELECT owner FROM locks').get().owner, 'owner');
+    byOwner.set('owner', { state: 'dead', reason: 'process_missing' });
+    assert.deepEqual(finalizeGcLockSubjects(db, planned, byOwner), {
+      deleted: 1, deferred: 0, live: 0
+    });
+  } finally {
+    db.close();
+  }
+});
 
 test('GC lock finalization preserves a lock when its owner re-registers after evidence probing', () => {
   const db = fixtureDb();

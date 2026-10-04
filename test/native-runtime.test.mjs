@@ -404,6 +404,22 @@ test('native ownership pointer requires confirmed exit or changed complete proce
   });
 });
 
+test('native ownership does not replace a live legacy Mac runtime after token migration', async t => {
+  await fixture(t, {}, async (ctx, deps, options) => {
+    const current = { pid: process.pid, startToken: 'darwin:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Sun Oct  4 03:40:06 2026',
+      commandHash: 'a'.repeat(64) };
+    const previous = { root: ctx.root, meshDb: ctx.dbPath, pid: process.pid, port: 12345,
+      token: 'local-fixture-credential-'.repeat(2), generation: 'previous-runtime',
+      processIdentity: { ...current, startToken: '1789353593:539676:Sun Oct  4 03:40:06 2026' } };
+    writeNativePointer(ctx, previous);
+    await assert.rejects(startNativeService(ctx, deps, { ...options,
+      inspectProcessIdentity: () => ({ state: 'live', identity: current }) }), { code: 'NATIVE_RUNTIME_IN_USE' });
+    assert.deepEqual(readNativePointer(ctx), previous);
+    return startNativeService(ctx, deps, { ...options,
+      inspectProcessIdentity: () => ({ state: 'dead', identity: null }) });
+  });
+});
+
 test('native ownership loss fences a second start and closes only the owned providers', async (t) => {
   let ownerWorker;
   const f = await fixture(t, {}, async (ctx, deps, options) => {

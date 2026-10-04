@@ -67,6 +67,24 @@ test('ambiguous duplicate runtime identity fields are unknown to destructive cle
   }), { state: 'unknown', reclaimable: false });
 });
 
+test('an observed live legacy Mac owner is never reclaimed merely because the token format changed', t => {
+  const legacy = { ...stored, startToken: '1789353593:539676:Sun Oct  4 03:40:06 2026' };
+  const current = { ...stored, startToken: 'darwin:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Sun Oct  4 03:40:06 2026' };
+  const runtime = { pid: stored.pid, process_identity: legacy };
+  const inspect = () => ({ state: 'live', identity: current });
+  for (const ageMs of [0, RUNTIME_POINTER_UNKNOWN_GRACE_MS * 10]) {
+    assert.deepEqual(classifyRuntimePointer(runtime, { inspect, ageMs }), { state: 'unknown', reclaimable: false });
+  }
+  const pointer = tempPointer(t, runtime);
+  const before = fs.readFileSync(pointer.file, 'utf8');
+  const reclaimed = reclaimRuntimePointerFiles([pointer.file], { inspect,
+    nowMs: () => pointer.timestampMs + RUNTIME_POINTER_UNKNOWN_GRACE_MS * 10 });
+  assert.equal(reclaimed.reclaimed, 0); assert.equal(reclaimed.blocked, true);
+  assert.equal(fs.readFileSync(pointer.file, 'utf8'), before);
+  assert.deepEqual(classifyRuntimePointer(runtime, { inspect: () => ({ state: 'dead', identity: null }) }),
+    { state: 'dead', reclaimable: true });
+});
+
 test('runtime process identity is published only when it is complete and live', () => {
   assert.deepEqual(runtimeProcessIdentity({
     inspect: () => ({ state: 'live', identity: stored })

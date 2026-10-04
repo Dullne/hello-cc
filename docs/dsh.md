@@ -18,6 +18,8 @@ node /absolute/path/to/hello-cc/bin/hcc.mjs --root /path/to/project dsh web -- -
 
 Below, `hcc` means a CLI containing these changes. An older global installation may not include them.
 
+macOS 1.0.5 upgrades use a stable boot-session identity. Follow the [process identity migration notes](macos-process-identity.md) and restart owned runtimes normally.
+
 ## Choose An Entry Point
 
 | Entry | Use | Lifecycle owner |
@@ -113,7 +115,7 @@ Project overlays work directly from source. The managed manifest records the Cor
 
 ```bash
 npm pack --ignore-scripts
-dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.4.tgz
+dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.5.tgz
 ```
 
 Harness requires explicit approval for native dependency builds. If add returns `ERR_PNPM_IGNORED_BUILDS`, merge the following into the selected profile's `pnpm-workspace.yaml` and rerun the same add command. The default path is `~/.dsh/profiles/web/pnpm-workspace.yaml`; use the configured DSH_HOME when different. Preserve existing settings and approve only the candidate's pinned native dependency:

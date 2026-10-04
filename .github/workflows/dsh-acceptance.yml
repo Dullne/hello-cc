@@ -6,6 +6,7 @@ on:
       - master
       - codex/dsh-stable-source
       - codex/dsh-stable-fixes
+      - codex/dsh-macos-boot-identity
   pull_request:
   workflow_dispatch:
 

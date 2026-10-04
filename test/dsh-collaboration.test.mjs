@@ -85,6 +85,17 @@ test('Cordis recovery rejects a dead owner whose runtime session differs from it
   assert.deepEqual(f.record(), before);
 });
 
+test('Cordis recovery preserves a live legacy Mac owner across the boot-token migration', { skip: process.platform !== 'darwin' }, t => {
+  const f = fixture(t), live = inspectProcessIdentity(process.pid);
+  assert.equal(live.state, 'live'); assert.match(live.identity.startToken, /^darwin:/);
+  const start = live.identity.startToken.split(':').slice(2).join(':');
+  f.withDb(db => db.prepare('UPDATE peers SET pid=?, pid_start_token=?, pid_command_hash=?')
+    .run(process.pid, `1789353593:539676:${start}`, live.identity.commandHash));
+  const before = f.record(), resumed = f.run(true);
+  assert.equal(resumed.status, 1); assert.equal(resumed.code, 'DSH_COLLABORATION_CONFLICT');
+  assert.deepEqual(f.record(), before, 'token migration must not replace a live Cordis owner');
+});
+
 test('Cordis recovery rejects a dead owner with an incomplete command identity', { skip: !supported }, t => {
   const f = fixture(t);
   for (const incomplete of [null, 'invalid-command-hash']) {

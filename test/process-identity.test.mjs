@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import {
   compareProcessIdentity,
+  isProcessIdentityIncompatible,
   inspectProcessIdentity,
   parseLinuxStatStartTicks,
   parsePsStartIdentity,
@@ -42,6 +43,10 @@ function inspectMockLinuxProcess(t, { command, firstStartTicks, secondStartTicks
   });
   return withPlatform('linux', () => inspectProcessIdentity(42));
 }
+
+const MAC_BOOT_UUID = '26f764bf-dad6-4f9c-b55d-522470aaf4e8';
+const MAC_PROCESS_START = 'Mon Aug  3 06:10:11 2026';
+const MAC_START_TOKEN = `darwin:${MAC_BOOT_UUID}:${MAC_PROCESS_START}`;
 
 function successfulCommand(stdout) {
   return { error: undefined, status: 0, stdout, stderr: '' };
@@ -102,7 +107,7 @@ test('returns unknown when macOS start identity changes during inspection', (t) 
   t.mock.method(process, 'kill', () => {});
   let startReads = 0;
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
-    if (command === 'sysctl') return successfulCommand('{ sec = 1, usec = 0 }\n');
+    if (command === 'sysctl') return successfulCommand(MAC_BOOT_UUID + '\n');
     if (args.at(-1) === 'lstart=') {
       return successfulCommand(startReads++ === 0
         ? 'S  Mon Aug  3 06:10:11 2026\n'
@@ -136,7 +141,7 @@ for (const scenario of [
     t.mock.method(process, 'kill', () => {}); // PID remains addressable, including Z.
     let reads = 0;
     const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
-      if (command === 'sysctl') return successfulCommand('{ sec = 100, usec = 42 }\n');
+      if (command === 'sysctl') return successfulCommand(MAC_BOOT_UUID + '\n');
       if (args.at(-1) === 'lstart=') {
         assert.deepEqual(args.slice(-4), ['-o', 'stat=', '-o', 'lstart=']);
         const state = reads++ === 0 ? scenario.first : scenario.last;
@@ -151,7 +156,7 @@ for (const scenario of [
       assert.equal(observed.state, scenario.expected);
       assert.equal(reads, scenario.reads);
       if (scenario.expected !== 'live') assert.equal(observed.identity, null);
-      else assert.equal(observed.identity.startToken, '100:42:Mon Aug  3 06:10:11 2026');
+      else assert.equal(observed.identity.startToken, MAC_START_TOKEN);
     } finally {
       spawnMock.mock.restore();
       syncBuiltinESMExports();
@@ -224,9 +229,8 @@ test('collects the same macOS identity under different caller locales', (t) => {
   const psEnvironments = [];
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
     if (command === 'sysctl') {
-      return successfulCommand(
-        `{ sec = 100, usec = 42 } ${process.env.TZ}/${process.env.LC_ALL}/${process.env.LANG}\n`
-      );
+      assert.deepEqual(args, ['-n', 'kern.bootsessionuuid']);
+      return successfulCommand(MAC_BOOT_UUID + '\n');
     }
     psEnvironments.push(options?.env);
     const deterministic = options?.env?.TZ === 'UTC' &&
@@ -252,7 +256,7 @@ test('collects the same macOS identity under different caller locales', (t) => {
     const second = withPlatform('darwin', () => inspectProcessIdentity(42));
 
     assert.equal(first.state, 'live');
-    assert.equal(first.identity.startToken, '100:42:Mon Aug  3 06:10:11 2026');
+    assert.equal(first.identity.startToken, MAC_START_TOKEN);
     assert.deepEqual(second.identity, first.identity);
     assert.equal(psEnvironments.length, 6);
     for (const environment of psEnvironments) {
@@ -271,25 +275,102 @@ test('collects the same macOS identity under different caller locales', (t) => {
   }
 });
 
-test('returns unknown for malformed macOS boot time fields', (t) => {
+test('returns unknown for malformed or absent macOS boot-session UUID without a wall-clock fallback', (t) => {
   t.mock.method(process, 'kill', () => {});
-  const bootOutputs = ['not a boot time\n', '{ sec = 100 } Mon Aug  3 06:10:11 2026\n'];
+  const bootOutputs = ['', 'not-a-uuid\n', '{ sec = 100, usec = 42 }\n',
+    '00000000-0000-0000-0000-000000000000\n', MAC_BOOT_UUID + '\n' + MAC_BOOT_UUID,
+    '26f764bf-dad6-0f9c-b55d-522470aaf4e8', '26f764bf-dad6-4f9c-755d-522470aaf4e8'];
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
-    if (command === 'sysctl') return successfulCommand(bootOutputs.shift());
-    if (args.at(-1) === 'lstart=') return successfulCommand('S  Mon Aug  3 06:10:11 2026\n');
-    if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
-    throw new Error(`unexpected fixture command: ${command} ${args.join(' ')}`);
+    assert.equal(command, 'sysctl');
+    assert.deepEqual(args, ['-n', 'kern.bootsessionuuid']);
+    return successfulCommand(bootOutputs.shift());
   });
   syncBuiltinESMExports();
   try {
-    const malformed = withPlatform('darwin', () => inspectProcessIdentity(42));
-    const missingUsec = withPlatform('darwin', () => inspectProcessIdentity(42));
-    assert.deepEqual(malformed, { state: 'unknown', identity: null });
-    assert.deepEqual(missingUsec, { state: 'unknown', identity: null });
-  } finally {
-    spawnMock.mock.restore();
+    while (bootOutputs.length) assert.deepEqual(withPlatform('darwin', () => inspectProcessIdentity(42)), { state: 'unknown', identity: null });
+  } finally { spawnMock.mock.restore(); syncBuiltinESMExports(); }
+});
+
+for (const failure of [{ status: 1, stdout: '', stderr: 'unknown oid' },
+  { error: { code: 'EACCES' }, status: null, stdout: '' }]) {
+  test(`macOS boot-session query failure stays unknown (${failure.error?.code || failure.status})`, t => {
+    t.mock.method(process, 'kill', () => {});
+    const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
+      assert.equal(command, 'sysctl'); assert.deepEqual(args, ['-n', 'kern.bootsessionuuid']); return failure;
+    });
     syncBuiltinESMExports();
-  }
+    try { assert.deepEqual(withPlatform('darwin', () => inspectProcessIdentity(42)), { state: 'unknown', identity: null }); }
+    finally { spawnMock.mock.restore(); syncBuiltinESMExports(); }
+  });
+}
+
+test('missing sysctl PATH entry uses the same boot-session query at its system path', t => {
+  t.mock.method(process, 'kill', () => {});
+  const calls = [];
+  const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
+    calls.push([command, args]);
+    if (command === 'sysctl') return { error: { code: 'ENOENT' }, status: null };
+    if (command === '/usr/sbin/sysctl') return successfulCommand(MAC_BOOT_UUID.toUpperCase() + '\n');
+    if (args.at(-1) === 'lstart=') return successfulCommand('S ' + MAC_PROCESS_START + '\n');
+    if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
+    throw new Error('unexpected fixture command');
+  });
+  syncBuiltinESMExports();
+  try {
+    const observed = withPlatform('darwin', () => inspectProcessIdentity(42));
+    assert.equal(observed.state, 'live'); assert.equal(observed.identity.startToken, MAC_START_TOKEN);
+    assert.deepEqual(calls.slice(0, 2), [['sysctl', ['-n', 'kern.bootsessionuuid']], ['/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid']]]);
+  } finally { spawnMock.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test('macOS clock-adjusted boottime never enters the process identity; a new boot UUID does', t => {
+  t.mock.method(process, 'kill', () => {});
+  let bootUuid = MAC_BOOT_UUID, wallBootUsec = 539676;
+  const reads = [];
+  const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args) => {
+    if (command === 'sysctl') {
+      reads.push(args[1]);
+      if (args[1] === 'kern.boottime') return successfulCommand(`{ sec = 1789353593, usec = ${wallBootUsec} }\n`);
+      if (args[1] === 'kern.bootsessionuuid') return successfulCommand(bootUuid + '\n');
+    }
+    if (args.at(-1) === 'lstart=') return successfulCommand('S ' + MAC_PROCESS_START + '\n');
+    if (args.at(-1) === 'command=') return successfulCommand('/usr/bin/node app.mjs\n');
+    throw new Error('unexpected fixture command');
+  });
+  syncBuiltinESMExports();
+  try {
+    const first = withPlatform('darwin', () => inspectProcessIdentity(42));
+    wallBootUsec = 379612;
+    const corrected = withPlatform('darwin', () => inspectProcessIdentity(42));
+    assert.equal(first.state, 'live'); assert.deepEqual(corrected, first);
+    bootUuid = 'fd45eeca-410c-464b-b795-39a8d9c6059e';
+    const rebooted = withPlatform('darwin', () => inspectProcessIdentity(42));
+    assert.equal(rebooted.state, 'live');
+    assert.equal(compareProcessIdentity(first.identity, rebooted.identity), 'dead');
+    assert.deepEqual(reads, ['kern.bootsessionuuid', 'kern.bootsessionuuid', 'kern.bootsessionuuid']);
+  } finally { spawnMock.mock.restore(); syncBuiltinESMExports(); }
+});
+
+test('legacy Darwin wall-clock and current boot-session tokens grant neither ownership nor exit', async () => {
+  const legacy = { pid: 42, startToken: `100:42:${MAC_PROCESS_START}`, commandHash: 'a'.repeat(64) };
+  const current = { ...legacy, startToken: MAC_START_TOKEN };
+  assert.equal(compareProcessIdentity(legacy, current), 'unknown');
+  assert.equal(compareProcessIdentity(current, legacy), 'unknown');
+  assert.equal(compareProcessIdentity(legacy, legacy), 'live');
+  assert.equal(compareProcessIdentity(current, current), 'live');
+  assert.equal(compareProcessIdentity(legacy, { ...current, pid: 43 }), 'dead');
+  assert.equal(isProcessIdentityIncompatible(legacy, current), true);
+  assert.equal(isProcessIdentityIncompatible(current, legacy), true);
+  assert.equal(isProcessIdentityIncompatible(legacy, { ...current, pid: 43 }), false);
+  assert.equal(isProcessIdentityIncompatible(legacy, { ...current, commandHash: null }), false);
+  assert.equal(isProcessIdentityIncompatible(legacy, { ...current, startToken: 'darwin:invalid:Mon Aug  3 06:10:11 2026' }), false);
+  assert.equal(isProcessIdentityIncompatible(legacy, legacy), false);
+  assert.equal(isProcessIdentityIncompatible({ ...legacy, startToken: `0:42:${MAC_PROCESS_START}` }, current), false);
+  assert.equal(isProcessIdentityIncompatible({ ...legacy, startToken: `100:1000000:${MAC_PROCESS_START}` }, current), false);
+  assert.deepEqual(await waitForProcessIdentityExit(legacy, { timeoutMs: 0,
+    inspect: () => ({ state: 'live', identity: current }) }), { state: 'unknown', identity: null });
+  assert.deepEqual(await waitForProcessIdentityExit(legacy, { timeoutMs: 0,
+    inspect: () => ({ state: 'dead', identity: null }) }), { state: 'dead', identity: null });
 });
 
 test('rejects a reused PID fingerprint', () => {
