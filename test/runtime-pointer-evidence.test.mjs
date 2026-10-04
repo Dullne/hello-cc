@@ -241,6 +241,44 @@ test('strict pointer reclamation distinguishes confirmed dead from old unknown e
   assert.equal(fs.existsSync(unknown.file), true);
 });
 
+test('owner-scoped reclamation checks the replacement identity while holding the pointer lock', (t) => {
+  const pointer = tempPointer(t, { pid: stored.pid, process_identity: stored });
+  const replacement = { pid: stored.pid, process_identity: { ...stored, startToken: 'boot:replacement' } };
+  let inspections = 0;
+  const result = reclaimRuntimePointerFiles([pointer.file], {
+    expectedIdentity: stored,
+    reclaimUnknown: false,
+    inspect: () => { inspections++; return { state: 'dead', identity: null }; },
+    withLock: (file, callback) => {
+      fs.writeFileSync(file, JSON.stringify(replacement));
+      return callback(file);
+    }
+  });
+  assert.equal(result.reclaimed, 0);
+  assert.equal(result.blocked, true);
+  assert.equal(result.outcomes[0].reason, 'owner_changed');
+  assert.equal(inspections, 0, 'a replacement pointer is not considered for cleanup even if its process is dead');
+  assert.deepEqual(JSON.parse(fs.readFileSync(pointer.file, 'utf8')), replacement);
+});
+
+test('owner-scoped reclamation preserves changed commands and ambiguous identity fields', (t) => {
+  for (const runtime of [
+    { pid: stored.pid, process_identity: { ...stored, commandHash: 'c'.repeat(64) } },
+    { pid: stored.pid, process_identity: stored, processIdentity: stored },
+    { pid: stored.pid }
+  ]) {
+    const pointer = tempPointer(t, runtime);
+    const result = reclaimRuntimePointerFiles([pointer.file], {
+      expectedIdentity: stored, reclaimUnknown: false,
+      inspect: () => ({ state: 'dead', identity: null })
+    });
+    assert.equal(result.reclaimed, 0);
+    assert.equal(result.outcomes[0].reason, 'owner_changed');
+    assert.deepEqual(JSON.parse(fs.readFileSync(pointer.file, 'utf8')), runtime);
+  }
+  assert.throws(() => reclaimRuntimePointerFiles([], { expectedIdentity: { pid: stored.pid } }), TypeError);
+});
+
 test('strict reclamation preserves a legacy macOS runtime pointer until its process is confirmed dead', (t) => {
   const legacy = { ...stored, startToken: '100:42:Mon Aug  3 06:10:11 2026' };
   const current = { ...stored, startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };

@@ -104,6 +104,34 @@ jobs:
           }
           NODE
 
+      - name: Verify candidate approval layers with the official runtime
+        id: approval_layers
+        if: steps.package.outputs.mode == 'candidate'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/approval-layers.log"
+          import path from 'node:path';
+          import { createRequire } from 'node:module';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const official = path.join(root, 'official');
+          const unpacked = path.join(root, 'unpacked', 'package');
+          const requireOfficial = createRequire(path.join(official, 'package.json'));
+          const binary = requireOfficial.resolve('@deepseek-ai/dsh/lib/bin.js');
+          // Historical release archives keep their own fixed scripts. This
+          // candidate-only check runs the selected candidate's script and
+          // serves deterministic responses locally; no credentials or model.
+          const env = { PATH: process.env.PATH, LANG: 'C.UTF-8', SHELL: '/bin/sh',
+            HOME: path.join(root, 'home'), TMPDIR: root, DSH_TELEMETRY_DISABLED: '1' };
+          const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-approval-layers-acceptance.mjs'),
+            '--dsh-bin', binary, '--output', path.join(root, 'evidence', 'approval-layers.json')],
+            { cwd: unpacked, env, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
       - name: Verify selected package with the installed public CLI
         id: acceptance
         timeout-minutes: 30
@@ -150,7 +178,15 @@ jobs:
             const text = JSON.stringify(redactSecrets({ failure: receipt.failure, completedChecks: receipt.checks?.length })).slice(-6000);
             console.log('::error title=Installed Harness failure::' + text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A'));
           }
-          for (const name of ['official-install.log', 'installed-acceptance.log']) {
+          const approvalFile = path.join(evidence, 'approval-layers.json');
+          if (fs.existsSync(approvalFile)) {
+            const receipt = JSON.parse(fs.readFileSync(approvalFile, 'utf8'));
+            const text = JSON.stringify(redactSecrets({ completed: receipt.completed, error: receipt.error,
+              scenarios: receipt.scenarios?.map(value => ({ name: value.name, completed: value.completed,
+                permissionRequests: value.requests?.length })), cleanup: receipt.cleanup, sourceChanges: receipt.sourceChanges })).slice(-6000);
+            console.log('::error title=Candidate approval layers::' + text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A'));
+          }
+          for (const name of ['official-install.log', 'installed-acceptance.log', 'approval-layers.log']) {
             const file = path.join(evidence, name);
             if (!fs.existsSync(file)) continue;
             const text = redactSecrets(fs.readFileSync(file, 'utf8').split('\n').slice(-60).join('\n')).slice(-6000);
@@ -168,6 +204,7 @@ jobs:
           HCC_ACCEPTANCE_TARGET: ${{ steps.package.outputs.acceptanceTarget }}
           HCC_INSTALL_OUTCOME: ${{ steps.install.outcome }}
           HCC_ACCEPTANCE_OUTCOME: ${{ steps.acceptance.outcome }}
+          HCC_APPROVAL_LAYERS_OUTCOME: ${{ steps.approval_layers.outcome }}
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
@@ -182,6 +219,7 @@ jobs:
             acceptanceTarget: process.env.HCC_ACCEPTANCE_TARGET || null,
             officialInstall: process.env.HCC_INSTALL_OUTCOME,
             installedAcceptance: process.env.HCC_ACCEPTANCE_OUTCOME,
+            candidateApprovalLayers: process.env.HCC_APPROVAL_LAYERS_OUTCOME,
             modelCallsRequested: false, npmPublicationRequested: false,
             scope: 'CI runner only; no employee-device or genuine business acceptance'
           }, null, 2) + '\n');

@@ -13,6 +13,9 @@ import { createMessageStore } from '../lib/core/coordination/messages.mjs';
 import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
+import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
+import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
+import { createSessionSync } from '../lib/web/browser/session-sync.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
 
 // Real project SQLite and authenticated loopback native protocol, fake owned
@@ -38,6 +41,12 @@ async function fixture(t, configuration = {}) {
   const adapters = new Map(), created = [], bridges = [];
   const options = { pollMs: 60000, adapterFactory: async (provider, options) => {
     const peer = options.env.HCC_PEER;
+    if (configuration[peer]?.claudeSdk) {
+      const sdk = configuration[peer].claudeSdk;
+      const adapter = createClaudeAdapter({ ...options, query: input => sdk.query(input),
+        onEvent: event => { options.onEvent(event); sdk.observed(event); } });
+      adapters.set(peer, adapter); created.push(adapter); return adapter;
+    }
     const state = { provider, status: 'new', sessionId: null, turnId: null, executorId: options.executorId,
       capabilities: { send: true, resume: true, interrupt: true, close: true } };
     const adapter = { state, options, sent: [], interrupted: [], closed: 0,
@@ -79,6 +88,165 @@ async function fixture(t, configuration = {}) {
     receipts: () => mesh.prepare("SELECT type,payload FROM events WHERE type LIKE 'native.web.submission.%' ORDER BY id").all()
       .map((row) => ({ ...row, payload: JSON.parse(row.payload) })) };
 }
+
+function controlledClaudeSdk() {
+  const output = [];
+  let waiting, ended = false, request, confirmInit, confirmQuery;
+  const initialized = new Promise(resolve => { confirmInit = resolve; });
+  const queryStarted = new Promise(resolve => { confirmQuery = resolve; });
+  const stream = {
+    [Symbol.asyncIterator]() { return this; },
+    next() {
+      if (output.length) return Promise.resolve({ value: output.shift(), done: false });
+      if (ended) return Promise.resolve({ done: true });
+      return new Promise(resolve => { waiting = resolve; });
+    },
+    async close() {
+      ended = true;
+      await request?.prompt.return();
+      waiting?.({ done: true }); waiting = null;
+    }
+  };
+  return {
+    query(input) { request = input; confirmQuery(input); return stream; },
+    async consume() { return (await queryStarted).prompt.next(); },
+    observed(event) { if (event.initialized) confirmInit(); },
+    async initialize(sessionId) {
+      const value = { type: 'system', subtype: 'init', session_id: sessionId };
+      if (waiting) { const resolve = waiting; waiting = null; resolve({ value, done: false }); }
+      else output.push(value);
+      await initialized;
+    }
+  };
+}
+
+for (const viaReadAction of [false, true]) for (const applyFreshFirst of [false, true]) {
+  test(`Claude initialization preserves its Web owner when a running/null ${viaReadAction ? 'explicit read' : 'poll snapshot'} arrives late${applyFreshFirst ? ' after a fresh read' : ''}`, async t => {
+    const sdk = controlledClaudeSdk();
+    const f = await fixture(t, { c: { claudeSdk: sdk } });
+    await f.start('c', { provider: 'claude' });
+    let hold = false, captured, release;
+    const capturedSnapshot = new Promise(resolve => { captured = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const sessions = new Map(), frames = [], clientCloses = [], receiverRecoveries = [];
+    const serializer = createSessionSerialize({ sessions, ctx: f.ctx, cookieSocketValid: () => true,
+      sameResolvedPath: (a, b) => path.resolve(a) === path.resolve(b) });
+    const receiver = createSessionSync({ root: f.ctx.root, sessionId: 'c',
+      requestSnapshot: frame => receiverRecoveries.push(frame) });
+    const client = { OPEN: 1, readyState: 1, bufferedAmount: 0, hccStateSync: true,
+      send(text) { const frame = JSON.parse(text); frames.push(frame); receiver.receive(frame); },
+      close(code, reason) { clientCloses.push({ code, reason }); } };
+    let stateReads = 0;
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      if (route.startsWith('/workers/c/state')) stateReads++;
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (hold && method === 'GET' && route.startsWith('/workers/c/state')) {
+        hold = false; captured(value); await gate;
+      }
+      return value;
+    }, sessions, { broadcast: serializer.broadcast, closeSessionClients: serializer.closeSessionClients });
+    await web.discoverNativeSessions(f.ctx);
+    const view = web.session('c');
+    const identity = { ...view.nativeIdentity };
+    view.actionTokens.add('original-controller');
+    view.clients.add(client);
+    serializer.sendStateSnapshot(view, client);
+    assert.equal(receiver.state.sessionId, null);
+    await web.nativeAction(view, 'send', { text: 'controlled first message', submissionId: 'claude_init_order_1' });
+    await f.service.poll();
+    await sdk.consume();
+    hold = true;
+    const poll = viaReadAction ? web.nativeAction(view, 'read') : web.pollNativeSessions(f.ctx);
+    const stale = await capturedSnapshot;
+    assert.equal(stale.snapshot.status, 'running');
+    assert.equal(stale.snapshot.sessionId, null);
+    await sdk.initialize('confirmed-sdk-session');
+    assert.equal(f.mesh.prepare('SELECT provider_session_id FROM peer_bindings WHERE peer=?').get('c').provider_session_id,
+      'confirmed-sdk-session');
+    if (applyFreshFirst) await web.nativeAction(view, 'read');
+    const readsBeforeRelease = stateReads;
+    release(); await poll;
+    assert.equal(web.session('c'), view);
+    assert.equal(view.nativeRetired, undefined);
+    assert.equal(view.nativeSnapshot().connected, true);
+    assert.equal(view.nativeIdentity.owner, identity.owner);
+    assert.equal(view.nativeIdentity.generation, identity.generation);
+    assert.equal(view.nativeIdentity.sessionId, 'confirmed-sdk-session');
+    assert.equal(view.actionTokens.has('original-controller'), true);
+    assert.equal(web.closedClients.length, 0);
+    assert.equal(stateReads, readsBeforeRelease + 1, 'initialization confirmation uses exactly one extra state read');
+    assert.equal(receiver.state.sessionId, 'confirmed-sdk-session');
+    assert.equal(receiver.state.connected, true);
+    assert.equal(receiver.state.owner, identity.owner);
+    assert.equal(receiver.state.generation, identity.generation);
+    assert.equal(new Set(frames.map(frame => frame.generation)).size, 1, 'wire generation stays stable');
+    assert.deepEqual(receiverRecoveries, []);
+    assert.deepEqual(clientCloses, []);
+    assert.equal(f.created.length, 1);
+  });
+}
+
+for (const replaceService of [false, true]) {
+  test(`Claude initialization confirmation rejects a ${replaceService ? 'service generation' : 'worker owner'} replaced before the second read`, async t => {
+    const sdk = controlledClaudeSdk();
+    const f = await fixture(t, { c: { claudeSdk: sdk } });
+    await f.start('c', { provider: 'claude' });
+    let hold = false, captured, release, replace = false;
+    const capturedSnapshot = new Promise(resolve => { captured = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      if (replace && method === 'GET' && route.startsWith('/workers/c/state')) {
+        replace = false;
+        if (replaceService) await f.restart();
+        else await f.api('POST', '/close', { peer: 'c' });
+        await f.start('c', { provider: 'claude', resume: 'last' });
+      }
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (hold && method === 'GET' && route.startsWith('/workers/c/state')) {
+        hold = false; captured(); await gate;
+      }
+      return value;
+    });
+    await web.discoverNativeSessions(f.ctx);
+    const view = web.session('c'); view.actionTokens.add('old-controller');
+    await web.nativeAction(view, 'send', { text: 'first message', submissionId: 'claude_replace_order_1' });
+    await f.service.poll(); await sdk.consume();
+    hold = true;
+    const poll = web.pollNativeSessions(f.ctx);
+    await capturedSnapshot;
+    await sdk.initialize('confirmed-sdk-session');
+    replace = true; release(); await poll;
+    assert.equal(view.nativeRetired, true);
+    assert.equal(view.nativeSnapshot().error.code, 'NATIVE_OWNER_CHANGED');
+    assert.equal(view.actionTokens.size, 0);
+    assert.ok(web.closedClients.includes(view));
+    await assert.rejects(web.nativeAction(view, 'send', { text: 'stale message', submissionId: 'claude_replace_order_2' }),
+      { code: 'NATIVE_OWNER_CHANGED' });
+    assert.equal(f.mesh.prepare('SELECT COUNT(*) AS n FROM messages WHERE kind<>?').get('reply').n, 1,
+      'replacement never receives input through the original controller');
+  });
+}
+
+test('a confirmed Claude session cannot change to another UUID on the same worker owner', async t => {
+  const f = await fixture(t); await f.start('c', { provider: 'claude' });
+  let stateReads = 0;
+  const web = f.bridge((ctx, method, route, body, options) => {
+    if (route.startsWith('/workers/c/state')) stateReads++;
+    return nativeRequest(ctx, method, route, body, options);
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const view = web.session('c'); view.actionTokens.add('old-controller');
+  f.adapters.get('c').state.sessionId = 'different-confirmed-uuid';
+  f.adapters.get('c').emit({ type: 'status', status: 'idle' });
+  const before = stateReads;
+  await assert.rejects(web.nativeAction(view, 'read'), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(stateReads, before + 1, 'known identity changes never enter initialization confirmation');
+  assert.equal(view.nativeRetired, true);
+  assert.equal(view.nativeIdentity.sessionId, 'session-c');
+  assert.equal(view.actionTokens.size, 0);
+});
 
 test('Web creates each native provider through the existing daemon and opens the same owned worker', async t => {
   const f = await fixture(t), web = f.bridge();

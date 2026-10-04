@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { createMiscCommands } from '../lib/cli/commands/misc.mjs';
 import { CliError } from '../lib/shared/errors.mjs';
+import { waitForProcessIdentityExit } from '../lib/process/identity.mjs';
 
 function commandFixture(waitResult) {
   const events = [];
@@ -58,6 +59,21 @@ test('down does not report success while the runtime process is still live', asy
     fixture.cmdDown({}, []),
     (error) => error instanceof CliError && error.code === 'RUNTIME_STOP_TIMEOUT'
   );
+  assert.deepEqual(fixture.events, ['request', 'wait:boot-a:100']);
+});
+
+test('an owner exiting after the accepted-stop deadline does not turn its earlier timeout into success', async () => {
+  let elapsed = 0;
+  const observe = () => elapsed <= 5000
+    ? { state: 'live', identity: fixtureIdentity() } : { state: 'dead', identity: null };
+  const atDeadline = await waitForProcessIdentityExit(fixtureIdentity(), {
+    timeoutMs: 5000, intervalMs: 25, inspect: observe,
+    monotonicNow: () => elapsed, sleep: async delay => { elapsed += delay; }
+  });
+  const fixture = commandFixture(atDeadline);
+  await assert.rejects(fixture.cmdDown({}, []), { code: 'RUNTIME_STOP_TIMEOUT' });
+  elapsed++;
+  assert.equal(observe().state, 'dead', 'a later fixture observation can confirm exit without a signal');
   assert.deepEqual(fixture.events, ['request', 'wait:boot-a:100']);
 });
 

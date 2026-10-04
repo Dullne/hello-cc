@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { interactionCompletionDiagnostics } from '../scripts/web-native-interaction-diagnostics.mjs';
+import { interactionCompletionDiagnostics, isKnownDshEscalationApproval } from '../scripts/web-native-interaction-diagnostics.mjs';
 
 const request = (requestId, tool = 'write', input = {}) => ({ requestId, kind: 'approval', method: 'session/request_permission',
   params: { toolCall: { title: tool, rawInput: input } } });
@@ -57,4 +57,31 @@ test('only exact test-owned paths are identified and regular bounded targets are
     assert.deepEqual(diagnostic.targets[1], { role: 'denied', exists: true, regularFile: false, sha256: null });
     assert.equal(JSON.stringify(diagnostic).includes(directory), false);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('only the one known second escalation layer of the identical approved write is recognized', () => {
+  const first = { ...request(0, 'write', { file_path: '/fixture/allowed', content: 'EXPECTED',
+    sandbox_permissions: 'danger-full-access', justification: 'Only this test-owned file.' }),
+    executorId: 'owned-executor', sessionId: 'owned-session', turnId: 'owned-turn' };
+  first.params.toolCall.toolCallId = 'owned-call'; first.params.options = [{ kind: 'allow_once', optionId: 'allow-once' }];
+  const next = { ...structuredClone(first), requestId: 1 };
+  const settings = { target: '/fixture/allowed', content: 'EXPECTED', priorDecision: 'accept' };
+  assert.equal(isKnownDshEscalationApproval(first, next, settings), true);
+  for (const settingsChange of [{ priorDecision: 'decline' }, { additionalAnswers: 1 }, { target: '/another-target' }, { content: 'CHANGED' }]) {
+    assert.equal(isKnownDshEscalationApproval(first, next, { ...settings, ...settingsChange }), false);
+  }
+  for (const change of [
+    value => { value.requestId = 0; }, value => { value.executorId = 'other'; }, value => { value.sessionId = 'other'; },
+    value => { value.turnId = 'other'; }, value => { value.kind = 'userInput'; }, value => { value.method = 'unknown'; },
+    value => { value.truncated = true; }, value => { value.params.toolCall.toolCallId = 'another-call'; },
+    value => { value.params.toolCall.title = 'bash'; }, value => { value.params.toolCall.contextPending = true; },
+    value => { value.params.toolCall.contextTruncated = true; }, value => { value.params.toolCall.rawInput.content = 'CHANGED'; },
+    value => { value.params.toolCall.rawInput.file_path = '/another-target'; },
+    value => { value.params.toolCall.rawInput.sandbox_permissions = 'workspace-write'; },
+    value => { value.params.toolCall.rawInput.justification = 'Different operation'; },
+    value => { value.params.toolCall.rawInput.extra = 'unexpected'; }, value => { value.params.options = []; },
+  ]) {
+    const different = structuredClone(next); change(different);
+    assert.equal(isKnownDshEscalationApproval(first, different, settings), false);
+  }
 });

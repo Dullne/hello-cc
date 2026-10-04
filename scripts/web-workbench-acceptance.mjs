@@ -114,9 +114,15 @@ function browserInstrumentation() {
   if (!['http:', 'https:'].includes(window.location.protocol)) return;
   localStorage.setItem('hcc.lang', 'zh'); localStorage.setItem('hcc.theme', 'light');
   const Original = window.WebSocket;
-  window.__hccAcceptance = { sockets: [], frames: 0, bytes: 0, longTasks: [] };
+  window.__hccAcceptance = { sockets: [], outboundTypes: [], frames: 0, bytes: 0, longTasks: [] };
   window.WebSocket = class extends Original {
     constructor(...values) { super(...values); window.__hccAcceptance.sockets.push(this); this.addEventListener('message', event => { window.__hccAcceptance.frames++; window.__hccAcceptance.bytes += typeof event.data === 'string' ? event.data.length : 0; }); }
+    send(data) {
+      let type = 'other';
+      try { const value = JSON.parse(data); if (['input', 'control', 'resize', 'state.snapshot.request'].includes(value.type)) type = value.type; } catch {}
+      window.__hccAcceptance.outboundTypes.push(type);
+      return super.send(data);
+    }
   };
   if (window.PerformanceObserver?.supportedEntryTypes?.includes('longtask')) new PerformanceObserver(list => {
     window.__hccAcceptance.longTasks.push(...list.getEntries().map(entry => ({ start: entry.startTime, duration: entry.duration })));
@@ -176,6 +182,7 @@ async function extendedChecks(page, context) {
   if (!await page.evaluate(() => window.hccHandoff.canControl)) await page.locator('#claimControlBtn').click();
   await page.waitForFunction(() => window.hccHandoff.canControl);
   check('actual WebSocket reconnect restores missing output without replaying unsent input');
+  await automaticReconnectChecks(page);
 
   const observerContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await observerContext.addInitScript(browserInstrumentation);
@@ -231,6 +238,79 @@ async function extendedChecks(page, context) {
   const cliHelp = hcc('--help'); assert.ok(cliHelp.includes('hello-cc') || cliHelp.includes('hcc'));
   check('public installed CLI and current same-origin bootstrap assets read back successfully');
   await shot(page, 'desktop-native-long-history');
+}
+async function automaticReconnectChecks(page) {
+  // Exercise the shipped reconnect timer and polling path with actual sockets.
+  // Only the session-list response is faulted; no implementation is replaced.
+  const draft = 'Automatic recovery keeps this draft unsent';
+  await page.locator('#nativeDraft').fill(draft);
+  const sent = adapters.get('codex').sent || 0;
+  const outboundStart = await page.evaluate(() => window.__hccAcceptance.outboundTypes.length);
+  let unavailable = false, faultedReads = 0;
+  const writes = [];
+  const track = request => {
+    if (request.method() !== 'GET' && new URL(request.url()).pathname.startsWith('/api/sessions/')) writes.push(request.method() + ' ' + new URL(request.url()).pathname);
+  };
+  const route = async requestRoute => {
+    const response = await requestRoute.fetch();
+    const body = await response.json();
+    if (unavailable) {
+      for (const session of body.sessions || []) if (session.id === 'qa-codex') session.status = 'disconnected';
+      faultedReads++;
+    }
+    await requestRoute.fulfill({ response, json: body });
+  };
+  const pattern = /\/api\/sessions(?:\?|$)/;
+  page.on('request', track);
+  await page.route(pattern, route);
+  try {
+    const closed = await page.evaluate(async () => {
+      window.hccProjectReads.invalidate();
+      await window.hccHandoff.refreshSessions();
+      const sockets = window.__hccAcceptance.sockets;
+      const current = sockets.filter(socket => socket.readyState === WebSocket.OPEN);
+      if (current.length !== 1) throw new Error('Expected exactly one connected primary socket');
+      await new Promise(resolve => {
+        current[0].addEventListener('close', resolve, { once: true });
+        current[0].close(1000, 'acceptance automatic recovery');
+      });
+      const closedAt = performance.now();
+      return { socketCount: sockets.length, closedAt };
+    });
+    // Enable the list fault only after onclose has scheduled its first timer.
+    unavailable = true;
+    closed.listRefreshMs = await page.evaluate(async closedAt => {
+      window.hccProjectReads.invalidate();
+      await window.hccHandoff.refreshSessions();
+      return performance.now() - closedAt;
+    }, closed.closedAt);
+    assert.ok(closed.listRefreshMs < 600, 'Faulted list must arrive before the first reconnect timer can fire');
+    assert.ok(faultedReads > 0);
+    // The first timer has a 600–900ms delay. Keep the real clock running long
+    // enough for it to observe the disconnected list and leave no timer active.
+    await page.waitForFunction(closedAt => performance.now() - closedAt >= 1300, closed.closedAt);
+    await page.waitForFunction(() => document.getElementById('connState').dataset.stateKey === 'offline');
+    assert.equal(await page.evaluate(() => window.__hccAcceptance.sockets.length), closed.socketCount);
+    assert.equal(await page.evaluate(() => Boolean(window.hccHandoff.actionToken || window.hccHandoff.canControl)), false);
+    adapters.get('codex').emit({ type: 'message', itemId: 'automatic-gap', text: 'RECOVERED_AUTOMATICALLY_AFTER_LIST_OUTAGE' });
+    unavailable = false;
+    await page.evaluate(async () => { window.hccProjectReads.invalidate(); await window.hccHandoff.refreshSessions(); });
+    await page.waitForFunction(() => /(已连接|Connected)$/.test(document.getElementById('handoffConnection').textContent) && document.getElementById('nativeEvents').textContent.includes('RECOVERED_AUTOMATICALLY_AFTER_LIST_OUTAGE'), null, { timeout: 15000 });
+    assert.equal(await page.evaluate(() => window.__hccAcceptance.sockets.length), closed.socketCount + 1);
+    assert.equal(await page.locator('#nativeDraft').inputValue(), draft);
+    assert.equal(adapters.get('codex').sent || 0, sent);
+    assert.equal(await page.evaluate(() => window.hccHandoff.canControl), false);
+    assert.deepEqual(writes, [], 'Automatic recovery must not replay input, approvals or control actions');
+    const outboundMutations = await page.evaluate(start => window.__hccAcceptance.outboundTypes.slice(start).filter(type => ['input', 'control', 'resize'].includes(type)), outboundStart);
+    assert.deepEqual(outboundMutations, [], 'Automatic recovery must not send WebSocket control or input frames');
+    evidence.automaticReconnect = { faultedReads, listRefreshMs: closed.listRefreshMs, unavailableObservedMs: 1300, newSockets: 1, automatic: true, draftPreserved: true, replayedWrites: writes.length, outboundMutations: outboundMutations.length, explicitControlReclaim: true };
+  } finally {
+    page.off('request', track);
+    await page.unroute(pattern, route);
+  }
+  await page.locator('#claimControlBtn').click();
+  await page.waitForFunction(() => window.hccHandoff.canControl);
+  check('automatic reconnect resumes after a transient disconnected session list without replay or implicit control reclaim');
 }
 async function projectLifecycleChecks() {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });

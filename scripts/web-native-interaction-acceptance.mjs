@@ -23,7 +23,7 @@ import { readNativePointer } from '../lib/runtime/native/store.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
 import { resolveDshBinary, createDshEnvironment } from '../lib/integrations/dsh.mjs';
 import { checkDshRuntime, DSH_CORDIS_VERSION } from '../lib/integrations/dsh-cordis.mjs';
-import { interactionCompletionDiagnostics } from './web-native-interaction-diagnostics.mjs';
+import { interactionCompletionDiagnostics, isKnownDshEscalationApproval } from './web-native-interaction-diagnostics.mjs';
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
@@ -197,13 +197,33 @@ try {
     };
   });
   async function state(peer) { return api('GET', '/workers/' + peer + '/state'); }
-  async function finish(peer, submission, answeredRequest = null) {
+  async function finish(peer, submission, answeredRequest = null, approvedOperation = null) {
     if (answeredRequest) answeredApprovals.set(peer, { request: answeredRequest, submission });
+    const additionalAnswered = new Set();
     return until(async () => {
       const value = await state(peer), delivery = value.deliveries.find(row => row.submission_id === submission);
-      if (answeredRequest && value.snapshot.pendingApprovals?.some(request => request.requestId !== answeredRequest.requestId)) {
+      const additional = answeredRequest && value.snapshot.pendingApprovals?.filter(request => request.requestId !== answeredRequest.requestId && !additionalAnswered.has(request.requestId));
+      if (additional?.length) {
         const diagnostic = interactionCompletionDiagnostics(value, { answeredRequest, submissionId: submission,
           ownedTargets: [{ role: 'allowed', path: dshAllowed }, { role: 'denied', path: dshDenied }] });
+        const next = additional[0];
+        if (additional.length === 1 && approvedOperation && isKnownDshEscalationApproval(answeredRequest, next, {
+          ...approvedOperation, priorDecision: 'accept', additionalAnswers: additionalAnswered.size,
+        })) {
+          // Answer the separately rendered official escalation only after the
+          // full original operation and ownership match. A new call, target,
+          // content, tool, or any third layer falls through to failure.
+          const key = JSON.stringify([root, peer, next.executorId, next.requestId]);
+          const escapedKey = key.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+          const button = page.locator('#nativeApprovals button[data-decision="accept"][data-request-key="' + escapedKey + '"]');
+          await button.waitFor({ timeout: 15000 });
+          await shot('dsh-real-escalation-layer');
+          await button.click(); additionalAnswered.add(next.requestId);
+          (evidence.knownDshApprovalLayers ||= []).push({ ...diagnostic, decision: 'accept',
+            toolCallId: next.params.toolCall.toolCallId, requestIds: [answeredRequest.requestId, next.requestId], layerCount: 2,
+            sameToolCall: true, sameOriginalOperation: true, answeredThrough: 'Web button for this exact request' });
+          return false;
+        }
         evidence.additionalApproval = diagnostic;
         throw new Error(peer + ' requested a different pending approval after the prior answer; bounded metadata saved');
       }
@@ -306,7 +326,8 @@ try {
       await shot('dsh-real-permission-mobile');
       check('dsh operation summary and persistent details render on desktop and 390px mobile');
       await page.setViewportSize({ width: 1440, height: 1000 });
-      await page.locator('#nativeApprovals button[data-decision="accept"]').click(); await finish(peer, delivery.submission_id, request);
+      await page.locator('#nativeApprovals button[data-decision="accept"]').click();
+      await finish(peer, delivery.submission_id, request, { target: allowed, content: 'DSH_APPROVED_OK' });
       assert.equal(fs.readFileSync(allowed, 'utf8').trim(), 'DSH_APPROVED_OK');
       assert.equal((await state(peer)).snapshot.sessionId, result.sessionId);
       check('dsh real ACP write approval returns to the original model turn');

@@ -2,6 +2,7 @@
 // provider bodies, raw tool input, environment values, or arbitrary paths.
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 const methods = new Set(['session/request_permission', 'claude/canUseTool']);
 const tools = new Set(['write', 'read', 'get', 'str_replace_editor', 'bash', 'Write', 'Read', 'Edit', 'Bash']);
@@ -13,6 +14,26 @@ const kinds = new Set(['approval', 'permissions', 'userInput', 'elicitation']);
 const safe = (value, allowed) => allowed.has(value) ? value : value == null ? null : 'other';
 const identifier = value => Number.isSafeInteger(value) || (typeof value === 'string' && /^[\w.-]{1,120}$/.test(value)) ? value : null;
 const timestamp = value => Number.isFinite(value) ? value : typeof value === 'string' && /^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(value) ? value : null;
+
+// rc.2 can ask once at tools/pre-execute and once inside write's explicit
+// sandbox escalation. This recognizes only that same exact test-owned write;
+// it never grants permission and is not a product approval policy.
+export function isKnownDshEscalationApproval(first, next, { target, content, priorDecision, additionalAnswers = 0 } = {}) {
+  if (priorDecision !== 'accept' || additionalAnswers !== 0 || !first || !next || first.requestId === next.requestId) return false;
+  for (const key of ['executorId', 'sessionId', 'turnId']) if (typeof first[key] !== 'string' || !first[key] || first[key] !== next[key]) return false;
+  for (const request of [first, next]) {
+    if (identifier(request.requestId) === null) return false;
+    if (request.method !== 'session/request_permission' || request.kind !== 'approval' || request.truncated) return false;
+    const call = request.params?.toolCall, input = call?.rawInput;
+    if (call?.title !== 'write' || call.contextPending || call.contextTruncated || typeof call.toolCallId !== 'string' || identifier(call.toolCallId) === null) return false;
+    if (!input || input.file_path !== target || input.content !== content || input.sandbox_permissions !== 'danger-full-access') return false;
+    if (typeof input.justification !== 'string' || !input.justification.trim() || input.justification.length > 1000) return false;
+    if (!isDeepStrictEqual(Object.keys(input).sort(), ['content', 'file_path', 'justification', 'sandbox_permissions'])) return false;
+    if (!request.params.options?.some(option => option.kind === 'allow_once')) return false;
+  }
+  return first.params.toolCall.toolCallId === next.params.toolCall.toolCallId &&
+    isDeepStrictEqual(first.params.toolCall.rawInput, next.params.toolCall.rawInput);
+}
 
 function fileEvidence(target) {
   const result = { role: target.role, exists: false, regularFile: false, sha256: null };
@@ -43,7 +64,8 @@ export function interactionCompletionDiagnostics(state, { answeredRequest, submi
     const tool = request.params?.toolCall, input = tool?.rawInput || request.params?.input;
     const target = targets.find(target => input?.file_path === target.path || input?.path === target.path);
     return { requestId: identifier(request.requestId), method: safe(request.method, methods), kind: safe(request.kind, kinds),
-      toolName: safe(tool?.title || request.params?.tool, tools), targetExactOwned: Boolean(target), targetRole: target?.role || null };
+      toolName: safe(tool?.title || request.params?.tool, tools), toolCallId: identifier(tool?.toolCallId),
+      targetExactOwned: Boolean(target), targetRole: target?.role || null };
   });
   return {
     schemaVersion: 1, differentPendingRequest: differentRequest,
