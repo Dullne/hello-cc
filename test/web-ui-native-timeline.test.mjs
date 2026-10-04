@@ -150,6 +150,11 @@ test('native rendering reuses unchanged DOM and restores reading, tool expansion
   const writes = output.writes; f.render(data); assert.equal(output.writes, writes);
   f.element('nativeScroll').scrollTop = 180; f.element('nativeScroll').emit('scroll');
   output.details[0].open = true; f.element('nativeIdentityDetails').open = true;
+  const expandedTool = output.details[0];
+  f.render(data);
+  assert.equal(output.writes, writes, 'an unchanged refresh after expanding a tool must preserve DOM');
+  assert.equal(output.details[0], expandedTool);
+  assert.equal(expandedTool.open, true);
   f.render(data, 'b'); f.render(data, 'a');
   assert.equal(f.element('nativeScroll').scrollTop, 180); assert.equal(output.details[0].open, true);
   assert.equal(f.element('nativeIdentityDetails').open, true);

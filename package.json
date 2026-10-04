@@ -1,6 +1,6 @@
 {
   "name": "@logicseek/hello-cc",
-  "version": "1.0.5",
+  "version": "1.1.0-rc.2",
   "description": "Local control plane for coordinating Claude Code, Codex, and other coding CLI sessions.",
   "type": "module",
   "bin": {

@@ -14,6 +14,8 @@ import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
+import { createNativeStore } from '../lib/runtime/native/store.mjs';
+import { createAgentDefaults } from '../lib/web/agent-defaults.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { createSessionSync } from '../lib/web/browser/session-sync.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
@@ -41,6 +43,10 @@ async function fixture(t, configuration = {}) {
   const adapters = new Map(), created = [], bridges = [];
   const options = { pollMs: 60000, adapterFactory: async (provider, options) => {
     const peer = options.env.HCC_PEER;
+    if (configuration[peer]?.realClaude) {
+      const adapter = createClaudeAdapter({ ...options, query: () => { throw new Error('This fixture must not start a model query'); } });
+      adapters.set(peer, adapter); created.push(adapter); return adapter;
+    }
     if (configuration[peer]?.claudeSdk) {
       const sdk = configuration[peer].claudeSdk;
       const adapter = createClaudeAdapter({ ...options, query: input => sdk.query(input),
@@ -52,6 +58,7 @@ async function fixture(t, configuration = {}) {
     const adapter = { state, options, sent: [], interrupted: [], closed: 0,
       capabilities: state.capabilities, snapshot: () => structuredClone(state),
       async open(input) { this.openInput = input; state.sessionId = input.sessionId || (configuration[peer]?.unknownSession ? null : 'session-' + peer);
+        if (configuration[peer]?.resumeError && input.sessionId) throw configuration[peer].resumeError;
         state.status = 'idle'; return this.snapshot(); },
       async send(input) { this.sent.push(input); this.active = input; state.status = 'running'; state.turnId = 'turn-' + peer;
         return { status: 'queued', turnId: state.turnId }; },
@@ -60,7 +67,7 @@ async function fixture(t, configuration = {}) {
         this.emit({ type: 'message', text: 'answer from ' + peer, submissionId: this.active.submissionId, turnId });
         this.emit({ type: 'completed', status: 'completed', submissionId: this.active.submissionId, turnId }); },
       async interrupt(input) { this.interrupted.push(input); return { status: 'interrupt_requested', turnId: input.turnId }; },
-      async close() { if (state.status === 'closed') return; this.closed++; state.status = 'closed'; }
+      async close() { if (state.status === 'closed') return; this.closed++; if (configuration[peer]?.closeError) throw configuration[peer].closeError; state.status = 'closed'; }
     };
     adapters.set(peer, adapter); created.push(adapter); return adapter;
   } };
@@ -81,7 +88,7 @@ async function fixture(t, configuration = {}) {
     for (const bridge of bridges) bridge.closeNativeBridge();
     await service.shutdown(); mesh.close(); fs.rmSync(root, { recursive: true, force: true });
   });
-  return { ctx, mesh, api, adapters, created, bridge, key,
+  return { ctx, mesh, api, adapters, created, bridge, key, defaults: createAgentDefaults({ connectWebProject: connect }),
     start: (peer = 'a', extra = {}) => api('POST', '/workers', { peer, provider: 'codex', ...extra }),
     get service() { return service; },
     async restart() { await service.shutdown(); service = await startNativeService(ctx, deps, options); },
@@ -277,7 +284,7 @@ test('Web native creation rejects ambiguous inputs, foreign paths and existing o
   fs.symlinkSync(outside, path.join(f.ctx.root, 'outside'), process.platform === 'win32' ? 'junction' : 'dir');
   fs.writeFileSync(path.join(f.ctx.root, 'ordinary-file'), 'not a directory');
   for (const change of [{ kind: 'shell' }, { id: 'all' }, { id: '' }, { id: '../escape' }, { id: null },
-    { model: '' }, { model: 1 }, { model: 'x'.repeat(257) }, { cwd: '' }, { cwd: null }, { cwd: 'missing' },
+    { model: 1 }, { model: 'x'.repeat(257) }, { cwd: '' }, { cwd: null }, { cwd: 'missing' },
     { cwd: 'ordinary-file' }, { mode: 'new' }, { resume: 'last' }, { force: false },
     { binary: 'codex' }, { env: {} }, { command: 'codex' }, { backend: 'native' }, { db: outside }]) {
     await assert.rejects(web.startNativeSession({ ...base, ...change }), { code: 'BAD_REQUEST' });
@@ -818,3 +825,240 @@ test('native account read rechecks binding ownership after the provider response
   finish(); await assert.rejects(reading,{code:'NATIVE_PEER_IN_USE'});
   assert.equal(f.mesh.prepare('SELECT runtime_target FROM peer_bindings WHERE peer=?').get('a').runtime_target,'replaced-owner');
 });
+
+test('new native workers resolve one project-default snapshot before awaiting runtime startup', async t => {
+  const f = await fixture(t); fs.mkdirSync(path.join(f.ctx.root, 'work'));
+  const original = f.defaults.readAgentDefaults(f.ctx); original.defaultProvider = 'claude';
+  original.providers.claude = { model: 'first-model', cwd: 'work' };
+  const saved = f.defaults.saveAgentDefaults(f.ctx, original);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const web = f.bridge(nativeRequest, new Map(), { ensureRuntime: () => gate });
+  const pending = web.startNativeSession({ projectCtx: f.ctx, transport: 'native' });
+  saved.defaultProvider = 'dsh'; saved.providers.claude = { model: 'later-model', cwd: '.' };
+  f.defaults.saveAgentDefaults(f.ctx, saved); release();
+  const session = await pending;
+  assert.equal(session.kind, 'claude'); assert.match(session.id, /^native-claude-/);
+  assert.equal(session.cwd, path.join(f.ctx.root, 'work'));
+  assert.equal(f.adapters.get(session.id).openInput.model, 'first-model');
+  const later = await web.startNativeSession({ projectCtx: f.ctx, transport: 'native' });
+  assert.equal(later.kind, 'dsh');
+});
+
+test('explicit native model clearing omits model downstream and does not change the saved defaults or resume', async t => {
+  const f = await fixture(t), settings = f.defaults.readAgentDefaults(f.ctx);
+  settings.providers.codex.model = 'saved-model'; f.defaults.saveAgentDefaults(f.ctx, settings);
+  const posts = [], web = f.bridge((ctx, method, route, body, options) => {
+    if (method === 'POST' && route === '/workers') posts.push(body);
+    return nativeRequest(ctx, method, route, body, options);
+  });
+  for (const model of [null, '', '   ']) {
+    await web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', model });
+    assert.equal(Object.hasOwn(posts.at(-1), 'model'), false);
+  }
+  const inherited = await web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex' });
+  assert.equal(posts.at(-1).model, 'saved-model');
+  await f.api('POST', '/close', { peer: inherited.id });
+  const row = (await web.nativeWorkerHistory(f.ctx, inherited.id)).worker;
+  await web.resumeNativeSession(f.ctx, row.peer, { owner: row.owner, sessionId: row.sessionId, confirmed: true });
+  assert.equal(Object.hasOwn(posts.at(-1), 'model'), false);
+  assert.equal(f.defaults.readAgentDefaults(f.ctx).providers.codex.model, 'saved-model');
+});
+
+test('native defaults with a directory removed during startup fail before provider admission', async t => {
+  const f = await fixture(t); const directory = path.join(f.ctx.root, 'work'); fs.mkdirSync(directory);
+  const settings = f.defaults.readAgentDefaults(f.ctx); settings.providers.codex.cwd = 'work'; f.defaults.saveAgentDefaults(f.ctx, settings);
+  const web = f.bridge(nativeRequest, new Map(), { ensureRuntime: async () => { fs.rmdirSync(directory); } });
+  await assert.rejects(web.startNativeSession({ projectCtx: f.ctx, transport: 'native' }), { code: 'BAD_REQUEST' });
+  assert.equal(f.created.length, 0);
+  assert.equal(f.defaults.readAgentDefaults(f.ctx).providers.codex.cwd, 'work');
+});
+
+test('Web retained history stays project scoped and readable after the native daemon closes', async t => {
+  const f = await fixture(t), web = f.bridge();
+  await f.start('a'); f.adapters.get('a').emit({ type: 'message', text: 'retained output' });
+  let history = await web.listNativeHistory(f.ctx);
+  assert.equal(history.workers[0].owned, true); assert.equal(history.workers[0].resumeReason, 'active');
+  assert.equal(history.retention.complete, false);
+  await f.service.shutdown();
+  history = await web.listNativeHistory(f.ctx);
+  assert.equal(history.runtimeAvailable, false); assert.equal(history.workers[0].resumable, true);
+  assert.equal(history.workers[0].status, 'closed');
+  const detail = await web.nativeWorkerHistory(f.ctx, 'a');
+  assert.ok(detail.events.some(event => event.payload.text === 'retained output'));
+  assert.ok(detail.events.every(event => event.peer === 'a'));
+  await assert.rejects(web.nativeWorkerHistory(f.ctx, 'foreign'), { code: 'NATIVE_HISTORY_NOT_FOUND' });
+});
+
+test('Web history does not offer restore for a rebound or unverified native cwd', async t => {
+  const f = await fixture(t), web = f.bridge();
+  const selected = path.join(f.ctx.root, 'selected');
+  fs.mkdirSync(selected);
+  await f.start('a', { cwd: selected });
+  await f.api('POST', '/close', { peer: 'a' });
+  const before = (await web.listNativeHistory(f.ctx)).workers[0];
+  assert.equal(before.resumable, true);
+  fs.renameSync(selected, path.join(f.ctx.root, 'original'));
+  fs.mkdirSync(selected);
+  let row = (await web.listNativeHistory(f.ctx)).workers[0];
+  assert.equal(row.resumeReason, 'cwd_changed');
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', {
+    owner: row.owner, sessionId: row.sessionId, confirmed: true
+  }), { code: 'NATIVE_RESUME_NOT_READY' });
+  const store = createNativeStore(f.ctx);
+  try { store.db.prepare("UPDATE workers SET cwd_identity=NULL WHERE peer='a'").run(); }
+  finally { store.close(); }
+  row = (await web.listNativeHistory(f.ctx)).workers[0];
+  assert.equal(row.resumeReason, 'history_unverified');
+  assert.equal(row.resumable, false);
+  assert.equal(f.created.length, 1);
+});
+
+test('Web resumes only a confirmed closed saved worker with the original peer and provider session', async t => {
+  const f = await fixture(t), web = f.bridge();
+  await f.start('a'); await web.discoverNativeSessions(f.ctx);
+  const previousView = web.session();
+  await f.api('POST', '/close', { peer: 'a' });
+  const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+  const restored = await web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true });
+  assert.equal(restored.id, 'a'); assert.equal(restored.kind, 'codex');
+  assert.equal(restored.binding.provider_session_id, saved.sessionId); assert.notEqual(restored.nativeIdentity.owner, saved.owner);
+  assert.equal(previousView.nativeRetired, true);
+  assert.deepEqual(f.adapters.get('a').openInput, { sessionId: saved.sessionId, model: undefined });
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true }), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(f.created.length, 2);
+});
+
+test('Web restore confirmation, capabilities, unchanged ownership and confirmed shutdown are required', async t => {
+  const f = await fixture(t), web = f.bridge(); await f.start('a');
+  let row = (await web.listNativeHistory(f.ctx)).workers[0];
+  const input = () => ({ owner: row.owner, sessionId: row.sessionId, confirmed: true });
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', { ...input(), confirmed: false }), { code: 'BAD_REQUEST' });
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', { ...input(), model: 'other-model' }), { code: 'BAD_REQUEST' });
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input()), { code: 'NATIVE_RESUME_NOT_READY' });
+  await f.api('POST', '/close', { peer: 'a' });
+  const store = createNativeStore(f.ctx);
+  try {
+    store.db.prepare("UPDATE workers SET status='disconnected' WHERE peer='a'").run();
+    row = (await web.listNativeHistory(f.ctx)).workers[0]; assert.equal(row.resumeReason, 'not_closed');
+    await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input()), { code: 'NATIVE_RESUME_NOT_READY' });
+    store.db.prepare("UPDATE workers SET status='closed' WHERE peer='a'").run();
+  } finally { store.close(); }
+  f.mesh.prepare("UPDATE peer_bindings SET runtime_target='different-owner' WHERE peer='a'").run();
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input()), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(f.created.length, 1);
+  await f.start('dsh-no-resume', { provider: 'dsh' });
+  f.adapters.get('dsh-no-resume').state.capabilities.resume = false;
+  await f.api('POST', '/close', { peer: 'dsh-no-resume' });
+  const unsupported = (await web.listNativeHistory(f.ctx)).workers.find(worker => worker.peer === 'dsh-no-resume');
+  assert.equal(unsupported.resumeReason, 'provider_unsupported'); assert.equal(unsupported.resumable, false);
+});
+
+test('daemon admission fences an owner replaced after the Web restore preflight', async t => {
+  const f = await fixture(t); await f.start('a'); await f.api('POST', '/close', { peer: 'a' });
+  let posts = 0;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    if (method === 'POST' && route === '/workers') {
+      posts++; f.mesh.prepare("UPDATE peer_bindings SET runtime_target='replacement-owner' WHERE peer='a'").run();
+    }
+    return nativeRequest(ctx, method, route, body, options);
+  });
+  const row = (await web.listNativeHistory(f.ctx)).workers[0];
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', { owner: row.owner, sessionId: row.sessionId, confirmed: true }), { code: 'NATIVE_RESUME_UNCONFIRMED' });
+  assert.equal(posts, 1); assert.equal(f.created.length, 1);
+  assert.equal(f.mesh.prepare("SELECT runtime_target FROM peer_bindings WHERE peer='a'").get().runtime_target, 'replacement-owner');
+});
+
+test('an uncertain restore is never replayed and the original peer is discoverable', async t => {
+  const f = await fixture(t); await f.start('a'); await f.api('POST', '/close', { peer: 'a' });
+  let posts = 0;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const result = await nativeRequest(ctx, method, route, body, options);
+    if (method === 'POST' && route === '/workers') { posts++; throw Object.assign(new Error('lost response'), { code: 'NATIVE_CLIENT_TIMEOUT', extra: { uncertain: true } }); }
+    return result;
+  });
+  const row = (await web.listNativeHistory(f.ctx)).workers[0], input = { owner: row.owner, sessionId: row.sessionId, confirmed: true };
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), error => error.code === 'NATIVE_RESUME_UNCONFIRMED' && error.extra.peer === 'a');
+  await web.discoverNativeSessions(f.ctx);
+  assert.equal(web.session().binding.provider_session_id, row.sessionId);
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(posts, 1); assert.equal(f.created.length, 2);
+});
+
+test('resume provider failure preserves its saved identity and refuses another attempt under the stale owner', async t => {
+  const configuration = { a: {} }, f = await fixture(t, configuration), web = f.bridge();
+  await f.start('a'); await f.api('POST', '/close', { peer: 'a' });
+  const row = (await web.listNativeHistory(f.ctx)).workers[0], input = { owner: row.owner, sessionId: row.sessionId, confirmed: true };
+  configuration.a.resumeError = Object.assign(new Error('provider restore unavailable'), { code: 'NATIVE_UNSUPPORTED' });
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), error => error.code === 'NATIVE_RESUME_UNCONFIRMED' && /provider restore unavailable/.test(error.message));
+  const history = (await web.listNativeHistory(f.ctx)).workers[0];
+  assert.equal(history.status, 'error'); assert.equal(history.sessionId, row.sessionId); assert.equal(history.resumable, false);
+  await assert.rejects(web.resumeNativeSession(f.ctx, 'a', input), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(f.created.length, 2);
+});
+
+test('real Claude adapter lazy restore keeps the saved session binding before its first model query', async t => {
+  const configuration = { a: {} }, f = await fixture(t, configuration), web = f.bridge();
+  await f.start('a', { provider: 'claude' }); await f.api('POST', '/close', { peer: 'a' });
+  const row = (await web.listNativeHistory(f.ctx)).workers[0]; configuration.a.realClaude = true;
+  const restored = await web.resumeNativeSession(f.ctx, 'a', { owner: row.owner, sessionId: row.sessionId, confirmed: true });
+  assert.equal(restored.nativeSnapshot().status, 'ready'); assert.equal(restored.nativeSnapshot().sessionId, null);
+  assert.equal(restored.binding.provider_session_id, row.sessionId); assert.equal(restored.id, 'a');
+  assert.notEqual(restored.nativeIdentity.owner, row.owner);
+});
+
+for (const retirePrevious of [false, true]) {
+  test(`Claude lazy restore replaces a ${retirePrevious ? 'retired' : 'closed'} confirmed Web view and waits for SDK initialization`, async t => {
+    const originalSdk = controlledClaudeSdk(), resumedSdk = controlledClaudeSdk();
+    const configuration = { a: { claudeSdk: originalSdk } };
+    const f = await fixture(t, configuration), web = f.bridge();
+    await f.start('a', { provider: 'claude' });
+    await web.discoverNativeSessions(f.ctx);
+    const previousView = web.session();
+    await web.nativeAction(previousView, 'send', { text: 'first message', submissionId: 'claude_before_resume_1' });
+    await f.service.poll(); await originalSdk.consume();
+    await originalSdk.initialize('retained-claude-session');
+    await web.nativeAction(previousView, 'read');
+    assert.equal(previousView.nativeIdentity.sessionId, 'retained-claude-session');
+    await web.nativeAction(previousView, 'close');
+    if (retirePrevious) await web.discoverNativeSessions(f.ctx);
+    assert.equal(Boolean(previousView.nativeRetired), retirePrevious);
+    const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    configuration.a.claudeSdk = resumedSdk;
+    const before = f.mesh.prepare('SELECT COUNT(*) AS n FROM messages').get().n;
+    const restored = await web.resumeNativeSession(f.ctx, 'a', {
+      owner: saved.owner, sessionId: saved.sessionId, confirmed: true
+    });
+    assert.notEqual(restored, previousView);
+    assert.equal(previousView.nativeRetired, true);
+    assert.notEqual(restored.nativeIdentity.owner, saved.owner);
+    assert.equal(restored.nativeIdentity.generation, previousView.nativeIdentity.generation);
+    assert.equal(restored.nativeSnapshot().status, 'ready');
+    assert.equal(restored.nativeSnapshot().sessionId, null);
+    assert.equal(restored.binding.provider_session_id, saved.sessionId);
+    assert.equal(f.mesh.prepare('SELECT COUNT(*) AS n FROM messages').get().n, before,
+      'restoring does not send an automatic prompt');
+    restored.actionTokens.add('resumed-controller');
+    await web.nativeAction(restored, 'send', { text: 'continue saved session', submissionId: 'claude_after_resume_1' });
+    await f.service.poll();
+    await web.nativeAction(restored, 'read');
+    assert.equal(restored.nativeSnapshot().status, 'queued');
+    assert.equal(restored.nativeSnapshot().sessionId, null);
+    await resumedSdk.consume();
+    await web.pollNativeSessions(f.ctx);
+    assert.equal(restored.nativeSnapshot().status, 'running');
+    assert.equal(restored.nativeSnapshot().sessionId, null);
+    assert.equal(restored.nativeRetired, undefined);
+    assert.equal(restored.actionTokens.has('resumed-controller'), true);
+    await resumedSdk.initialize(saved.sessionId);
+    await web.nativeAction(restored, 'read');
+    assert.equal(web.session(), restored);
+    assert.equal(restored.nativeSnapshot().sessionId, saved.sessionId);
+    assert.equal(restored.nativeSnapshot().connected, true);
+    assert.equal(restored.actionTokens.has('resumed-controller'), true);
+    assert.equal(f.created.length, 2);
+    await assert.rejects(web.nativeAction(previousView, 'send', {
+      text: 'stale controller', submissionId: 'claude_stale_resume_1'
+    }), { code: 'NATIVE_OWNER_CHANGED' });
+  });
+}

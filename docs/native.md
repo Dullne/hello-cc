@@ -61,28 +61,41 @@ DeepSeek Harness default to **Background Agent**, which creates a native worker
 and starts or reuses the project's independent native runtime. You do not need
 to run `hcc native start` first; the provider requirements above still apply.
 
-The working directory defaults to the selected project root and can be a
-subdirectory within that project. The worker continues to share the selected
+**Settings** can save the project default provider plus a model and an in-project
+working directory for each provider. **New Agent** prefills these values; when no
+directory is configured it uses the project root. The worker continues to share the selected
 project's HCC task and message bus. Select or add another project to work outside
 that root. **Model (optional)** can stay empty to use the provider's configured
 default; any supplied value must be supported by that provider. **Name (optional)**
 can stay empty for a generated peer name.
 
-This Web entry creates new native sessions only; native resume remains available
-through the CLI. **Advanced options** keeps the terminal CLI and Codex App Server
-paths, including their existing history controls. Shell uses a terminal;
-DeepSeek Harness uses a background worker.
+These defaults live in the selected HCC project database and apply only to future
+Web native creations. They do not change running workers, history resume, CLI
+launches or provider account files. Concurrent saves use revision checks; reload
+and review the latest values after a conflict. Clearing the model in the creation
+form explicitly chooses the provider's own default for that one worker.
+
+**New Agent** creates a new native session. **History → HCC retained history**
+browses saved native workers and explicitly resumes workers recorded as closed.
+Resume keeps the peer and provider session ID, rechecks ownership, and starts a
+new executor. CLI resume remains available. **Advanced options** keeps the terminal
+CLI and Codex App Server paths, including their existing history controls. Shell
+uses a terminal; DeepSeek Harness uses a background worker.
 
 After creation, send prompts and inspect receipts or approvals in the same Web
 session. Creating a worker does not by itself complete a model task. Closing
 the page or stopping Web preserves the independent native runtime and worker;
 explicitly close the worker when it is no longer needed. The dated acceptance
 records below do not establish real-model or release acceptance of this new
-creation entry. See the [Web guide](web-handoff.zh-CN.md).
+creation or history/resume entries. See the [Web guide](web-handoff.zh-CN.md).
 
 The **Files** entry browses saved project files and artifacts without creating a
-worker or sending file contents to a model. It provides bounded, read-only text,
-Markdown, image, PDF and static HTML previews; uploads and editing are not included.
+worker or sending file contents to a model. It provides bounded text, Markdown,
+image, PDF and static HTML previews. Explicit uploads create new project files
+without replacing existing names (up to 10 MiB); complete UTF-8 text files can be
+edited and saved with a revision check (up to 1 MiB). Conflicts and uncertain write
+results keep the draft for inspection. These actions do not attach files to a model
+conversation. See the [project file guide](web-handoff.zh-CN.md#上传与编辑项目文件).
 
 ## CLI
 
@@ -183,6 +196,13 @@ it does not attach to an existing live TUI or desktop instance. HCC cannot prove
 that an external application has independently opened the same saved session,
 so do not open the same conversation concurrently outside the owned runtime.
 
+New saved workers also retain the filesystem identity of their working
+directory. Resume requires that identity to still match, even if the path
+spelling is unchanged. Older workers without that evidence remain readable in
+HCC history but are not automatically resumable; manual review and association
+are not yet implemented. Web history marks these records as unavailable before
+the native service rechecks at admission.
+
 Native workers receive a worker-specific `HCC_ROOT`, `HCC_DB`, `HCC_PEER`, and
 `HCC_NATIVE_OWNER`. A provider hook must match the peer's native transport owner.
 Its native hook path only heartbeats that owner and renews its locks. It does
@@ -256,8 +276,10 @@ explicitly. Truncated requests can only be declined or cancelled. Nested schemas
   attaching to or taking over an existing TUI/Desktop session is not implemented.
 - Web can create Codex, Claude and dsh native workers, and discovers existing
   workers in the same project. It exposes messages, delivery receipts,
-  interruption, and explicit closure. Web creation currently supports new
-  sessions only; use the CLI for native resume. Closing the page or Web runtime
+  interruption, and explicit closure. History reads retained project events and
+  explicitly resumes closed workers; it is not the provider's complete transcript.
+  Active workers and workers without confirmed closure cannot resume from this
+  entry. Closing the page or Web runtime
   preserves the independent native worker. Human responses are bound to the
   current executor and turn. See the [Web handoff guide](web-handoff.zh-CN.md).
 - Codex, Claude and dsh native workers receive project- and peer-scoped HCC MCP

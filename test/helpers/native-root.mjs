@@ -20,13 +20,13 @@ function candidatePorts(root) {
 // This removes environmental collisions from fixtures; it does not relax the
 // product's conservative refusal of an unidentified listener. Bind only our
 // candidate ports, never connect to or inspect an existing process.
-export async function createNativeTestRoot(prefix) {
+export async function createNativeTestRoot(prefix, { projectSubdir = '' } = {}) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
     const listeners = [];
     let failure;
     try {
-      for (const port of candidatePorts(root)) {
+      for (const port of candidatePorts(path.join(root, projectSubdir))) {
         const listener = net.createServer();
         listeners.push(listener);
         await new Promise((resolve, reject) => {

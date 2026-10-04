@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { createNativeStore, nativePaths, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 
 function fixture(t) {
@@ -261,4 +262,24 @@ test('legacy native deliveries migrate as peer data without inferred user author
   const migrated = f.store();
   assert.equal(migrated.delivery('web', 1).origin, 'peer');
   assert.equal(migrated.queue('web', 2, 'new-local-user', 'user').origin, 'user');
+});
+
+test('legacy native worker rows migrate without inventing a directory identity', (t) => {
+  const f = fixture(t), paths = nativePaths(f.ctx, { create: true });
+  const legacy = new DatabaseSync(paths.db);
+  legacy.exec(`CREATE TABLE workers (
+    peer TEXT PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT,
+    cwd TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL
+  )`);
+  legacy.prepare('INSERT INTO workers VALUES (?,?,?,?,?,?)')
+    .run('old', 'codex', 'old-thread', f.ctx.root, 'closed', 1);
+  legacy.close();
+  const store = f.store();
+  assert.equal(store.worker('old').session_id, 'old-thread');
+  assert.equal(store.worker('old').cwd_identity, null);
+  store.saveWorker({ peer: 'new', provider: 'codex', cwd: f.ctx.root,
+    cwdIdentity: captureSelectedCwdSnapshot(f.ctx.root), sessionId: 'new-thread', status: 'closed' });
+  const identity = JSON.parse(store.worker('new').cwd_identity);
+  assert.equal(identity.version, 1);
+  assert.equal(identity.canonical, fs.realpathSync(f.ctx.root));
 });

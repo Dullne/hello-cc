@@ -138,6 +138,32 @@ test('project visit generation rejects A to B to A late replies without cancelli
   left.dispose(); right.dispose();
 });
 
+test('browser requests carry the selected identity and only explicit selection may omit it', async () => {
+  const calls = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url, headers: options.headers });
+    return { ok: true };
+  };
+  const requests = createProjectRequests({ broker: createReadBroker({ fetchJson: fetcher }), fetcher,
+    root: '/selected', requireIdentity: true });
+  await assert.rejects(requests.request('/api/state'), { code: 'PROJECT_IDENTITY_REQUIRED' });
+  assert.equal(calls.length, 0);
+  await requests.request('/api/projects/select?root=%2Fother', { method: 'POST', explicitSelection: true,
+    headers: { 'X-HCC-Root-Identity': 'forged' } });
+  assert.equal(calls[0].url, '/api/projects/select?root=%2Fother');
+  assert.equal(calls[0].headers['X-HCC-Browser'], '1');
+  assert.equal(calls[0].headers['X-HCC-Root-Identity'], undefined);
+  requests.setRoot('/selected', 'identity-A');
+  await requests.request('/api/state');
+  assert.equal(calls[1].url, '/api/state?root=%2Fselected');
+  assert.equal(calls[1].headers['x-hcc-root-identity'], 'identity-A');
+  requests.setRoot('/selected', 'identity-B');
+  await requests.request('/api/state');
+  assert.equal(calls.length, 3, 'same root with a new inode identity must bypass the old read cache');
+  assert.equal(calls[2].headers['x-hcc-root-identity'], 'identity-B');
+  requests.dispose();
+});
+
 test('writes invalidate both panes before and after completion and are never shared or retried', async () => {
   const reads = deferredFetch(), writes = deferredFetch();
   const broker = createReadBroker({ fetchJson: reads.fetcher });

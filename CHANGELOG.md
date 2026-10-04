@@ -16,6 +16,34 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.2
+
+### Summary
+
+This local Web workbench candidate adds project Agent defaults, retained native
+history with explicit closed-worker resume, and project file upload/editing.
+It is based on the 1.0.5 delivery line and retains its process identity, tmux
+snapshot and shutdown fixes. A local candidate does not establish publication.
+
+### Highlights
+
+- Create Codex, Claude and DeepSeek Harness background Agents from one Web form;
+  save project defaults without changing provider credentials or global settings.
+- Read HCC-retained native events and resume explicitly closed workers with
+  owner, session and working-directory identity checks.
+- Upload new project files up to 10 MiB and edit complete UTF-8 text up to 1 MiB,
+  with revision conflicts, preserved drafts and explicit uncertain-write readback.
+- Bind browser project requests and drafts to the selected directory identity.
+- Keep the existing terminal/App Server modes, readonly previews and bounded
+  reconnect behavior.
+
+### Validation
+
+The candidate is checked with the full source regression suite, a disposable
+npm installation and desktop/narrow browser flows. Real-provider entry and
+history checks have separate receipts. These checks do not establish a public
+release, a global installation upgrade or real business acceptance.
+
 ## 1.0.5
 
 ### Summary
