@@ -54,22 +54,31 @@ npm install --no-save --package-lock=false @anthropic-ai/claude-agent-sdk@0.3.28
 默认使用“后台 Agent”，创建 native worker 并按需启动或复用该项目的独立 native
 runtime。无需先运行 `hcc native start`；上述 provider 安装和认证要求仍然适用。
 
-工作目录默认所选项目根目录，也可指定项目内的子目录；worker 继续共享所选项目的
+顶部“设置”可保存项目默认 provider，以及各 provider 的默认模型和项目内工作目录。
+新建表单会预填这些值；未设置工作目录时使用项目根目录。worker 继续共享所选项目的
 HCC 任务和消息总线。要在根目录之外工作，先选择或添加相应项目。“模型（可选）”
 留空时使用 provider 当前配置，填写时需使用该 provider 支持的模型值；“名称（可选）”
 留空时自动生成 peer 名称。
 
-此 Web 入口只新建 native 会话，native resume 继续通过 CLI 使用。“高级选项”保留
-终端 CLI、Codex App Server 及各自原有的历史恢复操作。Shell 使用终端，DeepSeek
-Harness 使用后台 worker。
+这些默认值只用于后续 Web 新建 native worker，不改变既有 worker、恢复或 CLI 启动。
+配置由项目数据库保存，跨浏览器读取；并发保存发生冲突时需重新载入核对。详情见
+[项目启动默认值](web-handoff.zh-CN.md#项目-agent-启动默认值)。
+
+“新建 Agent”创建新 native 会话；项目栏“历史”中的“HCC 保留历史”可查看已保存的
+worker，并显式恢复已关闭的 worker。恢复保留原 peer 和 provider 会话 ID，重新核对
+所有权后启动新执行器。CLI resume 继续可用。“高级选项”保留终端 CLI、Codex App
+Server 及各自原有的历史恢复操作。Shell 使用终端，DeepSeek Harness 使用后台 worker。
 
 创建后在同一 Web 会话内发送提示、查看投递回执或处理审批。创建 worker 不代表模型
 任务已经完成。关闭页面或停止 Web 都保留独立 native runtime 和 worker；不再需要时
 明确关闭 worker。下方带日期的既有验收记录不代表这个新建入口已通过真实模型或发布
 验收。详细操作见 [Web 指南](web-handoff.zh-CN.md)。
 
-顶部“文件”可只读浏览项目文件与生成产物，无需创建 worker。预览不会上传文件给模型；
-类型、大小和静态 HTML 的限制见 [文件与产物预览](web-handoff.zh-CN.md#浏览文件与产物)。
+顶部“文件”可浏览项目文件与生成产物，也可显式上传新文件（最大 10 MiB）或编辑完整
+UTF-8 文本（最大 1 MiB），无需创建 worker。同名上传不覆盖，文本保存会检查版本；
+冲突或回执不确定时保留草稿。这些操作不会把文件发送给模型。详情见
+[文件与产物预览](web-handoff.zh-CN.md#浏览文件与产物)及
+[上传与编辑](web-handoff.zh-CN.md#上传与编辑项目文件)。
 
 ## CLI 使用
 
@@ -158,6 +167,11 @@ hcc native start --peer codex-reviewer --provider codex --resume last
 的连接恢复会话历史，不是附着已有的活动 TUI 或桌面实例。HCC 无法证明外部应用
 没有独立打开同一个保存会话，因此不要同时在 owned runtime 外写入该会话。
 
+新保存的 worker 还记录工作目录的文件系统身份；即使路径文字未变，恢复前也必须
+重新匹配该身份。缺少此证据的旧 worker 仍可在 HCC 历史中读取，但不能自动恢复；
+人工核验与关联流程尚未实现。Web 历史会先标为不可恢复，native 服务在实际接纳时
+再次校验。
+
 worker 获得明确的 `HCC_ROOT`、`HCC_DB`、`HCC_PEER`、`HCC_NATIVE_OWNER`。provider hook
 必须匹配该 peer 的 native transport owner。native hook 路径只刷新 owner 心跳和续
 期其锁，不覆盖 provider binding 或进程身份、不再次注入 inbox、不 ACK 消息，也
@@ -237,7 +251,8 @@ Web 刷新执行状态时在页面内存中保留填写内容；提交、请求�
 - 尚未实现接管或 attach 已有 Codex/Claude/dsh TUI、桌面会话；这些会话继续使用原
   transport。
 - Web 可新建 Codex、Claude、dsh native worker，也可发现并控制同一项目的现有 worker，
-  提供消息、回执、中断和明确关闭。Web 新建入口暂不提供 native resume，恢复使用 CLI。
+  提供消息、回执、中断和明确关闭。“历史”提供 HCC 保留事件与已关闭 worker 的显式恢复；
+  记录不是 provider 完整历史，活跃或停止未确认的 worker 不可从此入口恢复。
   关闭页面或 Web runtime 保留独立 native worker；支持与当前执行器、turn 绑定的人工应答。
   使用方式见 [Web 继续本地任务](web-handoff.zh-CN.md#本地-native-worker-接手)。
 - Codex、Claude 和 dsh native worker 自动获得项目与 peer 受限的 HCC MCP；

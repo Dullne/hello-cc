@@ -151,7 +151,17 @@ test('actual isolated tmux server starts the pane in the selected directory', as
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   assert.equal(monitor.pending(), false, 'bootstrap did not acknowledge checked chdir');
-  assert.equal(fs.readFileSync(output, 'utf8'), `${fs.realpathSync(selected)}\nOLD`);
+  // The bootstrap ACK precedes execve. Wait for the fixture command's full
+  // output as separate evidence instead of racing the newly started shell.
+  const expectedOutput = `${fs.realpathSync(selected)}\nOLD`;
+  let paneOutput = '';
+  while (Date.now() < deadline) {
+    try { paneOutput = fs.readFileSync(output, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (paneOutput === expectedOutput) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(paneOutput, expectedOutput, 'pane command did not finish writing its directory evidence');
   assert.equal(fs.existsSync(canary), false, 'a shell startup hook ran before the pinned bootstrap');
   assert.deepEqual(fs.readdirSync(trusted), []);
 });

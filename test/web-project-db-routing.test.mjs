@@ -148,6 +148,36 @@ test('POST /api/projects defaults to the selected root DB and validates explicit
   assert.equal(rejected.status, 403);
   assert.equal(rejected.body.error.code, 'PROJECT_PATH_FORBIDDEN');
   assert.equal(fs.existsSync(outside), false);
+  const freshRoot = path.join(f.sandbox, 'not-selected');
+  fs.mkdirSync(freshRoot);
+  const denied = await postProject(routes, { root: freshRoot, db: outside });
+  assert.equal(denied.status, 403);
+  assert.equal(fs.existsSync(path.join(freshRoot, '.hello-cc')), false,
+    'invalid database selection must not create project state');
+});
+
+test('browser HTTP and WebSocket requests carry the selected directory identity', (t) => {
+  const f = fixture(t);
+  const target = `/api/projects/select?root=${encodeURIComponent(f.otherRoot)}`;
+  const selected = f.projects.projectFromRequest({ method: 'POST', headers: {} },
+    new URL(target, 'http://localhost:8787'), { requireIdentity: true });
+  const identity = f.projects.selectedProjectIdentity(selected);
+  const api = new URL(`/api/runtime?root=${encodeURIComponent(f.otherRoot)}`, 'http://localhost:8787');
+  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, api,
+    { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
+    api, { requireIdentity: true }).root, selected.root);
+  const ws = new URL(`/ws/terminal/peer?root=${encodeURIComponent(f.otherRoot)}&browser=1&root_identity=${identity}`,
+    'http://localhost:8787');
+  assert.equal(f.projects.projectFromRequest({ headers: {} }, ws).root, selected.root);
+  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': 'different' } }, ws),
+    { code: 'PROJECT_PATH_CHANGED' });
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-moved`);
+  fs.mkdirSync(f.otherRoot);
+  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
+    api, { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, ws), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(f.connections.length, 0, 'identity checks must not open a project database');
 });
 
 test('a selected Web project cannot reconnect or expose its old managed session after A is rebound to B', {

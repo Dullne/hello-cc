@@ -10,6 +10,8 @@ import { createNativeLauncher } from '../lib/runtime/native/launcher.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { redactSecrets } from '../lib/shared/redact.mjs';
+import { createNativeTestRoot } from './helpers/native-root.mjs';
 
 async function until(check) {
   const deadline = Date.now() + 5000;
@@ -17,8 +19,8 @@ async function until(check) {
   assert.fail('native daemon did not finish shutdown');
 }
 
-function fixture(t) {
-  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-launcher-')));
+async function fixture(t) {
+  const directory = await createNativeTestRoot('hcc-native-launcher-', { projectSubdir: 'empty project' });
   const root = path.join(directory, 'empty project'), home = path.join(directory, 'home');
   fs.mkdirSync(root); fs.mkdirSync(home);
   const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
@@ -32,6 +34,22 @@ function fixture(t) {
         if (children.length) await until(() => !readNativePointer(ctx));
       }
     } finally {
+      // Preserve bounded public failure evidence before this fixture removes
+      // its private runtime log; never publish the complete log or pointer.
+      const exitCodes = children.map(child => child.exitCode).filter(code => Number.isInteger(code) && code !== 0);
+      if (exitCodes.length) {
+        try {
+          const lines = fs.readFileSync(path.join(root, '.hello-cc', 'native', 'runtime.log'), 'utf8')
+            .slice(-8192).split(/\r?\n/);
+          const errors = lines.filter(line => /^(?:hcc:|HCC_PINNED_|\{"code":)/.test(line)).slice(-6).map(line => {
+            try { const value = JSON.parse(line); return { code: value.code, message: value.message }; }
+            catch { return { code: line.match(/^(HCC_PINNED_[A-Z_]+)/)?.[1] || null, message: line }; }
+          });
+          t.diagnostic(JSON.stringify(redactSecrets({ nativeRuntimeFailure: { exitCodes, errors } })));
+        } catch (error) {
+          t.diagnostic(JSON.stringify({ nativeRuntimeFailure: { exitCodes, logReadError: error.code || 'UNKNOWN' } }));
+        }
+      }
       // Only children created by this fixture are eligible for fallback cleanup.
       for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
       fs.rmSync(directory, { recursive: true, force: true });
@@ -41,7 +59,7 @@ function fixture(t) {
 }
 
 test('shared native launcher starts a real empty-project daemon once and reuses it across competing launchers', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const firstLauncher = createNativeLauncher({ env: f.env, spawnProcess: f.spawnProcess, pollMs: 25 });
   // A second factory has no shared promise map: coordination must use the
   // loopback launch lock, just as independent CLI/Web processes do.
@@ -59,7 +77,7 @@ test('shared native launcher starts a real empty-project daemon once and reuses 
 });
 
 test('failed native launch releases its reservation and a later explicit attempt observes a fresh failure', async t => {
-  const f = fixture(t); let attempts = 0;
+  const f = await fixture(t); let attempts = 0;
   const ensure = createNativeLauncher({ env: f.env, pollMs: 5, spawnProcess() {
     attempts++;
     const child = new EventEmitter(); child.unref = () => {};
@@ -72,7 +90,7 @@ test('failed native launch releases its reservation and a later explicit attempt
 });
 
 test('native daemon never starts on a replacement root between capture and child spawn', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const original = `${f.ctx.root}-original`;
   let replaced = false;
   const ensure = createNativeLauncher({ env: f.env, pollMs: 10,
@@ -89,7 +107,7 @@ test('native daemon never starts on a replacement root between capture and child
 });
 
 test('native launcher rejects a root replaced after the CLI selected it', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const selected = captureSelectedCwdSnapshot(f.ctx.root);
   fs.renameSync(f.ctx.root, `${f.ctx.root}-original`);
   fs.mkdirSync(f.ctx.root);
@@ -100,7 +118,7 @@ test('native launcher rejects a root replaced after the CLI selected it', async 
 });
 
 test('native launcher refuses a stopping or mismatched daemon instead of spawning a replacement', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   writeNativePointer(f.ctx, { root: f.ctx.root, meshDb: f.ctx.dbPath, pid: process.pid,
     port: 1, token: 'x'.repeat(64), generation: 'test-generation' });
   let calls = 0;

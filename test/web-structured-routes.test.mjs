@@ -179,8 +179,8 @@ async function fixture(t, hooks = {}) {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const base = 'http://127.0.0.1:' + server.address().port;
-  const request = async (route, input, headers = {}) => {
-    const response = await fetch(base + route, { method: input === undefined ? 'GET' : 'POST',
+  const request = async (route, input, headers = {}, method = input === undefined ? 'GET' : 'POST') => {
+    const response = await fetch(base + route, { method,
       headers: { 'X-HCC-API-Version': '2', Origin: base, 'Content-Type': 'application/json', ...headers },
       ...(input === undefined ? {} : { body: JSON.stringify(input) }) });
     return { status: response.status, body: await response.json() };
@@ -218,6 +218,67 @@ test('POST sessions creates and returns each native provider view without termin
   assert.equal(f.nativePosts.length, 3); assert.equal(f.codexAdapters.length, 0); assert.equal(f.ptySpawns.length, 0);
   const listed = await f.request('/api/sessions');
   assert.equal(listed.body.sessions.length, 3);
+});
+
+test('project defaults HTTP uses revision CAS, rejects cross-origin writes and applies only to new native sessions', async t => {
+  const f = await fixture(t); fs.mkdirSync(path.join(f.ctx.root, 'work'));
+  const response = await f.request('/api/agent-defaults'), settings = response.body;
+  assert.equal(response.status, 200); assert.equal(settings.revision, 0);
+  settings.defaultProvider = 'dsh'; settings.providers.dsh = { model: 'default-dsh-model', cwd: 'work' };
+  assert.equal((await f.request('/api/agent-defaults', settings, { Origin: 'https://different.example' }, 'PUT')).status, 403);
+  assert.equal((await f.request('/api/agent-defaults', { ...settings, secret: 'not accepted' }, {}, 'PUT')).status, 400);
+  const saved = await f.request('/api/agent-defaults', settings, {}, 'PUT'); assert.equal(saved.status, 200); assert.equal(saved.body.revision, 1);
+  const conflict = await f.request('/api/agent-defaults', settings, {}, 'PUT');
+  assert.equal(conflict.status, 409); assert.equal(conflict.body.error.code, 'AGENT_DEFAULTS_CONFLICT');
+  const inherited = await f.request('/api/sessions', { transport: 'native' });
+  assert.equal(inherited.status, 200); assert.match(inherited.body.session.id, /^native-dsh-/);
+  assert.equal(f.nativePosts.at(-1).body.provider, 'dsh'); assert.equal(f.nativePosts.at(-1).body.model, 'default-dsh-model');
+  assert.equal(f.nativePosts.at(-1).body.cwd, path.join(f.ctx.root, 'work'));
+  const cleared = await f.request('/api/sessions', { transport: 'native', kind: 'dsh', model: null, cwd: '.' });
+  assert.equal(cleared.status, 200); assert.equal(Object.hasOwn(f.nativePosts.at(-1).body, 'model'), false);
+  assert.equal(f.nativePosts.at(-1).body.cwd, f.ctx.root);
+  const appServer = await f.request('/api/sessions', { transport: 'app-server', kind: 'codex' });
+  assert.equal(appServer.status, 200); assert.equal(appServer.body.session.type, 'app-server');
+  assert.equal((await f.request('/api/agent-defaults')).body.revision, 1);
+});
+
+test('native history HTTP exposes retained project records and restores only an explicitly confirmed saved identity', async t => {
+  const f = await fixture(t); await f.nativeSession('history-a');
+  let listing = await f.request('/api/native/history');
+  assert.equal(listing.status, 200); assert.equal(listing.body.workers[0].resumeReason, 'active');
+  assert.equal(listing.body.retention.complete, false);
+  await f.api('POST', '/close', { peer: 'history-a' });
+  listing = await f.request('/api/native/history');
+  const row = listing.body.workers[0]; assert.equal(row.resumable, true);
+  const detail = await f.request('/api/native/history/history-a?after=0');
+  assert.equal(detail.status, 200); assert.equal(detail.body.worker.peer, 'history-a'); assert.ok(Array.isArray(detail.body.events));
+  const input = { owner: row.owner, sessionId: row.sessionId, confirmed: true };
+  assert.equal((await f.request('/api/native/history/history-a/resume', { ...input, confirmed: false })).status, 400);
+  assert.equal((await f.request('/api/native/history/history-a/resume', { ...input, cwd: f.ctx.root })).status, 400);
+  assert.equal((await f.request('/api/native/history/history-a/resume', input, { Origin: 'https://different.example' })).status, 403);
+  assert.equal(f.nativePosts.length, 0);
+  const restored = await f.request('/api/native/history/history-a/resume', input);
+  assert.equal(restored.status, 200); assert.equal(restored.body.session.id, 'history-a');
+  assert.equal(restored.body.session.threadId, row.sessionId);
+  const repeated = await f.request('/api/native/history/history-a/resume', input);
+  assert.equal(repeated.status, 409); assert.equal(repeated.body.error.code, 'NATIVE_OWNER_CHANGED');
+  assert.equal(f.nativePosts.length, 1);
+  for (const cursor of ['-1', '1.5', '1e2', '9007199254740992']) {
+    assert.equal((await f.request('/api/native/history/history-a?after=' + cursor)).status, 400);
+  }
+});
+
+test('restored worker HTTP view failures preserve recovery identity without another provider admission', async t => {
+  const f = await fixture(t); await f.nativeSession('history-a'); await f.api('POST', '/close', { peer: 'history-a' });
+  const row = (await f.request('/api/native/history')).body.workers[0];
+  f.setNativeReadHook(() => { throw new CliError('NATIVE_RUNTIME_OFFLINE', 'temporary view failure'); });
+  const response = await f.request('/api/native/history/history-a/resume', { owner: row.owner, sessionId: row.sessionId, confirmed: true });
+  assert.equal(response.status, 409); assert.equal(response.body.error.code, 'NATIVE_WORKER_DISCOVERY_FAILED');
+  assert.equal(response.body.error.extra.peer, row.peer); assert.equal(response.body.error.extra.created, true);
+  assert.ok(response.body.error.extra.executorId); assert.notEqual(response.body.error.extra.executorId, row.owner);
+  f.setNativeReadHook(null);
+  assert.ok((await f.request('/api/sessions')).body.sessions.some(session => session.id === row.peer));
+  assert.equal(f.nativePosts.length, 1);
 });
 
 test('native initialization failures retain their error code and give actionable guidance for the saved peer', async t => {

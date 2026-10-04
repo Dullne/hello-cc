@@ -12,6 +12,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runSessionToolsChecks } from './web-session-tools-checks.mjs';
 import { runFilePreviewChecks } from './web-file-preview-checks.mjs';
+import { runNativeHandoffChecks } from './web-native-handoff-checks.mjs';
+import { createNativeFixtureRoot } from './native-fixture-root.mjs';
 
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
@@ -43,7 +45,7 @@ const [{ createEventHelpers }, { createPeerHelpers }, { createPeerBindingStore }
   load('lib/runtime/native/service.mjs'), load('lib/runtime/native/client.mjs')
 ]);
 const { API_VERSION } = await load('lib/web/api-version.mjs');
-const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-workbench-fixture-')));
+const sandbox = await createNativeFixtureRoot('hcc-workbench-fixture-', { projectSubdir: 'project with spaces' });
 const root = path.join(sandbox, 'project with spaces'), taskHome = path.join(sandbox, 'home'), bin = path.join(sandbox, 'bin');
 for (const folder of [root, taskHome, bin]) fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
 const socket = 'hcc-workbench-' + randomUUID();
@@ -63,7 +65,7 @@ function hashes() {
       for (const name of fs.readdirSync(target).sort()) walk(path.join(relative, name));
     } else result[relative] = createHash('sha256').update(fs.readFileSync(target)).digest('hex');
   }
-  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs']) walk(name);
+  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/native-fixture-root.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs', 'scripts/web-native-handoff-checks.mjs']) walk(name);
   return result;
 }
 const evidence = {
@@ -84,7 +86,7 @@ function hcc(...command) {
 const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
 const events = createEventHelpers(), bindings = createPeerBindingStore(events), peers = createPeerHelpers({ ...events, now: () => Math.floor(Date.now() / 1000) });
 const deps = { ...events, ...bindings, ...peers, ...createMessageStore(events), connect: () => new DatabaseSync(ctx.dbPath), detectBranch: () => '', liveProcessIdentity: pid => inspectProcessIdentity(pid).identity };
-const adapters = new Map();
+const adapters = new Map(), adaptersByPeer = new Map();
 let service, browser, runtime = false, tmux;
 const api = (method, route, body) => nativeRequest(ctx, method, route, body);
 const port = await new Promise((resolve, reject) => {
@@ -347,11 +349,12 @@ try{
  assert.ok(tmux && fs.existsSync(tmux), 'Install tmux or set HCC_ACCEPTANCE_TMUX');
  const quotedTmux = "'" + tmux.replaceAll("'", "'\"'\"'") + "'";
  fs.writeFileSync(path.join(bin,'tmux'),'#!/bin/sh\nexec '+quotedTmux+' -L '+socket+' "$@"\n',{mode:0o700});
- hcc('up','--no-discover','--no-guidance');runtime=true;
+ hcc('up','--no-discover','--no-guidance');
  service=await startNativeService(ctx,deps,{pollMs:60000,adapterFactory:async(provider,options)=>{
-  const state={provider,status:'idle',sessionId:'qa-'+provider,turnId:null,capabilities:{send:true,interrupt:true,close:true}};
-  const adapter={snapshot:()=>structuredClone(state),capabilities:state.capabilities,async open(){return this.snapshot();},async send(input){this.sent=(this.sent||0)+1;state.status='running';state.turnId='qa-turn';this.active=input;return{status:'queued',turnId:state.turnId};},async interrupt(){state.status='idle';state.turnId=null;},async close(){state.status='closed';},emit(value){options.onEvent({provider,sessionId:state.sessionId,turnId:'qa-turn',...value});},state};
-  adapters.set(provider,adapter);return adapter;
+  const peer=options.env.HCC_PEER;
+  const state={provider,status:'idle',sessionId:peer,turnId:null,executorId:options.executorId,capabilities:{send:true,interrupt:true,close:true,resume:true}};
+  const adapter={opens:[],snapshot:()=>structuredClone(state),capabilities:state.capabilities,async open(input={}){this.opens.push(structuredClone(input));if(input.sessionId)state.sessionId=input.sessionId;return this.snapshot();},async send(input){this.sent=(this.sent||0)+1;state.status='running';state.turnId='qa-turn';this.active=input;return{status:'queued',turnId:state.turnId};},async interrupt(){state.status='idle';state.turnId=null;},async close(){state.status='closed';},emit(value){options.onEvent({provider,sessionId:state.sessionId,turnId:'qa-turn',...value});},state};
+  adapters.set(provider,adapter);adaptersByPeer.set(peer,adapter);return adapter;
  }});
  for(const provider of ['codex','claude','dsh'])await api('POST','/workers',{peer:'qa-'+provider,provider});
  hcc('task','create','--title','统一 native 对话工作台');hcc('task','claim','--id','1','--peer','qa-codex');
@@ -389,11 +392,16 @@ try{
  assert.equal(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+2),true);const composer=await p.locator('.native-composer').boundingBox();assert.ok(composer.height>0&&composer.y+composer.height<=845);await shot(p,'mobile-native-conversation');check('390px mobile, both languages and themes, visible composer');
  await p.setViewportSize({width:1024,height:768});assert.equal(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+2),true);check('1024px tablet no horizontal overflow');
  await runSessionToolsChecks({page:p,adapters,root,check,shot});
- const invalidContext = await context.request.get(base + '/api/context/files?root=' + encodeURIComponent(root) + '&query=..%2F', {headers:{'X-HCC-API-Version':String(API_VERSION)}});
- assert.equal(invalidContext.status(),400);assert.equal((await invalidContext.json()).error.code,'INVALID_CONTEXT_QUERY');check('authenticated invalid context query returns HTTP 400');
+ const contextQuery = base + '/api/context/files?root=' + encodeURIComponent(root) + '&query=..%2F';
+ const unboundContext = await context.request.get(contextQuery, {headers:{'X-HCC-API-Version':String(API_VERSION)}});
+ assert.equal(unboundContext.status(),409);assert.equal((await unboundContext.json()).error.code,'PROJECT_PATH_CHANGED');
+ const projectIdentity = await p.evaluate(() => window.hccHandoff.projectIdentity);
+ const invalidContext = await context.request.get(contextQuery, {headers:{'X-HCC-API-Version':String(API_VERSION),'X-HCC-Root-Identity':projectIdentity,'X-HCC-Browser':'1'}});
+ assert.equal(invalidContext.status(),400);assert.equal((await invalidContext.json()).error.code,'INVALID_CONTEXT_QUERY');check('unbound cookie query is rejected; bound invalid context query returns HTTP 400');
  await extendedChecks(p,context);
  await projectLifecycleChecks();
  await runFilePreviewChecks({browser,base,token:env.HCC_WEB_TOKEN,sandbox,registerPage:p,adapters,check,shot,watch,browserInstrumentation,evidence});
+ await runNativeHandoffChecks({browser,base,token:env.HCC_WEB_TOKEN,adaptersByPeer,api,service,select,check,shot,watch,browserInstrumentation,evidence,stopWeb:()=>{hcc('down');runtime=false;}});
  assert.deepEqual(evidence.errors,[]);assert.deepEqual(evidence.console,[]);assert.deepEqual(hashes(),evidence.sourceFiles);check('zero browser errors and unchanged source hash during acceptance');evidence.success=true;
 } catch (error) {
   evidence.success = false; evidence.failure = { message: error.message, stack: error.stack };

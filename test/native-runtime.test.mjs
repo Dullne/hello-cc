@@ -499,3 +499,103 @@ test('native ownership loss fences a second start and closes only the owned prov
   await until(() => f.adapters.get('a').closed === 1 && readNativePointer(f.ctx) === null);
   await f.service.shutdown();
 });
+
+test('native resume rejects a rebound cwd and unverified legacy identity before reserving a peer', async (t) => {
+  const f = await fixture(t);
+  const selected = path.join(f.ctx.root, 'selected');
+  fs.mkdirSync(selected);
+  await f.start('rebound', { cwd: selected });
+  await f.api('POST', '/close', { peer: 'rebound' });
+  const store = createNativeStore(f.ctx);
+  try {
+    const saved = store.worker('rebound');
+    assert.equal(JSON.parse(saved.cwd_identity).version, 1);
+    assert.equal(JSON.parse(saved.cwd_identity).canonical, selected);
+  } finally { store.close(); }
+  const binding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='rebound'").get();
+  fs.renameSync(selected, path.join(f.ctx.root, 'original'));
+  fs.mkdirSync(selected);
+  await assert.rejects(f.start('rebound', { resume: 'last' }),
+    { code: 'PROJECT_PATH_CHANGED' });
+  assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='rebound'").get(), binding);
+
+  await f.start('legacy');
+  await f.api('POST', '/close', { peer: 'legacy' });
+  const legacyStore = createNativeStore(f.ctx);
+  try { legacyStore.db.prepare("UPDATE workers SET cwd_identity=NULL WHERE peer='legacy'").run(); }
+  finally { legacyStore.close(); }
+  await assert.rejects(f.start('legacy', { resume: 'last' }), { code: 'NATIVE_HISTORY_UNVERIFIED' });
+});
+
+test('a live native service refuses new workers after its selected root is replaced', async (t) => {
+  const f = await fixture(t);
+  const pointer = readNativePointer(f.ctx);
+  const original = `${f.ctx.root}-original`;
+  const replacement = `${f.ctx.root}-replacement`;
+  fs.renameSync(f.ctx.root, original);
+  fs.mkdirSync(f.ctx.root);
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const request = http.request({ host: '127.0.0.1', port: pointer.port,
+        path: '/workers', method: 'POST', headers: {
+          authorization: `Bearer ${pointer.token}`, 'content-type': 'application/json'
+        } }, res => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(data) }));
+      });
+      request.on('error', reject);
+      request.end(JSON.stringify({ peer: 'new', provider: 'codex' }));
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, 'PROJECT_PATH_CHANGED');
+  } finally {
+    fs.renameSync(f.ctx.root, replacement);
+    fs.renameSync(original, f.ctx.root);
+    fs.rmSync(replacement, { recursive: true, force: true });
+  }
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM peers').get().n, 0);
+});
+
+test('native worker admission rejects a project swap while adapter.open is awaiting', async t => {
+  const gate = deferred();
+  const f = await fixture(t, { pending: { openGate: gate } });
+  const opening = f.start('pending');
+  await until(() => f.adapters.has('pending'));
+  const original = `${f.ctx.root}-original`;
+  const replacement = `${f.ctx.root}-replacement`;
+  fs.renameSync(f.ctx.root, original);
+  fs.mkdirSync(f.ctx.root);
+  try {
+    gate.resolve();
+    await assert.rejects(opening, { code: 'PROJECT_PATH_CHANGED' });
+  } finally {
+    gate.resolve();
+    fs.renameSync(f.ctx.root, replacement);
+    fs.renameSync(original, f.ctx.root);
+    fs.rmSync(replacement, { recursive: true, force: true });
+  }
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM events WHERE type='native.worker.opened'").get().n, 0);
+});
+
+test('guarded resume admission requires a closed matching owner while unfenced CLI resume remains available', async t => {
+  const f = await fixture(t); await f.start('a');
+  const binding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='a'").get();
+  const resumeFence = { owner: binding.runtime_target, sessionId: binding.provider_session_id };
+  await assert.rejects(f.start('a', { resume: 'last', resumeFence }), { code: 'NATIVE_WORKER_EXISTS' });
+  const activeBinding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='a'").get();
+  for (const field of ['peer', 'provider', 'provider_session_id', 'transport', 'runtime_target']) {
+    assert.equal(activeBinding[field], binding[field], field);
+  }
+  await f.api('POST', '/close', { peer: 'a' });
+  // Closing legitimately refreshes updated_at. Compare refused admissions
+  // against the closed binding, even if shutdown crossed a clock second.
+  const closedBinding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='a'").get();
+  await assert.rejects(f.start('a', { resume: 'last', resumeFence: { ...resumeFence, owner: 'wrong-owner' } }), { code: 'NATIVE_OWNER_CHANGED' });
+  const store = createNativeStore(f.ctx);
+  try { store.db.prepare("UPDATE workers SET status='disconnected' WHERE peer='a'").run(); } finally { store.close(); }
+  await assert.rejects(f.start('a', { resume: 'last', resumeFence }), { code: 'NATIVE_RESUME_NOT_READY' });
+  assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='a'").get(), closedBinding);
+  await f.start('a', { resume: 'last' });
+  assert.equal((await f.api('GET', '/status')).workers[0].session_id, resumeFence.sessionId);
+});

@@ -137,10 +137,17 @@ export async function runFilePreviewChecks({ browser, base, token, sandbox, regi
     pdfScope: 'Typed PDF Blob, iframe handoff and downloaded bytes; browser PDF viewer internals and OS rendering are not asserted'
   };
   const pass = (id, label) => { receipt.checks.push(id); check('file preview: ' + label); };
+  const previousProject = await registerPage.evaluate(() => window.hccHandoff.projectRoot);
   for (const project of [first, second]) {
-    const added = await registerPage.evaluate(project => window.hccHandoff.api('/api/projects', { method: 'POST', body: JSON.stringify({ root: project }) }), project);
-    assert.equal(added.project.root, project);
+    await registerPage.locator('#openProjectDialog').click();
+    await registerPage.locator('#projectPath').fill(project);
+    await registerPage.locator('#addProjectBtn').click();
+    await registerPage.waitForFunction(project => window.hccHandoff.projectRoot === project &&
+      document.getElementById('projectDialog').hidden, project);
   }
+  await registerPage.locator('#projectSelect').selectOption(previousProject);
+  await registerPage.waitForFunction(project => window.hccHandoff.projectRoot === project &&
+    window.hccHandoff.actionToken && /(已连接|Connected)$/.test(document.getElementById('handoffConnection').textContent), previousProject);
   const context = await browser.newContext({ viewport: receipt.viewports[0], acceptDownloads: true });
   await context.addInitScript(browserInstrumentation);
   // Observe the normal browser Blob handoff. Fetching a blob: URL is outside
@@ -174,8 +181,11 @@ export async function runFilePreviewChecks({ browser, base, token, sandbox, regi
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
   };
   try {
-    await page.goto(base + '/?token=' + token + '&project=' + encodeURIComponent(first));
-    await page.waitForFunction(project => window.hccFiles && window.hccHandoff?.projectRoot === project, first);
+    await page.goto(base + '/?token=' + token);
+    await page.waitForFunction(() => window.hccFiles && window.hccHandoff?.actionToken &&
+      /(已连接|Connected)$/.test(document.getElementById('handoffConnection').textContent));
+    await page.locator('#projectSelect').selectOption(first);
+    await page.waitForFunction(project => window.hccHandoff?.projectRoot === project, first);
     assert.equal(await page.title(), 'hello-cc'); assert.equal(new URL(page.url()).origin, base);
     assert.ok((await page.locator('body').innerText()).includes('hello-cc'));
     assert.equal(await page.locator('vite-error-overlay,nextjs-portal,#webpack-dev-server-client-overlay').count(), 0);
@@ -282,9 +292,11 @@ export async function runFilePreviewChecks({ browser, base, token, sandbox, regi
     await page.locator('#filesClose').click();
     assert.equal(await page.evaluate(() => window.hccHandoff.sessions.length), 0);
     assert.deepEqual([...adapters.keys()], providers); assert.deepEqual(providers.map(provider => adapters.get(provider).sent || 0), sends);
-    assert.deepEqual(hashes(), before); assert.deepEqual(receipt.writeRequests, []);
+    assert.deepEqual(hashes(), before);
+    assert.deepEqual(receipt.writeRequests, [{ method: 'POST', path: '/api/projects/select', project: second }],
+      'Only the explicit project switch may write selection metadata; previews must not mutate files or workers');
     assert.ok(receipt.fileRequests.length > 0 && receipt.fileRequests.every(request => request.method === 'GET' && [first, second].includes(request.project)));
-    pass('readonly', 'preview preserves fixture bytes and makes no writes or Agent sends');
+    pass('readonly', 'preview preserves fixture bytes and makes no file writes or Agent sends');
     assert.deepEqual(receipt.checks, FILE_PREVIEW_CHECKS); receipt.success = true;
   } finally { await context.close(); }
 }

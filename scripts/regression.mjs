@@ -2089,7 +2089,26 @@ function browserSessionCookie(setCookie, endpoint, { expired = false } = {}) {
   return { name: match[1], sid: match[2], cookie: `${match[1]}=${match[2]}` };
 }
 
-async function issueBrowserSessionCookie({ signal } = {}) {
+async function selectCookieProject(baseUrl, cookie, projectRoot = root, { signal } = {}) {
+  const url = new URL('/api/projects/select', baseUrl);
+  url.searchParams.set('root', projectRoot);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Cookie: cookie,
+      Origin: new URL(baseUrl).origin,
+      'X-HCC-API-Version': '2'
+    },
+    signal
+  });
+  const selected = await response.json();
+  if (!response.ok || !selected.project_identity) {
+    fail(`cookie project selection failed: status=${response.status} body=${JSON.stringify(selected)}`);
+  }
+  return selected.project_identity;
+}
+
+async function issueBrowserSessionCookie({ signal, selectProject = true } = {}) {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
   const response = await fetch(new URL('/login', baseUrl), {
@@ -2103,7 +2122,9 @@ async function issueBrowserSessionCookie({ signal } = {}) {
   if (response.status !== 302) {
     fail(`browser session login failed: status=${response.status}`);
   }
-  return { baseUrl, origin: new URL(baseUrl).origin, ...browserSessionCookie(setCookie, baseUrl) };
+  const auth = browserSessionCookie(setCookie, baseUrl);
+  const projectIdentity = selectProject ? await selectCookieProject(baseUrl, auth.cookie, root, { signal }) : null;
+  return { baseUrl, origin: new URL(baseUrl).origin, ...auth, projectIdentity };
 }
 
 export async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
@@ -2117,6 +2138,7 @@ export async function cookieRuntimeFetch(route, auth, options = {}, params = {})
       Cookie: auth.cookie,
       Origin: auth.origin,
       'X-HCC-API-Version': '2',
+      ...(auth.projectIdentity ? { 'X-HCC-Root-Identity': auth.projectIdentity } : {}),
       ...(options.headers || {})
     }
   });
@@ -2132,6 +2154,7 @@ async function cookieRuntimeFetchWithoutOrigin(route, auth, options = {}, params
     headers: {
       Cookie: auth.cookie,
       'X-HCC-API-Version': '2',
+      ...(auth.projectIdentity ? { 'X-HCC-Root-Identity': auth.projectIdentity } : {}),
       ...(options.headers || {})
     }
   });
@@ -2157,9 +2180,10 @@ async function expectSocketMarkerAfter(ws, marker, action) {
   });
 }
 
-async function openCookieTerminalWebSocket(peer, cookie, params = {}) {
+async function openCookieTerminalWebSocket(peer, cookie, params = {}, selectedProjectIdentity = null) {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
+  const projectIdentity = selectedProjectIdentity || await selectCookieProject(baseUrl, cookie, params.root || root);
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('api_version', '2');
@@ -2171,7 +2195,8 @@ async function openCookieTerminalWebSocket(peer, cookie, params = {}) {
     const ws = trackTerminalControl(new WebSocket(url, {
       headers: {
         Cookie: cookie,
-        Origin: new URL(baseUrl).origin
+        Origin: new URL(baseUrl).origin,
+        'X-HCC-Root-Identity': projectIdentity
       }
     }));
     const timer = setTimeout(() => {
@@ -2261,7 +2286,7 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
 
 async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
   const auth = await issueBrowserSessionCookie();
-  const ws = await openCookieTerminalWebSocket(peer, auth.cookie, params);
+  const ws = await openCookieTerminalWebSocket(peer, auth.cookie, params, auth.projectIdentity);
   try {
     const closed = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`${peer} cookie websocket eviction close timeout`)), 10000);
@@ -2275,7 +2300,7 @@ async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
       });
     });
     for (let offset = 0; offset < 256; offset += 32) {
-      await Promise.all(Array.from({ length: 32 }, () => issueBrowserSessionCookie()));
+      await Promise.all(Array.from({ length: 32 }, () => issueBrowserSessionCookie({ selectProject: false })));
     }
     const closeResult = await closed;
     if (closeResult.code !== 4001 || !closeResult.reason.includes('session limit reached')) {
@@ -2898,7 +2923,7 @@ async function cookieSessionExpiryWorkflow() {
     }
 
     const auth = await issueBrowserSessionCookie();
-    ws = await openCookieTerminalWebSocket(expirySessionId, auth.cookie, { root });
+    ws = await openCookieTerminalWebSocket(expirySessionId, auth.cookie, { root }, auth.projectIdentity);
     if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
     const expiryWindow = createCookieExpiryWindow(COOKIE_EXPIRY_FIXTURE_TTL_SEC * 1000);
     // Listen before waiting so spontaneous expiry is retained. Start the close
@@ -3464,8 +3489,11 @@ async function setupRegression() {
   }
   if (setCookie.includes('Secure')) fail('plaintext LAN exchange issued a Secure cookie');
   const browserAuth = browserSessionCookie(setCookie, baseUrl);
-  // (b) API with the session cookie → 200
-  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: browserAuth.cookie, 'X-HCC-API-Version': '2' } });
+  // (b) API with the session cookie and explicitly selected project → 200
+  const cookieProjectIdentity = await selectCookieProject(baseUrl, browserAuth.cookie);
+  const withCookie = await fetch(`${baseUrl}/api/runtime`, {
+    headers: { Cookie: browserAuth.cookie, 'X-HCC-API-Version': '2', 'X-HCC-Root-Identity': cookieProjectIdentity }
+  });
   if (!withCookie.ok) fail(`API with session cookie required auth: ${withCookie.status}`);
   // (c) API with a bogus session cookie → 401
   const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `${browserAuth.name}=bogus`, 'X-HCC-API-Version': '2' } });
@@ -3477,6 +3505,7 @@ async function setupRegression() {
       Cookie: browserAuth.cookie,
       Origin: `http://127.0.0.1:${port + 1}`,
       'X-HCC-API-Version': '2',
+      'X-HCC-Root-Identity': cookieProjectIdentity,
       'Content-Type': 'application/json'
     },
     body: '{}'
@@ -3494,6 +3523,7 @@ async function setupRegression() {
       Cookie: browserAuth.cookie,
       Origin: new URL(baseUrl).origin,
       'X-HCC-API-Version': '2',
+      'X-HCC-Root-Identity': cookieProjectIdentity,
       'Content-Type': 'application/json'
     },
     body: '{}'
@@ -5098,7 +5128,7 @@ async function multiProjectWebWorkflow() {
     fail(`same-origin cookie administrator create failed or leaked its action token:\n${JSON.stringify(cookieCreated, null, 2)}`);
   }
 
-  const cookieAdminWs = await openCookieTerminalWebSocket(cookieAdminId, cookieAdmin.cookie, { root });
+  const cookieAdminWs = await openCookieTerminalWebSocket(cookieAdminId, cookieAdmin.cookie, { root }, cookieAdmin.projectIdentity);
   try {
     if (!cookieAdminWs.hccActionToken) fail('cookie administrator terminal snapshot omitted its action token');
     const inputRoute = `/api/sessions/${encodeURIComponent(cookieAdminId)}/input`;

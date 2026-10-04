@@ -5,8 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { CliError } from '../lib/shared/errors.mjs';
-import { PROJECT_FILE_LIMITS, listProjectFiles, previewProjectFile } from '../lib/web/project-files.mjs';
+import { PROJECT_FILE_LIMITS, listProjectFiles, previewProjectFile, projectContentRevision,
+  inspectProjectFileStatus, prepareProjectFileParent, verifyProjectFileParent } from '../lib/web/project-files.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 
 async function fixture(t) {
@@ -80,9 +82,11 @@ test('text, Markdown, HTML and extensionless project files return data, while SV
     ['docs/info.md', '# title\n', 'markdown', 'text/markdown'], ['dist/index.html', '<h1>result</h1>', 'html', 'text/html'],
     ['icon.svg', '<svg><script>example()</script></svg>', 'text', 'text/plain'], ['src/app.ts', 'export const n = 1;\n', 'text', 'text/plain']
   ]) {
-    await f.file(name, content);
+    const target = await f.file(name, content), stat = await fs.stat(target, { bigint: true });
     assert.deepEqual(await previewProjectFile(f.root, name), { path: name, name: path.basename(name), size: Buffer.byteLength(content),
-      kind, mime, encoding: 'utf8', content, truncated: false });
+      kind, mime, encoding: 'utf8', content, truncated: false, editable: true,
+      revision: projectContentRevision(stat, Buffer.from(content)), contentHash: createHash('sha256').update(content).digest('hex'),
+      bom: false, newline: content.includes('\n') ? 'lf' : 'none' });
   }
 });
 
@@ -94,6 +98,7 @@ test('unsupported binary files and mismatched media signatures never return a co
     const result = await previewProjectFile(f.root, name);
     assert.equal(result.kind, 'unsupported'); assert.equal(result.content, '');
     assert.equal(result.mime, 'application/octet-stream');
+    assert.equal(result.editable, false); assert.equal(Object.hasOwn(result, 'revision'), false);
   }
 });
 
@@ -107,7 +112,7 @@ test('allowlisted media requires matching magic and returns only base64 JSON dat
     ['report.pdf', Buffer.from('%PDF-1.7\n%%EOF'), 'application/pdf', 'pdf']
   ]) {
     await f.file(name, bytes);
-    assert.deepEqual(await previewProjectFile(f.root, name), { path: name, name, size: bytes.length, kind, mime, encoding: 'base64', content: bytes.toString('base64') });
+    assert.deepEqual(await previewProjectFile(f.root, name), { path: name, name, size: bytes.length, kind, mime, encoding: 'base64', content: bytes.toString('base64'), editable: false });
   }
 });
 
@@ -117,10 +122,83 @@ test('text truncation keeps complete UTF-8 and media limits fail before reading 
   await f.file('large.txt', prefix + '中文');
   const result = await previewProjectFile(f.root, 'large.txt');
   assert.equal(result.truncated, true); assert.equal(result.content, prefix); assert.ok(!result.content.includes('\ufffd'));
+  assert.equal(result.editable, false); assert.equal(Object.hasOwn(result, 'revision'), false);
   await f.file('large.html', '<p>' + 'a'.repeat(PROJECT_FILE_LIMITS.textBytes));
   const html = await previewProjectFile(f.root, 'large.html'); assert.equal(html.kind, 'html'); assert.equal(html.truncated, true);
   const target = await f.file('large.pdf', '%PDF-1.7'); await fs.truncate(target, PROJECT_FILE_LIMITS.mediaBytes + 1);
   await assert.rejects(previewProjectFile(f.root, 'large.pdf'), { code: 'PROJECT_FILE_TOO_LARGE' });
+});
+
+test('editable previews preserve BOM and newlines, while revisions change for metadata or content replacements', async t => {
+  const f = await fixture(t);
+  for (const [name, content, newline] of [['bom.txt', '\ufefffirst\r\nsecond\r\n', 'crlf'],
+    ['mixed.txt', 'first\r\nsecond\nthird\r', 'mixed'], ['empty.txt', '', 'none']]) {
+    const target = await f.file(name, content), first = await previewProjectFile(f.root, name);
+    assert.equal(first.editable, true); assert.equal(first.content, content); assert.equal(first.newline, newline);
+    assert.equal(first.bom, content.startsWith('\ufeff'));
+    assert.deepEqual(Buffer.from(first.content), await fs.readFile(target));
+    assert.match(first.revision, /^v1-[a-f0-9]{64}$/);
+    assert.equal((await previewProjectFile(f.root, name)).revision, first.revision);
+  }
+  const target = await f.file('revision.txt', 'same content'), first = await previewProjectFile(f.root, 'revision.txt');
+  await fs.chmod(target, 0o700);
+  const changedMode = await previewProjectFile(f.root, 'revision.txt');
+  assert.notEqual(changedMode.revision, first.revision); assert.equal(changedMode.contentHash, first.contentHash);
+  await fs.rename(target, target + '.old'); await fs.writeFile(target, 'same content');
+  const replacement = await previewProjectFile(f.root, 'revision.txt');
+  assert.notEqual(replacement.revision, changedMode.revision); assert.equal(replacement.contentHash, first.contentHash);
+  await fs.writeFile(target, 'new content');
+  const changedContent = await previewProjectFile(f.root, 'revision.txt');
+  assert.notEqual(changedContent.revision, replacement.revision); assert.notEqual(changedContent.contentHash, replacement.contentHash);
+});
+
+test('file status reports only a bounded hash of exact bytes and shares private-path restrictions', async t => {
+  const f = await fixture(t), bytes = Buffer.from([0, 255, 1, 2, 13, 10]);
+  await f.file('data.bin', bytes);
+  assert.deepEqual(await inspectProjectFileStatus(f.root, 'data.bin'), {
+    path: 'data.bin', size: bytes.length, contentHash: createHash('sha256').update(bytes).digest('hex')
+  });
+  await f.file('text.txt', '\ufeffhello\r\n');
+  assert.equal((await inspectProjectFileStatus(f.root, 'text.txt')).contentHash, (await previewProjectFile(f.root, 'text.txt')).contentHash);
+  const large = await f.file('large.bin'); await fs.truncate(large, PROJECT_FILE_LIMITS.mediaBytes + 1);
+  await assert.rejects(inspectProjectFileStatus(f.root, 'large.bin'), { code: 'PROJECT_FILE_TOO_LARGE' });
+  for (const relative of ['.env', '.hcc-file-write-private.txt', 'nested/.HCC-FILE-WRITE-private']) {
+    await assert.rejects(inspectProjectFileStatus(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
+    await assert.rejects(prepareProjectFileParent(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
+  }
+  await f.file('.hcc-file-write-private.txt', 'must stay hidden');
+  assert.ok(!(await listProjectFiles(f.root)).entries.some(entry => entry.name.startsWith('.hcc-file-write-')));
+});
+
+test('status refuses changes during its FD read and releases the file handle', async t => {
+  const f = await fixture(t), target = await f.file('status.txt', 'first');
+  const original = fs.open; let opened;
+  fs.open = async (...args) => {
+    const handle = await original(...args);
+    if (args[0] === target) {
+      opened = handle; const read = handle.read.bind(handle);
+      handle.read = async (...input) => { const result = await read(...input); await fs.writeFile(target, 'changed'); return result; };
+    }
+    return handle;
+  };
+  try { await assert.rejects(inspectProjectFileStatus(f.root, 'status.txt'), { code: 'PROJECT_FILE_CHANGED' }); }
+  finally { fs.open = original; }
+  assert.equal(opened.fd, -1);
+});
+
+test('prepared parents hold a read descriptor without creating files and reject directory replacement', async t => {
+  const f = await fixture(t); await f.directory('output');
+  const prepared = await prepareProjectFileParent(f.root, 'output/new.txt');
+  try {
+    assert.equal(prepared.name, 'new.txt'); assert.equal(prepared.snapshot.absolute, path.join(f.root, 'output'));
+    assert.deepEqual(await fs.readdir(prepared.snapshot.absolute), []);
+    assert.equal((await prepared.handle.stat()).isDirectory(), true);
+    await verifyProjectFileParent(prepared.snapshot, prepared.handle);
+    await fs.rename(prepared.snapshot.absolute, prepared.snapshot.absolute + '-old'); await fs.mkdir(prepared.snapshot.absolute);
+    await assert.rejects(verifyProjectFileParent(prepared.snapshot, prepared.handle), { code: 'PROJECT_FILE_CHANGED' });
+  } finally { await prepared.handle.close(); }
+  await fs.symlink('output', path.join(f.root, 'alias'));
+  await assert.rejects(prepareProjectFileParent(f.root, 'alias/new.txt'), { code: 'PROJECT_FILE_FORBIDDEN' });
 });
 
 test('a file replaced between inspection and opening is refused without returning either body', async t => {
