@@ -148,6 +148,19 @@ test('down diagnostics accept only the process observation state enum', () => {
   }
 });
 
+test('down diagnostics retain bounded phase timing without untrusted phase text', () => {
+  for (const stopPhase of ['evidence_unavailable', 'exit_unconfirmed', 'pointer_cleanup_failed', 'pointer_changed']) {
+    const result = fixtureDownResult({ status: 1, stderr: formatJson(false, {
+      code: 'RUNTIME_UNREACHABLE', stopPhase, stopElapsedMs: 8014, confirmationMs: 5
+    }) });
+    assert.deepEqual(result.extra, { stopElapsedMs: 8014, confirmationMs: 5, stopPhase });
+  }
+  const result = fixtureDownResult({ status: 1, stderr: formatJson(false, {
+    code: 'RUNTIME_UNREACHABLE', stopPhase: 'PRIVATE_PHASE', stopElapsedMs: 'PRIVATE_TIME', confirmationMs: -1
+  }) });
+  assert.deepEqual(result.extra, {});
+});
+
 test('fixture down reads the real CLI JSON error channel without exposing stderr', t => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-down-channel-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));

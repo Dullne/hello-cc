@@ -19,6 +19,7 @@ import { redactSecrets } from '../lib/shared/redact.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import { readOwnedReentryOutputAtDeadline, readReentryTrace } from './shim-reentry-probe.mjs';
 import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
+import { parseShutdownDiagnostics } from '../lib/web/shutdown-diagnostics.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -61,6 +62,7 @@ for (const key of Object.keys(env)) {
   if (key.startsWith('HCC_')) delete env[key];
 }
 if (process.env.HCC_REGRESSION_DEBUG === '1') env.HCC_DEBUG = '1';
+env.HCC_SHUTDOWN_DIAGNOSTICS = '1';
 delete env.TMUX;
 delete env.TMUX_PANE;
 
@@ -225,13 +227,15 @@ function fixtureCliResultParts(result) {
 
 export function fixtureDownResult(result) {
   const { diagnostic, extra } = fixtureCliResultParts(result);
-  const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
+  const numeric = ['pid', 'elapsedMs', 'timeoutMs', 'stopElapsedMs', 'confirmationMs'];
   return {
     ...diagnostic,
     extra: {
       ...Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
         Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]])),
-      ...(['live', 'dead', 'unknown'].includes(extra.state) ? { state: extra.state } : {})
+      ...(['live', 'dead', 'unknown'].includes(extra.state) ? { state: extra.state } : {}),
+      ...(['evidence_unavailable', 'exit_unconfirmed', 'pointer_cleanup_failed', 'pointer_changed'].includes(extra.stopPhase)
+        ? { stopPhase: extra.stopPhase } : {})
     }
   };
 }
@@ -276,6 +280,13 @@ function rememberRuntimePid(pid) {
 function collectRuntimeDiagnostic(extra = {}) {
   const diagnostic = { stage: currentStage, pid: runtimePid,
     owner: observeFixtureOwner(runtimeOwner), pointerExists: fs.existsSync(path.join(root, '.hello-cc', 'runtime.json')), ...extra };
+  let logFd;
+  try {
+    logFd = fs.openSync(path.join(root, '.hello-cc', 'web.log'), 'r');
+    const size = fs.fstatSync(logFd).size, bytes = Buffer.alloc(Math.min(size, 65536));
+    fs.readSync(logFd, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
+    diagnostic.shutdownPhases = parseShutdownDiagnostics(bytes.toString('utf8'), runtimePid);
+  } catch {} finally { if (logFd !== undefined) fs.closeSync(logFd); }
   try {
     const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { readOnly: true, timeout: 200 });
     try { diagnostic.events = db.prepare('SELECT id, type FROM events ORDER BY id DESC LIMIT 12').all(); }
@@ -3018,12 +3029,15 @@ async function assertWebWrapperParentSurvives() {
   }
 }
 
-async function stopRuntime() {
+async function stopRuntime({ peerStops = [] } = {}) {
   if (!runtimePid) return;
   const owner = runtimeOwner;
   const before = observeFixtureOwner(owner);
+  const downStarted = performance.now();
   const down = fixtureDownResult(stopFixtureCli());
-  lastStopDiagnostic = { before, down, stack: new Error('stopRuntime').stack.split('\n').slice(1, 7), signals: [] };
+  const downDurationMs = Math.round(performance.now() - downStarted);
+  const afterDown = observeFixtureOwner(owner);
+  lastStopDiagnostic = { before, down, downDurationMs, afterDown, peerStops, stack: new Error('stopRuntime').stack.split('\n').slice(1, 7), signals: [] };
   try {
     await waitForFixtureOwnerExit(owner, 5000);
   } catch (err) {
@@ -6696,9 +6710,12 @@ async function askBroadcastWorkflow() {
 
 async function downGcPackWorkflow() {
   log('[9/13] down/gc/pack');
-  hccMaybe(['peer', 'stop', 'shell-a']);
-  hccMaybe(['peer', 'stop', 'shell-b']);
-  await stopRuntime();
+  const peerStops = ['shell-a', 'shell-b'].map(peer => {
+    const started = performance.now();
+    const result = fixtureDownResult(hccMaybe(['--json', 'peer', 'stop', peer]));
+    return { ...result, durationMs: Math.round(performance.now() - started) };
+  });
+  await stopRuntime({ peerStops });
   await waitFor(() => !fs.existsSync(path.join(root, '.hello-cc', 'runtime.json')), 'runtime cleanup', 5000);
   hcc(['gc', '--older-than', '0', '--yes']);
   const pack = JSON.parse(run('npm', ['pack', '--dry-run', '--json']));
