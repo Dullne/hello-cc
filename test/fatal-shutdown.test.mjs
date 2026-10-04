@@ -240,9 +240,11 @@ test('runtime pointer cleanup requires the exact current pid', (t) => {
 
 test('Web fatal wiring retains one complete session shutdown path', () => {
   const source = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'runtime-main.mjs'), 'utf8');
+  const shutdownStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'shutdown-state.mjs'), 'utf8');
   const serializeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'), 'utf8');
   assert.ok(serializeSource.includes('function closeSessionClients('), 'closeSessionClients moved to session-serialize.mjs');
   assert.match(source, /createFatalShutdownController/);
+  assert.match(source, /cleanupRuntimeState\(\{ ctx, sessions, connectWebProject, now, ownerIdentity: processIdentity \}\)/);
   assert.doesNotMatch(source, /kept alive|crashWindowStart|crashCount/);
   assert.match(source, /process\.on\('uncaughtException',[\s\S]*fatalController\.fatal/);
   assert.match(source, /process\.on\('unhandledRejection',[\s\S]*fatalController\.fatal/);
@@ -262,6 +264,6 @@ test('Web fatal wiring retains one complete session shutdown path', () => {
     'wss.close()',
     'server.close('
   ]) {
-    assert.ok(source.includes(expected), `Web shutdown lost ${expected}`);
+    assert.ok((source + shutdownStateSource).includes(expected), `Web shutdown lost ${expected}`);
   }
 });

@@ -18,6 +18,7 @@ import { inspectProcessIdentity, compareProcessIdentity } from '../lib/process/i
 import { redactSecrets } from '../lib/shared/redact.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import { readReentryTrace } from './shim-reentry-probe.mjs';
+import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -1956,13 +1957,14 @@ async function fetchTerminalSnapshot(peer, params = {}) {
   });
 }
 
-async function issueBrowserSessionCookie() {
+async function issueBrowserSessionCookie({ signal } = {}) {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
   const response = await fetch(new URL('/login', baseUrl), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token: runtime.token || '' }),
+    signal,
     redirect: 'manual'
   });
   const setCookie = response.headers.get('set-cookie') || '';
@@ -1973,7 +1975,7 @@ async function issueBrowserSessionCookie() {
   return { baseUrl, origin: new URL(baseUrl).origin, sid };
 }
 
-async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
+export async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
   const url = new URL(route, auth.baseUrl);
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
@@ -2766,6 +2768,7 @@ async function cookieSessionExpiryWorkflow() {
     const auth = await issueBrowserSessionCookie();
     ws = await openCookieTerminalWebSocket(expirySessionId, auth.sid, { root });
     if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
+    const expiryWindow = createCookieExpiryWindow(COOKIE_EXPIRY_FIXTURE_TTL_SEC * 1000);
     // Listen before waiting so spontaneous expiry is retained. Start the close
     // deadline only after expiry, and defer rejection to avoid an unhandled
     // error while this fixture is still waiting for the cookie to expire.
@@ -2776,34 +2779,42 @@ async function cookieSessionExpiryWorkflow() {
       ws.once('error', error => resolve({ error }));
     });
 
-    // Issuance precedes the snapshot. Waiting a complete TTL from the snapshot
-    // therefore guarantees expiry even at either side of a whole-second tick.
-    await sleep(COOKIE_EXPIRY_FIXTURE_TTL_SEC * 1000);
+    // A probe-only cookie is issued after the target cookie. Observing its
+    // expiry must not revoke the target socket before its input guard runs.
+    const probeAuth = await expiryWindow.prepare(signal => issueBrowserSessionCookie({ signal }));
+    // Cookie expiry uses the server's wall clock, which can advance more slowly
+    // than this fixture's timer. Observe real expiry within the original total
+    // TTL + close budget before sending input on this same socket.
+    await expiryWindow.waitForHttpExpiry(signal =>
+      cookieRuntimeFetch('/api/runtime', probeAuth, { signal }));
+    if (ws.readyState !== WebSocket.OPEN) fail('target cookie websocket closed before the expired-input check');
     ws.send(JSON.stringify({
       type: 'input',
       data: `echo ${marker}\r`,
       action_token: ws.hccActionToken,
       epoch: ws.hccControl.epoch
     }));
-    const closeResult = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('expired cookie websocket close timeout')), 5000);
-      closed.then(result => {
-        clearTimeout(timer);
-        if (result.error) reject(result.error);
-        else resolve(result);
-      });
+    let closeError = null;
+    const closeResult = await expiryWindow.waitForClose(closed).catch(error => {
+      closeError = error; return null;
     });
-    if (closeResult.code !== 4001 || !closeResult.reason.includes('session expired')) {
-      fail(`expired cookie websocket did not close with 4001/session expired:\n${JSON.stringify(closeResult, null, 2)}`);
-    }
-
+    // Inspect the HTTP and input boundaries even if the close observation
+    // times out; a missing close event must not hide accepted terminal input.
     const expiredHttp = await cookieRuntimeFetch('/api/runtime', auth);
+    const snapshot = await fetchTerminalSnapshot(expirySessionId, { root });
+    const inputRejected = !snapshot.includes(marker);
     if (expiredHttp.status !== 401) {
       fail(`expired browser cookie remained authorized over HTTP: ${expiredHttp.status}`);
     }
-    const snapshot = await fetchTerminalSnapshot(expirySessionId, { root });
-    if (snapshot.includes(marker)) {
+    if (!inputRejected) {
       fail(`expired browser cookie executed terminal input after expiry:\n${snapshot}`);
+    }
+    if (closeError) {
+      fail(`expired cookie websocket close failed: code=${closeError.code || 'CLOSE_FAILED'} httpStatus=${expiredHttp.status} inputRejected=${inputRejected}`);
+    }
+    if (closeResult.error) throw closeResult.error;
+    if (closeResult.code !== 4001 || !closeResult.reason.includes('session expired')) {
+      fail(`expired cookie websocket did not close with 4001/session expired:\n${JSON.stringify(closeResult, null, 2)}`);
     }
   } finally {
     if (ws && ws.readyState !== WebSocket.CLOSED) {
