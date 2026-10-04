@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runSessionToolsChecks } from './web-session-tools-checks.mjs';
 import { runFilePreviewChecks } from './web-file-preview-checks.mjs';
 import { runNativeHandoffChecks } from './web-native-handoff-checks.mjs';
+import { createNativeFixtureRoot } from './native-fixture-root.mjs';
 
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
@@ -44,7 +45,7 @@ const [{ createEventHelpers }, { createPeerHelpers }, { createPeerBindingStore }
   load('lib/runtime/native/service.mjs'), load('lib/runtime/native/client.mjs')
 ]);
 const { API_VERSION } = await load('lib/web/api-version.mjs');
-const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-workbench-fixture-')));
+const sandbox = await createNativeFixtureRoot('hcc-workbench-fixture-', { projectSubdir: 'project with spaces' });
 const root = path.join(sandbox, 'project with spaces'), taskHome = path.join(sandbox, 'home'), bin = path.join(sandbox, 'bin');
 for (const folder of [root, taskHome, bin]) fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
 const socket = 'hcc-workbench-' + randomUUID();
@@ -64,7 +65,7 @@ function hashes() {
       for (const name of fs.readdirSync(target).sort()) walk(path.join(relative, name));
     } else result[relative] = createHash('sha256').update(fs.readFileSync(target)).digest('hex');
   }
-  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs', 'scripts/web-native-handoff-checks.mjs']) walk(name);
+  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/native-fixture-root.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs', 'scripts/web-native-handoff-checks.mjs']) walk(name);
   return result;
 }
 const evidence = {
@@ -348,7 +349,7 @@ try{
  assert.ok(tmux && fs.existsSync(tmux), 'Install tmux or set HCC_ACCEPTANCE_TMUX');
  const quotedTmux = "'" + tmux.replaceAll("'", "'\"'\"'") + "'";
  fs.writeFileSync(path.join(bin,'tmux'),'#!/bin/sh\nexec '+quotedTmux+' -L '+socket+' "$@"\n',{mode:0o700});
- hcc('up','--no-discover','--no-guidance');runtime=true;
+ hcc('up','--no-discover','--no-guidance');
  service=await startNativeService(ctx,deps,{pollMs:60000,adapterFactory:async(provider,options)=>{
   const peer=options.env.HCC_PEER;
   const state={provider,status:'idle',sessionId:peer,turnId:null,executorId:options.executorId,capabilities:{send:true,interrupt:true,close:true,resume:true}};

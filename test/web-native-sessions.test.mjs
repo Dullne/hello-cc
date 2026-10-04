@@ -14,6 +14,7 @@ import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
+import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 import { createNativeStore } from '../lib/runtime/native/store.mjs';
 import { createAgentDefaults } from '../lib/web/agent-defaults.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
@@ -43,6 +44,10 @@ async function fixture(t, configuration = {}) {
   const adapters = new Map(), created = [], bridges = [];
   const options = { pollMs: 60000, adapterFactory: async (provider, options) => {
     const peer = options.env.HCC_PEER;
+    if (configuration[peer]?.codexRpc) {
+      const adapter = createCodexAdapter({ ...options, rpcFactory: () => configuration[peer].codexRpc });
+      adapters.set(peer, adapter); created.push(adapter); return adapter;
+    }
     if (configuration[peer]?.realClaude) {
       const adapter = createClaudeAdapter({ ...options, query: () => { throw new Error('This fixture must not start a model query'); } });
       adapters.set(peer, adapter); created.push(adapter); return adapter;
@@ -95,6 +100,137 @@ async function fixture(t, configuration = {}) {
     receipts: () => mesh.prepare("SELECT type,payload FROM events WHERE type LIKE 'native.web.submission.%' ORDER BY id").all()
       .map((row) => ({ ...row, payload: JSON.parse(row.payload) })) };
 }
+
+function controlledCodexRpc() {
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  const rpc = {
+    async start() {}, async notify() {}, async close() {},
+    async request(method, input) {
+      calls.push(method);
+      if (method === 'initialize') return {};
+      if (method === 'thread/start') { entered(); await gate; return { thread: { id: 'confirmed-codex-session', turns: [] } }; }
+      if (method === 'thread/resume') return { thread: { id: input.threadId, turns: [] } };
+      throw new Error('This fixture must not send a model or account request: ' + method);
+    }
+  };
+  return { rpc, calls, started, release: () => release() };
+}
+
+for (const viaReadAction of [false, true]) for (const applyFreshFirst of [false, true]) {
+  test(`Codex creation preserves its opening Web view when a null-session ${viaReadAction ? 'explicit read' : 'poll snapshot'} arrives late${applyFreshFirst ? ' after a fresh read' : ''}`, async t => {
+    const provider = controlledCodexRpc();
+    const f = await fixture(t, { a: { codexRpc: provider.rpc } });
+    let hold = false, capture, release, captureCreate, releaseCreate, stateReads = 0;
+    const captured = new Promise(resolve => { capture = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const created = new Promise(resolve => { captureCreate = resolve; });
+    const createGate = new Promise(resolve => { releaseCreate = resolve; });
+    t.after(() => { provider.release(); release(); releaseCreate(); });
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      if (method === 'GET' && route.startsWith('/workers/a/state')) stateReads++;
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (method === 'POST' && route === '/workers') { captureCreate(value); await createGate; }
+      if (hold && method === 'GET' && route.startsWith('/workers/a/state')) { hold = false; capture(value); await gate; }
+      return value;
+    });
+    const starting = web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
+    void starting.catch(() => {}); // Keep an earlier lifecycle assertion failure from leaking this pending rejection.
+    await provider.started;
+    await web.discoverNativeSessions(f.ctx);
+    const view = web.session(), client = { fixture: true };
+    view.clients.add(client); view.actionTokens.add('opening-controller');
+    assert.equal(view.nativeIdentity.sessionId, null);
+    assert.equal(view.nativeSnapshot().status, 'opening');
+    hold = true;
+    const reading = viaReadAction ? web.nativeAction(view, 'read') : web.discoverNativeSessions(f.ctx);
+    const stale = await captured;
+    assert.equal(stale.snapshot.sessionId, null);
+    provider.release();
+    const receipt = await created;
+    assert.equal(receipt.sessionId, 'confirmed-codex-session');
+    if (applyFreshFirst) await web.nativeAction(view, 'read');
+    const readsBeforeRelease = stateReads;
+    release(); await reading;
+    assert.equal(stateReads, readsBeforeRelease + 1, 'initialization confirmation uses one extra state read');
+    releaseCreate();
+    assert.equal(await starting, view);
+    assert.equal(web.session(), view);
+    assert.equal(view.nativeRetired, undefined);
+    assert.equal(view.nativeIdentity.sessionId, receipt.sessionId);
+    assert.equal(view.nativeIdentity.owner, receipt.executorId);
+    assert.equal(view.nativeSnapshot().connected, true);
+    assert.equal(view.nativeSnapshot().status, 'idle');
+    assert.equal(view.clients.has(client), true);
+    assert.equal(view.actionTokens.has('opening-controller'), true);
+    assert.equal(web.closedClients.includes(view), false);
+    assert.equal(f.created.length, 1);
+    assert.deepEqual(provider.calls, ['initialize', 'thread/start']);
+  });
+}
+
+for (const replaceService of [false, true]) {
+  test(`Codex initialization confirmation rejects a ${replaceService ? 'service generation' : 'worker owner'} replaced before the second read`, async t => {
+    const provider = controlledCodexRpc();
+    const f = await fixture(t, { a: { codexRpc: provider.rpc } });
+    let hold = false, replace = false, capture, release, captureCreate, releaseCreate;
+    const captured = new Promise(resolve => { capture = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const created = new Promise(resolve => { captureCreate = resolve; });
+    const createGate = new Promise(resolve => { releaseCreate = resolve; });
+    t.after(() => { provider.release(); release(); releaseCreate(); });
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      if (replace && method === 'GET' && route.startsWith('/workers/a/state')) {
+        replace = false;
+        if (replaceService) await f.restart();
+        else await f.api('POST', '/close', { peer: 'a' });
+        await f.start('a', { resume: 'last' });
+      }
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (method === 'POST' && route === '/workers') { captureCreate(); await createGate; }
+      if (hold && method === 'GET' && route.startsWith('/workers/a/state')) { hold = false; capture(); await gate; }
+      return value;
+    });
+    const starting = web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
+    void starting.catch(() => {});
+    await provider.started;
+    await web.discoverNativeSessions(f.ctx);
+    const view = web.session(); view.actionTokens.add('old-controller');
+    hold = true;
+    const scanning = web.discoverNativeSessions(f.ctx);
+    await captured;
+    provider.release(); await created;
+    replace = true; release(); await scanning;
+    assert.equal(view.nativeRetired, true);
+    assert.equal(view.nativeSnapshot().error.code, 'NATIVE_OWNER_CHANGED');
+    assert.equal(view.actionTokens.size, 0);
+    releaseCreate();
+    await assert.rejects(starting, { code: 'NATIVE_WORKER_DISCOVERY_FAILED' });
+    await assert.rejects(web.nativeAction(view, 'read'), { code: 'NATIVE_OWNER_CHANGED' });
+    assert.equal(f.mesh.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0);
+  });
+}
+
+test('a nonnull Codex session mismatch is rejected without initialization retry', async t => {
+  const f = await fixture(t); await f.start('a');
+  let mismatch = false, stateReads = 0;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const value = await nativeRequest(ctx, method, route, body, options);
+    if (method === 'GET' && route.startsWith('/workers/a/state')) {
+      stateReads++;
+      if (mismatch) value.snapshot.sessionId = 'different-session';
+    }
+    return value;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const view = web.session(), before = stateReads;
+  mismatch = true;
+  await assert.rejects(web.nativeAction(view, 'read'), { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(stateReads, before + 1);
+  assert.equal(view.nativeRetired, true);
+});
 
 function controlledClaudeSdk() {
   const output = [];
@@ -385,6 +521,178 @@ test('a stale discovery list cannot retire a worker created while its status rea
   assert.equal(web.session(session.id), session);
   assert.equal(session.nativeRetired, undefined);
   assert.equal(session.status, 'running'); assert.equal(web.closedClients.length, 0);
+});
+
+for (const restoring of [false, true]) {
+  test(`a delayed discovery state preserves the connected view established by ${restoring ? 'restore' : 'creation'}`, async t => {
+    const f = await fixture(t);
+    let holdCreate = false, holdScan = false, captureCreate, captureScan, releaseCreate, releaseScan;
+    const created = new Promise(resolve => { captureCreate = resolve; });
+    const scanned = new Promise(resolve => { captureScan = resolve; });
+    const createGate = new Promise(resolve => { releaseCreate = resolve; });
+    const scanGate = new Promise(resolve => { releaseScan = resolve; });
+    t.after(() => { releaseCreate(); releaseScan(); });
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (holdCreate && method === 'POST' && route === '/workers') {
+        holdCreate = false; captureCreate(value); await createGate;
+      }
+      if (holdScan && method === 'GET' && route.startsWith('/workers/a/state')) {
+        holdScan = false; captureScan(value); await scanGate;
+      }
+      return value;
+    });
+    let previous, saved;
+    if (restoring) {
+      await f.start('a'); await web.discoverNativeSessions(f.ctx);
+      previous = web.session();
+      await web.nativeAction(previous, 'close');
+      saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    }
+    holdCreate = true;
+    const opening = restoring
+      ? web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true })
+      : web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
+    const receipt = await created;
+    holdScan = true;
+    const scanning = web.discoverNativeSessions(f.ctx);
+    const captured = await scanned;
+    releaseCreate();
+    const view = await opening;
+    const client = { fixture: true };
+    view.clients.add(client); view.actionTokens.add('current-controller');
+    assert.equal(web.session(), view);
+    assert.equal(captured.owner, receipt.executorId);
+    releaseScan(); await scanning;
+    assert.equal(web.session(), view, 'the connected view survives the delayed discovery response');
+    assert.equal(view.nativeRetired, undefined);
+    assert.equal(view.clients.has(client), true);
+    assert.equal(view.actionTokens.has('current-controller'), true);
+    assert.equal(web.closedClients.includes(view), false);
+    const state = await web.nativeAction(view, 'read');
+    assert.equal(state.owner, receipt.executorId);
+    assert.equal(state.connected, true);
+    await web.nativeAction(view, 'send', { text: 'current controller remains usable', submissionId: 'scan_current_view_1' });
+    assert.equal(f.receipts().filter(row => row.type === 'native.web.submission.queued').length, 1);
+    assert.equal(f.created.length, restoring ? 2 : 1);
+    if (restoring) {
+      assert.equal(previous.nativeRetired, true);
+      assert.equal(view.nativeIdentity.sessionId, saved.sessionId);
+      await assert.rejects(web.nativeAction(previous, 'read'), { code: 'NATIVE_OWNER_CHANGED' });
+    }
+  });
+}
+
+for (const failBeforeRequest of [false, true]) {
+  test(`a delayed old-owner discovery ${failBeforeRequest ? 'request rejection' : 'response'} cannot change the restored view`, async t => {
+    const f = await fixture(t); await f.start('a');
+    let hold = false, capture, release;
+    const captured = new Promise(resolve => { capture = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      const gated = hold && method === 'GET' && route.startsWith('/workers/a/state');
+      if (gated) hold = false;
+      if (gated && failBeforeRequest) { capture(); await gate; }
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (gated && !failBeforeRequest) { capture(); await gate; }
+      return value;
+    });
+    await web.discoverNativeSessions(f.ctx);
+    const previous = web.session();
+    hold = true;
+    const scanning = web.discoverNativeSessions(f.ctx);
+    await captured;
+    await web.nativeAction(previous, 'close');
+    const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    const view = await web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true });
+    const client = { fixture: true };
+    view.clients.add(client); view.actionTokens.add('restored-controller');
+    release(); await scanning;
+    assert.equal(web.session(), view);
+    assert.equal(view.nativeRetired, undefined);
+    assert.equal(view.nativeSnapshot().connected, true);
+    assert.equal(view.clients.has(client), true);
+    assert.equal(view.actionTokens.has('restored-controller'), true);
+    assert.equal(web.closedClients.includes(view), false);
+    assert.equal(previous.nativeRetired, true);
+    await assert.rejects(web.nativeAction(previous, 'read'), { code: 'NATIVE_OWNER_CHANGED' });
+    assert.equal((await web.nativeAction(view, 'read')).owner, view.nativeIdentity.owner);
+  });
+}
+
+for (const retireView of [false, true]) {
+  test(`a delayed discovery state cannot revive a ${retireView ? 'retired' : 'closed'} view after its executor closed`, async t => {
+    const f = await fixture(t); await f.start('a');
+    let hold = false, capture, release;
+    const captured = new Promise(resolve => { capture = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (hold && method === 'GET' && route.startsWith('/workers/a/state')) {
+        hold = false; capture(); await gate;
+      }
+      return value;
+    });
+    await web.discoverNativeSessions(f.ctx);
+    const view = web.session();
+    view.actionTokens.add('original-controller');
+    hold = true;
+    const scanning = web.discoverNativeSessions(f.ctx);
+    await captured;
+    await web.nativeAction(view, 'close');
+    if (retireView) {
+      await assert.rejects(web.nativeAction(view, 'read'), { code: 'NATIVE_WORKER_NOT_FOUND' });
+      assert.equal(view.nativeRetired, true);
+    }
+    release(); await scanning;
+    assert.equal(web.session(), view);
+    if (retireView) assert.equal(view.nativeRetired, true);
+    else { assert.equal(view.status, 'exited'); assert.equal(view.nativeSnapshot().status, 'closed'); }
+    assert.equal(view.nativeSnapshot().connected, false);
+    assert.equal(view.actionTokens.size, 0);
+    await assert.rejects(web.nativeAction(view, 'read'), { code: retireView ? 'NATIVE_OWNER_CHANGED' : 'NATIVE_WORKER_NOT_FOUND' });
+    assert.equal(f.created.length, 1);
+  });
+}
+
+test('a delayed discovery status cannot retire the restored view using its previous owner', async t => {
+  const f = await fixture(t); await f.start('a');
+  let hold = false, capture, release, released = false;
+  const captured = new Promise(resolve => { capture = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const stateReadsAfterRelease = [];
+  t.after(() => release());
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    if (released && method === 'GET' && route.startsWith('/workers/a/state')) stateReadsAfterRelease.push(route);
+    const value = await nativeRequest(ctx, method, route, body, options);
+    if (hold && method === 'GET' && route === '/status') { hold = false; capture(value); await gate; }
+    return value;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const previous = web.session();
+  hold = true;
+  const scanning = web.discoverNativeSessions(f.ctx);
+  const oldStatus = await captured;
+  assert.equal(oldStatus.workers[0].owner, previous.nativeIdentity.owner);
+  await web.nativeAction(previous, 'close');
+  const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+  const view = await web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true });
+  const client = { fixture: true };
+  view.clients.add(client); view.actionTokens.add('restored-controller');
+  released = true; release(); await scanning;
+  assert.equal(web.session(), view);
+  assert.equal(view.nativeRetired, undefined);
+  assert.equal(view.nativeSnapshot().connected, true);
+  assert.equal(view.clients.has(client), true);
+  assert.equal(view.actionTokens.has('restored-controller'), true);
+  assert.equal(web.closedClients.includes(view), false);
+  assert.deepEqual(stateReadsAfterRelease, [], 'the old discovery status cannot address the new view through its old owner');
+  assert.equal((await web.nativeAction(view, 'read')).owner, view.nativeIdentity.owner);
+  await web.nativeAction(view, 'send', { text: 'restored controller remains usable', submissionId: 'scan_status_owner_1' });
+  assert.equal(f.receipts().filter(row => row.type === 'native.web.submission.queued').length, 1);
+  assert.equal(f.created.length, 2);
 });
 
 test('Web discovers only actual native workers, reuses their binding, and creates no executor', async (t) => {

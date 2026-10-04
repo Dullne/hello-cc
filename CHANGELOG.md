@@ -34,6 +34,10 @@ snapshot and shutdown fixes. A local candidate does not establish publication.
 - Upload new project files up to 10 MiB and edit complete UTF-8 text up to 1 MiB,
   with revision conflicts, preserved drafts and explicit uncertain-write readback.
 - Bind browser project requests and drafts to the selected directory identity.
+- Preserve native Web connections and control tokens when background discovery
+  overlaps Agent creation or history restore; discard stale discovery results.
+- Recheck provider initialization before rejecting an older snapshot with no
+  session ID, and retain exact project file matches when a wider search times out.
 - Keep the existing terminal/App Server modes, readonly previews and bounded
   reconnect behavior.
 

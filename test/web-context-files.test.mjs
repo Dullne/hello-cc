@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { listContextFiles } from '../lib/web/context-files.mjs';
+import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hcc-context-files-'));
@@ -22,6 +23,41 @@ test('context files stay project-relative and omit symlinks, credentials and gen
   await fs.symlink(path.join(root, 'src'), path.join(root, 'internal-link'));
   assert.deepEqual(await listContextFiles(root), { paths: ['README.md', 'src/App.mjs'], truncated: false });
   assert.deepEqual(await listContextFiles(root, 'SRC/app'), { paths: ['src/App.mjs'], truncated: false });
+  for (const query of [...files.filter(file => file !== 'README.md' && file !== 'src/App.mjs'), 'linked-directory/private.txt', 'linked-file', 'internal-link/App.mjs']) {
+    assert.deepEqual(await listContextFiles(root, query), { paths: [], truncated: false }, query);
+  }
+});
+
+test('an exact relative filename remains available when directory reads consume the scan budget', async t => {
+  const root = await fixture(t);
+  await fs.mkdir(path.join(root, '.hello-cc'));
+  await fs.mkdir(path.join(root, 'node_modules'));
+  await fs.mkdir(path.join(root, 'src'));
+  await fs.writeFile(path.join(root, 'src/claude-marker.txt'), 'fixture');
+  const identity = captureSelectedCwdIdentity(root); t.after(() => identity.release());
+  const opendir = fs.opendir;
+  const delayed = t.mock.method(fs, 'opendir', async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 225));
+    return opendir(...args);
+  });
+  assert.deepEqual(await listContextFiles(root, 'src/claude-marker.txt', { rootIdentity: identity }),
+    { paths: ['src/claude-marker.txt'], truncated: true });
+  assert.deepEqual(await listContextFiles(root, 'claude-marker', { rootIdentity: identity }),
+    { paths: [], truncated: true });
+  delayed.mock.restore();
+  assert.deepEqual(await listContextFiles(root, 'src/claude-marker.txt', { rootIdentity: identity }),
+    { paths: ['src/claude-marker.txt'], truncated: false });
+});
+
+test('an exact hit is deduplicated while other substring matches and result limits remain intact', async t => {
+  const root = await fixture(t);
+  await fs.mkdir(path.join(root, 'src'));
+  await fs.writeFile(path.join(root, 'marker.txt'), 'fixture');
+  await fs.writeFile(path.join(root, 'src/marker.txt'), 'fixture');
+  assert.deepEqual(await listContextFiles(root, 'marker.txt'),
+    { paths: ['marker.txt', 'src/marker.txt'], truncated: false });
+  assert.deepEqual(await listContextFiles(root, 'marker.txt', { limit: 1 }),
+    { paths: ['marker.txt'], truncated: true });
 });
 
 test('invalid context queries and nonfinite budgets are rejected before filesystem traversal', async () => {
