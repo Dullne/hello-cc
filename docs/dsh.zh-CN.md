@@ -18,6 +18,8 @@ node /absolute/path/to/hello-cc/bin/hcc.mjs --root /path/to/project dsh web -- -
 
 下文 `hcc` 指包含这些代码的 CLI。已有的全局 `hcc` 未必包含此接入。
 
+macOS 从 1.0.5 起使用稳定的启动周期标记。升级时按[进程身份迁移说明](macos-process-identity.md)正常重启所管理的运行时，保留身份无法比较的旧进程。
+
 ## 选择入口
 
 | 入口 | 适用场景 | 会话由谁持有 |
@@ -115,7 +117,7 @@ hcc native start --peer dsh-reviewer --provider dsh --binary /absolute/path/to/d
 
 ```bash
 npm pack --ignore-scripts
-dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.4.tgz
+dsh plugin --profile web add /absolute/path/to/logicseek-hello-cc-1.0.5.tgz
 ```
 
 Harness 的 pnpm 策略要求明确允许原生依赖构建。若首次 add 返回 `ERR_PNPM_IGNORED_BUILDS`，在所选 profile 的 `pnpm-workspace.yaml` 中合并以下配置，然后重跑同一 add 命令；默认位置是 `~/.dsh/profiles/web/pnpm-workspace.yaml`，自定义 DSH_HOME 时以该目录为准。保留文件中已有设置，只批准候选包使用的固定版本：

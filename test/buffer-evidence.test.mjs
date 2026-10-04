@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { decideClockSafety } from '../lib/core/coordination/clock-safety.mjs';
+import { resolvePeerEvidence } from '../lib/core/peers/evidence.mjs';
 import {
   collectBufferEvidence,
   externalBufferSessionIds,
@@ -23,6 +24,52 @@ const identity = {
   startToken: 'boot:started',
   commandHash: 'a'.repeat(64)
 };
+
+for (const kind of ['external', 'tmux']) {
+  test(`aged ${kind} buffers retain incompatible Darwin owners until observed exit`, (t) => {
+    const root = tempRoot(t);
+    const directory = path.join(root, '.hello-cc', 'bufs');
+    fs.mkdirSync(directory, { recursive: true });
+    const canonical = fs.realpathSync.native(directory);
+    const stored = { ...identity, startToken: '1759200000:539676:Sun Oct  4 03:00:00 2026' };
+    let current = { state: 'live', identity: {
+      ...identity,
+      startToken: 'darwin:54a2cf47-9cb7-4be8-b9ab-6823a2af4c11:Sun Oct  4 03:00:00 2026'
+    } };
+    const file = path.join(canonical, kind === 'external' ? 'legacy.out' : 'tmux-7-legacy.pipe');
+    const reference = kind === 'external' ? path.join(canonical, 'legacy.meta') : file;
+    fs.writeFileSync(file, 'preserve output');
+    if (kind === 'external') {
+      fs.writeFileSync(reference, JSON.stringify({ wrapper_pid: stored.pid, wrapper_identity: stored }));
+    }
+    const original = fs.readFileSync(reference, 'utf8');
+    const stat = fs.lstatSync(reference);
+    const tracker = new Map([[reference, {
+      state: 'unknown', sinceMonotonicMs: 0, identity: `${stat.dev}:${stat.ino}`
+    }]]);
+    const row = {
+      id: 'legacy', status: 'exited', pid: stored.pid, pid_start_token: stored.startToken,
+      pid_command_hash: stored.commandHash, transport: 'tmux', runtime_session_id: 'legacy', runtime_target: '%7'
+    };
+    const options = {
+      directories: [directory],
+      projectDbs: kind === 'tmux' ? [{ ctx: { root }, db: { prepare: () => ({ all: () => [row] }) } }] : [],
+      inspectProcess: () => current,
+      observePeer: () => resolvePeerEvidence({ peer: row, processes: [{ storedIdentity: stored, current }] }),
+      unknownTracker: tracker, monotonicNowMs: () => 1_000_000, nowMs: () => 1_000_000,
+      unknownGraceMs: 120_000
+    };
+    const protectedEvidence = collectBufferEvidence(options);
+    assert.equal(protectedEvidence.protectedPaths.has(file), true);
+    assert.equal(protectedEvidence.unknownPaths.has(file), false);
+    assert.equal(tracker.get(reference).state, 'incompatible');
+    assert.equal(fs.readFileSync(reference, 'utf8'), original);
+    current = { state: 'dead', identity: null };
+    const afterExit = collectBufferEvidence(options);
+    assert.equal(afterExit.protectedPaths.has(file), false);
+    assert.equal(afterExit.unknownPaths.has(file), false);
+  });
+}
 
 test('external buffer discovery is read-only when a project directory disappears', (t) => {
   const root = tempRoot(t);

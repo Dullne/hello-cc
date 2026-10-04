@@ -16,6 +16,35 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.0.5
+
+### Summary
+
+macOS process identities use the kernel boot session UUID so changes to the
+reported boot time cannot make a running process appear to have been replaced.
+The issue was observed during post-release sustained acceptance of 1.0.4.
+
+### Highlights
+
+- Preserve process identity across changes to the wall-clock-derived boot time.
+- Keep live processes with an older Darwin identity format protected while their
+  ownership cannot be compared; a format change does not prove that an owner exited.
+- Retain strict process state, start time and zombie checks, with unknown results
+  when a stable boot session identifier cannot be read.
+- Keep the existing npm `latest` release channel.
+
+### Validation
+
+Targeted regression tests cover boot identity drift, boot-session changes,
+malformed observations and conservative handling of existing runtime ownership.
+Full source, package, current-device and sustained-run validation are recorded
+separately. The interrupted 1.0.4 sustained run remains a failed attempt.
+
+Existing processes keep the implementation they started with. Quit and reopen
+Harness normally to activate the update. An older active owned runtime should
+finish and stop normally before it is reclaimed; do not force takeover based
+on an incompatible identity marker.
+
 ## 1.0.4
 
 ### Summary

@@ -17,6 +17,7 @@ import {
   sameLockAcquireSubject
 } from '../lib/core/coordination/lock-evidence.mjs';
 import { scopedLockResource } from '../lib/core/coordination/locks.mjs';
+import { taskOwnerLiveness } from '../lib/core/peers/liveness.mjs';
 import {
   prepareTmuxRestartBinding,
   rollbackTmuxRestartBinding
@@ -26,6 +27,8 @@ const { resolvePeerEvidence } = peerEvidence;
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
+const LEGACY_DARWIN_TOKEN = '1759200000:539676:Sun Oct  4 03:00:00 2026';
+const CURRENT_DARWIN_TOKEN = 'darwin:54a2cf47-9cb7-4be8-b9ab-6823a2af4c11:Sun Oct  4 03:00:00 2026';
 
 test('provider restart may restore only a detached tmux binding with a CAS rollback token', () => {
   const db = new DatabaseSync(':memory:');
@@ -101,6 +104,53 @@ function verifiedTmux(options = {}) {
     process: options.process || processEvidence(700, { name: 'pane' })
   };
 }
+
+function incompatibleProcessEvidence(pid = 700) {
+  return processEvidence(pid, {
+    storedIdentity: identity(pid, LEGACY_DARWIN_TOKEN),
+    currentIdentity: identity(pid, CURRENT_DARWIN_TOKEN)
+  });
+}
+
+for (const status of ['working', 'exited']) {
+  test(`live Darwin migration remains protected unknown despite ${status} status and expired TTL`, () => {
+    const input = { peer: { status }, processes: [incompatibleProcessEvidence()] };
+    const evidence = resolvePeerEvidence(input);
+    assert.deepEqual(evidence, { state: 'unknown', reason: 'process_identity_incompatible' });
+    assert.equal(input.processes[0].storedIdentity.startToken, LEGACY_DARWIN_TOKEN);
+    assert.equal(peerEvidence.peerEvidenceAllowsReap(evidence, {
+      nowSec: 100_000, lastSeenAt: 1, staleAfterSec: 120, graceUntil: 121
+    }), false);
+    const liveness = taskOwnerLiveness({ status: 'running', owner: 'owner' }, [{
+      id: 'owner', status, last_seen_at: 1,
+      evidence_state: evidence.state, evidence_reason: evidence.reason
+    }], [], 100_000, 600);
+    assert.equal(liveness.owner_stale, false);
+    assert.equal(liveness.takeover_ready, false);
+    assert.equal(liveness.owner_evidence_state, 'unknown');
+    const dead = resolvePeerEvidence({
+      ...input,
+      processes: [{ ...input.processes[0], current: { state: 'dead', identity: null } }]
+    });
+    assert.equal(dead.state, 'dead');
+    assert.equal(peerEvidence.peerEvidenceAllowsReap(dead), true);
+  });
+}
+
+test('Darwin compatibility protection requires a live observation and applies to tmux evidence', () => {
+  const process = incompatibleProcessEvidence();
+  assert.deepEqual(resolvePeerEvidence({
+    peer: { status: 'exited' }, tmux: verifiedTmux({ process })
+  }), { state: 'unknown', reason: 'process_identity_incompatible' });
+  assert.deepEqual(resolvePeerEvidence({
+    peer: { status: 'working' },
+    processes: [{ ...process, current: { ...process.current, state: 'unknown' } }]
+  }), { state: 'unknown', reason: 'process_identity_incomplete' });
+  assert.deepEqual(resolvePeerEvidence({
+    peer: { status: 'exited' },
+    processes: [process, processEvidence(701, { state: 'dead', currentIdentity: null })]
+  }), { state: 'unknown', reason: 'process_identity_incompatible' });
+});
 
 const fixtures = [
   {
@@ -385,6 +435,33 @@ test('aged tmux-unknown owner follows age policy instead of staying active forev
       ownerEvidenceFor: () => ({ state: 'unknown', reason: 'tmux_evidence_incomplete' })
     });
     assert.equal(task.owner, 'taker');
+  } finally {
+    db.close();
+  }
+});
+
+test('stale task takeover preserves an incompatible live Darwin owner until observed dead', () => {
+  const db = taskStoreDb();
+  try {
+    db.prepare("INSERT INTO tasks VALUES (1, 'work', 'running', NULL, 'owner-a', NULL, 1)").run();
+    db.prepare('INSERT INTO peers VALUES (?, ?, ?, ?, ?, ?)')
+      .run('owner-a', 'exited', 700, LEGACY_DARWIN_TOKEN, HASH_A, 1);
+    const store = createTaskStore({ now: () => 100_000 });
+    const options = {
+      reason: 'aged migration owner', policy: 'stale', staleAfter: 60,
+      ownerEvidenceFor: () => resolvePeerEvidence({
+        peer: { status: 'exited' }, processes: [incompatibleProcessEvidence()]
+      })
+    };
+    assert.throws(() => store.takeOverTaskForPeer(db, 'taker', 1, options), {
+      code: 'TAKEOVER_POLICY'
+    });
+    assert.equal(db.prepare('SELECT owner FROM tasks WHERE id = 1').get().owner, 'owner-a');
+    assert.equal(db.prepare('SELECT pid_start_token FROM peers WHERE id = ?').get('owner-a').pid_start_token,
+      LEGACY_DARWIN_TOKEN);
+    assert.equal(store.takeOverTaskForPeer(db, 'taker', 1, {
+      ...options, ownerEvidenceFor: () => ({ state: 'dead', reason: 'process_missing' })
+    }).owner, 'taker');
   } finally {
     db.close();
   }
@@ -702,6 +779,12 @@ test('tmux binding GC selects only strict explicit-exit-live or dead-process mod
     ...subject,
     owner_evidence: { state: 'live', reason: 'process_identity_match' }
   }, liveObserved), { ok: false, reason: 'tmux_owner_process_live' });
+  for (const observed of [liveObserved, deadObserved]) {
+    assert.deepEqual(validate({
+      ...subject,
+      owner_evidence: resolvePeerEvidence({ processes: [incompatibleProcessEvidence()] })
+    }, observed), { ok: false, reason: 'tmux_owner_process_incompatible' });
+  }
   assert.deepEqual(validate({ ...subject, status: 'idle' }, deadObserved), { ok: true, mode: 'dead_process' });
   assert.deepEqual(validate(subject, {
     ...liveObserved,

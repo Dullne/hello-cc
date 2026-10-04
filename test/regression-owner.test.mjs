@@ -68,6 +68,26 @@ test('signals recheck original ownership and never signal a reused, zombie or un
   assert.deepEqual(sent, [[owner.pid, 'SIGTERM'], [owner.pid, 'SIGKILL']]);
 });
 
+test('fixture owner refuses signals when macOS start-token formats cannot be compared', () => {
+  const suffix = '26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026';
+  const legacy = { ...owner, startToken: `mac:${suffix}` };
+  const current = { ...owner, startToken: `darwin:${suffix}` };
+  const sent = [];
+  for (const [stored, inspected] of [[legacy, current], [current, legacy]]) {
+    const observe = () => observeFixtureOwner(stored, {
+      inspect: () => ({ state: 'live', identity: inspected }), psState: () => 'S'
+    });
+    assert.equal(observe().state, 'unknown');
+    assert.equal(observe().reason, 'identity_incompatible');
+    for (const signal of ['SIGTERM', 'SIGKILL']) {
+      assert.equal(signalFixtureOwner(stored, signal, {
+        observe, send: (pid, value) => sent.push([pid, value])
+      }).sent, false);
+    }
+  }
+  assert.deepEqual(sent, []);
+});
+
 test('fixture wait accepts original owner exit by PID reuse without signaling the replacement', async () => {
   let calls = 0, clock = 0;
   const result = await waitForFixtureOwnerExit(owner, 5000, {

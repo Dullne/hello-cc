@@ -7,6 +7,7 @@ on:
       - codex/dsh-stable-source
       - codex/dsh-stable-fixes
       - codex/web-workbench-*
+      - codex/dsh-macos-boot-identity
   pull_request:
 
 permissions:
@@ -106,16 +107,14 @@ jobs:
                 const bytes = Buffer.alloc(Math.min(size, 256 * 1024));
                 fs.readSync(file, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
                 const lines = bytes.toString('utf8').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
-                // Publish only test names, source locations, result counts and
-                // recognized error codes; raw errors, arguments and env stay out.
+                // Publish only test names, source locations and result counts;
+                // raw errors, arguments and env stay out.
                 const selected = lines.filter(line =>
                   (/^\s*(?:✖|not ok\s+\d+(?:\s+-)?)(?:\s|$)/.test(line) && !/failing tests:/.test(line)) ||
                   /^test at test\/[A-Za-z0-9_./-]+:\d+:\d+$/.test(line) ||
                   /^(?:#|ℹ) (?:tests|pass|fail|cancelled|skipped|todo|duration_ms) \d/.test(line)
                 ).map(line => line.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 350));
-                const codes = lines.flatMap(line => [...line.matchAll(/\b(?:ERR_[A-Z0-9_]{1,60}|EACCES|ENOENT|EPERM|PROJECT_PATH_FORBIDDEN|HCC_PINNED_(?:CWD_CHANGED|EXEC_FAILED))\b/g)]
-                  .map(match => 'error code: ' + match[0]));
-                const details = [...new Set([...selected, ...codes])].slice(-24).join('\n').slice(0, 6000);
+                const details = [...new Set(selected)].slice(-24).join('\n').slice(0, 6000);
                 if (details) summary += '\n' + details;
               } finally { fs.closeSync(file); }
             }

@@ -6,6 +6,7 @@ import { createLockCommands } from '../lib/cli/commands/lock.mjs';
 import { createTaskCommands } from '../lib/cli/commands/task.mjs';
 import { createTaskStore } from '../lib/core/coordination/tasks.mjs';
 import { annotateTasksWithLiveness } from '../lib/core/peers/liveness.mjs';
+import { resolvePeerEvidence } from '../lib/core/peers/evidence.mjs';
 import { initSchema, tx } from '../lib/db/schema.mjs';
 import { createEventHelpers } from '../lib/db/events.mjs';
 import * as args from '../lib/cli-args.mjs';
@@ -17,7 +18,7 @@ import { observeClockSafetyInTransaction, clockSafetyUnavailable } from '../lib/
 import { clockGraceSuppressed, readClockGraceUntil } from '../lib/shared/clock-grace.mjs';
 import { CliError } from '../lib/shared/errors.mjs';
 
-function fixture(t) {
+function fixture(t, options = {}) {
   const db = new DatabaseSync(':memory:');
   initSchema(db);
   db.prepare("INSERT INTO meta(key,value) VALUES('clock_last_observed_at','1000')").run();
@@ -25,7 +26,8 @@ function fixture(t) {
   let output;
   const now = () => 1000;
   const events = createEventHelpers({ now });
-  const observePeerEvidence = (_ctx, row) => ({ state: row?.pid_start_token || 'unknown' });
+  const observePeerEvidence = options.observePeerEvidence ||
+    ((_ctx, row) => ({ state: row?.pid_start_token || 'unknown' }));
   const common = {
     ...args, ...locks, ...evidence, ...events,
     connect: () => db, now, iso: String, tx, touchCurrentPeer() {},
@@ -51,6 +53,31 @@ function fixture(t) {
   `).run(resource, resource, owner, taskId, expiresAt);
   return { db, lockCommands, taskCommands, peer, insert, output: () => output };
 }
+
+test('expired Darwin migration locks remain visible and reject takeover until the owner exits', async (t) => {
+  const stored = {
+    pid: 700, startToken: '1759200000:539676:Sun Oct  4 03:00:00 2026', commandHash: 'a'.repeat(64)
+  };
+  let observation = { state: 'live', identity: {
+    ...stored, startToken: 'darwin:54a2cf47-9cb7-4be8-b9ab-6823a2af4c11:Sun Oct  4 03:00:00 2026'
+  } };
+  const f = fixture(t, { observePeerEvidence: (_ctx, row) => resolvePeerEvidence({
+    peer: row, processes: [{ storedIdentity: stored, current: observation }]
+  }) });
+  f.peer('owner', stored.startToken);
+  f.db.prepare("UPDATE peers SET status = 'exited', last_seen_at = 1 WHERE id = 'owner'").run();
+  f.insert('retained', 'owner', 1);
+  const before = f.db.prepare('SELECT * FROM locks').get();
+  await f.lockCommands.cmdLock({}, ['list']);
+  assert.deepEqual(f.output().map((lock) => lock.resource), ['retained']);
+  await assert.rejects(f.lockCommands.cmdLock({}, ['acquire', '--peer', 'taker', '--resource', 'retained']), {
+    code: 'LOCK_HELD'
+  });
+  assert.deepEqual(f.db.prepare('SELECT * FROM locks').get(), before);
+  observation = { state: 'dead', identity: null };
+  await f.lockCommands.cmdLock({}, ['acquire', '--peer', 'taker', '--resource', 'retained']);
+  assert.equal(f.db.prepare('SELECT owner FROM locks').get().owner, 'taker');
+});
 
 test('default lock list shows expired live locks, preserves grace, and performs no clock renewal', async (t) => {
   const f = fixture(t);

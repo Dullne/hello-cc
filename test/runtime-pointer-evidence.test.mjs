@@ -63,13 +63,32 @@ test('legacy macOS runtime pointers retain unknown evidence across the boot toke
     for (const ageMs of [0, RUNTIME_POINTER_UNKNOWN_GRACE_MS - 1, RUNTIME_POINTER_UNKNOWN_GRACE_MS]) {
       assert.deepEqual(classifyRuntimePointer({ pid: saved.pid, process_identity: saved }, {
         inspect: () => ({ state: 'live', identity: observed }), ageMs
-      }), { state: 'unknown', reclaimable: ageMs >= RUNTIME_POINTER_UNKNOWN_GRACE_MS });
+      }), { state: 'unknown', reclaimable: false });
     }
   }
   assert.deepEqual(classifyRuntimePointer({ pid: current.pid, process_identity: current }, {
     inspect: () => ({ state: 'live', identity: { ...current,
       startToken: 'mac:36f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' } })
   }), { state: 'dead', reclaimable: true }, 'confirmed boot identity mismatches remain dead');
+});
+
+test('live workbench preview pointers are retained beyond the unknown grace period after upgrade', t => {
+  const preview = { ...stored, startToken: 'mac:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Mon Aug  3 06:10:11 2026' };
+  const current = { ...preview, startToken: preview.startToken.replace(/^mac:/, 'darwin:') };
+  const pointer = tempPointer(t, { pid: preview.pid, process_identity: preview });
+  const before = fs.readFileSync(pointer.file, 'utf8');
+  const nowMs = () => pointer.timestampMs + RUNTIME_POINTER_UNKNOWN_GRACE_MS * 10;
+  const blocked = reclaimRuntimePointerFiles([pointer.file], {
+    inspect: () => ({ state: 'live', identity: current }), nowMs
+  });
+  assert.equal(blocked.blocked, true);
+  assert.equal(blocked.reclaimed, 0);
+  assert.equal(fs.readFileSync(pointer.file, 'utf8'), before);
+  const exited = reclaimRuntimePointerFiles([pointer.file], {
+    inspect: () => ({ state: 'dead', identity: null }), nowMs
+  });
+  assert.equal(exited.reclaimed, 1);
+  assert.equal(fs.existsSync(pointer.file), false);
 });
 
 test('ambiguous duplicate runtime identity fields are unknown to destructive cleanup', () => {
@@ -81,6 +100,24 @@ test('ambiguous duplicate runtime identity fields are unknown to destructive cle
     inspect: () => ({ state: 'dead', identity: null }),
     ageMs: RUNTIME_POINTER_UNKNOWN_GRACE_MS - 1
   }), { state: 'unknown', reclaimable: false });
+});
+
+test('an observed live legacy Mac owner is never reclaimed merely because the token format changed', t => {
+  const legacy = { ...stored, startToken: '1789353593:539676:Sun Oct  4 03:40:06 2026' };
+  const current = { ...stored, startToken: 'darwin:26f764bf-dad6-4f9c-b55d-522470aaf4e8:Sun Oct  4 03:40:06 2026' };
+  const runtime = { pid: stored.pid, process_identity: legacy };
+  const inspect = () => ({ state: 'live', identity: current });
+  for (const ageMs of [0, RUNTIME_POINTER_UNKNOWN_GRACE_MS * 10]) {
+    assert.deepEqual(classifyRuntimePointer(runtime, { inspect, ageMs }), { state: 'unknown', reclaimable: false });
+  }
+  const pointer = tempPointer(t, runtime);
+  const before = fs.readFileSync(pointer.file, 'utf8');
+  const reclaimed = reclaimRuntimePointerFiles([pointer.file], { inspect,
+    nowMs: () => pointer.timestampMs + RUNTIME_POINTER_UNKNOWN_GRACE_MS * 10 });
+  assert.equal(reclaimed.reclaimed, 0); assert.equal(reclaimed.blocked, true);
+  assert.equal(fs.readFileSync(pointer.file, 'utf8'), before);
+  assert.deepEqual(classifyRuntimePointer(runtime, { inspect: () => ({ state: 'dead', identity: null }) }),
+    { state: 'dead', reclaimable: true });
 });
 
 test('runtime process identity is published only when it is complete and live', () => {

@@ -47,6 +47,7 @@ let currentStage = 'startup';
 let lastStopDiagnostic = null;
 const diagnosticSecrets = new Set();
 const fixtureFailures = new WeakSet();
+const fixtureCommandFailures = new WeakMap();
 const managedTmuxSessions = new Set();
 
 const env = {
@@ -68,8 +69,8 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
-function fail(message) {
-  const error = fixtureFailureError(message);
+function fail(message, commandResult = null, diagnosticOperation = null) {
+  const error = fixtureFailureError(message, commandResult, diagnosticOperation);
   if (process.env.GITHUB_ACTIONS === 'true') {
     const escaped = fixtureDiagnosticText({ stage: currentStage, failure: fixtureFailureDiagnostic(error) }, diagnosticSecrets)
       .replace(/%/g, '%25')
@@ -80,12 +81,14 @@ function fail(message) {
   throw error;
 }
 
-export function fixtureFailureError(message) {
+export function fixtureFailureError(message, commandResult = null, diagnosticOperation = null) {
   const error = new Error(String(message));
   Object.defineProperty(error, 'fixtureStack', {
     value: Object.freeze(new Error('fixture failure').stack.split('\n').slice(1, 7))
   });
   fixtureFailures.add(error);
+  const command = fixtureCommandResult(commandResult, diagnosticOperation);
+  if (command) fixtureCommandFailures.set(error, command);
   return error;
 }
 
@@ -95,7 +98,8 @@ export function fixtureFailureDiagnostic(error) {
     name: names.includes(error?.name) ? error.name : 'Error',
     stack: fixtureFailures.has(error)
       ? error.fixtureStack
-      : new Error('regression failure handler').stack.split('\n').slice(1, 7)
+      : new Error('regression failure handler').stack.split('\n').slice(1, 7),
+    ...(fixtureCommandFailures.has(error) ? { command: fixtureCommandFailures.get(error) } : {})
   };
 }
 
@@ -136,7 +140,9 @@ export function observeFixtureOwner(owner, { inspect = inspectProcessIdentity, p
   }
   details.birthHash = crypto.createHash('sha256').update(observed.identity.startToken).digest('hex');
   details.commandHash = observed.identity.commandHash;
-  if (compareProcessIdentity(owner, observed.identity) === 'dead') return { ...details, state: 'exited', reason: 'pid_reused' };
+  const comparison = compareProcessIdentity(owner, observed.identity);
+  if (comparison === 'dead') return { ...details, state: 'exited', reason: 'pid_reused' };
+  if (comparison !== 'live') return { ...details, state: 'unknown', reason: 'identity_incompatible' };
   if (owner.commandHash !== observed.identity.commandHash) return { ...details, state: 'unknown', reason: 'command_changed' };
   return { ...details, state: 'same-owner', reason: 'identity_match' };
 }
@@ -188,7 +194,7 @@ function fixtureCliFailurePayload(output) {
   return parse(text.slice(jsonStart + 1));
 }
 
-export function fixtureDownResult(result) {
+function fixtureCliResultParts(result) {
   // --json failures are written with console.error; stdout is retained as a
   // compatibility fallback for fixtures. Raw output never enters diagnostics.
   const stderrFailure = fixtureCliFailurePayload(result.stderr);
@@ -196,17 +202,40 @@ export function fixtureDownResult(result) {
   const payload = stderrFailure || stdoutFailure;
   const extra = payload?.error?.extra || payload?.error || {};
   const code = payload?.error?.code || result.error?.code;
-  const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
-  return {
+  const diagnostic = {
     status: Number.isSafeInteger(result.status) ? result.status : null,
-    signal: /^SIG[A-Z0-9]{1,12}$/.test(result.signal || '') ? result.signal : null,
+    signal: typeof result.signal === 'string' && Object.hasOwn(os.constants.signals, result.signal) ? result.signal : null,
     code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(code) ? code : null,
     source: stderrFailure ? 'stderr' : stdoutFailure ? 'stdout' : result.error?.code ? 'spawn' : null,
     stdoutBytes: typeof result.stdout === 'string' ? Buffer.byteLength(result.stdout) : 0,
-    stderrBytes: typeof result.stderr === 'string' ? Buffer.byteLength(result.stderr) : 0,
+    stderrBytes: typeof result.stderr === 'string' ? Buffer.byteLength(result.stderr) : 0
+  };
+  return { diagnostic, extra };
+}
+
+export function fixtureDownResult(result) {
+  const { diagnostic, extra } = fixtureCliResultParts(result);
+  const numeric = ['pid', 'elapsedMs', 'timeoutMs'];
+  return {
+    ...diagnostic,
     extra: Object.fromEntries(numeric.filter(key => typeof extra[key] === 'number' &&
       Number.isFinite(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]]))
   };
+}
+
+function fixtureCommandResult(result, operation) {
+  // Only this explicit fixture operation opts in. Never copy command arguments,
+  // error messages, output, URLs or peer identifiers into public annotations.
+  if (operation !== 'broadcast' || !result || typeof result !== 'object') return null;
+  const { diagnostic, extra } = fixtureCliResultParts(result);
+  const context = Object.fromEntries(['elapsedMs', 'timeoutMs'].filter(key =>
+    Number.isSafeInteger(extra[key]) && extra[key] >= 0).map(key => [key, extra[key]]));
+  if (Number.isSafeInteger(extra.status) && extra.status >= 100 && extra.status <= 599) context.status = extra.status;
+  if (extra.method === 'GET' || extra.method === 'POST') context.method = extra.method;
+  const route = typeof extra.path === 'string' ? extra.path.split(/[?#]/, 1)[0] : '';
+  if (route === '/api/sessions') context.path = route;
+  else if (/^\/api\/sessions\/[^/?#]+\/input$/.test(route)) context.path = '/api/sessions/:peer/input';
+  return Object.freeze({ operation, ...diagnostic, extra: Object.freeze(context) });
 }
 
 export function fixtureStopEnvironment(base) {
@@ -295,7 +324,7 @@ function run(command, args, options = {}) {
   });
   if (result.status !== 0) {
     const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
-    fail(`${commandText(command, args)} failed${output ? `\n${output}` : ''}`);
+    fail(`${commandText(command, args)} failed${output ? `\n${output}` : ''}`, result, options.diagnosticOperation);
   }
   return result.stdout || '';
 }
@@ -6648,7 +6677,7 @@ async function askBroadcastWorkflow() {
   }
   await waitForFile(dispatchFile, 'DISPATCH_OK', 'task dispatch injection');
   const broadcastFile = path.join(outDir, 'broadcast-ok');
-  hcc(['broadcast', `echo BROADCAST_OK > ${broadcastFile}`, '--from', 'human', '--inject']);
+  hccJson(['broadcast', `echo BROADCAST_OK > ${broadcastFile}`, '--from', 'human', '--inject'], { diagnosticOperation: 'broadcast' });
   await waitForFile(broadcastFile, 'BROADCAST_OK', 'broadcast injection');
 }
 
