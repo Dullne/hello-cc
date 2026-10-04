@@ -2,11 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto,createHash} from 'node:crypto';
 import {createFileWrites,editableFile} from '../lib/web/ui-file-writes.mjs';
-const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const value=(content='original',extra={})=>({path:'note.txt',name:'note.txt',kind:'text',encoding:'utf8',content,size:Buffer.byteLength(content),revision:'r1',editable:true,newline:'none',...extra});
 function fixture(storage=new Map()) {
-  const nodes=new Map(),requests=[],updates=[],uploads=[],listeners=new Map();
+  const nodes=new Map(),requests=[],updates=[],uploads=[],listeners=new Map(),requestListeners=new Set();
   let consent=false;
   const node=id=>{
     if (!nodes.has(id)) nodes.set(id,{value:'',textContent:'',hidden:false,disabled:false,files:[],listeners:new Map(),
@@ -15,19 +14,31 @@ function fixture(storage=new Map()) {
   };
   const state={root:'/project',identity:'inode-a',directory:'',path:'note.txt',value:value(),visit:1,hidden:false};
   const bridge={projectRoot:'/project',projectIdentity:'inode-a',draftScope:'',tr:key=>key,
-    api(path,options){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});requests.push({path,options,resolve,reject});return promise;}};
+    api(path,options){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});requests.push({path,options,resolve,reject});for(const listener of requestListeners) listener();return promise;}};
   const window={hccHandoff:bridge,confirm:()=>consent,addEventListener:(name,listener)=>listeners.set(name,listener),hccUi:{safeGet:key=>storage.get(key),safeSet:(key,value)=>storage.set(key,value)}};
   const writer=createFileWrites({browser:{window,document:{getElementById:node},TextEncoder,Uint8Array,crypto:webcrypto,btoa},
     context:()=>state,updated:next=>{updates.push(next);state.value=next;writer.select();},uploaded:path=>uploads.push(path)});
   writer.select();
   return {node,state,bridge,writer,requests,updates,uploads,listeners,storage,
+    onRequest(listener){requestListeners.add(listener);return()=>requestListeners.delete(listener);},
     edit(text){node('filesEdit').emit('click');node('filesEditor').value=text;node('filesEditor').emit('input');},
     select(next){writer.suspend();Object.assign(state,next,{visit:state.visit+1});writer.select();},
     consent(value){consent=value;},
     choose(text,name='upload.txt') {const bytes=Buffer.from(text); node('filesUploadInput').files=[{name,size:bytes.length,arrayBuffer:async()=>bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength)}];node('filesUploadInput').emit('change');},
     click:id=>node(id).emit('click'),upload:()=>node('filesUploadForm').emit('submit')};
 }
-async function requestReady(f,index=0) {for(let n=0;n<50 && f.requests.length<=index;n++) await tick();assert.ok(f.requests[index],'request started');return f.requests[index];}
+async function requestReady(f,index=0) {
+  if (f.requests[index]) return f.requests[index];
+  // File reads and WebCrypto may span arbitrarily many event-loop turns.
+  // Observe the actual API invocation; the timeout only bounds a missing call.
+  return new Promise((resolve,reject)=>{
+    const unsubscribe=f.onRequest(()=>{
+      if (!f.requests[index]) return;
+      clearTimeout(timeout);unsubscribe();resolve(f.requests[index]);
+    });
+    const timeout=setTimeout(()=>{unsubscribe();reject(new Error('API request '+index+' did not start within 5 seconds'));},5000);
+  });
+}
 const saveReceipt=(content,revision='r2')=>({saved:true,path:'note.txt',revision,size:Buffer.byteLength(content),contentHash:hash(content)});
 
 test('only complete bounded UTF-8 text with a revision is editable',()=>{
