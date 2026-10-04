@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
@@ -9,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import { createNativeTestRoot } from './helpers/native-root.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -93,9 +93,10 @@ lines.on('line', (line) => {
 lines.on('close', () => process.exit(0));
 `;
 
-function fixture(t) {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-cli-'));
-  const root = path.join(sandbox, "project space ' quote");
+async function fixture(t) {
+  const projectSubdir = "project space ' quote";
+  const sandbox = await createNativeTestRoot('hcc-native-cli-', { projectSubdir });
+  const root = path.join(sandbox, projectSubdir);
   const home = path.join(sandbox, 'home');
   const binary = path.join(sandbox, 'fake-codex.mjs');
   const traceFile = path.join(sandbox, 'codex.jsonl');
@@ -188,7 +189,7 @@ function fixture(t) {
 }
 
 test('native CLI help, lifecycle and saved resume use only the owned stdio process', { skip: process.platform === 'win32' }, async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const help = f.raw('native', '--help');
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /native start --peer NAME --provider codex\|claude\|dsh/);
@@ -227,7 +228,7 @@ test('native CLI help, lifecycle and saved resume use only the owned stdio proce
 });
 
 test('native send and ordinary mesh messages receive one provider submission, reply and ack', { skip: process.platform === 'win32' }, async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const worker = f.start();
   const first = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'from-native-command');
   assert.equal(first.state, 'queued');
@@ -274,7 +275,7 @@ test('native send and ordinary mesh messages receive one provider submission, re
 });
 
 test('native CLI lists and answers hosted approvals and retains completion before admission', { skip: process.platform === 'win32' }, async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   f.start();
   const message = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator',
     '--body', 'approval-check fast-completion');
@@ -299,7 +300,7 @@ test('native CLI lists and answers hosted approvals and retains completion befor
 });
 
 test('native down closes an active owned worker without fabricating a reply or ack', { skip: process.platform === 'win32' }, async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   f.start();
   const message = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'hold-open');
   await f.waitDelivery(message.message_id, 'accepted');
@@ -318,7 +319,7 @@ test('native down closes an active owned worker without fabricating a reply or a
 
 
 test('native CLI response files carry validated MCP content through the owning executor', { skip: process.platform === 'win32' }, async (t) => {
-  const f = fixture(t); f.start();
+  const f = await fixture(t); f.start();
   const message = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'mcp-form-check');
   const [request] = await f.wait(() => f.run('native', 'requests', '--peer', 'native-worker'), value => value.length === 1, 'MCP form request');
   const file = path.join(f.home, 'form-response.json');

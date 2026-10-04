@@ -2089,14 +2089,17 @@ function browserSessionCookie(setCookie, endpoint, { expired = false } = {}) {
   return { name: match[1], sid: match[2], cookie: `${match[1]}=${match[2]}` };
 }
 
-async function selectCookieProject(baseUrl, cookie, projectRoot = root, { signal } = {}) {
+async function selectCookieProject(baseUrl, cookie, projectRoot = root, {
+  signal, origin = new URL(baseUrl).origin, headers = {}
+} = {}) {
   const url = new URL('/api/projects/select', baseUrl);
   url.searchParams.set('root', projectRoot);
   const response = await fetch(url, {
     method: 'POST',
     headers: {
+      ...headers,
       Cookie: cookie,
-      Origin: new URL(baseUrl).origin,
+      Origin: origin,
       'X-HCC-API-Version': '2'
     },
     signal
@@ -3599,8 +3602,14 @@ async function setupRegression() {
     fail(`trusted proxy login did not issue a Secure cookie: status=${proxyExchange.status}`);
   }
   const proxyAuth = browserSessionCookie(proxySetCookie, proxyOrigin);
+  const proxyProjectIdentity = await selectCookieProject(baseUrl, proxyAuth.cookie, root, {
+    origin: proxyOrigin, headers: proxyHeaders
+  });
   const withProxyCookie = await fetch(`${baseUrl}/api/runtime`, {
-    headers: { ...proxyHeaders, Cookie: proxyAuth.cookie, 'X-HCC-API-Version': '2' }
+    headers: {
+      ...proxyHeaders, Cookie: proxyAuth.cookie, 'X-HCC-API-Version': '2',
+      'X-HCC-Root-Identity': proxyProjectIdentity
+    }
   });
   if (!withProxyCookie.ok) fail(`trusted proxy API rejected its session cookie: ${withProxyCookie.status}`);
   const proxyLogout = await fetch(`${baseUrl}/logout`, {
