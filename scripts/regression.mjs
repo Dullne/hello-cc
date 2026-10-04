@@ -20,6 +20,7 @@ import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import { readOwnedReentryOutputAtDeadline, readReentryTrace } from './shim-reentry-probe.mjs';
 import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
 import { waitForTerminalMarker, terminalMarkerFailureDiagnostic } from './regression-terminal-marker.mjs';
+import { fixtureFetch as fetch } from './regression-http-transport.mjs';
 import { parseShutdownDiagnostics } from '../lib/web/shutdown-diagnostics.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -1732,6 +1733,7 @@ function directTlsRequest(runtime, route, options = {}) {
   const body = options.body === undefined || options.body === null ? null : String(options.body);
   return new Promise((resolve, reject) => {
     const req = https.request({
+      agent: false,
       method: options.method || 'GET',
       hostname: url.hostname,
       port: url.port || 443,
