@@ -19,6 +19,7 @@ import { redactSecrets } from '../lib/shared/redact.mjs';
 import { applyBufferPlan, planBufferFiles } from '../lib/runtime/buffer-gc.mjs';
 import { readOwnedReentryOutputAtDeadline, readReentryTrace } from './shim-reentry-probe.mjs';
 import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
+import { waitForTerminalMarker, terminalMarkerFailureDiagnostic } from './regression-terminal-marker.mjs';
 import { parseShutdownDiagnostics } from '../lib/web/shutdown-diagnostics.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -96,12 +97,14 @@ export function fixtureFailureError(message, commandResult = null, diagnosticOpe
 
 export function fixtureFailureDiagnostic(error) {
   const names = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AssertionError', 'AbortError'];
+  const terminalMarker = terminalMarkerFailureDiagnostic(error);
   return {
     name: names.includes(error?.name) ? error.name : 'Error',
     stack: fixtureFailures.has(error)
       ? error.fixtureStack
       : new Error('regression failure handler').stack.split('\n').slice(1, 7),
-    ...(fixtureCommandFailures.has(error) ? { command: fixtureCommandFailures.get(error) } : {})
+    ...(fixtureCommandFailures.has(error) ? { command: fixtureCommandFailures.get(error) } : {}),
+    ...(terminalMarker ? { terminalMarker } : {})
   };
 }
 
@@ -1847,34 +1850,10 @@ async function waitForProcessExit(pid, label, timeoutMs = 5000) {
 }
 
 async function expectWebSocketMarker(peer, marker) {
-  await new Promise((resolve, reject) => {
-    let sawSnapshot = false;
-    let sawMarker = false;
-    const ws = trackTerminalControl(new WebSocket(runtimeWsUrl(peer), runtimeWsOptions()));
-    const timer = setTimeout(() => {
-      try { ws.terminate(); } catch {}
-      reject(new Error(`${peer} websocket timeout`));
-    }, TERMINAL_WEBSOCKET_TIMEOUT_MS);
-    ws.on('message', (raw) => {
-      const msg = JSON.parse(String(raw));
-      if (msg.type === 'snapshot') {
-        sawSnapshot = true;
-        claimTerminalControl(ws).then(() => ws.send(JSON.stringify({
-          type: 'input', data: `echo ${marker}\r`, action_token: ws.hccActionToken,
-          epoch: ws.hccControl.epoch
-        }))).catch(reject);
-      }
-      if (['snapshot', 'data', 'replace'].includes(msg.type) && String(msg.data || '').includes(marker)) {
-        sawMarker = true;
-      }
-      if (sawSnapshot && sawMarker) {
-        clearTimeout(timer);
-        releaseTerminalControl(ws);
-        ws.close();
-        resolve();
-      }
-    });
-    ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+  const ws = trackTerminalControl(new WebSocket(runtimeWsUrl(peer), runtimeWsOptions()));
+  await waitForTerminalMarker(ws, marker, {
+    claim: signal => claimTerminalControl(ws, { signal }),
+    release: () => releaseTerminalControl(ws), timeoutMs: TERMINAL_WEBSOCKET_TIMEOUT_MS
   });
 }
 
@@ -1884,31 +1863,44 @@ function trackTerminalControl(ws) {
   ws.on('message', (raw) => {
     let message;
     try { message = JSON.parse(String(raw)); } catch { return; }
+    if (!message || typeof message !== 'object') return;
     if (message.action_token) ws.hccActionToken = message.action_token;
     if (message.control) ws.hccControl = message.control;
   });
   return ws;
 }
 
-async function claimTerminalControl(ws) {
+export async function claimTerminalControl(ws, { signal } = {}) {
+  const aborted = () => Object.assign(new Error('terminal control claim aborted'), { code: 'TERMINAL_CONTROL_ABORTED' });
+  if (signal?.aborted) throw aborted();
   if (ws.hccControl?.can_control) return ws.hccControl;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => finish(new Error('terminal control claim timeout')), 5000);
+    let settled = false;
     const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       ws.off('message', onMessage);
+      signal?.removeEventListener('abort', onAbort);
       if (error) reject(error);
       else resolve(ws.hccControl);
     };
     const onMessage = (raw) => {
+      if (settled) return;
       let message;
       try { message = JSON.parse(String(raw)); } catch { return; }
+      if (!message || typeof message !== 'object') return;
       if (message.type === 'error') finish(new Error(`terminal control claim failed: ${JSON.stringify(message.error)}`));
       else if (message.type === 'control' && message.control?.can_control) finish();
     };
+    const onAbort = () => finish(aborted());
     ws.on('message', onMessage);
-    ws.send(JSON.stringify({ type: 'control', action: 'claim', action_token: ws.hccActionToken,
-      epoch: ws.hccControl?.epoch, force: true }));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      ws.send(JSON.stringify({ type: 'control', action: 'claim', action_token: ws.hccActionToken,
+        epoch: ws.hccControl?.epoch, force: true }));
+    } catch (error) { finish(error); }
   });
 }
 
