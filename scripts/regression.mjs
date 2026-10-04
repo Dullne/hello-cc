@@ -177,21 +177,31 @@ function fixtureCliFailurePayload(output) {
   const parse = value => {
     try {
       const payload = JSON.parse(value);
-      return payload?.ok === false && payload.error && typeof payload.error === 'object' &&
+      return payload?.ok === false && !Array.isArray(payload) && payload.error && typeof payload.error === 'object' &&
         !Array.isArray(payload.error) ? payload : null;
     } catch { return null; }
   };
   const direct = parse(text);
   if (direct) return direct;
-  // Node can precede the CLI's multiline JSON with a warning and its trace
-  // hint. Accept only a small recognizable prefix, never arbitrary log text.
-  const jsonStart = text.lastIndexOf('\n{');
-  if (jsonStart < 0 || jsonStart > 4096) return null;
-  const prefix = text.slice(0, jsonStart).split('\n').map(line => line.trim()).filter(Boolean);
-  if (prefix.length > 8 || !prefix.every(line =>
+  // Node warnings can precede or follow the CLI's complete JSON document.
+  // Strip only bounded, recognized edge lines; never scan arbitrary logs for
+  // inner objects, which could turn a nested error into the CLI failure.
+  const lines = text.split(/\r?\n/);
+  let first = 0, last = lines.length, warningLines = 0, warningBytes = 0;
+  const warning = line =>
     /^\(node:\d+\) (?:\[[A-Z][A-Z0-9_]*\] )?(?:[A-Za-z]+Warning|Warning):/.test(line) ||
-    /^\(Use `node --trace-(?:warnings|deprecation) \.\.\.` to show where the warning was created\)$/.test(line))) return null;
-  return parse(text.slice(jsonStart + 1));
+    /^\(Use (?:`node --trace-(?:warnings|deprecation) \.\.\.`|node --trace-(?:warnings|deprecation)(?: \.\.\.)?) to show where the warning was created\)$/.test(line);
+  const strip = line => {
+    const trimmed = line.trim();
+    if (trimmed && !warning(trimmed)) return false;
+    if (trimmed) warningLines += 1;
+    warningBytes += Buffer.byteLength(line) + 1;
+    return true;
+  };
+  while (first < last && strip(lines[first])) first += 1;
+  while (first < last && strip(lines[last - 1])) last -= 1;
+  if (warningLines > 8 || warningBytes > 4096) return null;
+  return parse(lines.slice(first, last).join('\n'));
 }
 
 function fixtureCliResultParts(result) {

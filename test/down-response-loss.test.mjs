@@ -7,10 +7,12 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createMiscCommands } from '../lib/cli/commands/misc.mjs';
-import { waitForLiveProcessIdentity, waitForProcessIdentityExit } from '../lib/process/identity.mjs';
+import { compareProcessIdentity, inspectProcessIdentity, waitForLiveProcessIdentity,
+  waitForProcessIdentityExit } from '../lib/process/identity.mjs';
 import { runtimeRequest } from '../lib/runtime/client.mjs';
 import { reclaimRuntimePointerFiles } from '../lib/runtime/state.mjs';
 import { CliError } from '../lib/shared/errors.mjs';
+import { withFileLock } from '../lib/shared/file-lock.mjs';
 
 const original = { pid: 42, startToken: 'boot:100', commandHash: 'a'.repeat(64) };
 
@@ -21,16 +23,26 @@ function fixture(t, { observed = { state: 'dead', identity: null }, replacement 
   const pointer = path.join(directory, 'runtime.json');
   const runtime = { pid: original.pid, process_identity: identity,
     source: source || pointer, base_url: 'http://127.0.0.1:1' };
-  const saved = replacement || (present ? { pid: original.pid, process_identity: original } : null);
-  if (saved) fs.writeFileSync(pointer, JSON.stringify(saved));
+  const saved = replacement || (present ? runtime : null);
+  // Capture a live original owner before the request, then model the runtime's
+  // removal or a successor's publication while the stop response is lost.
+  fs.writeFileSync(pointer, JSON.stringify(runtime));
   const failure = new CliError('RUNTIME_UNREACHABLE', 'Stop response was interrupted');
   let requests = 0, waits = 0, reclaims = 0;
   const output = [];
-  const commands = createMiscCommands({ path, process: { env: {} }, CliError,
+  const commands = createMiscCommands({ path, fs, process: { env: {} }, CliError,
     printResult: (_ctx, value) => output.push(value),
     readRuntime: () => runtime, runtimePath: () => pointer,
     globalRuntimePath: () => path.join(directory, 'global.json'),
-    runtimeRequest: async () => { requests++; throw failure; },
+    runtimeRequest: async () => {
+      requests++;
+      if (replacement) fs.writeFileSync(pointer, JSON.stringify(replacement));
+      else if (!present) fs.unlinkSync(pointer);
+      throw failure;
+    },
+    compareProcessIdentity,
+    inspectProcessIdentity: () => ({ state: 'live', identity: original }),
+    withFileLock,
     reclaimRuntimePointerFiles: (files, options) => {
       reclaims++;
       return reclaimRuntimePointerFiles(files, { ...options, inspect: () => observed });
@@ -51,7 +63,7 @@ test('down confirms the original owner exit after a lost response and self-remov
   const f = fixture(t);
   await f.cmdDown({}, []);
   assert.equal(f.output.length, 1);
-  assert.deepEqual(f.counts(), { requests: 1, waits: 1, reclaims: 1 });
+  assert.deepEqual(f.counts(), { requests: 1, waits: 1, reclaims: 0 });
   assert.equal(fs.existsSync(f.pointer), false);
 });
 
@@ -76,10 +88,11 @@ for (const state of ['live', 'dead']) {
     const replacementIdentity = { ...original, startToken: 'boot:200' };
     const f = fixture(t, { replacement: { pid: original.pid, process_identity: replacementIdentity },
       observed: { state, identity: state === 'live' ? replacementIdentity : null } });
-    await f.cmdDown({}, []);
+    await assert.rejects(f.cmdDown({}, []), error => error === f.failure);
     assert.deepEqual(JSON.parse(fs.readFileSync(f.pointer, 'utf8')), f.saved);
-    assert.equal(f.output.length, 1);
-    assert.equal(f.counts().requests, 1, 'never send another stop to the replacement');
+    assert.equal(f.output.length, 0);
+    assert.deepEqual(f.counts(), { requests: 1, waits: 1, reclaims: 0 },
+      'never send another stop to, or reclaim, the replacement');
   });
 }
 
@@ -126,13 +139,15 @@ test('real HTTP stop can remove its pointer, lose the response and exit without 
       source: pointer, base_url: 'http://127.0.0.1:' + port };
     fs.writeFileSync(pointer, JSON.stringify(runtime));
     const output = [];
-    let transportFailure;
-    const commands = createMiscCommands({ path, process: { env: {} }, CliError,
+    let transportFailure, requests = 0;
+    const commands = createMiscCommands({ path, fs, process: { env: {} }, CliError,
       readRuntime: () => runtime, runtimePath: () => pointer,
       globalRuntimePath: () => path.join(directory, 'global.json'),
       reclaimRuntimePointerFiles, waitForProcessIdentityExit,
+      compareProcessIdentity, inspectProcessIdentity, withFileLock,
       printResult: (_ctx, value) => output.push(value), PRODUCT_NAME: 'hello-cc',
       runtimeRequest: async (...args) => {
+        requests++;
         try { return await runtimeRequest(...args); }
         catch (error) { transportFailure = error.code; throw error; }
       }
@@ -141,6 +156,7 @@ test('real HTTP stop can remove its pointer, lose the response and exit without 
     try { await commands.cmdDown({ root: directory, dbPath: path.join(directory, 'mesh.db') }, []); }
     catch (error) { downError = error; }
     assert.equal(transportFailure, 'RUNTIME_UNREACHABLE');
+    assert.equal(requests, 1, 'response recovery must not replay the stop request');
     assert.deepEqual(await exited, [0, null]);
     assert.equal(fs.existsSync(pointer), false);
     t.diagnostic('Stop reached the real HTTP server; its pointer disappeared and its process exited 0 without a signal');

@@ -8,6 +8,7 @@ on:
       - codex/dsh-stable-fixes
       - 'codex/web-workbench-*'
       - codex/dsh-macos-boot-identity
+      - codex/dsh-stop-confirmation
     tags:
       - 'v*'
   pull_request:

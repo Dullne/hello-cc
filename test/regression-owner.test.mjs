@@ -9,6 +9,7 @@ import { observeFixtureOwner, signalFixtureOwner, waitForFixtureOwnerExit,
   fixtureDiagnosticText, fixtureDownResult, fixtureFailureError,
   fixtureFailureDiagnostic, fixtureStopEnvironment } from '../scripts/regression.mjs';
 import { readRuntime } from '../lib/runtime/state.mjs';
+import { formatJson } from '../lib/format.mjs';
 
 const owner = { pid: 12345, startToken: 'boot:original', commandHash: 'a'.repeat(64) };
 const observation = (value, state = 'S') => observeFixtureOwner(owner, {
@@ -171,6 +172,120 @@ test('fixture down extracts bounded warning-prefixed JSON and ignores private ou
     assert.equal(diagnostic.code, null);
     assert.deepEqual(diagnostic.extra, {});
     assert.doesNotMatch(JSON.stringify(diagnostic), /arbitrary private prefix|ExperimentalWarning/);
+  }
+});
+
+for (const stdout of ['', 'ordinary stdout', formatJson(true, { runtime: 'private-runtime' })]) {
+  test(`down diagnostics extract stderr CliError JSON after ${stdout ? 'non-error' : 'empty'} stdout`, () => {
+    const stderr = formatJson(false, {
+        code: 'RUNTIME_UNREACHABLE', pid: owner.pid, elapsedMs: 12, timeoutMs: 8000,
+        message: 'Bearer private-token', token: 'private-token', body: 'private-body',
+        runtime: 'private-runtime', method: 'POST', path: '/api/runtime/stop',
+        errorName: 'private-name', state: 'unknown'
+      }) + '\n';
+    const result = fixtureDownResult({ status: 1, signal: null, stdout, stderr });
+    assert.deepEqual(result, {
+      status: 1, signal: null, code: 'RUNTIME_UNREACHABLE',
+      source: 'stderr', stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
+      extra: { pid: owner.pid, elapsedMs: 12, timeoutMs: 8000 }
+    });
+    assert.doesNotMatch(JSON.stringify(result), /private-|Bearer|POST|runtime\/stop|unknown/);
+  });
+}
+
+test('down stderr diagnostics reject malformed output, invalid codes and nonnumeric context', () => {
+  for (const [stderr, source] of [
+    ['private-body Bearer private-token', null],
+    ['null', null],
+    [JSON.stringify({ error: ['private-body'] }), null],
+    [formatJson(false, { code: 'PRIVATE\nTOKEN', pid: 'private-pid', elapsedMs: -1, timeoutMs: 'private-timeout' }), 'stderr']
+  ]) {
+    assert.deepEqual(fixtureDownResult({ status: 1, stdout: '', stderr }), {
+      status: 1, signal: null, code: null, source, stdoutBytes: 0, stderrBytes: Buffer.byteLength(stderr), extra: {}
+    });
+  }
+  assert.deepEqual(fixtureDownResult({ status: null, error: { code: 'ENOENT' }, stderr: 'private-body' }), {
+    status: null, signal: null, code: 'ENOENT', source: 'spawn', stdoutBytes: 0,
+    stderrBytes: Buffer.byteLength('private-body'), extra: {}
+  });
+});
+
+for (const pretty of [true, false]) {
+  test(`down diagnostics read a standalone ${pretty ? 'pretty' : 'single-line'} JSON error around Node warnings`, () => {
+    const error = {
+      code: 'RUNTIME_STOP_TIMEOUT', pid: owner.pid, timeoutMs: 5000,
+      message: 'private-body "quoted" { fake: [private-token] } \\ escaped',
+      private: [{ error: { code: 'PRIVATE_FAKE_CODE' } }], token: 'private-token'
+    };
+    const document = pretty ? formatJson(false, error) : JSON.stringify({ ok: false, error });
+    const warning = '(node:123) ExperimentalWarning: SQLite is an experimental feature\n(Use node --trace-warnings to show where the warning was created)';
+    for (const stderr of [document, `${warning}\n${document}`, `${document}\n${warning}`, `${warning}\n${document}\n${warning}`]) {
+      const result = fixtureDownResult({ status: 1, stdout: '', stderr });
+      assert.deepEqual(result, {
+        status: 1, signal: null, code: 'RUNTIME_STOP_TIMEOUT', source: 'stderr', stdoutBytes: 0,
+        stderrBytes: Buffer.byteLength(stderr), extra: { pid: owner.pid, timeoutMs: 5000 }
+      });
+      assert.doesNotMatch(JSON.stringify(result), /private-|PRIVATE_FAKE_CODE|ExperimentalWarning|quoted|escaped/);
+    }
+  });
+}
+
+test('down diagnostics reject nested, prefixed, truncated and malformed JSON error fragments', () => {
+  const document = formatJson(false, { code: 'PRIVATE_FAKE_CODE', token: 'private-token' });
+  for (const stderr of [
+    `private-log ${document}`,
+    `${document} private-log`,
+    `[\n${document}\n]`,
+    `{ "private":\n${document}\n}`,
+    `private-log { "private": [\n${document}\n] }`,
+    `{ "private": [\n${document}`,
+    `{ "private": [\n${document}\n}`, // Mismatched delimiters.
+    '{"error":{"code":"PRIVATE_FAKE_CODE",}}',
+    JSON.stringify({ message: document }),
+    '{"message":"private-body\n' + document + '\n"}'
+  ]) {
+    assert.deepEqual(fixtureDownResult({ status: 1, stdout: '', stderr }), {
+      status: 1, signal: null, code: null, source: null, stdoutBytes: 0,
+      stderrBytes: Buffer.byteLength(stderr), extra: {}
+    });
+  }
+});
+
+test('down diagnostics reject arbitrary log containers even before a later independent error object', () => {
+  const nested = formatJson(false, { code: 'PRIVATE_FAKE_CODE', pid: 99, token: 'private-token' });
+  const actual = formatJson(false, { code: 'RUNTIME_UNREACHABLE', elapsedMs: 12 });
+  for (const prefixed of [
+    `private-log [meta] { "private":\n${nested}\n}`,
+    `private-log {} [meta] [\n${nested}\n]`,
+    `{} { "private":\n${nested}\n}`
+  ]) {
+    // Only known Node warnings may surround the CLI error. A valid JSON object
+    // later in arbitrary output does not establish that it is the CLI failure.
+    for (const stderr of [prefixed, `${prefixed}\n${actual}`]) {
+      const result = fixtureDownResult({ status: 1, stderr });
+      assert.deepEqual(result, {
+        status: 1, signal: null, code: null, source: null, stdoutBytes: 0,
+        stderrBytes: Buffer.byteLength(stderr), extra: {}
+      });
+      assert.doesNotMatch(JSON.stringify(result), /PRIVATE_FAKE_CODE|private-token/);
+    }
+  }
+});
+
+test('down diagnostic warning limits apply across both sides of the JSON document', () => {
+  const document = formatJson(false, { code: 'RUNTIME_STOP_TIMEOUT' });
+  const warning = '(node:123) ExperimentalWarning: PRIVATE_WARNING\n';
+  const accepted = warning.repeat(4) + document + '\n' + warning.repeat(4);
+  assert.equal(fixtureDownResult({ status: 1, stderr: accepted }).code, 'RUNTIME_STOP_TIMEOUT');
+  for (const stderr of [
+    warning.repeat(5) + document + '\n' + warning.repeat(4),
+    document + '\n(node:123) ExperimentalWarning: ' + 'x'.repeat(4096)
+  ]) {
+    const result = fixtureDownResult({ status: 1, stderr });
+    assert.equal(result.code, null);
+    assert.equal(result.source, null);
+    assert.deepEqual(result.extra, {});
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_WARNING|ExperimentalWarning/);
   }
 });
 
