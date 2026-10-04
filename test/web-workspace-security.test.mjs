@@ -5,7 +5,7 @@ import http from 'node:http';
 import vm from 'node:vm';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
-import { createCookieAuth } from '../lib/web/cookie-auth.mjs';
+import { createCookieAuth, createCookieNameForRequest } from '../lib/web/cookie-auth.mjs';
 import { authOk, contentSecurityPolicy, requestIsSecure, sendHttp } from '../lib/web/http.mjs';
 import { nativePanelScript } from '../lib/web/ui-native.mjs';
 
@@ -19,6 +19,7 @@ async function fixture(t) {
   let currentTime = 1000;
   const token = 'workspace-test-token';
   const auth = createCookieAuth({ now: () => currentTime, ttlSec: 60, maxSessions: 10,
+    cookieNameForRequest: createCookieNameForRequest(),
     requestIsSecure, authOk, token, trustProxy: false });
   const renders = [];
   const { handleWebRequest } = createHttpRoutes({ ...auth, token,
@@ -33,7 +34,8 @@ async function fixture(t) {
   const base = 'http://127.0.0.1:' + server.address().port;
   const get = (route, headers = {}) => fetch(base + route, { headers, redirect: 'manual' });
   const sid = auth.issueSession();
-  return { ...auth, base, get, sid, cookie: 'hcc_sid=' + sid, renders,
+  const cookie = auth.sessionCookieHeader(sid, { socket: { localPort: server.address().port } }).split(';')[0];
+  return { ...auth, base, get, sid, cookie, renders,
     expire() { currentTime += 61; } };
 }
 
@@ -63,7 +65,7 @@ test('only authenticated pane HTML opts into same-origin framing and forbids nes
 test('pane route rejects missing, forged, expired and token-only credentials without rendering a login frame', async t => {
   const f = await fixture(t);
   for (const [route, headers] of [
-    ['/pane', {}], ['/pane', { cookie: 'hcc_sid=forged' }],
+    ['/pane', {}], ['/pane', { cookie: f.cookie.replace(/=.*/, '=forged') }],
     ['/pane?token=workspace-test-token', {}], ['/pane', { authorization: 'Bearer workspace-test-token' }]
   ]) {
     const response = await f.get(route, headers);

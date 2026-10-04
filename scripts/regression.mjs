@@ -2021,6 +2021,18 @@ async function fetchTerminalSnapshot(peer, params = {}) {
   });
 }
 
+function browserSessionCookie(setCookie, endpoint, { expired = false } = {}) {
+  const url = new URL(endpoint);
+  const protocol = url.protocol.slice(0, -1);
+  const effectivePort = url.port || (protocol === 'https' ? '443' : '80');
+  const expectedName = `hcc_sid_v2_${protocol}_${effectivePort}`;
+  const match = String(setCookie).match(/^([^=;\s]+)=([^;]*)/);
+  if (!match || match[1] !== expectedName || (expired ? match[2] !== '' : !match[2])) {
+    fail(`browser session cookie did not match endpoint scope ${expectedName} (expired=${expired})`);
+  }
+  return { name: match[1], sid: match[2], cookie: `${match[1]}=${match[2]}` };
+}
+
 async function issueBrowserSessionCookie({ signal } = {}) {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
@@ -2032,11 +2044,10 @@ async function issueBrowserSessionCookie({ signal } = {}) {
     redirect: 'manual'
   });
   const setCookie = response.headers.get('set-cookie') || '';
-  const sid = setCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-  if (response.status !== 302 || !sid) {
-    fail(`browser session login failed: status=${response.status} cookie=${setCookie}`);
+  if (response.status !== 302) {
+    fail(`browser session login failed: status=${response.status}`);
   }
-  return { baseUrl, origin: new URL(baseUrl).origin, sid };
+  return { baseUrl, origin: new URL(baseUrl).origin, ...browserSessionCookie(setCookie, baseUrl) };
 }
 
 export async function cookieRuntimeFetch(route, auth, options = {}, params = {}) {
@@ -2047,7 +2058,7 @@ export async function cookieRuntimeFetch(route, auth, options = {}, params = {})
   return fetch(url, {
     ...options,
     headers: {
-      Cookie: `hcc_sid=${auth.sid}`,
+      Cookie: auth.cookie,
       Origin: auth.origin,
       'X-HCC-API-Version': '2',
       ...(options.headers || {})
@@ -2063,7 +2074,7 @@ async function cookieRuntimeFetchWithoutOrigin(route, auth, options = {}, params
   return fetch(url, {
     ...options,
     headers: {
-      Cookie: `hcc_sid=${auth.sid}`,
+      Cookie: auth.cookie,
       'X-HCC-API-Version': '2',
       ...(options.headers || {})
     }
@@ -2090,7 +2101,7 @@ async function expectSocketMarkerAfter(ws, marker, action) {
   });
 }
 
-async function openCookieTerminalWebSocket(peer, sid, params = {}) {
+async function openCookieTerminalWebSocket(peer, cookie, params = {}) {
   const runtime = currentRuntime();
   const baseUrl = runtime.base_url || `http://127.0.0.1:${port}`;
   const url = new URL(`/ws/terminal/${encodeURIComponent(peer)}`, baseUrl);
@@ -2103,7 +2114,7 @@ async function openCookieTerminalWebSocket(peer, sid, params = {}) {
     let settled = false;
     const ws = trackTerminalControl(new WebSocket(url, {
       headers: {
-        Cookie: `hcc_sid=${sid}`,
+        Cookie: cookie,
         Origin: new URL(baseUrl).origin
       }
     }));
@@ -2144,12 +2155,12 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
     redirect: 'manual'
   });
   const setCookie = login.headers.get('set-cookie') || '';
-  const sid = setCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-  if (login.status !== 302 || !sid) {
-    fail(`cookie websocket login failed: status=${login.status} cookie=${setCookie}`);
+  if (login.status !== 302) {
+    fail(`cookie websocket login failed: status=${login.status}`);
   }
+  const auth = browserSessionCookie(setCookie, baseUrl);
 
-  const ws = await openCookieTerminalWebSocket(peer, sid, params);
+  const ws = await openCookieTerminalWebSocket(peer, auth.cookie, params);
   try {
     const closed = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`${peer} cookie websocket logout close timeout`)), 5000);
@@ -2166,7 +2177,7 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
       fetch(new URL('/logout', baseUrl), {
         method: 'POST',
         headers: {
-          Cookie: `hcc_sid=${sid}`,
+          Cookie: auth.cookie,
           Origin: origin
         }
       }),
@@ -2175,11 +2186,12 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
     if (logout.status !== 204 || !(logout.headers.get('set-cookie') || '').includes('Max-Age=0')) {
       fail(`cookie websocket logout did not expire its session: status=${logout.status}`);
     }
+    browserSessionCookie(logout.headers.get('set-cookie') || '', baseUrl, { expired: true });
     if (closeResult.code !== 4001 || ws.readyState !== WebSocket.CLOSED) {
       fail(`cookie websocket logout did not close the established socket with 4001:\n${JSON.stringify({ closeResult, readyState: ws.readyState }, null, 2)}`);
     }
     const revoked = await fetch(new URL('/api/runtime', baseUrl), {
-      headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' }
+      headers: { Cookie: auth.cookie, 'X-HCC-API-Version': '2' }
     });
     if (revoked.status !== 401) {
       fail(`cookie websocket logout left the old cookie authorized: ${revoked.status}`);
@@ -2193,7 +2205,7 @@ async function assertLogoutClosesCookieWebSocket(peer, params = {}) {
 
 async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
   const auth = await issueBrowserSessionCookie();
-  const ws = await openCookieTerminalWebSocket(peer, auth.sid, params);
+  const ws = await openCookieTerminalWebSocket(peer, auth.cookie, params);
   try {
     const closed = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`${peer} cookie websocket eviction close timeout`)), 10000);
@@ -2214,7 +2226,7 @@ async function assertEvictionClosesCookieWebSocket(peer, params = {}) {
       fail(`cookie websocket eviction did not close with 4001:\n${JSON.stringify(closeResult, null, 2)}`);
     }
     const revoked = await fetch(new URL('/api/runtime', auth.baseUrl), {
-      headers: { Cookie: `hcc_sid=${auth.sid}`, 'X-HCC-API-Version': '2' }
+      headers: { Cookie: auth.cookie, 'X-HCC-API-Version': '2' }
     });
     if (revoked.status !== 401) fail(`evicted cookie remained authorized: ${revoked.status}`);
   } finally {
@@ -2830,7 +2842,7 @@ async function cookieSessionExpiryWorkflow() {
     }
 
     const auth = await issueBrowserSessionCookie();
-    ws = await openCookieTerminalWebSocket(expirySessionId, auth.sid, { root });
+    ws = await openCookieTerminalWebSocket(expirySessionId, auth.cookie, { root });
     if (!ws.hccActionToken) fail('short-TTL cookie terminal snapshot omitted its action token');
     const expiryWindow = createCookieExpiryWindow(COOKIE_EXPIRY_FIXTURE_TTL_SEC * 1000);
     // Listen before waiting so spontaneous expiry is retained. Start the close
@@ -2918,8 +2930,8 @@ async function webSecretRedactionWorkflow() {
       body: JSON.stringify({ token: secret }),
       redirect: 'manual'
     });
-    const sid = (login.headers.get('set-cookie') || '').match(/hcc_sid=([^;]+)/)?.[1] || '';
-    if (login.status !== 302 || !sid) fail(`redaction login failed with status ${login.status}`);
+    if (login.status !== 302) fail(`redaction login failed with status ${login.status}`);
+    const auth = browserSessionCookie(login.headers.get('set-cookie') || '', runtime.base_url);
 
     const create = await runtimeFetch('/api/sessions', {
       method: 'POST',
@@ -2933,7 +2945,7 @@ async function webSecretRedactionWorkflow() {
       })
     }, { root });
     if (!create.ok) fail(`redaction PTY create failed with status ${create.status}`);
-    terminalWs = await openCookieTerminalWebSocket(sessionId, sid, { root });
+    terminalWs = await openCookieTerminalWebSocket(sessionId, auth.cookie, { root });
     terminalWs.send(JSON.stringify({ type: 'resize', cols: 90, rows: 28,
       action_token: terminalWs.hccActionToken, epoch: terminalWs.hccControl.epoch }));
 
@@ -2950,7 +2962,7 @@ async function webSecretRedactionWorkflow() {
 
     const invalidCookie = await fetch(new URL('/api/runtime', runtime.base_url), {
       headers: {
-        Cookie: `hcc_sid=${secret}`,
+        Cookie: `${auth.name}=${secret}`,
         'X-HCC-API-Version': '2'
       }
     });
@@ -3266,14 +3278,14 @@ async function setupRegression() {
     { headers: { Accept: 'text/html' } }
   );
   const directTlsSetCookie = String(directTlsExchange.headers['set-cookie']?.[0] || '');
-  const directTlsSid = directTlsSetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-  if (directTlsExchange.status !== 302 || !directTlsSid || !directTlsSetCookie.includes('Secure')) {
-    fail(`direct TLS login did not issue a Secure cookie: status=${directTlsExchange.status} cookie=${directTlsSetCookie}`);
+  if (directTlsExchange.status !== 302 || !directTlsSetCookie.includes('Secure')) {
+    fail(`direct TLS login did not issue a Secure cookie: status=${directTlsExchange.status}`);
   }
+  const directTlsAuth = browserSessionCookie(directTlsSetCookie, directTlsRuntime.base_url);
   const directTlsLogout = await directTlsRequest(directTlsRuntime, '/logout', {
     method: 'POST',
     headers: {
-      Cookie: `hcc_sid=${directTlsSid}`,
+      Cookie: directTlsAuth.cookie,
       Origin: new URL(directTlsRuntime.base_url).origin
     }
   });
@@ -3281,8 +3293,9 @@ async function setupRegression() {
   if (directTlsLogout.status !== 204 ||
       !directTlsLogoutCookie.includes('Max-Age=0') ||
       !directTlsLogoutCookie.includes('Secure')) {
-    fail(`direct TLS logout did not expire a Secure cookie: status=${directTlsLogout.status} cookie=${directTlsLogoutCookie}`);
+    fail(`direct TLS logout did not expire a Secure cookie: status=${directTlsLogout.status}`);
   }
+  browserSessionCookie(directTlsLogoutCookie, directTlsRuntime.base_url, { expired: true });
   await stopRuntime();
 
   await assertWebWrapperParentSurvives();
@@ -3390,24 +3403,22 @@ async function setupRegression() {
   });
   if (exchange.status !== 302) fail(`browser-nav ?token did not exchange to a cookie redirect: ${exchange.status}`);
   const setCookie = exchange.headers.get('set-cookie') || '';
-  if (!setCookie.includes('hcc_sid=') || !setCookie.includes('HttpOnly') || !setCookie.includes('SameSite=Lax')) {
-    fail(`exchange did not set an HttpOnly SameSite cookie: ${setCookie}`);
+  if (!setCookie.includes('HttpOnly') || !setCookie.includes('SameSite=Lax')) {
+    fail('exchange did not set an HttpOnly SameSite cookie');
   }
-  if (setCookie.includes('Secure')) fail(`plaintext LAN exchange issued a Secure cookie: ${setCookie}`);
-  const sidMatch = setCookie.match(/hcc_sid=([^;]+)/);
-  if (!sidMatch) fail(`exchange did not return a session id: ${setCookie}`);
-  const sid = sidMatch[1];
+  if (setCookie.includes('Secure')) fail('plaintext LAN exchange issued a Secure cookie');
+  const browserAuth = browserSessionCookie(setCookie, baseUrl);
   // (b) API with the session cookie → 200
-  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' } });
+  const withCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: browserAuth.cookie, 'X-HCC-API-Version': '2' } });
   if (!withCookie.ok) fail(`API with session cookie required auth: ${withCookie.status}`);
   // (c) API with a bogus session cookie → 401
-  const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: 'hcc_sid=bogus', 'X-HCC-API-Version': '2' } });
+  const bogusCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `${browserAuth.name}=bogus`, 'X-HCC-API-Version': '2' } });
   if (bogusCookie.status !== 401) fail(`API with bogus session cookie did not 401: ${bogusCookie.status}`);
   // (d) cookie-authenticated writes require an exact same-origin Origin header.
   const crossOriginCookieWrite = await fetch(`${baseUrl}/api/csrf-probe`, {
     method: 'POST',
     headers: {
-      Cookie: `hcc_sid=${sid}`,
+      Cookie: browserAuth.cookie,
       Origin: `http://127.0.0.1:${port + 1}`,
       'X-HCC-API-Version': '2',
       'Content-Type': 'application/json'
@@ -3424,7 +3435,7 @@ async function setupRegression() {
   const sameOriginCookieWrite = await fetch(`${baseUrl}/api/csrf-probe`, {
     method: 'POST',
     headers: {
-      Cookie: `hcc_sid=${sid}`,
+      Cookie: browserAuth.cookie,
       Origin: new URL(baseUrl).origin,
       'X-HCC-API-Version': '2',
       'Content-Type': 'application/json'
@@ -3451,23 +3462,25 @@ async function setupRegression() {
     body: JSON.stringify({ token: cookieToken }),
     redirect: 'manual'
   });
-  if (loginPost.status !== 302 || !(loginPost.headers.get('set-cookie') || '').includes('hcc_sid=')) {
+  if (loginPost.status !== 302) {
     fail(`POST /login did not issue a session cookie: ${loginPost.status}`);
   }
+  browserSessionCookie(loginPost.headers.get('set-cookie') || '', baseUrl);
 
   // (h) logout revokes the opaque session and expires the browser cookie.
   const logout = await fetch(`${baseUrl}/logout`, {
     method: 'POST',
     headers: {
-      Cookie: `hcc_sid=${sid}`,
+      Cookie: browserAuth.cookie,
       Origin: new URL(baseUrl).origin
     }
   });
   const logoutCookie = logout.headers.get('set-cookie') || '';
-  if (logout.status !== 204 || !logoutCookie.includes('hcc_sid=') || !logoutCookie.includes('Max-Age=0')) {
-    fail(`logout did not revoke and expire the session cookie: status=${logout.status} cookie=${logoutCookie}`);
+  if (logout.status !== 204 || !logoutCookie.includes('Max-Age=0')) {
+    fail(`logout did not revoke and expire the session cookie: status=${logout.status}`);
   }
-  const revokedCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${sid}`, 'X-HCC-API-Version': '2' } });
+  browserSessionCookie(logoutCookie, baseUrl, { expired: true });
+  const revokedCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: browserAuth.cookie, 'X-HCC-API-Version': '2' } });
   if (revokedCookie.status !== 401) fail(`logout left the old session cookie authorized: ${revokedCookie.status}`);
 
   // (i) trusted loopback reverse-proxy headers mark issued and expired cookies
@@ -3496,14 +3509,18 @@ async function setupRegression() {
     redirect: 'manual'
   });
   const proxySetCookie = proxyExchange.headers.get('set-cookie') || '';
-  const proxySid = proxySetCookie.match(/hcc_sid=([^;]+)/)?.[1] || '';
-  if (proxyExchange.status !== 302 || !proxySid || !proxySetCookie.includes('Secure')) {
-    fail(`trusted proxy login did not issue a Secure cookie: status=${proxyExchange.status} cookie=${proxySetCookie}`);
+  if (proxyExchange.status !== 302 || !proxySetCookie.includes('Secure')) {
+    fail(`trusted proxy login did not issue a Secure cookie: status=${proxyExchange.status}`);
   }
+  const proxyAuth = browserSessionCookie(proxySetCookie, proxyOrigin);
+  const withProxyCookie = await fetch(`${baseUrl}/api/runtime`, {
+    headers: { ...proxyHeaders, Cookie: proxyAuth.cookie, 'X-HCC-API-Version': '2' }
+  });
+  if (!withProxyCookie.ok) fail(`trusted proxy API rejected its session cookie: ${withProxyCookie.status}`);
   const proxyLogout = await fetch(`${baseUrl}/logout`, {
     method: 'POST',
     headers: {
-      Cookie: `hcc_sid=${proxySid}`,
+      Cookie: proxyAuth.cookie,
       Origin: proxyOrigin,
       'X-Forwarded-Host': 'public.example.test:9443',
       'X-Forwarded-Proto': 'https'
@@ -3511,9 +3528,12 @@ async function setupRegression() {
   });
   const proxyLogoutCookie = proxyLogout.headers.get('set-cookie') || '';
   if (proxyLogout.status !== 204 || !proxyLogoutCookie.includes('Max-Age=0') || !proxyLogoutCookie.includes('Secure')) {
-    fail(`trusted proxy logout did not expire a Secure cookie: status=${proxyLogout.status} cookie=${proxyLogoutCookie}`);
+    fail(`trusted proxy logout did not expire a Secure cookie: status=${proxyLogout.status}`);
   }
-  const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, { headers: { Cookie: `hcc_sid=${proxySid}`, 'X-HCC-API-Version': '2' } });
+  browserSessionCookie(proxyLogoutCookie, proxyOrigin, { expired: true });
+  const revokedProxyCookie = await fetch(`${baseUrl}/api/runtime`, {
+    headers: { ...proxyHeaders, Cookie: proxyAuth.cookie, 'X-HCC-API-Version': '2' }
+  });
   if (revokedProxyCookie.status !== 401) fail(`trusted proxy logout left the old cookie authorized: ${revokedProxyCookie.status}`);
 
   // A forwarded authority other than the pinned public origin is untrusted.
@@ -3528,7 +3548,7 @@ async function setupRegression() {
   });
   const defaultPortProxySetCookie = defaultPortProxyExchange.headers.get('set-cookie') || '';
   if (defaultPortProxyExchange.status !== 403 || defaultPortProxySetCookie) {
-    fail(`unpinned proxy authority received a session: status=${defaultPortProxyExchange.status} cookie=${defaultPortProxySetCookie}`);
+    fail(`unpinned proxy authority received a session: status=${defaultPortProxyExchange.status} setCookie=${Boolean(defaultPortProxySetCookie)}`);
   }
   const unpinnedProxyLogin = await fetch(`${baseUrl}/login`, {
     method: 'POST',
@@ -3553,7 +3573,7 @@ async function setupRegression() {
     });
     const spoofedLanCookie = spoofedLanExchange.headers.get('set-cookie') || '';
     if (spoofedLanExchange.status !== 403 || spoofedLanCookie) {
-      fail(`non-loopback forwarded spoof received a session: status=${spoofedLanExchange.status} cookie=${spoofedLanCookie}`);
+      fail(`non-loopback forwarded spoof received a session: status=${spoofedLanExchange.status} setCookie=${Boolean(spoofedLanCookie)}`);
     }
   } else {
     log('non-loopback forwarded spoof: no non-loopback IPv4 interface; focused boundary coverage retained');
@@ -5022,7 +5042,7 @@ async function multiProjectWebWorkflow() {
     fail(`same-origin cookie administrator create failed or leaked its action token:\n${JSON.stringify(cookieCreated, null, 2)}`);
   }
 
-  const cookieAdminWs = await openCookieTerminalWebSocket(cookieAdminId, cookieAdmin.sid, { root });
+  const cookieAdminWs = await openCookieTerminalWebSocket(cookieAdminId, cookieAdmin.cookie, { root });
   try {
     if (!cookieAdminWs.hccActionToken) fail('cookie administrator terminal snapshot omitted its action token');
     const inputRoute = `/api/sessions/${encodeURIComponent(cookieAdminId)}/input`;

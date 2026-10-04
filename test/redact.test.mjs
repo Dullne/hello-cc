@@ -65,6 +65,21 @@ test('redacts an entire CLI token argument before argv boundaries are joined', (
   );
 });
 
+test('redacts legacy and endpoint-scoped session values in diagnostics', () => {
+  const secret = 'session-fixture-value';
+  for (const name of ['hcc_sid', 'hcc_sid_v2_http_8787', 'hcc_sid_v2_https_443']) {
+    const fragment = `${name}=${secret}; Path=/`;
+    assert.equal(redactSecrets(fragment), `${name}=${REDACTED}; Path=/`);
+    assert.deepEqual(redactCliArgs(['--diagnostic', fragment]), ['--diagnostic', `${name}=${REDACTED}; Path=/`]);
+    assert.deepEqual(redactSecrets({ [name]: secret, nested: { detail: fragment } }),
+      { [name]: REDACTED, nested: { detail: `${name}=${REDACTED}; Path=/` } });
+    const error = redactSecrets(new Error(fragment));
+    assert.equal(error.message.includes(secret), false);
+    assert.equal(error.stack.includes(secret), false);
+  }
+  assert.equal(redactSecrets('hcc_sid_v2_http_8787'), 'hcc_sid_v2_http_8787');
+});
+
 test('replaces recursive references without mutating the source', () => {
   const input = { name: 'root', children: [] };
   input.self = input;

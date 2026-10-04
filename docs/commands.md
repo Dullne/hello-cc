@@ -57,6 +57,15 @@ want coordination without the Web console or shims. Provider shims only join
 projects with a local `.hello-cc/runtime.json` from `hcc web`; they do not use a
 global runtime to manage arbitrary directories.
 
+One browser can sign in to multiple Web instances on different listener ports
+of the same host without refresh or logout replacing another instance's login.
+Cookie names use the protocol and actual listener port, or the fixed
+`--proxy-origin` protocol and port behind a trusted reverse proxy. Sign in again
+after upgrading; legacy cookies are neither reused nor cleared. This prevents
+accidental collisions and is not a browser security boundary. When separate SSH
+tunnels map the same remote listener port to different local ports, use separate
+browser profiles or hostnames: the direct listener cannot identify that mapping.
+
 ## Native Workers
 
 ```text

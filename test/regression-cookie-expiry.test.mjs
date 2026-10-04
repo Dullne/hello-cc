@@ -140,7 +140,8 @@ test('cookie HTTP wrapper forwards cancellation to a stalled real request', { ti
   const baseUrl = 'http://127.0.0.1:' + server.address().port;
   const controller = new AbortController();
   const failure = new Error('fixture cancellation');
-  const request = cookieRuntimeFetch('/api/runtime', { baseUrl, origin: baseUrl, sid: 'fixture-cookie' }, { signal: controller.signal });
+  const cookie = `hcc_sid_v2_http_${server.address().port}=fixture-cookie`;
+  const request = cookieRuntimeFetch('/api/runtime', { baseUrl, origin: baseUrl, cookie }, { signal: controller.signal });
   const rejected = assert.rejects(request, error => error === failure);
   const watchdog = setTimeout(() => server.closeAllConnections(), 1000);
   try {
