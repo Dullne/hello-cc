@@ -50,6 +50,7 @@ let lastStopDiagnostic = null;
 const diagnosticSecrets = new Set();
 const fixtureFailures = new WeakSet();
 const fixtureCommandFailures = new WeakMap();
+const fixtureHttpFailures = new WeakMap();
 const managedTmuxSessions = new Set();
 
 const env = {
@@ -104,8 +105,69 @@ export function fixtureFailureDiagnostic(error) {
       ? error.fixtureStack
       : new Error('regression failure handler').stack.split('\n').slice(1, 7),
     ...(fixtureCommandFailures.has(error) ? { command: fixtureCommandFailures.get(error) } : {}),
+    ...(fixtureHttpFailures.has(error) ? { http: fixtureHttpFailures.get(error) } : {}),
     ...(terminalMarker ? { terminalMarker } : {})
   };
+}
+
+function fixtureHttpRoute(route) {
+  if (typeof route !== 'string') return null;
+  const pathname = route.split(/[?#]/, 1)[0];
+  if (['/', '/api/projects', '/api/runtime', '/api/runtime/gc-buffers', '/api/detected',
+    '/api/sessions', '/api/sessions/attach', '/api/resumable',
+    '/assets/web/browser/core.mjs', '/assets/web/ui-agent-start.mjs'].includes(pathname)) return pathname;
+  const action = pathname.match(/^\/api\/peers\/[^/?#]+\/actions\/(status|state|inbox|heartbeat|task-next|task-takeover|lock-acquire)$/);
+  if (action) return `/api/peers/:peer/actions/${action[1]}`;
+  const session = pathname.match(/^\/api\/sessions\/[^/?#]+\/(input|stop)$/);
+  if (session) return `/api/sessions/:peer/${session[1]}`;
+  if (/^\/api\/detected\/[^/?#]+\/msg$/.test(pathname)) return '/api/detected/:peer/msg';
+  return null;
+}
+
+function fixtureHttpCallFrames() {
+  // Capture our call site before invoking fetch. Never parse the thrown error's
+  // stack, whose text can contain URLs, request data or third-party messages.
+  const capture = {};
+  Error.captureStackTrace(capture, withFixtureHttpDiagnostic);
+  const source = pathToFileURL(path.join(repoRoot, 'scripts', 'regression.mjs')).href;
+  const location = new RegExp(`(?:^|[ (])${source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:(\\d+):(\\d+)\\)?$`);
+  return Object.freeze(String(capture.stack).split('\n').flatMap((frame) => {
+    const match = frame.match(location);
+    if (!match) return [];
+    return [Object.freeze({ file: 'scripts/regression.mjs', line: Number(match[1]), column: Number(match[2]) })];
+  }).slice(0, 6));
+}
+
+function fixtureHttpNetworkCode(error) {
+  const allowed = ['ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND',
+    'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET'];
+  // Reading data descriptors avoids evaluating arbitrary error/cause getters.
+  try {
+    const direct = Object.getOwnPropertyDescriptor(error, 'code')?.value;
+    const cause = Object.getOwnPropertyDescriptor(error, 'cause')?.value;
+    const nested = cause && Object.getOwnPropertyDescriptor(cause, 'code')?.value;
+    return allowed.includes(direct) ? direct : allowed.includes(nested) ? nested : null;
+  } catch { return null; }
+}
+
+export async function withFixtureHttpDiagnostic(route, options, request) {
+  const method = options?.method ?? 'GET';
+  const context = {
+    method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(method) ? method : null,
+    route: fixtureHttpRoute(route),
+    callFrames: fixtureHttpCallFrames()
+  };
+  const started = performance.now();
+  try {
+    return await request();
+  } catch (error) {
+    if (error && (typeof error === 'object' || typeof error === 'function') && !fixtureHttpFailures.has(error)) {
+      fixtureHttpFailures.set(error, Object.freeze({ ...context,
+        code: fixtureHttpNetworkCode(error), elapsedMs: Math.max(0, Math.round(performance.now() - started)) }));
+    }
+    throw error;
+  }
 }
 
 export function fixtureDiagnosticText(value, secrets = []) {
@@ -1656,11 +1718,13 @@ function currentRuntimeUrl(route, params = {}) {
   return runtimeUrl(currentRuntime(), route, params);
 }
 
-function runtimeFetch(route, options = {}, params = {}) {
-  const runtime = currentRuntime();
-  const headers = { ...(options.headers || {}), 'X-HCC-API-Version': '2' };
-  if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
-  return fetch(runtimeUrl(runtime, route, params), { ...options, headers });
+export function runtimeFetch(route, options = {}, params = {}) {
+  return withFixtureHttpDiagnostic(route, options, () => {
+    const runtime = currentRuntime();
+    const headers = { ...(options.headers || {}), 'X-HCC-API-Version': '2' };
+    if (runtime.token) headers.Authorization = `Bearer ${runtime.token}`;
+    return fetch(runtimeUrl(runtime, route, params), { ...options, headers });
+  });
 }
 
 function directTlsRequest(runtime, route, options = {}) {
@@ -4710,7 +4774,7 @@ async function multiProjectWebWorkflow() {
     fail(`detected API did not return liveness metadata:\n${JSON.stringify(detectedJson, null, 2)}`);
   }
 
-  const htmlResponse = await fetch(currentRuntimeUrl('/'));
+  const htmlResponse = await withFixtureHttpDiagnostic('/', {}, () => fetch(currentRuntimeUrl('/')));
   const pageHtml = await htmlResponse.text();
   if (!pageHtml.includes('type="module" src="/assets/web/browser/core.mjs"')) fail('web page missing ESM bootstrap');
   const moduleSources = [];

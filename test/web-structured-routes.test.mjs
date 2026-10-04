@@ -25,11 +25,42 @@ import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 
 // Production HTTP routing, ownership stores, and native loopback protocol;
 // provider adapters are in-memory fakes, with no CLI, model, or tmux calls.
+// OS socket-lock behavior has its own file-lock/native-runtime coverage. These
+// route fixtures must not depend on unrelated desktop listeners on hashed ports.
+function createFixtureOwnership() {
+  const owners = new Map();
+  return target => {
+    const key = path.join(fs.realpathSync.native(path.dirname(target)), path.basename(target));
+    if (owners.has(key)) throw Object.assign(new Error('Fixture native owner already held'), { code: 'ERR_FILE_LOCK_BUSY' });
+    const owner = Symbol('fixture native owner');
+    owners.set(key, owner);
+    return Object.freeze({
+      canonicalTarget: key,
+      assertHeld() {
+        if (owners.get(key) !== owner) throw Object.assign(new Error('Fixture native owner released'), { code: 'ERR_FILE_LOCK_LOST' });
+      },
+      release() { if (owners.get(key) === owner) owners.delete(key); }
+    });
+  };
+}
+
 async function fixture(t, hooks = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-http-structured-')));
+  const cleanups = [];
+  t.after(async () => {
+    const failures = [];
+    for (const cleanup of cleanups.reverse()) {
+      try { await cleanup(); } catch (error) { failures.push(error); }
+    }
+    // Preserve the private root for diagnosis if a resource could not close.
+    if (failures.length) throw new AggregateError(failures, 'Structured route fixture cleanup failed');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
   fs.mkdirSync(path.dirname(ctx.dbPath));
-  const db = new DatabaseSync(ctx.dbPath); initSchema(db); db.exec('PRAGMA journal_mode=WAL');
+  const db = new DatabaseSync(ctx.dbPath);
+  cleanups.push(() => db.close());
+  initSchema(db); db.exec('PRAGMA journal_mode=WAL');
   const connect = (project = ctx) => {
     const connection = new DatabaseSync(project.dbPath);
     connection.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
@@ -41,6 +72,7 @@ async function fixture(t, hooks = {}) {
   const bindings = createPeerBindingStore(events);
   const messages = createMessageStore(events);
   const sessions = new Map(), lease = createControlLease();
+  cleanups.push(() => { for (const session of sessions.values()) lease.forget(session); });
   const key = (project, id) => project.root + '\0' + id;
   const sessionsForProject = (project) => [...sessions.values()].filter(s => s.ctx.root === project.root);
   const closeSessionClients = (session) => { lease.forget(session); session.clients.clear(); session.actionTokens.clear(); };
@@ -49,6 +81,7 @@ async function fixture(t, hooks = {}) {
   const service = await startNativeService(ctx, { ...events, ...peers, ...bindings, ...messages,
     connect, detectBranch: () => '', liveProcessIdentity: () => inspectProcessIdentity(process.pid).identity }, {
     pollMs: 60000,
+    acquireOwnership: createFixtureOwnership(),
     adapterFactory: async (provider, options) => {
       await hooks.beforeNativeAdapter?.(provider, options);
       const peer = options.env.HCC_PEER;
@@ -72,6 +105,7 @@ async function fixture(t, hooks = {}) {
       nativeAdapters.set(peer, adapter); return adapter;
     }
   });
+  cleanups.push(() => service.shutdown());
   const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: 3000 });
   const native = createNativeSessions({ sessions, sessionKey: key, connectWebProject: connect,
     broadcast() {}, closeSessionClients, now, addEvent: events.addEvent,
@@ -82,7 +116,13 @@ async function fixture(t, hooks = {}) {
       return result;
     }
   });
+  cleanups.push(() => native.closeNativeBridge());
   const codexAdapters = [], codexCalls = [];
+  cleanups.push(async () => {
+    const results = await Promise.allSettled(codexAdapters.map(adapter => Promise.resolve().then(() => adapter.close())));
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (failures.length) throw new AggregateError(failures, 'Fixture Codex adapters did not all close');
+  });
   let nextId = 0;
   const codex = createCodexSessions({ sessions, sessionKey: key,
     nextProjectSessionId: () => 'codex-' + (++nextId), connectWebProject: connect,
@@ -133,7 +173,11 @@ async function fixture(t, hooks = {}) {
     webErrorStatus: error => error.code === 'BAD_REQUEST' ? 400 : error.code === 'NOT_FOUND' ? 404 : 409
   });
   const server = http.createServer(handleWebRequest);
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  cleanups.push(async () => {
+    server.closeAllConnections();
+    if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const base = 'http://127.0.0.1:' + server.address().port;
   const request = async (route, input, headers = {}) => {
     const response = await fetch(base + route, { method: input === undefined ? 'GET' : 'POST',
@@ -146,13 +190,6 @@ async function fixture(t, hooks = {}) {
     return { controller: { action_token: 'controller', epoch: controller.epoch },
       observer: { action_token: 'observer', epoch: observer.epoch } };
   };
-  t.after(async () => {
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
-    native.closeNativeBridge();
-    for (const session of sessions.values()) lease.forget(session);
-    for (const adapter of codexAdapters) await adapter.close();
-    await service.shutdown(); db.close(); fs.rmSync(root, { recursive: true, force: true });
-  });
   return { ctx, db, request, api, native, codex, lease, sessions, controllers,
     nativeAdapters, nativePosts, nativeReads, codexAdapters, codexCalls, ptySpawns, writes,
     setNativeReadHook(fn) { onNativeRead = fn; }, pollNative: () => service.poll(),
