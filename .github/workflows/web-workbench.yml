@@ -32,9 +32,17 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
       - name: Source workbench acceptance without models
+        id: source_acceptance
         run: npm run test:web -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/source"
       - name: Pack, install and exercise the public CLI and browser assets
+        id: installed_acceptance
         run: npm run test:web:installed -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/installed"
+      - name: Publish safe acceptance failure diagnostics
+        if: always() && (steps.source_acceptance.outcome == 'failure' || steps.installed_acceptance.outcome == 'failure')
+        env:
+          HCC_SOURCE_ACCEPTANCE_OUTCOME: ${{ steps.source_acceptance.outcome }}
+          HCC_INSTALLED_ACCEPTANCE_OUTCOME: ${{ steps.installed_acceptance.outcome }}
+        run: node scripts/web-acceptance-diagnostics.mjs --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT" --source-outcome "$HCC_SOURCE_ACCEPTANCE_OUTCOME" --installed-outcome "$HCC_INSTALLED_ACCEPTANCE_OUTCOME"
       - name: Upload screenshots, source hashes and receipts
         if: always()
         uses: actions/upload-artifact@v4
