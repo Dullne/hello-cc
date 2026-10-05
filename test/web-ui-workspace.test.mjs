@@ -7,7 +7,7 @@ const origin = 'http://127.0.0.1:51945';
 const copy = value => JSON.parse(JSON.stringify(value));
 const message = (action, project = '/a', extra = {}) => ({ type: 'hcc-workspace', version: 1, action, project, ...extra });
 
-function fixture({ embedded = false, parent, stored = {}, mobile = false, active = 'one' } = {}) {
+function fixture({ embedded = false, paneAllowed = true, parent, stored = {}, mobile = false, active = 'one' } = {}) {
   const elements = new Map(), frames = [], sent = [], writes = [], effects = [], timers = new Map(), listeners = new Map();
   const storage = new Map(Object.entries(stored));
   let timerId = 0;
@@ -52,7 +52,7 @@ function fixture({ embedded = false, parent, stored = {}, mobile = false, active
       if (changed.length) dispatch('hcc:preferences', { detail: { changed, preferences: this.preferences } });
     } };
   const app = element('app'); app.dataset.view = 'terminal';
-  const host = { embedded, app, primary: element('workspacePrimaryPane'), project: () => state.root, active: () => state.active,
+  const host = { embedded, paneAllowed, app, primary: element('workspacePrimaryPane'), project: () => state.root, active: () => state.active,
     ready: () => state.ready, sessions: () => state.sessions,
     esc: value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])),
     showTerminal() { app.dataset.view = 'terminal'; }, layoutChanged() {},
@@ -213,4 +213,22 @@ test('mobile pane switching keeps the hidden pane inert and closing returns acce
   assert.equal(f.element('workspacePrimaryPane').inert, true); assert.equal(f.element('workspaceSecondPane').inert, true);
   f.element('workspaceSecondary').emit('click'); f.workspace.close();
   assert.equal(f.element('workspacePrimaryPane').inert, false); assert.equal(f.frame(), undefined);
+});
+
+
+test('a page without a browser session cannot mount split panes or restore a saved open layout', () => {
+  const saved = JSON.stringify({ version: 1, open: true, direction: 'rows', ratio: .6, session: 'two' });
+  const f = fixture({ paneAllowed: false, stored: { 'hcc.workspace:/a': saved } });
+  assert.equal(f.element('splitBtn').disabled, true);
+  assert.equal(f.element('splitBtn').attributes.title, 'workspace.requiresBrowserSession');
+  assert.equal(f.workspace.isOpen, false);
+  assert.equal(f.frames.length, 0);
+  f.element('splitBtn').emit('click');
+  f.workspace.open();
+  f.workspace.sync();
+  assert.equal(f.frames.length, 0);
+  assert.equal(f.element('workspaceSecondPane').hidden, true);
+  assert.equal(f.state.active, 'one');
+  assert.equal(f.storage.get('hcc.workspace:/a'), saved, 'the layout remains available after a later sign-in');
+  assert.deepEqual(f.effects, []);
 });

@@ -599,3 +599,33 @@ test('default Claude loader keeps an installed SDK dependency error instead of r
   });
   await adapter.close();
 });
+
+
+test('Claude forks the transcript before returning, then resumes only the new session', async () => {
+  const sdk = fakeSdk({ initialize: false });
+  const forks = [];
+  const adapter = createClaudeAdapter({ query: sdk.query, forkSession: async (id, options) => {
+    forks.push({ id, options }); return { sessionId: 'new-child-session' };
+  } });
+  const state = await adapter.open({ forkSessionId: 'parent-session' });
+  assert.deepEqual(forks, [{ id: 'parent-session', options: { dir: undefined } }]);
+  assert.equal(state.sessionId, 'new-child-session');
+  assert.equal(sdk.calls, 0, 'fork does not submit a hidden inference prompt');
+  await adapter.send({ text: 'recall context', submissionId: 'child-submission' });
+  assert.equal(sdk.args.options.resume, 'new-child-session');
+  assert.equal(sdk.args.options.forkSession, undefined, 'no second lazy fork');
+  sdk.emit({ type: 'system', subtype: 'init', session_id: 'new-child-session' });
+  await until(() => adapter.snapshot().sessionId === 'new-child-session');
+  await adapter.close();
+});
+
+test('Claude fork rejects missing support, parent reuse and another provider home', async () => {
+  const sdk = fakeSdk();
+  await assert.rejects(createClaudeAdapter({ query: sdk.query }).open({ forkSessionId: 'parent' }), { code: 'NATIVE_CAPABILITY_UNSUPPORTED' });
+  await assert.rejects(createClaudeAdapter({ query: sdk.query, forkSession: async () => ({ sessionId: 'parent' }) }).open({ forkSessionId: 'parent' }), { code: 'NATIVE_SESSION_MISMATCH' });
+  let calls = 0;
+  await assert.rejects(createClaudeAdapter({ query: sdk.query, env: { CLAUDE_CONFIG_DIR: '/unowned-home' },
+    forkSession: async () => { calls++; return { sessionId: 'child' }; }
+  }).open({ forkSessionId: 'parent' }), { code: 'NATIVE_FORK_ENV_MISMATCH' });
+  assert.equal(calls, 0);
+});

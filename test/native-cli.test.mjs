@@ -56,7 +56,9 @@ lines.on('line', (line) => {
   if (frame.method === 'initialized') return;
   if (frame.method === 'thread/start' || frame.method === 'thread/resume') {
     threadId = params.threadId || 'fake-thread-' + process.pid;
-    return result(frame.id, { thread: { id: threadId, turns: [] } });
+    return result(frame.id, { thread: { id: threadId, turns: [] },
+      sandbox: { type: params.sandbox === 'read-only' ? 'readOnly' : 'workspaceWrite', networkAccess: false },
+      approvalPolicy: params.approvalPolicy });
   }
   if (frame.method === 'turn/start') {
     const text = params.input.map((item) => item.text || '').join('\\n');
@@ -66,7 +68,19 @@ lines.on('line', (line) => {
     if (!turn.fast) result(frame.id, { turn: { id: turn.id, status: 'inProgress' } });
     notify('turn/started', { threadId, turn: { id: turn.id, status: 'inProgress' } });
     if (text.includes('hold-open')) return;
-    if (text.includes('mcp-form-check')) {
+    if (text.includes('user-input-check')) {
+      const id = 'fake-question-' + (++requestCount);
+      approvals.set(id, turn); turn.pending++;
+      write({ id, method: 'item/tool/requestUserInput', params: { threadId, turnId: turn.id,
+        questions: [{ id: 'review_scope', header: 'Scope', question: 'Which area should be inspected?', isOther: false, isSecret: false,
+          options: [{ label: 'Tests only', description: 'Inspect tests.' }, { label: 'Runtime only', description: 'Inspect runtime.' }] }] } });
+      for (const method of ['item/commandExecution/requestApproval',
+        'item/fileChange/requestApproval', 'item/permissions/requestApproval']) {
+        const escalationId = 'fake-question-escalation-' + (++requestCount);
+        approvals.set(escalationId, turn); turn.pending++;
+        write({ id: escalationId, method, params: { threadId, turnId: turn.id, itemId: escalationId, reason: 'question must not grant permissions' } });
+      }
+    } else if (text.includes('mcp-form-check')) {
       const id = 'fake-mcp-form-' + (++requestCount);
       approvals.set(id, turn); turn.pending++;
       write({ id, method: 'mcpServer/elicitation/request', params: { threadId, turnId: turn.id, serverName: 'form-fixture', mode: 'form', message: 'Project preferences',
@@ -333,4 +347,85 @@ test('native CLI response files carry validated MCP content through the owning e
   assert.deepEqual(f.trace().find(row => row.frame?.id === request.requestId && row.frame.result).frame.result, { action: 'accept', content: { enabled: false, count: 2 } });
   assert.equal(JSON.stringify(f.run('native', 'events', '--peer', 'native-worker')).includes('"content"'), false);
   f.run('native', 'down'); await f.waitStopped();
+});
+
+test('native CLI can retry one explicit submission ID without queueing a second message', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const args = ['native', 'send', '--peer', 'native-worker', '--from', 'coordinator',
+    '--body', 'one durable CLI request', '--submission-id', 'cli_retry_001'];
+  const first = f.run(...args);
+  const retry = f.run(...args);
+  assert.equal(retry.message_id, first.message_id);
+  assert.equal(retry.submission_id, 'cli_retry_001');
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='one durable CLI request'").get().n, 1));
+  f.fail('NATIVE_SUBMISSION_MISMATCH', ...args.slice(0, 7), 'different', '--submission-id', 'cli_retry_001');
+  f.fail('BAD_ARGS', 'native', 'send', '--peer', 'native-worker', '--body', 'x', '--submission-id', 'bad');
+});
+
+test('native CLI rejects invalid and non-Codex sandbox before starting a daemon', async t => {
+  const f = await fixture(t);
+  for (const [provider, sandbox] of [['codex', 'danger-full-access'], ['codex', ''], ['claude', 'read-only'], ['dsh', 'workspace-write']]) {
+    f.fail('BAD_ARGS', 'native', 'start', '--peer', 'readonly-worker', '--provider', provider, '--sandbox=' + sandbox);
+    assert.equal(fs.existsSync(f.pointer), false);
+    assert.equal(f.trace().length, 0);
+  }
+});
+
+test('native CLI preserves read-only sandbox on resume and declines escalation requests', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  const worker = f.start('readonly-worker', ['--sandbox', 'read-only']);
+  assert.equal(worker.sandbox, 'read-only');
+  assert.equal(worker.sandboxVerified, true);
+  assert.equal(worker.capabilities.approvals, false);
+  assert.equal(worker.capabilities.userInput, true);
+  const opened = f.trace().find(row => row.frame?.method === 'thread/start').frame.params;
+  assert.equal(opened.sandbox, 'read-only');
+  assert.equal(opened.approvalPolicy, 'never');
+  assert.equal(opened.config?.mcp_servers?.hello_cc_scoped, undefined);
+  const sent = f.run('native', 'send', '--peer', 'readonly-worker', '--body', 'approval-check');
+  await f.waitDelivery(sent.message_id, 'completed', 'readonly-worker');
+  const turn = f.trace().find(row => row.frame?.method === 'turn/start').frame.params;
+  assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(turn.approvalPolicy, 'never');
+  assert.deepEqual(f.run('native', 'requests', '--peer', 'readonly-worker'), []);
+  assert.doesNotMatch(turn.input[0].text, /Use this exact prefix for HCC commands/);
+  const questionMessage = f.run('native', 'send', '--peer', 'readonly-worker', '--from', 'coordinator', '--body', 'user-input-check');
+  const [question] = await f.wait(() => f.run('native', 'requests', '--peer', 'readonly-worker'),
+    value => value.length === 1 && value[0].kind === 'userInput', 'read-only ordinary question');
+  assert.equal(question.method, 'item/tool/requestUserInput');
+  const readonlyState = f.run('native', 'status').workers.find(value => value.peer === 'readonly-worker');
+  assert.equal(readonlyState.sandbox, 'read-only');
+  assert.equal(readonlyState.capabilities.approvals, false);
+  assert.equal(readonlyState.capabilities.userInput, true);
+  const questionEscalations = f.trace().filter(row => row.frame?.id?.startsWith?.('fake-question-escalation-') && row.frame.result);
+  assert.deepEqual(questionEscalations.map(row => row.frame.result), [
+    { decision: 'decline' }, { decision: 'decline' }, { permissions: {}, scope: 'turn' }
+  ]);
+  f.fail('NATIVE_APPROVAL_MISMATCH', 'native', 'respond', '--peer', 'readonly-worker',
+    '--request', questionEscalations[0].frame.id, '--decision', 'accept');
+  const answerFile = path.join(f.home, 'question-response.json');
+  const answers = { review_scope: { answers: ['Tests only'] } };
+  fs.writeFileSync(answerFile, JSON.stringify({ answers }), { mode: 0o600 });
+  const answered = f.run('native', 'respond', '--peer', 'readonly-worker', '--request', String(question.requestId),
+    '--decision', 'accept', '--response-file', answerFile);
+  assert.equal(answered.status, 'submitted');
+  assert.equal((await f.waitDelivery(questionMessage.message_id, 'completed', 'readonly-worker')).state, 'completed');
+  assert.deepEqual(f.trace().find(row => row.frame?.id === question.requestId && row.frame.result).frame.result, { answers });
+  assert.deepEqual(f.run('native', 'requests', '--peer', 'readonly-worker'), []);
+  const questionTurn = f.trace().filter(row => row.frame?.method === 'turn/start').at(-1).frame.params;
+  assert.deepEqual(questionTurn.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(questionTurn.approvalPolicy, 'never');
+  assert.equal(f.run('msg', 'inbox', '--peer', 'coordinator').find(message => message.reply_to === questionMessage.message_id).body, 'fake-codex-answer');
+  f.run('native', 'close', '--peer', 'readonly-worker');
+  const resumed = f.start('readonly-worker', ['--resume', 'last']);
+  assert.equal(resumed.sandbox, 'read-only');
+  assert.equal(resumed.sessionId, worker.sessionId);
+  assert.equal(f.trace().find(row => row.frame?.method === 'thread/resume').frame.params.sandbox, 'read-only');
+  f.run('native', 'close', '--peer', 'readonly-worker');
+  const count = f.trace().filter(row => row.kind === 'started').length;
+  const mismatch = f.raw('native', 'start', '--peer', 'readonly-worker', '--provider', 'codex', '--binary', f.binary,
+    '--resume', 'last', '--sandbox', 'workspace-write');
+  assert.notEqual(mismatch.status, 0);
+  assert.equal(f.trace().filter(row => row.kind === 'started').length, count);
 });

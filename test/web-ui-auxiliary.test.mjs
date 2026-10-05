@@ -513,3 +513,43 @@ test('history opened before project initialization explains the wait and loads w
   f.requests[0].resolve({workers:[historyWorker()],runtimeAvailable:true}); await settle();
   assert.equal(f.element('historyThreads').buttons.length,1); assert.equal(f.element('historyRefresh').disabled,false);
 });
+
+
+test('native retry sends only the original pending payload with the current control lease', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState()); f.fill('nativeDraft', 'original pending message');
+  const first = f.click('nativeSend'), original = JSON.parse(f.requests[0].options.body);
+  f.requests[0].reject(new Error('queue receipt lost')); await first;
+  assert.equal(f.element('nativeRetryPending').hidden, false);
+  assert.equal(f.element('nativeRetryPending').disabled, false);
+  f.fill('nativeDraft', 'new draft edits');
+  f.selection.epoch = 4; f.selection.actionToken = 'lease-refreshed';
+  const retrying = f.click('nativeRetryPending');
+  const retry = JSON.parse(f.requests[1].options.body);
+  assert.equal(retry.submissionId, original.submissionId);
+  assert.equal(retry.text, 'original pending message');
+  assert.equal(retry.retry, true);
+  assert.equal(retry.epoch, 4); assert.equal(retry.action_token, 'lease-refreshed');
+  await f.click('nativeRetryPending'); assert.equal(f.requests.length, 2);
+  f.requests[1].resolve({ receipt: { submission_id: retry.submissionId, message_id: 12, state: 'queued' },
+    state: nativeStringState({ deliveries: [{ submission_id: retry.submissionId, message_id: 12, state: 'queued' }] }) });
+  await retrying;
+  assert.equal(f.element('nativeDraft').value, 'new draft edits');
+  assert.equal(f.element('nativeRetryPending').hidden, true);
+  assert.equal(JSON.parse([...f.storage.values()][0]).pending, null);
+});
+
+test('native retry stays fenced after an executor replacement or loss of control', async () => {
+  const f = fixture(nativePanelScript, 'native');
+  f.window.hccNative.render(nativeStringState()); f.fill('nativeDraft', 'retained pending message');
+  const sending = f.click('nativeSend'); f.requests[0].reject(new Error('queue receipt lost')); await sending;
+  f.selection.canControl = false; f.window.hccNative.sync();
+  assert.equal(f.element('nativeRetryPending').disabled, true);
+  await f.click('nativeRetryPending'); assert.equal(f.requests.length, 1);
+  f.selection.canControl = true;
+  f.window.hccNative.render(nativeStringState({ owner: 'replacement-worker', generation: 'replacement-generation' }));
+  assert.equal(f.element('nativeRetryPending').disabled, true);
+  await f.click('nativeRetryPending'); assert.equal(f.requests.length, 1);
+  assert.equal(f.element('nativeDraft').value, 'retained pending message');
+  assert.ok(JSON.parse([...f.storage.values()][0]).pending);
+});

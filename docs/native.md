@@ -16,6 +16,41 @@ multiple pending inbox messages into the same turn. ACP resume and session close
 depend on the extensions the provider advertises. HCC does not claim that an ACP
 resume replays the original conversation transcript.
 
+## Session fork and retries with the original ID
+
+`hcc native fork --parent codex-reviewer --peer codex-branch` invokes the provider's
+session fork. Codex uses `thread/fork`; Claude uses the optional SDK's
+`forkSession`. The child receives a distinct session ID, executor, delivery records
+and subsequent history, plus its own MCP scope when the sandbox permits HCC tools.
+The parent keeps its identity. After
+closing the child, `native start --peer codex-branch --provider codex --resume
+last` resumes the child session. Fork inherits the parent's working directory
+and verifies its identity; pending inbox messages and permission grants are not
+copied.
+
+Only saved HCC-owned native sessions can fork. The parent must be idle or
+explicitly closed, without an active turn, pending approval, queued message or
+unresolved delivery. Parent send, close and inbox dispatch are fenced while
+forking. Existing TUI/Desktop sessions are outside this scope. A Claude SDK
+without `forkSession` reports unsupported capability. DeepSeek Harness
+0.2.0-rc.2 ACP does not implement fork; HCC does not replay a transcript to
+simulate native fork.
+
+A new message may use a unique `--submission-id` containing 8–100 letters,
+digits, underscores or hyphens. After a lost receipt, inspect `native
+deliveries`, then retry the same worker, sender, task and body with the original
+ID. Matching retries return the original durable receipt; changed payloads or
+targets are rejected. The project database commits the message and submission
+ID together. If the native delivery projection was not yet saved, retry or
+worker recovery repairs the original delivery while retaining local user
+origin. Retrying an existing `uncertain` delivery does not replay execution.
+
+Web offers **Retry same submission** for an unconfirmed send. Explicit
+confirmation follows receipt inspection, and the retry must retain the original
+executor and body. Later draft edits are preserved. Executor or project changes
+disable the old retry. Missing durable pending records or expired messages are
+rejected rather than sent as new work.
+
 ## Requirements
 
 Use Node.js 24 or later and a provider installed and authenticated in the same
@@ -121,12 +156,56 @@ message bus even when `--cwd DIR` selects another working directory. `--model
 MODEL` selects a provider-supported model. `--binary PATH` overrides the Codex
 or dsh executable. Claude uses the SDK and rejects `--binary`.
 
+### Codex read-only file sandbox
+
+```sh
+hcc native start --peer codex-readonly --provider codex --sandbox read-only
+hcc native close --peer codex-readonly
+hcc native start --peer codex-readonly --provider codex --resume last
+```
+
+Only Codex accepts `--sandbox read-only|workspace-write`. New sessions default to
+the existing `workspace-write` behavior. Resume inherits the stored policy when
+omitted and rejects a different explicit policy; use a new worker for a different
+policy. Legacy saved Codex workers migrate to their original workspace-write mode.
+Retries before a session exists inherit the selected policy unless explicitly changed. Before
+creating/resuming a Codex worker, both CLI and Web require the runtime's sandbox-policy
+protocol version. It refuses an older daemon before sending a create request and
+does not restart it automatically. Creation is bound to the just-verified runtime
+generation; a missing identity or instance replacement rejects the request without
+following the successor or retrying. After existing project work finishes, stop the
+old runtime and start it with this version. Older runtime code cannot enforce the
+new stored policy; downgrade execution is outside this read-only guarantee.
+Web can still inspect or close a legacy worker, but refuses Codex send/respond
+when its fresh snapshot has no sandbox policy. Read-only workers must also report
+provider verification before those actions. Web mutations are bound to the runtime
+generation observed immediately before admission.
+
+Read-only fixes approval policy to `never`, requests `readOnly` and disabled
+sandbox network for each new turn, and denies command/file/permission escalation
+and MCP elicitation. Ordinary user questions remain available. Start/resume fail
+closed if the provider does not report the requested policy, or if a resumed
+thread already has an active turn. Forks require the same checks. `sandboxVerified` means matching provider
+readback, not independent proof of operating-system enforcement.
+
+HCC does not inject its scoped mutation MCP or command instructions into a
+read-only worker. Its control plane still records messages, replies, delivery
+receipts and audit events. The provider file sandbox does not make every external
+service, user-configured MCP server or hook read-only; strict acceptance still
+needs a private HOME without external tools. This policy is separate from the Web
+viewer/control lease: a controller may still submit a review to a read-only worker.
+
+Available since `1.1.0-rc.4`. Native Web snapshots retain `sandbox` and
+`sandboxVerified`. Choose the read-only policy with the CLI. Native forks inherit the saved parent
+policy and cannot override it; the child is independently verified before use.
+
 | Command | Options / behavior |
 | --- | --- |
 | `hcc native up` | Start or reuse the project's background runtime |
 | `hcc native status` | Inspect persisted worker state and runtime identity |
-| `hcc native start` | Required `--peer NAME --provider codex\|claude\|dsh`; optional `--cwd DIR --model MODEL --resume last`; `--binary PATH` is available only for Codex and dsh |
-| `hcc native send` | Required `--peer NAME --body TEXT`; optional `--from NAME --task ID`; returns a durable message/submission receipt |
+| `hcc native start` | Required `--peer NAME --provider codex\|claude\|dsh`; optional `--cwd DIR --model MODEL --resume last`; `--binary PATH` is available only for Codex and dsh; `--sandbox read-only\|workspace-write` is Codex-only |
+| `hcc native fork` | Required `--parent NAME --peer NEW_NAME`; optional `--model MODEL --binary PATH`; forks an HCC-owned Codex or Claude session into a new worker |
+| `hcc native send` | Required `--peer NAME --body TEXT`; optional `--from NAME --task ID --submission-id ID`; returns a durable message/submission receipt |
 | `hcc native deliveries` | Optional `--peer NAME`; inspect delivery receipts |
 | `hcc native events` | Required `--peer NAME`; optional `--after ID`; inspect a bounded event history |
 | `hcc native requests` | Requires `--peer NAME`; inspect pending requests bound to this executor, session and turn |

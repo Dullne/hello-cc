@@ -22,6 +22,7 @@ import { createCookieExpiryWindow } from './regression-cookie-expiry.mjs';
 import { waitForTerminalMarker, terminalMarkerFailureDiagnostic } from './regression-terminal-marker.mjs';
 import { fixtureFetch as fetch } from './regression-http-transport.mjs';
 import { parseShutdownDiagnostics } from '../lib/web/shutdown-diagnostics.mjs';
+import { assertGcPreviewMetadata } from './helpers/gc-clock-observation.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -6179,6 +6180,7 @@ async function bufferGcArbitrationWorkflow() {
   } finally {
     unifiedDb.close();
   }
+  const gapPreviewStartedAtSec = Math.floor(Date.now() / 1000);
   setSiblingClockGap(Math.floor(fs.statSync(gapOrphan).mtimeMs / 1000));
   const beforeGapPreviewDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
   let beforeGapMeta;
@@ -6191,8 +6193,11 @@ async function bufferGcArbitrationWorkflow() {
   const afterGapPreviewDb = new DatabaseSync(path.join(secondProjectRoot, '.hello-cc', 'mesh.db'), { timeout: 5000 });
   try {
     const afterGapMeta = afterGapPreviewDb.prepare('SELECT key, value FROM meta ORDER BY key').all();
-    if (JSON.stringify(afterGapMeta) !== JSON.stringify(beforeGapMeta) ||
-        !afterGapPreviewDb.prepare('SELECT 1 FROM events WHERE id = ?').get(unifiedIds.event) ||
+    assertGcPreviewMetadata(beforeGapMeta, afterGapMeta, {
+      startedAtSec: gapPreviewStartedAtSec,
+      finishedAtSec: Math.floor(Date.now() / 1000)
+    });
+    if (!afterGapPreviewDb.prepare('SELECT 1 FROM events WHERE id = ?').get(unifiedIds.event) ||
         !afterGapPreviewDb.prepare("SELECT 1 FROM locks WHERE resource = 'gc-unified-lock'").get() ||
         !afterGapPreviewDb.prepare("SELECT 1 FROM peers WHERE id = 'gc-unified-dead'").get()) {
       fail(`manual GC dry-run changed unified clock state: ${JSON.stringify({ beforeGapMeta, afterGapMeta })}`);
@@ -11097,6 +11102,13 @@ function manualGcRetentionContractWorkflow() {
     }
     if (fs.existsSync(ordinaryBuffer)) fail('ordinary GC did not remove eligible technical buffer state');
 
+    const beforeDryRun = new DatabaseSync(gcDbPath, { timeout: 5000 });
+    let beforeDryRunMeta;
+    try {
+      beforeDryRunMeta = beforeDryRun.prepare('SELECT key, value FROM meta ORDER BY key').all();
+    } finally {
+      beforeDryRun.close();
+    }
     const historyDryRun = readJson(['gc', '--older-than', '0', '--history']);
     for (const key of ['old_events', 'old_tasks', 'old_messages', 'old_handoffs']) {
       if (Number(historyDryRun[key] || 0) < 1) {
@@ -11108,6 +11120,10 @@ function manualGcRetentionContractWorkflow() {
     }
     const afterDryRun = new DatabaseSync(gcDbPath, { timeout: 5000 });
     try {
+      const afterDryRunMeta = afterDryRun.prepare('SELECT key, value FROM meta ORDER BY key').all();
+      if (JSON.stringify(afterDryRunMeta) !== JSON.stringify(beforeDryRunMeta)) {
+        fail(`CLI-only history dry-run changed persisted metadata: ${JSON.stringify({ beforeDryRunMeta, afterDryRunMeta })}`);
+      }
       if (!rowExists(afterDryRun, 'messages', seeded.message) ||
           !rowExists(afterDryRun, 'handoffs', seeded.handoff)) {
         fail('history dry-run changed persisted history');

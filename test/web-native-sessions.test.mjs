@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -15,7 +16,7 @@ import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
-import { createNativeStore } from '../lib/runtime/native/store.mjs';
+import { createNativeStore, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 import { createAgentDefaults } from '../lib/web/agent-defaults.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { createSessionSync } from '../lib/web/browser/session-sync.mjs';
@@ -64,6 +65,7 @@ async function fixture(t, configuration = {}) {
       capabilities: state.capabilities, snapshot: () => structuredClone(state),
       async open(input) { this.openInput = input; state.sessionId = input.sessionId || (configuration[peer]?.unknownSession ? null : 'session-' + peer);
         if (configuration[peer]?.resumeError && input.sessionId) throw configuration[peer].resumeError;
+        if (input.sandbox !== undefined) { state.sandbox = input.sandbox; state.sandboxVerified = true; }
         state.status = 'idle'; return this.snapshot(); },
       async send(input) { this.sent.push(input); this.active = input; state.status = 'running'; state.turnId = 'turn-' + peer;
         return { status: 'queued', turnId: state.turnId }; },
@@ -118,6 +120,161 @@ function controlledCodexRpc() {
   };
   return { rpc, calls, started, release: () => release() };
 }
+
+// A real authenticated loopback daemon stand-in for admission compatibility.
+// Any unexpected mutation reaches this server and is recorded; it never starts
+// a provider or changes a stored worker.
+async function withRuntimeStandIn(f, { version, replaceStatusRead } = {}, run) {
+  const original = readNativePointer(f.ctx);
+  const status = await f.api('GET', '/status');
+  delete status.sandboxPolicyVersion;
+  if (version !== undefined) status.sandboxPolicyVersion = version;
+  status.generation = 'web-policy-checked-runtime';
+  const requests = [];
+  let statusReads = 0;
+  const server = http.createServer((request, response) => {
+    const authorized = request.headers.authorization === 'Bearer ' + original.token;
+    requests.push({ method: request.method, route: request.url, authorized });
+    response.setHeader('content-type', 'application/json');
+    if (!authorized) { response.writeHead(401); response.end(JSON.stringify({ ok: false, error: { code: 'NATIVE_UNAUTHORIZED' } })); return; }
+    if (request.method === 'GET' && request.url === '/status') {
+      if (++statusReads === replaceStatusRead) {
+        writeNativePointer(f.ctx, { ...original, port: server.address().port, generation: 'web-policy-successor-runtime' });
+      }
+      response.end(JSON.stringify({ ok: true, data: status }));
+      return;
+    }
+    response.writeHead(409);
+    response.end(JSON.stringify({ ok: false, error: { code: 'UNEXPECTED_MUTATION' } }));
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  writeNativePointer(f.ctx, { ...original, port: server.address().port, generation: status.generation });
+  try { await run(requests); }
+  finally {
+    writeNativePointer(f.ctx, original);
+    await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+  }
+}
+
+for (const restore of [false, true]) {
+  test(`Web Codex ${restore ? 'restore' : 'creation'} refuses an old daemon before any mutation`, async t => {
+    const f = await fixture(t), web = f.bridge();
+    let saved;
+    if (restore) {
+      await f.start('a', { sandbox: 'read-only' });
+      await f.api('POST', '/close', { peer: 'a' });
+      saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    }
+    await withRuntimeStandIn(f, {}, async requests => {
+      const operation = restore
+        ? web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true })
+        : web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
+      await assert.rejects(operation, { code: 'NATIVE_SANDBOX_RUNTIME_UNSUPPORTED' });
+      assert.ok(requests.length > 0);
+      assert.ok(requests.every(request => request.method === 'GET' && request.route === '/status' && request.authorized));
+      assert.equal(web.session(), undefined);
+      assert.equal(f.created.length, restore ? 1 : 0);
+    });
+  });
+
+  test(`Web Codex ${restore ? 'restore' : 'creation'} rejects a replaced runtime before sending its mutation`, async t => {
+    const f = await fixture(t), web = f.bridge();
+    let saved;
+    if (restore) {
+      await f.start('a', { sandbox: 'read-only' });
+      await f.api('POST', '/close', { peer: 'a' });
+      saved = (await web.listNativeHistory(f.ctx)).workers[0];
+    }
+    await withRuntimeStandIn(f, { version: 1, replaceStatusRead: restore ? 2 : 1 }, async requests => {
+      const operation = restore
+        ? web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true })
+        : web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
+      await assert.rejects(operation, { code: 'NATIVE_OWNER_CHANGED' });
+      assert.equal(readNativePointer(f.ctx).generation, 'web-policy-successor-runtime');
+      assert.ok(requests.every(request => request.method === 'GET' && request.route === '/status' && request.authorized));
+      assert.equal(web.session(), undefined);
+      assert.equal(f.created.length, restore ? 1 : 0);
+    });
+  });
+}
+
+test('Web restores a read-only Codex worker with its saved policy and checked runtime generation', async t => {
+  const f = await fixture(t), posts = [];
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    if (method === 'POST') posts.push({ route, body, options });
+    return nativeRequest(ctx, method, route, body, options);
+  });
+  await f.start('a', { sandbox: 'read-only' });
+  await f.api('POST', '/close', { peer: 'a' });
+  const saved = (await web.listNativeHistory(f.ctx)).workers[0];
+  const session = await web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true });
+  assert.equal(session.nativeSnapshot().sandbox, 'read-only');
+  assert.equal(session.nativeSnapshot().sandboxVerified, true);
+  assert.equal(f.adapters.get('a').openInput.sandbox, 'read-only');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].options.expectedGeneration, session.nativeIdentity.generation);
+});
+
+for (const action of ['send', 'respond']) {
+  test(`Web refuses ${action} on a legacy Codex snapshot without a sandbox policy`, async t => {
+    const f = await fixture(t), posts = [];
+    await f.start('a');
+    const web = f.bridge(async (ctx, method, route, body, options) => {
+      if (method === 'POST') posts.push(route);
+      const value = await nativeRequest(ctx, method, route, body, options);
+      if (route.startsWith('/workers/a/state')) { delete value.snapshot.sandbox; delete value.snapshot.sandboxVerified; }
+      return value;
+    });
+    await web.discoverNativeSessions(f.ctx);
+    const session = web.session();
+    assert.equal((await web.nativeAction(session, 'read')).connected, true, 'legacy diagnosis remains available');
+    await assert.rejects(web.nativeAction(session, action, { text: 'must not send', submissionId: 'legacy_policy_001' }),
+      { code: 'NATIVE_SANDBOX_RUNTIME_UNSUPPORTED' });
+    assert.deepEqual(posts, []);
+    assert.deepEqual(f.adapters.get('a').sent, []);
+    assert.deepEqual(f.receipts(), []);
+  });
+}
+
+test('Web refuses sending to a read-only Codex snapshot without provider verification', async t => {
+  const f = await fixture(t), posts = [];
+  await f.start('a', { sandbox: 'read-only' });
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    if (method === 'POST') posts.push(route);
+    const value = await nativeRequest(ctx, method, route, body, options);
+    if (route.startsWith('/workers/a/state')) value.snapshot.sandboxVerified = false;
+    return value;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  await assert.rejects(web.nativeAction(web.session(), 'send', { text: 'must not send', submissionId: 'unverified_policy_001' }),
+    { code: 'NATIVE_SANDBOX_UNVERIFIED' });
+  assert.deepEqual(posts, []);
+  assert.deepEqual(f.adapters.get('a').sent, []);
+});
+
+test('Web mutation keeps the runtime generation checked by its preceding state read', async t => {
+  const f = await fixture(t);
+  await f.start('a', { sandbox: 'read-only' });
+  const original = readNativePointer(f.ctx);
+  let replace = false;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const value = await nativeRequest(ctx, method, route, body, options);
+    if (replace && method === 'GET' && route.startsWith('/workers/a/state')) {
+      replace = false;
+      writeNativePointer(ctx, { ...original, generation: 'web-action-successor-runtime' });
+    }
+    return value;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  replace = true;
+  try {
+    await assert.rejects(web.nativeAction(web.session(), 'send', { text: 'must not send', submissionId: 'generation_policy_001' }),
+      { code: 'NATIVE_OWNER_CHANGED' });
+    assert.equal(readNativePointer(f.ctx).generation, 'web-action-successor-runtime');
+    assert.deepEqual(f.adapters.get('a').sent, []);
+    assert.equal((await f.api('GET', '/deliveries')).length, 0);
+  } finally { writeNativePointer(f.ctx, original); }
+});
 
 for (const viaReadAction of [false, true]) for (const applyFreshFirst of [false, true]) {
   test(`Codex creation preserves its opening Web view when a null-session ${viaReadAction ? 'explicit read' : 'poll snapshot'} arrives late${applyFreshFirst ? ' after a fresh read' : ''}`, async t => {
@@ -444,7 +601,7 @@ test('Web native creation reserves explicit names and gives concurrent unnamed r
   const first = web.startNativeSession({ ...base, id: 'reserved' });
   await assert.rejects(web.startNativeSession({ ...base, id: 'reserved' }), { code: 'NATIVE_WORKER_EXISTS' });
   const anonymous = Array.from({ length: 4 }, () => web.startNativeSession(base));
-  ready();
+  ready(await f.api('GET', '/status'));
   const created = await Promise.all([first, ...anonymous]);
   assert.equal(new Set(created.map(session => session.id)).size, 5);
   assert.equal(f.created.length, 5);
@@ -719,6 +876,25 @@ test('Web discovers only actual native workers, reuses their binding, and create
   await f.api('POST', '/close', { peer: 'a' });
   const freshWeb = f.bridge();
   assert.equal((await freshWeb.discoverNativeSessions(f.ctx)).length, 0, 'saved closed workers are not live executors');
+});
+
+test('Web retains provider file sandbox metadata separately from viewer control ownership', async t => {
+  const f = await fixture(t);
+  await f.start('readonly', { sandbox: 'read-only' });
+  const web = f.bridge();
+  await web.discoverNativeSessions(f.ctx);
+  const state = web.session('readonly').nativeSnapshot();
+  assert.equal(state.sandbox, 'read-only');
+  assert.equal(state.sandboxVerified, true);
+  assert.equal(state.connected, true);
+  assert.equal(state.capabilities.send, true, 'a file sandbox must not become a disconnected/viewer-only control lease');
+  const snapshot = web.session('readonly').nativeSnapshot();
+  snapshot.sandbox = 'workspace-write';
+  assert.equal(web.session('readonly').nativeSnapshot().sandbox, 'read-only');
+  await f.api('POST', '/close', { peer: 'readonly' });
+  await f.start('readonly', { resume: 'last' });
+  await web.discoverNativeSessions(f.ctx);
+  assert.equal(web.session('readonly').nativeSnapshot().sandbox, 'read-only');
 });
 
 test('Claude and dsh workers share the bridge and first provider identity binds without replacing the view', async (t) => {
@@ -1232,7 +1408,7 @@ test('Web resumes only a confirmed closed saved worker with the original peer an
   assert.equal(restored.id, 'a'); assert.equal(restored.kind, 'codex');
   assert.equal(restored.binding.provider_session_id, saved.sessionId); assert.notEqual(restored.nativeIdentity.owner, saved.owner);
   assert.equal(previousView.nativeRetired, true);
-  assert.deepEqual(f.adapters.get('a').openInput, { sessionId: saved.sessionId, model: undefined });
+  assert.deepEqual(f.adapters.get('a').openInput, { sessionId: saved.sessionId, model: undefined, sandbox: 'workspace-write' });
   await assert.rejects(web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true }), { code: 'NATIVE_OWNER_CHANGED' });
   assert.equal(f.created.length, 2);
 });
@@ -1400,3 +1576,29 @@ for (const retirePrevious of [false, true]) {
     }), { code: 'NATIVE_OWNER_CHANGED' });
   });
 }
+
+test('an uncertain Web receipt requires an explicit same-ID same-worker retry after inspection', async (t) => {
+  const f = await fixture(t); await f.start();
+  let sends = 0;
+  const web = f.bridge(async (ctx, method, route, body, options) => {
+    const result = await nativeRequest(ctx, method, route, body, options);
+    if (method === 'POST' && route === '/send') { sends++;
+      throw Object.assign(new Error('lost queue response'), { code: 'NATIVE_CLIENT_TIMEOUT', extra: { uncertain: true } }); }
+    return result;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const input = { text: 'one attempt', submissionId: 'web_submission_004' };
+  await assert.rejects(web.nativeAction(web.session(), 'send', input), { code: 'NATIVE_CLIENT_TIMEOUT' });
+  const rebuilt = f.bridge(); await rebuilt.discoverNativeSessions(f.ctx);
+  await assert.rejects(rebuilt.nativeAction(rebuilt.session(), 'send', input), { code: 'SUBMISSION_EXISTS' });
+  await assert.rejects(rebuilt.nativeAction(rebuilt.session(), 'send', { ...input, text: 'changed', retry: true }),
+    { code: 'NATIVE_SUBMISSION_MISMATCH' });
+  await f.start('b'); await rebuilt.discoverNativeSessions(f.ctx);
+  await assert.rejects(rebuilt.nativeAction(rebuilt.session('b'), 'send', { ...input, retry: true }),
+    { code: 'NATIVE_SUBMISSION_MISMATCH' });
+  const repaired = await rebuilt.nativeAction(rebuilt.session(), 'send', { ...input, retry: true });
+  assert.equal(repaired.submission_id, input.submissionId);
+  assert.equal(sends, 1); assert.equal(f.mesh.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+  assert.equal(f.adapters.get('a').sent.length, 0);
+  assert.equal(rebuilt.session().nativeSnapshot().deliveries[0].submission_id, input.submissionId);
+});

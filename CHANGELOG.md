@@ -16,6 +16,45 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.4
+
+### Summary
+
+This preview adds guarded forks for owned Codex and Claude sessions, durable
+submission retries, and a persisted Codex read-only policy. It retains the
+session isolation and shutdown fixes from rc.3.
+
+### Highlights
+
+- Fork an idle, owned Codex or Claude session into a distinct worker and provider
+  session. Pending approvals, unresolved deliveries and changing parent bindings
+  prevent a fork. DeepSeek Harness does not currently support native fork.
+- Create Codex workers with `--sandbox read-only`. Resumes and forks retain the
+  saved policy; approval escalation and HCC scoped MCP are disabled for these
+  workers. Codex must confirm the policy before the worker becomes available.
+  This is a provider filesystem sandbox, not an all-tools or network guarantee.
+- Retry an unconfirmed Web submission with its original ID and message after
+  reviewing its receipts. A later edited draft remains intact. Retries require
+  current control and the original executor identity. Older pending records
+  without the required identity remain available for manual review only.
+- Persist the message and its retry identity together; repair the delivery
+  record after interruption without creating a second message. Uncertain
+  provider execution is never automatically replayed.
+- Refresh late DeepSeek Harness tool input on the existing approval request,
+  preserving its identity and oversized-input restrictions.
+- Disable split views when the page lacks the browser session required by its
+  embedded pane. Keep saved layouts for a later authenticated page.
+- Distinguish the active runtime's clock observation from manual GC mutations
+  in regression checks while requiring all other metadata to remain unchanged.
+
+### Validation
+
+Validation covers policy persistence, legacy-runtime refusal, fork inheritance,
+submission recovery and browser retry behavior with later draft edits. Source,
+installed-package, CI and real-provider results retain separate receipts; prior
+historical connection-reset and provider failures are not reclassified by a
+passing retry. Existing frozen release archives remain unchanged.
+
 ## 1.1.0-rc.3
 
 ### Summary

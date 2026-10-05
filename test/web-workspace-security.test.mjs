@@ -15,9 +15,8 @@ const appSource = fs.readFileSync(new URL('../lib/cli/app.mjs', import.meta.url)
 const senderSource = appSource.slice(appSource.indexOf('function sendWebHtml('), appSource.indexOf('\nfunction webErrorStatus('));
 const sendWebHtml = vm.runInNewContext('(' + senderSource + ')', { randomBytes, sendHttp });
 
-async function fixture(t) {
+async function fixture(t, { token = 'workspace-test-token' } = {}) {
   let currentTime = 1000;
-  const token = 'workspace-test-token';
   const auth = createCookieAuth({ now: () => currentTime, ttlSec: 60, maxSessions: 10,
     cookieNameForRequest: createCookieNameForRequest(),
     requestIsSecure, authOk, token, trustProxy: false });
@@ -57,7 +56,8 @@ test('only authenticated pane HTML opts into same-origin framing and forbids nes
   assert.match(pane.headers.get('content-security-policy'), /script-src 'self' 'nonce-[A-Za-z0-9_-]+'/);
   assert.equal(pane.headers.get('referrer-policy'), 'no-referrer');
   assert.match(await pane.text(), /Auxiliary pane/);
-  assert.equal(typeof f.renders[0], 'string', 'legacy root renderer still receives a nonce');
+  assert.equal(f.renders[0].paneAllowed, true, 'only a live browser session advertises split availability');
+  assert.match(f.renders[0].nonce, /^[A-Za-z0-9_-]{16,}$/);
   assert.equal(f.renders[1].pane, true, 'pane renderer receives the server-owned mode');
   assert.match(f.renders[1].nonce, /^[A-Za-z0-9_-]{16,}$/);
 });
@@ -166,4 +166,22 @@ test('same native session keeps pane drafts and asynchronous admission receipts 
   await mainSending;
   assert.equal(nativeBrowser(storage).element('nativeDraft').value, '');
   assert.equal(nativeBrowser(storage, 'auxiliary').element('nativeDraft').value, 'secondary later edits');
+});
+
+
+test('tokenless and token-only root pages do not advertise access to cookie-protected panes', async t => {
+  const local = await fixture(t, { token: '' });
+  const root = await local.get('/', { accept: 'text/html' });
+  assert.equal(root.status, 200);
+  assert.match(await root.text(), /Workspace/);
+  assert.equal(local.renders[0].paneAllowed, false);
+  const blocked = await local.get('/pane');
+  assert.equal(blocked.status, 401);
+  assert.equal(blocked.headers.get('x-frame-options'), 'DENY');
+  assert.equal(local.renders.length, 1, 'denied pane never renders an embeddable document');
+
+  const tokenOnly = await fixture(t);
+  const direct = await tokenOnly.get('/?token=workspace-test-token');
+  assert.equal(direct.status, 200);
+  assert.equal(tokenOnly.renders[0].paneAllowed, false, 'a token without browser navigation has not established a browser session');
 });

@@ -59,7 +59,7 @@ test('Codex opens its own stdio app-server with handshake and bounded permission
       sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user' }] ]);
   assert.deepEqual(f.callbacks.args, ['app-server', '--stdio']);
   assert.equal(f.callbacks.binary, 'codex');
-  assert.equal(f.adapter.capabilities.fork, false);
+  assert.equal(f.adapter.capabilities.fork, true);
   await assert.rejects(f.adapter.open(), { code: 'NATIVE_SESSION_ALREADY_OPEN' });
 });
 
@@ -96,6 +96,165 @@ test('Codex resumes an explicitly supplied HCC thread through its owned server',
   assert.equal(f.calls.at(-1)[1].threadId, 'hcc-saved-thread');
   await f.adapter.close();
   assert.equal(f.closeCount, 1);
+});
+
+function readOnlyResponse(sessionId = 'owned-thread', overrides = {}) {
+  return { thread: { id: sessionId, turns: [] }, sandbox: { type: 'readOnly', networkAccess: false },
+    approvalPolicy: 'never', ...overrides };
+}
+
+test('Codex keeps default and explicit workspace-write behavior compatible', async () => {
+  for (const sandbox of [undefined, 'workspace-write']) {
+    const f = fixture();
+    const result = await f.adapter.open({ sandbox });
+    assert.equal(result.sandbox, 'workspace-write');
+    assert.equal(result.sandboxVerified, false, 'missing provider evidence must not be called verified');
+    assert.equal(f.calls.at(-1)[1].sandbox, 'workspace-write');
+    assert.equal(f.calls.at(-1)[1].approvalPolicy, 'on-request');
+    await f.adapter.close();
+  }
+});
+
+test('Codex rejects invalid sandbox values before creating an RPC or changing state', async () => {
+  for (const sandbox of [null, '', 'readOnly', 'workspaceWrite', 'danger-full-access', ' read-only ', false, 0, [], {}]) {
+    const f = fixture();
+    await assert.rejects(f.adapter.open({ sandbox }), { code: 'BAD_ARGS' });
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.callbacks, undefined);
+    assert.equal(f.adapter.snapshot().status, 'new');
+    assert.equal(f.adapter.snapshot().sandbox, null);
+    assert.equal(f.adapter.snapshot().sandboxVerified, false);
+  }
+});
+
+test('Codex starts and resumes read-only only after matching provider policy evidence', async () => {
+  for (const sessionId of [undefined, 'hcc-saved-thread']) {
+    for (const networkAccess of [undefined, false]) {
+      const f = fixture((method) => {
+        if (method === (sessionId ? 'thread/resume' : 'thread/start')) {
+          return readOnlyResponse(sessionId, { sandbox: { type: 'readOnly', ...(networkAccess === undefined ? {} : { networkAccess }) } });
+        }
+      }, { interactive: true });
+      const result = await f.adapter.open({ sessionId, sandbox: 'read-only', model: 'test-model' });
+      const [method, params] = f.calls.at(-1);
+      assert.equal(method, sessionId ? 'thread/resume' : 'thread/start');
+      assert.equal(params.sandbox, 'read-only');
+      assert.equal(params.approvalPolicy, 'never');
+      assert.equal(params.approvalsReviewer, 'user');
+      assert.equal(params.config['features.request_permissions_tool'], false);
+      assert.equal(params.config['features.default_mode_request_user_input'], true);
+      assert.equal(result.sandbox, 'read-only');
+      assert.equal(result.sandboxVerified, true);
+      assert.equal(result.capabilities.approvals, false);
+      assert.equal(result.capabilities.userInput, true);
+      assert.equal(result.capabilities.fork, true);
+      assert.equal(Object.hasOwn(f.adapter, 'fork'), false);
+      await f.adapter.close();
+    }
+  }
+});
+
+test('Codex fails read-only start/resume closed when policy evidence is missing or broader', async () => {
+  const invalidPolicies = [
+    { sandbox: undefined }, { sandbox: null }, { sandbox: 'read-only' },
+    { sandbox: { type: 'workspaceWrite' } }, { sandbox: { type: 'dangerFullAccess' } },
+    { sandbox: { type: 'externalSandbox' } }, { sandbox: { type: 'unknown' } },
+    { sandbox: { type: 'readOnly', networkAccess: true } },
+    { sandbox: { type: 'readOnly', networkAccess: null } },
+    { approvalPolicy: undefined }, { approvalPolicy: null }, { approvalPolicy: 'on-request' }
+  ];
+  for (const sessionId of [undefined, 'hcc-saved-thread']) {
+    for (const policy of invalidPolicies) {
+      const f = fixture((method) => {
+        if (method === (sessionId ? 'thread/resume' : 'thread/start')) return readOnlyResponse(sessionId, policy);
+      });
+      await assert.rejects(f.adapter.open({ sessionId, sandbox: 'read-only' }), { code: 'NATIVE_SANDBOX_UNVERIFIED' });
+      assert.equal(f.closeCount, 1);
+      assert.equal(f.adapter.snapshot().status, 'error');
+      assert.equal(f.adapter.snapshot().sandboxVerified, false);
+      assert.equal(f.adapter.snapshot().sessionId, null);
+      await assert.rejects(f.adapter.send({ text: 'must not continue' }), { code: 'NATIVE_SESSION_NOT_OPEN' });
+      assert.equal(f.calls.some(([method]) => ['turn/start', 'turn/steer'].includes(method)), false);
+      assert.equal(f.calls.filter(([method]) => ['thread/start', 'thread/resume'].includes(method)).length, 1);
+    }
+  }
+});
+
+test('Codex refuses a preexisting active turn instead of steering it as read-only', async () => {
+  for (const thread of [
+    { id: 'hcc-saved-thread', turns: [{ id: 'already-running', status: 'inProgress' }] },
+    { id: 'hcc-saved-thread', turns: [], status: { type: 'active', activeFlags: [] } }
+  ]) {
+    const f = fixture((method) => method === 'thread/resume' ? readOnlyResponse('hcc-saved-thread', { thread }) : undefined);
+    await assert.rejects(f.adapter.open({ sessionId: 'hcc-saved-thread', sandbox: 'read-only' }), { code: 'NATIVE_READ_ONLY_BUSY' });
+    assert.equal(f.closeCount, 1);
+    assert.equal(f.adapter.snapshot().sandboxVerified, false);
+    assert.equal(f.adapter.snapshot().sessionId, null);
+    await assert.rejects(f.adapter.send({ text: 'must not steer' }), { code: 'NATIVE_SESSION_NOT_OPEN' });
+    assert.equal(f.calls.some(([method]) => method === 'turn/steer' || method === 'turn/interrupt'), false);
+  }
+});
+
+test('Codex pins read-only policy for every new turn while steering keeps its turn fence', async () => {
+  const f = fixture((method) => method === 'thread/start' ? readOnlyResponse() : undefined);
+  await f.adapter.open({ sandbox: 'read-only' });
+  await f.adapter.send({ text: 'inspect', submissionId: 'first' });
+  await f.adapter.send({ text: 'follow-up', expectedTurnId: 'turn-1' });
+  assert.deepEqual(f.calls.at(-2), ['turn/start', { threadId: 'owned-thread',
+    input: [{ type: 'text', text: 'inspect' }], clientUserMessageId: 'first',
+    sandboxPolicy: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'never' }]);
+  assert.deepEqual(f.calls.at(-1), ['turn/steer', { threadId: 'owned-thread',
+    input: [{ type: 'text', text: 'follow-up' }], expectedTurnId: 'turn-1' }]);
+  f.callbacks.onNotification('turn/completed', { threadId: 'owned-thread', turn: { id: 'turn-1', status: 'completed' } });
+  await f.adapter.send({ text: 'inspect again' });
+  assert.deepEqual(f.calls.at(-1)[1].sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  assert.equal(f.calls.at(-1)[1].approvalPolicy, 'never');
+  await f.adapter.close();
+});
+
+test('interactive read-only Codex auto-denies all command/file/permission and MCP approvals', async () => {
+  const f = fixture((method) => method === 'thread/start' ? readOnlyResponse() : undefined, { interactive: true });
+  await f.adapter.open({ sandbox: 'read-only' });
+  await f.adapter.send({ text: 'inspect only' });
+  const params = { threadId: 'owned-thread', turnId: 'turn-1', itemId: 'item-1' };
+  for (const [method, expected] of [
+    ['item/commandExecution/requestApproval', { decision: 'decline' }],
+    ['item/fileChange/requestApproval', { decision: 'decline' }],
+    ['item/permissions/requestApproval', { permissions: {}, scope: 'turn' }],
+    ['mcpServer/elicitation/request', { action: 'decline' }]
+  ]) {
+    assert.deepEqual(await f.callbacks.onRequest(method, params, method), expected);
+    assert.equal(f.adapter.snapshot().pendingApprovals.length, 0);
+    assert.throws(() => f.adapter.respond({ ...params, executorId: f.adapter.snapshot().executorId,
+      sessionId: 'owned-thread', requestId: method, decision: 'accept' }), { code: 'NATIVE_APPROVAL_MISMATCH' });
+  }
+  assert.equal(f.events.filter((event) => event.type === 'approval' && event.decision === 'decline').length, 4);
+  await f.adapter.close();
+});
+
+test('interactive read-only Codex retains ordinary user questions without permission grants', async () => {
+  const f = fixture((method) => method === 'thread/start' ? readOnlyResponse() : undefined, { interactive: true });
+  await f.adapter.open({ sandbox: 'read-only' });
+  await f.adapter.send({ text: 'inspect only' });
+  const question = f.callbacks.onRequest('item/tool/requestUserInput', { threadId: 'owned-thread', turnId: 'turn-1',
+    questions: [{ id: 'scope' }] }, 'question');
+  const pending = f.adapter.snapshot().pendingApprovals[0];
+  assert.equal(pending.kind, 'userInput');
+  f.adapter.respond({ ...pending, answers: { scope: { answers: ['tests only'] } } });
+  assert.deepEqual(JSON.parse(JSON.stringify(await question)), { answers: { scope: { answers: ['tests only'] } } });
+  assert.equal(f.adapter.snapshot().pendingApprovals.length, 0);
+  await f.adapter.close();
+});
+
+test('Codex does not retry a rejected read-only policy as workspace-write', async () => {
+  const f = fixture((method) => {
+    if (method === 'thread/start') throw Object.assign(new Error('read-only unsupported'), { code: -32602 });
+  });
+  await assert.rejects(f.adapter.open({ sandbox: 'read-only' }), { code: -32602 });
+  assert.equal(f.closeCount, 1);
+  assert.equal(f.calls.filter(([method]) => method === 'thread/start').length, 1);
+  assert.equal(f.calls.at(-1)[1].sandbox, 'read-only');
+  assert.equal(f.adapter.snapshot().sandboxVerified, false);
 });
 
 test('Codex admits concurrent sends as start then steer with the active turn precondition', async () => {
@@ -411,4 +570,61 @@ test('native Codex account reads stay on the same worker and consume executor-wi
   assert.doesNotMatch(JSON.stringify([after,f.events]),/secret-email|secret-access-token|accessToken/);
   assert.deepEqual(f.calls.filter(c=>c[0].startsWith('account/')),[['account/read',{refreshToken:false}],['account/rateLimits/read',{}]]);
   await f.adapter.close(); await assert.rejects(f.adapter.readAccount(),{code:'NATIVE_SESSION_NOT_OPEN'});
+});
+
+
+test('Codex native fork creates a distinct thread with a fresh scoped configuration', async () => {
+  const f = fixture((method) => method === 'thread/fork' ? { thread: { id: 'forked-thread', turns: [] } } : undefined,
+    { interactive: true, mcpServers: { child_scope: { command: 'child-mcp' } } });
+  const state = await f.adapter.open({ forkSessionId: 'source-thread', model: 'same-model' });
+  assert.equal(state.sessionId, 'forked-thread');
+  const call = f.calls.find(value => value[0] === 'thread/fork');
+  assert.equal(call[1].threadId, 'source-thread');
+  assert.equal(call[1].config.mcp_servers.child_scope.command, 'child-mcp');
+  assert.equal(call[1].approvalPolicy, 'on-request');
+  assert.equal(call[1].approvalsReviewer, 'user');
+  assert.equal(f.calls.some(value => ['thread/start', 'thread/resume'].includes(value[0])), false);
+  await f.adapter.close();
+});
+
+test('Codex fork refuses ambiguous input and a provider returning the parent identity', async () => {
+  const invalid = fixture();
+  await assert.rejects(invalid.adapter.open({ sessionId: 'a', forkSessionId: 'a' }), { code: 'BAD_ARGS' });
+  assert.equal(invalid.calls.length, 0);
+  for (const id of ['source-thread', '', null]) {
+    const f = fixture(method => method === 'thread/fork' ? { thread: { id, turns: [] } } : undefined);
+    await assert.rejects(f.adapter.open({ forkSessionId: 'source-thread' }), { code: 'NATIVE_PROTOCOL_ERROR' });
+    assert.equal(f.closeCount, 1);
+  }
+});
+
+test('Codex verifies forked child read-only policy before exposing it or admitting a turn', async () => {
+  for (const [policy, code] of [
+    [{}, null],
+    [{ sandbox: { type: 'workspaceWrite' } }, 'NATIVE_SANDBOX_UNVERIFIED'],
+    [{ approvalPolicy: 'on-request' }, 'NATIVE_SANDBOX_UNVERIFIED'],
+    [{ thread: { id: 'readonly-child', turns: [{ id: 'active-before-fork', status: 'inProgress' }] } }, 'NATIVE_READ_ONLY_BUSY']
+  ]) {
+    const f = fixture(method => method === 'thread/fork' ? readOnlyResponse('readonly-child', policy) : undefined, { interactive: true });
+    const opening = f.adapter.open({ forkSessionId: 'readonly-parent', sandbox: 'read-only' });
+    if (code) {
+      await assert.rejects(opening, { code });
+      assert.equal(f.adapter.snapshot().sessionId, null);
+      await assert.rejects(f.adapter.send({ text: 'must not execute' }), { code: 'NATIVE_SESSION_NOT_OPEN' });
+    } else {
+      const child = await opening;
+      assert.equal(child.sessionId, 'readonly-child');
+      assert.equal(child.sandboxVerified, true);
+      assert.equal(child.capabilities.approvals, false);
+      await f.adapter.send({ text: 'inspect the child' });
+      assert.deepEqual(f.calls.at(-1)[1].sandboxPolicy, { type: 'readOnly', networkAccess: false });
+      assert.equal(f.calls.at(-1)[1].approvalPolicy, 'never');
+    }
+    const forks = f.calls.filter(([method]) => method === 'thread/fork');
+    assert.equal(forks.length, 1);
+    assert.equal(forks[0][1].threadId, 'readonly-parent');
+    assert.equal(forks[0][1].sandbox, 'read-only');
+    assert.equal(forks[0][1].approvalPolicy, 'never');
+    await f.adapter.close();
+  }
 });

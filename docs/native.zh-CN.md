@@ -14,6 +14,34 @@ Native 模式运行由 HCC 创建并持有的后台 worker。共享 peer、任�
 不代表 host 会把多条待处理消息塞进同一个 turn。ACP 的 resume 和 session close
 取决于 provider 声明的扩展；不能把 ACP resume 等同于重放原始会话历史。
 
+## 会话 fork 与原 ID 重试
+
+`hcc native fork --parent codex-reviewer --peer codex-branch` 使用 provider 自身的
+会话 fork。Codex 通过 `thread/fork`，Claude 通过可选 SDK 的 `forkSession` 创建
+新的会话 ID；子 worker 有独立 executor、消息投递记录和后续历史，策略允许 HCC
+工具时也有独立 MCP scope。
+父会话仍保留原身份；关闭子 worker 后可用 `native start --peer codex-branch
+--provider codex --resume last` 恢复子会话。fork 继承父会话的工作目录，并复核目录
+身份，不复制父 worker 的未决 inbox 或权限批准。
+
+只能 fork HCC 持有且保存了会话 ID 的 native worker。父 worker 必须空闲或已明确
+关闭，无活动 turn、待审批请求、排队或结果不明的投递；fork 期间暂停父 worker
+的发送、关闭和 inbox 分发。已有 TUI/Desktop 会话不在此范围内。Claude SDK
+缺少 `forkSession` 时明确报不支持。DeepSeek Harness 0.2.0-rc.2 的 ACP 实现未提供
+fork；HCC 不用 transcript 重放冒充原生 fork。
+
+每条新消息可指定唯一的 `--submission-id`，格式为 8–100 个英文字母、数字、下划线
+或连字符。遇到回执丢失时先查 `native deliveries`，然后对同一 worker、sender、task
+和正文沿用原 ID 重试。相同 ID 返回原持久回执，正文或目标变化会被拒绝。项目
+数据库同时保存消息和 submission ID；若消息已提交而 native 投递记录尚未写入，
+重试或 worker 恢复会补齐原记录，保留用户请求来源。已有 `uncertain` 投递不会
+因为重试被自动重放。
+
+Web 遇到未确认提交时提供“沿用原提交重试”。此操作需核对持久回执后明确确认，
+并保持原执行器身份与原正文；之后编辑的草稿会保留。执行器或项目变化时禁用原
+提交重试。没有匹配的持久 pending 记录、或原消息已被清理时拒绝重试；不会把
+原 ID 当作新工作发送。
+
 ## 环境准备
 
 需要 Node.js 24 或更新版本，并在运行 HCC 的同一环境中安装、登录对应 provider。
@@ -103,12 +131,50 @@ hcc msg inbox --peer coordinator
 `--binary PATH` 覆盖 Codex 或 dsh 可执行文件。Claude 使用 SDK，传入 `--binary`
 会直接报错。
 
+### Codex 文件只读沙箱
+
+```sh
+hcc native start --peer codex-readonly --provider codex --sandbox read-only
+# 关闭后恢复原会话时继承已保存的策略；不要改成 workspace-write。
+hcc native close --peer codex-readonly
+hcc native start --peer codex-readonly --provider codex --resume last
+```
+
+`--sandbox` 仅支持 Codex 的 `read-only` 和 `workspace-write`。新会话未指定时保持
+`workspace-write`；恢复时未指定则继承存储策略，显式不同的策略会被拒绝，需要另建
+worker。旧版本记录迁移为原有 `workspace-write` 行为；无权限推断或自动升级。
+首次初始化尚未建立会话时，重试默认继承已选择策略，也可显式更改。CLI 与 Web 创建／恢复 Codex worker
+前检查后台服务的沙箱协议版本；旧服务不支持时在发送创建请求前拒绝，不自动重启。
+创建请求绑定刚核实的 runtime generation；期间实例被替换或身份缺失时拒绝发送，
+不会跟随新实例自动重试。
+应等项目任务结束后由用户停止旧 runtime，再以新版本启动。不要用旧版本 runtime
+读取新版本只读记录：旧代码不了解该策略，回退执行不属于只读保障。
+Web 仍可查看或关闭旧 worker；其最新快照不含沙箱策略时，拒绝 Codex 发送和回答审批／问题。
+只读 worker 还必须回报 provider 已校验策略，才能执行这两类操作。Web 写请求绑定准入前
+刚读取的 runtime generation，不会自动跟随替换实例。
+
+只读模式固定 `approvalPolicy: never`，每个新 turn 显式请求 `readOnly`、关闭沙箱网络，
+拒绝命令／文件／权限提升和 MCP 授权表单；普通用户问题仍可回答。启动／恢复要求
+provider 回报相符策略，否则关闭自有连接并报错；fork 子会话执行相同校验。已有活动 turn 的只读恢复也拒绝，
+不能用新策略为正在执行的旧 turn 作保证。`sandboxVerified` 仅表示 provider 回报匹配，
+不是一份操作系统行为证明。
+
+HCC 不为只读 worker 注入自有的任务／锁／结果写操作 MCP，也不提示模型执行 HCC
+写命令。HCC 控制面仍保存消息、回复、投递和审计。Codex 的文件沙箱不等于所有外部
+服务或用户配置的 MCP／hooks 都只读；严格隔离验收仍须独立 HOME、无外部工具。
+它也不同于网页“观察／控制”权限：控制者仍可向只读 worker 发送审阅请求。
+
+此功能自 `1.1.0-rc.4` 起提供。Web 的 native 快照会保留 `sandbox` 与 `sandboxVerified`。
+请通过 CLI 选择只读策略。
+原生 fork 继承父会话的持久化策略，不能覆盖或提升；子会话启用前会独立校验。
+
 | 命令 | 参数与作用 |
 | --- | --- |
 | `hcc native up` | 启动或复用本项目后台 runtime |
 | `hcc native status` | 查看持久化 worker 状态和 runtime 身份 |
-| `hcc native start` | 必须 `--peer NAME --provider codex\|claude\|dsh`；可选 `--cwd DIR --model MODEL --resume last`；`--binary PATH` 仅适用于 Codex 和 dsh |
-| `hcc native send` | 必须 `--peer NAME --body TEXT`；可选 `--from NAME --task ID`；返回持久消息/submission 回执 |
+| `hcc native start` | 必须 `--peer NAME --provider codex\|claude\|dsh`；可选 `--cwd DIR --model MODEL --resume last`；`--binary PATH` 仅适用于 Codex 和 dsh；`--sandbox read-only\|workspace-write` 仅适用于 Codex |
+| `hcc native fork` | 必须 `--parent NAME --peer NEW_NAME`；可选 `--model MODEL --binary PATH`；复制 HCC 持有的 Codex 或 Claude 会话到新 worker |
+| `hcc native send` | 必须 `--peer NAME --body TEXT`；可选 `--from NAME --task ID --submission-id ID`；返回持久消息/submission 回执 |
 | `hcc native deliveries` | 可选 `--peer NAME`，查看投递回执 |
 | `hcc native events` | 必须 `--peer NAME`；可选 `--after ID`，查看有界事件历史 |
 | `hcc native requests` | 必须 `--peer NAME`；查看与该执行器、会话、turn 绑定的待处理请求 |

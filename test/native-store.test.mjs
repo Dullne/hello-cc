@@ -283,3 +283,98 @@ test('legacy native worker rows migrate without inventing a directory identity',
   assert.equal(identity.version, 1);
   assert.equal(identity.canonical, fs.realpathSync(f.ctx.root));
 });
+
+
+test('native worker sandbox persists through status updates and restart without escalation', (t) => {
+  const f = fixture(t), store = f.store();
+  const worker = { peer: 'readonly', provider: 'codex', cwd: f.ctx.root, sessionId: 'saved-session', status: 'ready' };
+  store.saveWorker({ ...worker, sandbox: 'read-only' });
+  for (const status of ['running', 'error', 'uncertain', 'closed']) {
+    store.saveWorker({ ...worker, sessionId: null, status });
+    assert.equal(store.worker(worker.peer).sandbox, 'read-only', status);
+    assert.equal(store.worker(worker.peer).session_id, 'saved-session', status);
+  }
+  assert.throws(() => store.saveWorker({ ...worker, sandbox: 'workspace-write' }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+  assert.equal(store.worker(worker.peer).sandbox, 'read-only');
+  store.saveWorker({ ...worker, peer: 'legacy-default' });
+  store.saveWorker({ ...worker, peer: 'claude', provider: 'claude' });
+  store.saveWorker({ ...worker, peer: 'dsh', provider: 'dsh', sandbox: null });
+  store.close();
+  const restarted = f.store();
+  restarted.disconnected();
+  assert.equal(restarted.worker(worker.peer).sandbox, 'read-only');
+  assert.equal(restarted.worker('legacy-default').sandbox, 'workspace-write');
+  assert.equal(restarted.worker('claude').sandbox, null);
+  assert.equal(restarted.worker('dsh').sandbox, null);
+});
+
+test('native worker store rejects unsupported sandbox policies before writing', (t) => {
+  const f = fixture(t), store = f.store();
+  for (const sandbox of [null, '', false, 1, {}, [], 'danger-full-access', 'ReadOnly']) {
+    assert.throws(() => store.saveWorker({ peer: 'invalid', provider: 'codex', cwd: f.ctx.root, status: 'ready', sandbox }), { code: 'BAD_ARGS' });
+  }
+  for (const provider of ['claude', 'dsh']) {
+    assert.throws(() => store.saveWorker({ peer: provider, provider, cwd: f.ctx.root, status: 'ready', sandbox: 'read-only' }), { code: 'BAD_ARGS' });
+  }
+  assert.equal(store.workers().length, 0);
+});
+
+test('legacy native worker migration adds Codex compatibility policy without granting it to other providers', (t) => {
+  const f = fixture(t), paths = nativePaths(f.ctx, { create: true });
+  const legacy = new DatabaseSync(paths.db);
+  legacy.exec(`CREATE TABLE workers (
+    peer TEXT PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT,
+    cwd TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
+  for (const provider of ['codex', 'claude', 'dsh']) {
+    legacy.prepare('INSERT INTO workers VALUES (?,?,?,?,?,?)').run(provider, provider, `old-${provider}`, f.ctx.root, 'closed', 7);
+  }
+  legacy.close();
+  const migrated = f.store();
+  assert.equal(migrated.worker('codex').sandbox, 'workspace-write');
+  for (const provider of ['claude', 'dsh']) assert.equal(migrated.worker(provider).sandbox, null);
+  for (const provider of ['codex', 'claude', 'dsh']) {
+    assert.equal(migrated.worker(provider).session_id, `old-${provider}`);
+    assert.equal(migrated.worker(provider).status, 'closed');
+    assert.equal(migrated.worker(provider).updated_at, 7);
+  }
+  migrated.saveWorker({ peer: 'readonly', provider: 'codex', sessionId: 'new-readonly', cwd: f.ctx.root, status: 'idle', sandbox: 'read-only' });
+  migrated.close();
+  assert.equal(f.store().worker('readonly').sandbox, 'read-only', 'reopening the store must not repeat a broad permission migration');
+});
+
+test('an existing sandbox column with NULL policy is not silently migrated or defaulted on save', (t) => {
+  const f = fixture(t), store = f.store();
+  const worker = { peer: 'missing-policy', provider: 'codex', sessionId: 'saved-session', cwd: f.ctx.root, status: 'closed' };
+  store.saveWorker({ ...worker, sandbox: 'read-only' });
+  store.db.prepare('UPDATE workers SET sandbox=NULL WHERE peer=?').run(worker.peer);
+  store.close();
+  const reopened = f.store();
+  const before = reopened.worker(worker.peer);
+  assert.equal(before.sandbox, null);
+  assert.throws(() => reopened.saveWorker({ ...worker, status: 'opening' }), { code: 'BAD_ARGS' });
+  for (const sandbox of ['read-only', 'workspace-write']) {
+    assert.throws(() => reopened.saveWorker({ ...worker, sandbox }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+  }
+  assert.deepEqual(reopened.worker(worker.peer), before);
+});
+
+test('legacy worker sandbox schema and compatibility backfill migrate atomically', (t) => {
+  const f = fixture(t), paths = nativePaths(f.ctx, { create: true });
+  const legacy = new DatabaseSync(paths.db);
+  legacy.exec(`CREATE TABLE workers (
+    peer TEXT PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT,
+    cwd TEXT NOT NULL, status TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TRIGGER reject_backfill BEFORE UPDATE ON workers BEGIN
+      SELECT RAISE(ABORT, 'test sandbox backfill failure');
+    END;`);
+  legacy.prepare('INSERT INTO workers VALUES (?,?,?,?,?,?)').run('saved', 'codex', 'old-session', f.ctx.root, 'closed', 7);
+  legacy.close();
+  assert.throws(() => f.store(), /test sandbox backfill failure/);
+  const inspection = new DatabaseSync(paths.db);
+  try {
+    assert.equal(inspection.prepare('PRAGMA table_info(workers)').all().some(column => column.name === 'sandbox'), false);
+    assert.equal(inspection.prepare("SELECT session_id FROM workers WHERE peer='saved'").get().session_id, 'old-session');
+    inspection.exec('DROP TRIGGER reject_backfill');
+  } finally { inspection.close(); }
+  assert.equal(f.store().worker('saved').sandbox, 'workspace-write');
+});

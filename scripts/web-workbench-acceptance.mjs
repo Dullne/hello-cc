@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runSessionToolsChecks } from './web-session-tools-checks.mjs';
 import { runFilePreviewChecks } from './web-file-preview-checks.mjs';
 import { runNativeHandoffChecks } from './web-native-handoff-checks.mjs';
+import { createNativeRetryFault, runNativeRetryChecks, assertExpectedBrowserErrors } from './web-native-retry-checks.mjs';
 import { createNativeFixtureRoot } from './native-fixture-root.mjs';
 
 const args = process.argv.slice(2);
@@ -65,12 +66,12 @@ function hashes() {
       for (const name of fs.readdirSync(target).sort()) walk(path.join(relative, name));
     } else result[relative] = createHash('sha256').update(fs.readFileSync(target)).digest('hex');
   }
-  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/native-fixture-root.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs', 'scripts/web-native-handoff-checks.mjs']) walk(name);
+  for (const name of ['bin', 'lib', 'package.json', 'package-lock.json', 'scripts/web-workbench-acceptance.mjs', 'scripts/native-fixture-root.mjs', 'scripts/web-session-tools-checks.mjs', 'scripts/web-file-preview-checks.mjs', 'scripts/web-native-handoff-checks.mjs', 'scripts/web-native-retry-checks.mjs']) walk(name);
   return result;
 }
 const evidence = {
   schemaVersion: 1, dir, packageRoot: repo, packageVersion: JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version,
-  node: process.version, platform: process.platform, checks: [], screenshots: [], errors: [], console: [], cleanup: {},
+  node: process.version, platform: process.platform, checks: [], screenshots: [], errors: [], console: [], expectedErrors: [], cleanup: {},
   sourceFiles: hashes(), browser: 'Playwright 1.62.1; isolated headless context; repeatable CI runner',
   mode: 'Simulated native adapters; actual HTTP, SQLite, native service and browser; no models or credentials',
   startedAt: new Date().toISOString(), success: false
@@ -84,6 +85,7 @@ function hcc(...command) {
   return result.stdout;
 }
 const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
+const retryFault = createNativeRetryFault({ dbPath: ctx.dbPath });
 const events = createEventHelpers(), bindings = createPeerBindingStore(events), peers = createPeerHelpers({ ...events, now: () => Math.floor(Date.now() / 1000) });
 const deps = { ...events, ...bindings, ...peers, ...createMessageStore(events), connect: () => new DatabaseSync(ctx.dbPath), detectBranch: () => '', liveProcessIdentity: pid => inspectProcessIdentity(pid).identity };
 const adapters = new Map(), adaptersByPeer = new Map();
@@ -350,7 +352,7 @@ try{
  const quotedTmux = "'" + tmux.replaceAll("'", "'\"'\"'") + "'";
  fs.writeFileSync(path.join(bin,'tmux'),'#!/bin/sh\nexec '+quotedTmux+' -L '+socket+' "$@"\n',{mode:0o700});
  hcc('up','--no-discover','--no-guidance');
- service=await startNativeService(ctx,deps,{pollMs:60000,adapterFactory:async(provider,options)=>{
+ service=await startNativeService(ctx,deps,{pollMs:1000000,afterUserSubmissionMeshCommit:retryFault.afterMeshCommit,adapterFactory:async(provider,options)=>{
   const peer=options.env.HCC_PEER;
   const state={provider,status:'idle',sessionId:peer,turnId:null,executorId:options.executorId,capabilities:{send:true,interrupt:true,close:true,resume:true}};
   const adapter={opens:[],snapshot:()=>structuredClone(state),capabilities:state.capabilities,async open(input={}){this.opens.push(structuredClone(input));if(input.sessionId)state.sessionId=input.sessionId;return this.snapshot();},async send(input){this.sent=(this.sent||0)+1;state.status='running';state.turnId='qa-turn';this.active=input;return{status:'queued',turnId:state.turnId};},async interrupt(){state.status='idle';state.turnId=null;},async close(){state.status='closed';},emit(value){options.onEvent({provider,sessionId:state.sessionId,turnId:'qa-turn',...value});},state};
@@ -401,8 +403,9 @@ try{
  await extendedChecks(p,context);
  await projectLifecycleChecks();
  await runFilePreviewChecks({browser,base,token:env.HCC_WEB_TOKEN,sandbox,registerPage:p,adapters,check,shot,watch,browserInstrumentation,evidence});
+ await runNativeRetryChecks({browser,base,token:env.HCC_WEB_TOKEN,root,dbPath:ctx.dbPath,adaptersByPeer,api,service,retryFault,select,check,shot,watch,browserInstrumentation,evidence});
  await runNativeHandoffChecks({browser,base,token:env.HCC_WEB_TOKEN,adaptersByPeer,api,service,select,check,shot,watch,browserInstrumentation,evidence,stopWeb:()=>{hcc('down');runtime=false;}});
- assert.deepEqual(evidence.errors,[]);assert.deepEqual(evidence.console,[]);assert.deepEqual(hashes(),evidence.sourceFiles);check('zero browser errors and unchanged source hash during acceptance');evidence.success=true;
+ assert.deepEqual(evidence.errors,[]);assertExpectedBrowserErrors(evidence);assert.deepEqual(hashes(),evidence.sourceFiles);check('zero unexpected browser errors and unchanged source hash during acceptance');evidence.success=true;
 } catch (error) {
   evidence.success = false; evidence.failure = { message: error.message, stack: error.stack };
   console.error(error);

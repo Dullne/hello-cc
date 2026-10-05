@@ -19,6 +19,7 @@ import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { readNativePointer, writeNativePointer, createNativeStore } from '../lib/runtime/native/store.mjs';
 import { acquireFileLock, createFileLockLease, fileLockEndpoint } from '../lib/shared/file-lock.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
+import { createScopedMcpConfig } from '../lib/mcp/scope.mjs';
 
 function deferred() { let resolve; let reject; const promise = new Promise((a,b) => { resolve=a; reject=b; }); return {promise,resolve,reject}; }
 async function until(fn) {
@@ -37,17 +38,30 @@ async function fixture(t, config = {}, serviceOptions = {}, launch = startNative
   const peers = createPeerHelpers({now:()=>Math.floor(Date.now()/1000),liveProcessIdentity:()=>null});
   const messages = createMessageStore(events);
   const adapters = new Map();
+  const mcpCreations = [];
   const deps = {...events,...bindings,...peers,...messages,
     detectBranch:()=>'',liveProcessIdentity:()=>inspectProcessIdentity(process.pid).identity,
     connect(){ const db=new DatabaseSync(ctx.dbPath); db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000'); return db; }};
-  const options = {pollMs:60000,adapterFactory:async (provider, options) => {
+  const options = {pollMs:60000,
+    mcpConfigFactory(input) { mcpCreations.push(input.peer); return createScopedMcpConfig(input); },
+    adapterFactory:async (provider, options) => {
     const peer = options.env.HCC_PEER;
     const local = config[peer] || {};
-    const state = {provider,status:'new',sessionId:null,capabilities:{send:true,resume:true,interrupt:true,close:true}};
+    if (local.rpcFactory) {
+      const adapter = createCodexAdapter({ ...options, rpcFactory: local.rpcFactory });
+      adapters.set(peer, adapter);
+      return adapter;
+    }
+    const state = {provider,status:'new',sessionId:null,capabilities:{send:true,resume:true,interrupt:true,close:true,fork:provider!=='dsh'}};
     const adapter = {sent:[],closed:0,options,state,
       snapshot:()=>({...state}),capabilities:state.capabilities,
       emit(event){ options.onEvent({...event}); },
-      async open(input){ if(local.openGate) await local.openGate.promise; state.status='idle'; state.sessionId=input.sessionId || 'session-'+peer; return {...state}; },
+      async open(input){ this.openInput={...input}; if(local.openGate) await local.openGate.promise;
+        if(local.openError) throw local.openError;
+        state.status='idle'; state.sessionId=input.sessionId || 'session-'+peer;
+        if(local.echoSandbox) { state.sandbox=input.sandbox; state.sandboxVerified=true; }
+        if(Object.hasOwn(local,'reportedSandbox')) state.sandbox=local.reportedSandbox;
+        return {...state}; },
       async send(input){ this.sent.push(input); state.status='running'; this.active=input; if(local.send) return local.send(this,input);
         return {status:local.receipt || 'queued',turnId:'turn-'+peer}; },
       complete(fields={}){ state.status='idle'; this.emit({type:'completed',status:'completed',submissionId:this.active.submissionId,turnId:'turn-'+peer,text:'answer',...fields}); },
@@ -64,7 +78,7 @@ async function fixture(t, config = {}, serviceOptions = {}, launch = startNative
   const api=(method,route,body)=>nativeRequest(ctx,method,route,body,{timeoutMs:3000});
   const start=(peer,extra={})=>api('POST','/workers',{peer,provider:'codex',...extra});
   const delivery=async(peer)=>(await api('GET','/deliveries?peer='+peer))[0];
-  return {ctx,inspect,deps,adapters,api,start,delivery,get service(){return service;},
+  return {ctx,inspect,deps,adapters,mcpCreations,api,start,delivery,get service(){return service;},
     async restart(){await service.shutdown(); service=await startNativeService(ctx,deps,options);}};
 }
 
@@ -598,4 +612,364 @@ test('guarded resume admission requires a closed matching owner while unfenced C
   assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='a'").get(), closedBinding);
   await f.start('a', { resume: 'last' });
   assert.equal((await f.api('GET', '/status')).workers[0].session_id, resumeFence.sessionId);
+});
+
+
+test('native host forks only its owned idle or closed sessions into a distinct peer and scope', async t => {
+  const f = await fixture(t);
+  await f.start('parent');
+  const original = f.inspect.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('parent');
+  const child = await f.api('POST', '/fork', { parent: 'parent', peer: 'child' });
+  assert.equal(child.parentSessionId, 'session-parent');
+  assert.equal(child.sessionId, 'session-child');
+  assert.equal(f.adapters.get('child').openInput.forkSessionId, 'session-parent');
+  assert.notEqual(f.adapters.get('parent').options.executorId, f.adapters.get('child').options.executorId);
+  assert.deepEqual(f.inspect.prepare('SELECT * FROM peer_bindings WHERE peer=?').get('parent'), original);
+  assert.equal((await f.api('GET', '/deliveries?peer=child')).length, 0);
+  await f.api('POST', '/close', { peer: 'parent' });
+  const another = await f.api('POST', '/fork', { parent: 'parent', peer: 'another' });
+  assert.equal(another.sessionId, 'session-another');
+});
+
+test('native fork refuses unowned, unsupported, unresolved and directly injected source identities', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.api('POST', '/fork', { parent: 'unowned', peer: 'child' }), { code: 'NATIVE_SESSION_NOT_OWNED' });
+  await assert.rejects(f.start('child', { forkSessionId: 'external-session' }), { code: 'BAD_ARGS' });
+  await f.start('dsh-parent', { provider: 'dsh' });
+  await assert.rejects(f.api('POST', '/fork', { parent: 'dsh-parent', peer: 'child' }), { code: 'NATIVE_CAPABILITY_UNSUPPORTED' });
+  await f.start('parent');
+  await f.api('POST', '/send', { peer: 'parent', from: 'shell', body: 'pending' });
+  await assert.rejects(f.api('POST', '/fork', { parent: 'parent', peer: 'child' }), { code: 'NATIVE_FORK_NOT_READY' });
+  await f.service.poll();
+  await assert.rejects(f.api('POST', '/fork', { parent: 'parent', peer: 'child' }), { code: 'NATIVE_FORK_NOT_READY' });
+  assert.equal(f.adapters.has('child'), false);
+});
+
+test('native fork fences parent submission, close and dispatch until the child opens', async t => {
+  const gate = deferred();
+  const f = await fixture(t, { child: { openGate: gate } });
+  await f.start('parent');
+  const child = f.api('POST', '/fork', { parent: 'parent', peer: 'child' });
+  await until(() => f.adapters.has('child'));
+  await assert.rejects(f.api('POST', '/send', { peer: 'parent', from: 'shell', body: 'too soon' }), { code: 'NATIVE_FORK_NOT_READY' });
+  await assert.rejects(f.api('POST', '/close', { peer: 'parent' }), { code: 'NATIVE_FORK_NOT_READY' });
+  f.deps.sendMessage(f.inspect, 'shell', 'parent', null, 'ask', 'peer queue');
+  await f.service.poll();
+  assert.equal(f.adapters.get('parent').sent.length, 0);
+  gate.resolve(); await child;
+  await f.service.poll();
+  assert.equal(f.adapters.get('parent').sent.length, 1);
+});
+
+test('explicit submission retries repair a missing state delivery without inserting a second mesh message', async t => {
+  let failAfterMeshCommit = true;
+  const f = await fixture(t, {}, { afterUserSubmissionMeshCommit() {
+    if (failAfterMeshCommit) {
+      failAfterMeshCommit = false;
+      throw Object.assign(new Error('injected after mesh commit'), { code: 'INJECTED_CRASH_GAP' });
+    }
+  } });
+  await f.start('a');
+  const input = { peer: 'a', from: 'shell', body: 'only once', submissionId: 'retry_same_001' };
+  await assert.rejects(f.api('POST', '/send', input), { code: 'INJECTED_CRASH_GAP' });
+  const message = f.inspect.prepare("SELECT id FROM messages WHERE body='only once'").get();
+  assert.ok(message);
+  assert.equal((await f.api('GET', '/deliveries?peer=a')).length, 0);
+  const retried = await f.api('POST', '/send', input);
+  assert.equal(retried.message_id, message.id);
+  assert.equal(retried.submission_id, input.submissionId);
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='only once'").get().n, 1);
+  assert.equal((await f.delivery('a')).origin, 'user');
+  await assert.rejects(f.api('POST', '/send', { ...input, body: 'different' }), { code: 'NATIVE_SUBMISSION_MISMATCH' });
+});
+
+test('orphaned explicit submission keeps user origin during worker ingestion after restart', async t => {
+  let failAfterMeshCommit = true;
+  const f = await fixture(t, {}, { afterUserSubmissionMeshCommit() {
+    if (failAfterMeshCommit) {
+      failAfterMeshCommit = false;
+      throw Object.assign(new Error('injected after mesh commit'), { code: 'INJECTED_CRASH_GAP' });
+    }
+  } });
+  await f.start('a');
+  const input = { peer: 'a', from: 'web', body: 'preserve user intent', submissionId: 'retry_after_restart_001' };
+  await assert.rejects(f.api('POST', '/send', input), { code: 'INJECTED_CRASH_GAP' });
+  const messageId = f.inspect.prepare("SELECT id FROM messages WHERE body='preserve user intent'").get().id;
+  await f.restart();
+  await f.start('a', { resume: 'last' });
+  const delivery = await f.delivery('a');
+  assert.equal(delivery.message_id, messageId);
+  assert.equal(delivery.submission_id, input.submissionId);
+  assert.equal(delivery.origin, 'user');
+  const retried = await f.api('POST', '/send', input);
+  assert.equal(retried.message_id, messageId);
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='preserve user intent'").get().n, 1);
+});
+
+test('native fork rechecks the complete parent binding and closes only the child when transport changes during open', async t => {
+  const gate = deferred();
+  const f = await fixture(t, { child: { openGate: gate } });
+  await f.start('parent');
+  const forking = f.api('POST', '/fork', { parent: 'parent', peer: 'child' });
+  await until(() => f.adapters.has('child'));
+  f.inspect.prepare("UPDATE peer_bindings SET transport='tmux' WHERE peer='parent'").run();
+  const changedBinding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='parent'").get();
+  gate.resolve();
+  await assert.rejects(forking, { code: 'NATIVE_OWNER_CHANGED' });
+  assert.equal(f.adapters.get('child').closed, 1);
+  assert.equal(f.adapters.get('parent').closed, 0);
+  assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='parent'").get(), changedBinding);
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM events WHERE type='native.worker.forked'").get().n, 0);
+});
+
+
+test('native Codex read-only workers retain policy and omit mutating HCC tools and instructions', async (t) => {
+  const f = await fixture(t, { readonly: { echoSandbox: true } });
+  const created = await f.start('readonly', { sandbox: 'read-only' });
+  assert.equal(created.sandbox, 'read-only');
+  assert.equal(created.sandboxVerified, true);
+  const adapter = f.adapters.get('readonly');
+  assert.equal(adapter.openInput.sandbox, 'read-only');
+  assert.equal(adapter.options.mcpServers, undefined);
+  assert.equal(Object.hasOwn(adapter.options, 'mcpServers'), false);
+  assert.deepEqual(f.mcpCreations, []);
+  const state = await f.api('GET', '/workers/readonly/state');
+  assert.equal(state.sandbox, 'read-only');
+  assert.equal(state.snapshot.sandbox, 'read-only');
+  assert.equal(state.snapshot.sandboxVerified, true);
+  assert.equal((await f.api('GET', '/status')).workers[0].sandbox, 'read-only');
+  await f.api('POST', '/send', { peer: 'readonly', from: 'web', body: 'inspect the requested files' });
+  await f.service.poll();
+  assert.match(adapter.sent[0].text, /read-only file sandbox/);
+  assert.doesNotMatch(adapter.sent[0].text, /Use the scoped hello_cc_scoped MCP tools|Use this exact prefix|HCC_DB=/);
+  adapter.complete();
+  assert.equal((await f.delivery('readonly')).state, 'completed', 'the runtime still records its own control-plane receipts');
+  await f.api('POST', '/close', { peer: 'readonly' });
+  assert.equal((await f.api('GET', '/status')).workers[0].sandbox, 'read-only');
+  await f.restart();
+  const resumed = await f.start('readonly', { resume: 'last' });
+  assert.equal(resumed.sandbox, 'read-only');
+  assert.equal(f.adapters.get('readonly').openInput.sandbox, 'read-only');
+  assert.deepEqual(f.mcpCreations, []);
+});
+
+test('native worker sandbox defaults preserve existing provider behavior', async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.api('GET', '/status')).sandboxPolicyVersion, 1, 'policy capability is advertised before creating any worker');
+  assert.equal((await f.start('codex-default')).sandbox, 'workspace-write');
+  assert.equal(f.adapters.get('codex-default').openInput.sandbox, 'workspace-write');
+  for (const provider of ['claude', 'dsh']) {
+    assert.equal((await f.start(provider, { provider })).sandbox, null);
+    assert.equal(Object.hasOwn(f.adapters.get(provider).openInput, 'sandbox'), false);
+  }
+  assert.deepEqual(f.mcpCreations, ['codex-default', 'claude', 'dsh']);
+});
+
+test('native invalid and non-Codex sandbox requests fail before ownership or provider side effects', async (t) => {
+  const f = await fixture(t);
+  for (const sandbox of [null, '', false, 1, {}, [], 'danger-full-access', 'ReadOnly']) {
+    await assert.rejects(f.start('invalid', { sandbox }), { code: 'BAD_ARGS' });
+  }
+  for (const provider of ['claude', 'dsh']) {
+    for (const sandbox of ['read-only', 'workspace-write', null]) {
+      await assert.rejects(f.start(provider, { provider, sandbox }), { code: 'BAD_ARGS' });
+    }
+  }
+  assert.equal(f.adapters.size, 0);
+  assert.deepEqual(f.mcpCreations, []);
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM peers').get().n, 0);
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM peer_bindings').get().n, 0);
+  assert.deepEqual((await f.api('GET', '/status')).workers, []);
+});
+
+for (const initial of ['read-only', 'workspace-write']) {
+  test(`native resume cannot replace its saved ${initial} policy`, async (t) => {
+    const f = await fixture(t);
+    await f.start('saved', { sandbox: initial });
+    await f.api('POST', '/close', { peer: 'saved' });
+    const binding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='saved'").get();
+    const adapter = f.adapters.get('saved');
+    const mismatch = initial === 'read-only' ? 'workspace-write' : 'read-only';
+    await assert.rejects(f.start('saved', { resume: 'last', sandbox: mismatch }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+    assert.equal(f.adapters.get('saved'), adapter);
+    assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='saved'").get(), binding);
+    assert.equal((await f.api('GET', '/status')).workers[0].sandbox, initial);
+    assert.equal((await f.start('saved', { resume: 'last', sandbox: initial })).sandbox, initial);
+  });
+}
+
+test('native adapter sandbox conflicts fail closed without erasing requested policy during cleanup', async (t) => {
+  const f = await fixture(t, { conflict: { reportedSandbox: 'workspace-write' } });
+  await assert.rejects(f.start('conflict', { sandbox: 'read-only' }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+  assert.equal(f.adapters.get('conflict').closed, 1);
+  const worker = (await f.api('GET', '/status')).workers[0];
+  assert.equal(worker.sandbox, 'read-only');
+  assert.equal(worker.status, 'error');
+  assert.equal(worker.owned, false);
+});
+
+test('native read-only policy survives initialization and shutdown error persistence paths', async (t) => {
+  const configuration = {
+    broken: { openError: Object.assign(new Error('test initialization failure'), { code: 'TEST_OPEN_FAILED' }) },
+    live: { closeError: Object.assign(new Error('exit not confirmed'), { code: 'NATIVE_CLOSE_FAILED' }) }
+  };
+  const f = await fixture(t, configuration);
+  await assert.rejects(f.start('broken', { sandbox: 'read-only' }), { code: 'TEST_OPEN_FAILED' });
+  assert.equal((await f.api('GET', '/status')).workers.find(row => row.peer === 'broken').sandbox, 'read-only');
+  await f.start('live', { sandbox: 'read-only' });
+  const previousError = console.error; console.error = () => {};
+  try {
+    await assert.rejects(f.service.shutdown(), { code: 'NATIVE_SHUTDOWN_INCOMPLETE' });
+    const worker = (await f.api('GET', '/status')).workers.find(row => row.peer === 'live');
+    assert.equal(worker.sandbox, 'read-only');
+    assert.equal(worker.status, 'uncertain');
+  } finally { configuration.live.closeError = null; console.error = previousError; }
+  await f.service.shutdown();
+  const store = createNativeStore(f.ctx);
+  try { assert.equal(store.worker('live').sandbox, 'read-only'); }
+  finally { store.close(); }
+});
+
+test('native resume fails closed when an existing sandbox column has lost its policy', async (t) => {
+  const f = await fixture(t);
+  await f.start('missing-policy', { sandbox: 'read-only' });
+  await f.api('POST', '/close', { peer: 'missing-policy' });
+  const store = createNativeStore(f.ctx);
+  try { store.db.prepare('UPDATE workers SET sandbox=NULL WHERE peer=?').run('missing-policy'); }
+  finally { store.close(); }
+  await f.restart();
+  const adapter = f.adapters.get('missing-policy');
+  const binding = f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='missing-policy'").get();
+  assert.equal((await f.api('GET', '/status')).workers[0].sandbox, null);
+  await assert.rejects(f.start('missing-policy', { resume: 'last' }), { code: 'NATIVE_STATE_INVALID' });
+  for (const sandbox of ['read-only', 'workspace-write']) {
+    await assert.rejects(f.start('missing-policy', { resume: 'last', sandbox }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+  }
+  assert.equal(f.adapters.get('missing-policy'), adapter);
+  assert.deepEqual(f.mcpCreations, []);
+  assert.deepEqual(f.inspect.prepare("SELECT * FROM peer_bindings WHERE peer='missing-policy'").get(), binding);
+  assert.equal((await f.api('GET', '/status')).workers[0].sandbox, null);
+});
+
+test('retrying initialization before a session exists retains the saved sandbox unless explicitly changed', async (t) => {
+  const configuration = {
+    retry: { openError: Object.assign(new Error('test initialization failure'), { code: 'TEST_OPEN_FAILED' }) },
+    explicit: { openError: Object.assign(new Error('test initialization failure'), { code: 'TEST_OPEN_FAILED' }) }
+  };
+  const f = await fixture(t, configuration);
+  for (const peer of ['retry', 'explicit']) {
+    await assert.rejects(f.start(peer, { sandbox: 'read-only' }), { code: 'TEST_OPEN_FAILED' });
+    const row = (await f.api('GET', '/status')).workers.find(row => row.peer === peer);
+    assert.equal(row.session_id, null);
+    assert.equal(row.sandbox, 'read-only');
+    configuration[peer].openError = null;
+  }
+  assert.equal((await f.start('retry')).sandbox, 'read-only');
+  assert.equal(f.adapters.get('retry').openInput.sandbox, 'read-only');
+  assert.deepEqual(f.mcpCreations, []);
+  assert.equal((await f.start('explicit', { sandbox: 'workspace-write' })).sandbox, 'workspace-write');
+  assert.deepEqual(f.mcpCreations, ['explicit']);
+});
+
+test('authenticated read-only native responses answer exact user questions without enabling permission approvals', async (t) => {
+  let provider;
+  const f = await fixture(t, { readonly: { rpcFactory(options) {
+    provider = { options, async start() {}, async notify() {}, async close() {},
+      async request(method, params) {
+        if (method === 'initialize') return {};
+        if (method === 'thread/start') return { thread: { id: 'readonly-thread', turns: [] },
+          sandbox: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'never' };
+        if (method === 'turn/start') return { turn: { id: 'readonly-turn', status: 'inProgress' } };
+        assert.fail(`unexpected test provider request: ${method}`);
+      }
+    };
+    return provider;
+  } } });
+  const opened = await f.start('readonly', { sandbox: 'read-only' });
+  assert.equal(opened.capabilities.approvals, false);
+  assert.equal(opened.capabilities.userInput, true);
+  await f.api('POST', '/send', { peer: 'readonly', from: 'web', body: 'inspect without modifying files' });
+  await f.service.poll();
+  const params = { threadId: 'readonly-thread', turnId: 'readonly-turn', itemId: 'question',
+    questions: [{ id: 'scope', header: 'Scope', question: 'Which file?', options: [{ label: 'README' }] }] };
+  const answer = provider.options.onRequest('item/tool/requestUserInput', params, 1);
+  const state = await f.api('GET', '/workers/readonly/state');
+  assert.equal(state.snapshot.pendingApprovals[0].kind, 'userInput');
+  const response = { peer: 'readonly', generation: state.generation, owner: state.owner, executorId: state.owner,
+    sessionId: 'readonly-thread', turnId: 'readonly-turn', requestId: 1, decision: 'accept', answers: { scope: { answers: ['README'] } } };
+  for (const extra of [
+    { requestId: '1' }, { requestId: 99 }, { turnId: 'other-turn' }, { executorId: 'other-executor' },
+    { kind: 'approval' }, { kind: 'permissions' }, { permissions: { fileSystem: { write: ['/'] } } }, { scope: 'session' }
+  ]) {
+    await assert.rejects(f.api('POST', '/respond', { ...response, ...extra }), { code: 'NATIVE_APPROVAL_MISMATCH' });
+  }
+  assert.equal((await f.api('POST', '/respond', response)).status, 'submitted');
+  assert.deepEqual({ ...(await answer).answers }, { scope: { answers: ['README'] } });
+  assert.deepEqual((await f.api('GET', '/workers/readonly/state')).snapshot.pendingApprovals, []);
+  const cancelled = provider.options.onRequest('item/tool/requestUserInput', params, 2);
+  assert.equal((await f.api('POST', '/respond', { ...response, requestId: 2, decision: 'cancel' })).status, 'submitted');
+  assert.deepEqual(await cancelled, { answers: {} });
+  for (const [method, expected] of [
+    ['item/commandExecution/requestApproval', { decision: 'decline' }],
+    ['item/fileChange/requestApproval', { decision: 'decline' }],
+    ['item/permissions/requestApproval', { permissions: {}, scope: 'turn' }],
+    ['mcpServer/elicitation/request', { action: 'decline' }]
+  ]) {
+    assert.deepEqual(await provider.options.onRequest(method, { ...params, permissions: { fileSystem: { write: ['/'] } } }, method), expected);
+    await assert.rejects(f.api('POST', '/respond', { ...response, requestId: method, kind: 'userInput' }), { code: 'NATIVE_APPROVAL_MISMATCH' });
+  }
+  const final = await f.api('GET', '/workers/readonly/state');
+  assert.equal(final.snapshot.sandbox, 'read-only');
+  assert.equal(final.snapshot.capabilities.approvals, false);
+  assert.deepEqual(final.snapshot.pendingApprovals, []);
+});
+
+for (const closedParent of [false, true]) {
+  test(`native fork inherits read-only sandbox from a ${closedParent ? 'closed' : 'live'} parent`, async t => {
+    const f = await fixture(t, { parent: { echoSandbox: true }, child: { echoSandbox: true } });
+    await f.start('parent', { sandbox: 'read-only' });
+    if (closedParent) await f.api('POST', '/close', { peer: 'parent' });
+    await assert.rejects(f.api('POST', '/fork', { parent: 'parent', peer: 'escalated', sandbox: 'workspace-write' }), { code: 'BAD_ARGS' });
+    assert.equal(f.adapters.has('escalated'), false);
+    const child = await f.api('POST', '/fork', { parent: 'parent', peer: 'child' });
+    assert.equal(child.sandbox, 'read-only');
+    assert.equal(child.sandboxVerified, true);
+    assert.equal(f.adapters.get('child').openInput.sandbox, 'read-only');
+    assert.equal(f.adapters.get('child').openInput.forkSessionId, 'session-parent');
+    assert.equal(f.adapters.get('child').options.mcpServers, undefined);
+    assert.deepEqual(f.mcpCreations, []);
+    await f.api('POST', '/close', { peer: 'child' });
+    await assert.rejects(f.start('child', { resume: 'last', sandbox: 'workspace-write' }), { code: 'NATIVE_SANDBOX_MISMATCH' });
+    await f.restart();
+    const resumed = await f.start('child', { resume: 'last' });
+    assert.equal(resumed.sandbox, 'read-only');
+    assert.equal(resumed.sessionId, child.sessionId);
+    assert.deepEqual(f.mcpCreations, []);
+  });
+}
+
+test('native fork rejects missing or changing parent sandbox policy without adopting a writable child', async t => {
+  const gate = deferred();
+  const f = await fixture(t, { parent: { echoSandbox: true }, child: { echoSandbox: true, openGate: gate } });
+  await f.start('parent', { sandbox: 'read-only' });
+  const forking = f.api('POST', '/fork', { parent: 'parent', peer: 'child' });
+  const rejected = assert.rejects(forking, { code: 'NATIVE_SANDBOX_MISMATCH' });
+  await until(() => f.adapters.has('child'));
+  const store = createNativeStore(f.ctx);
+  try { store.db.prepare('UPDATE workers SET sandbox=NULL WHERE peer=?').run('parent'); } finally { store.close(); }
+  gate.resolve();
+  await rejected;
+  assert.equal(f.adapters.get('child').closed, 1);
+  assert.deepEqual(f.mcpCreations, []);
+  const child = (await f.api('GET', '/status')).workers.find(row => row.peer === 'child');
+  assert.equal(child.sandbox, 'read-only');
+  assert.equal(child.owned, false);
+  // Restore only fixture-owned corrupt state before shutting down its live parent.
+  const restore = createNativeStore(f.ctx);
+  try { restore.db.prepare('UPDATE workers SET sandbox=? WHERE peer=?').run('read-only', 'parent'); } finally { restore.close(); }
+  await f.api('POST', '/close', { peer: 'parent' });
+  const missing = createNativeStore(f.ctx);
+  try { missing.db.prepare('UPDATE workers SET sandbox=NULL WHERE peer=?').run('parent'); } finally { missing.close(); }
+  await assert.rejects(f.api('POST', '/fork', { parent: 'parent', peer: 'another-child' }), { code: 'NATIVE_STATE_INVALID' });
+  assert.equal(f.adapters.has('another-child'), false);
 });

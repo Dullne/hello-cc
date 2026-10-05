@@ -493,3 +493,63 @@ test('ACP oversized tool input stays bounded and cannot authorize a hidden write
     assert.deepEqual(await permission, { outcome: { outcome: 'selected', optionId: 'no' } });
   } finally { await f.adapter.close(); }
 });
+
+
+test('ACP tool input arriving after the context wait refreshes the original pending permission', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture({ adapterOptions: { interactive: true } });
+  const choices = [{ optionId: 'once', kind: 'allow_once' }, { optionId: 'no', kind: 'reject_once' }];
+  try {
+    await f.adapter.open(); await f.adapter.send({ text: 'write one authorized report' });
+    const permission = f.callbacks.onRequest('session/request_permission', {
+      sessionId: 'session-own', toolCall: { toolCallId: 'slow-write' }, options: choices
+    }, 504);
+    t.mock.timers.tick(1001); await flush();
+    const original = f.adapter.snapshot().pendingApprovals[0];
+    assert.equal(original.params.toolCall.contextPending, true);
+    assert.throws(() => f.adapter.respond({ ...original, decision: 'accept' }), { code: 'NATIVE_APPROVAL_CONTEXT_MISSING' });
+    const toolUpdate = sessionId => f.callbacks.onNotification('session/update', { sessionId, update: {
+      sessionUpdate: 'tool_call_update', toolCallId: 'slow-write', title: 'write report',
+      rawInput: { file_path: sessionId === 'session-own' ? '/workspace/one/report.json' : '/foreign/private' }
+    } });
+    toolUpdate('foreign');
+    assert.deepEqual(f.adapter.snapshot().pendingApprovals, [original]);
+    toolUpdate('session-own');
+    const [refreshed] = f.adapter.snapshot().pendingApprovals;
+    assert.equal(refreshed.params.toolCall.rawInput?.file_path, '/workspace/one/report.json');
+    assert.equal(refreshed.params.toolCall.contextPending, undefined);
+    for (const key of ['executorId', 'requestId', 'sessionId', 'turnId', 'createdAt']) assert.equal(refreshed[key], original[key]);
+    assert.deepEqual(refreshed.params.options, choices);
+    assert.equal(f.adapter.snapshot().pendingApprovals.length, 1);
+    assert.equal(f.events.filter(event => event.type === 'approval' && event.requestId === 504).length, 2);
+    f.adapter.respond({ ...refreshed, decision: 'accept' });
+    assert.deepEqual(await permission, { outcome: { outcome: 'selected', optionId: 'once' } });
+    assert.equal(f.adapter.snapshot().pendingApprovals.length, 0);
+  } finally { await f.adapter.close(); }
+});
+
+test('ACP late oversized tool input refreshes details while keeping acceptance blocked', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture({ adapterOptions: { interactive: true } });
+  try {
+    await f.adapter.open(); await f.adapter.send({ text: 'task' });
+    const permission = f.callbacks.onRequest('session/request_permission', { sessionId: 'session-own',
+      toolCall: { toolCallId: 'slow-large' }, options: [{ optionId: 'once', kind: 'allow_once' }, { optionId: 'no', kind: 'reject_once' }]
+    }, 505);
+    t.mock.timers.tick(1001); await flush();
+    f.callbacks.onNotification('session/update', { sessionId: 'session-own', update: {
+      sessionUpdate: 'tool_call_update', toolCallId: 'slow-large', title: 'write', rawInput: { content: 'x'.repeat(70000) }
+    } });
+    const [request] = f.adapter.snapshot().pendingApprovals;
+    assert.equal(request.params.toolCall.contextTruncated, true);
+    assert.equal(request.params.toolCall.contextPending, undefined);
+    assert.ok(JSON.stringify(request).length < 2048);
+    assert.throws(() => f.adapter.respond({ ...request, decision: 'accept' }), { code: 'NATIVE_APPROVAL_CONTEXT_MISSING' });
+    f.adapter.respond({ ...request, decision: 'decline' });
+    assert.deepEqual(await permission, { outcome: { outcome: 'selected', optionId: 'no' } });
+    f.callbacks.onNotification('session/update', { sessionId: 'session-own', update: {
+      sessionUpdate: 'tool_call_update', toolCallId: 'slow-large', rawInput: { file_path: '/late/ignored' }
+    } });
+    assert.equal(f.adapter.snapshot().pendingApprovals.length, 0, 'late metadata must not revive a resolved permission');
+  } finally { await f.adapter.close(); }
+});
