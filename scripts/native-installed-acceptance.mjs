@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
+import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import { readNativePointer, nativePaths } from '../lib/runtime/native/store.mjs';
 import { stabilityOptions, assertStabilityEvidence, stabilityPayload } from './native-stability-checks.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
@@ -39,7 +40,8 @@ const initialSources = sourceHashes();
 const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-installed-native-')));
 fs.chmodSync(sandbox, 0o700);
 const root = path.join(sandbox, 'project');
-const ctx = { root, cwd: root, dbPath: path.join(root, '.hello-cc/mesh.db') };
+// Resolve the database only after this process shares the CLI's private HOME.
+const ctx = { root, cwd: root, dbPath: null };
 const output = path.resolve(option('--output', path.join(sandbox, 'receipt.json')));
 const report = { startedAt: new Date().toISOString(), scope: 'installed public CLI, authenticated lifecycle, cross-provider messages, optional browser, bounded coding task and opt-in sustained stability',
   package: { directory: repo, version: JSON.parse(fs.readFileSync(path.join(repo, 'package.json'))).version,
@@ -47,7 +49,10 @@ const report = { startedAt: new Date().toISOString(), scope: 'installed public C
   node: process.version, sandbox, providers: {}, checks: [], cleanup: {}, sourceFiles: initialSources,
   acceptanceMode: stabilityOnly ? 'stability-only' : 'full', factoryInjected: false, queryInjected: false, authentication: 'existing route copied into test-owned private homes', screenshots: [], pageErrors: [], consoleErrors: [], limitations: [] };
 const credentials = [];
-const originalCodexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const credentialIdentities = new Map();
+const originalHomeEnv = process.env.HOME;
+const originalUserHome = fs.realpathSync(os.homedir());
+const originalCodexHome = path.resolve(process.env.CODEX_HOME || path.join(originalUserHome, '.codex'));
 const protectedFiles = ['config.toml', 'auth.json'].map(name => path.join(originalCodexHome, name)).filter(file => fs.existsSync(file));
 const protectedHashes = protectedFiles.map(file => [file, digest(file)]);
 let env, db, browser, runtimeStarted = false, webStarted = false;
@@ -58,14 +63,42 @@ const socket = `hcc-installed-${randomUUID()}`;
 const terminal = new Set(['completed', 'failed', 'uncertain']);
 function check(name, details = {}) { report.checks.push({ name, passed: true, ...details }); console.log(JSON.stringify({ check: name, ...details })); }
 function flush() { fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(redactSecrets(report), null, 2) + '\n', { mode: 0o600 }); }
-function privateDir(name) { const dir = path.join(sandbox, name); credentials.push(dir); fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); return dir; }
+function rememberCredentialDirectory(directory) {
+  const stat = fs.lstatSync(directory);
+  assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), 'Credential cleanup needs an owned directory');
+  credentials.push(directory);
+  credentialIdentities.set(directory, { canonical: fs.realpathSync(directory), dev: stat.dev, ino: stat.ino });
+  return directory;
+}
+function privateDir(name) {
+  const directory = path.join(sandbox, name);
+  fs.mkdirSync(directory, { mode: 0o700 });
+  return rememberCredentialDirectory(directory);
+}
+function removeCredentialDirectory(directory) {
+  const saved = credentialIdentities.get(directory);
+  let current;
+  try { current = fs.lstatSync(directory); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  // Refuse a replaced directory or alias before deleting test credentials.
+  assert.ok(saved && current.isDirectory() && !current.isSymbolicLink() &&
+    current.dev === saved.dev && current.ino === saved.ino && fs.realpathSync(directory) === saved.canonical,
+  'Test credential directory changed identity; retained it for inspection');
+  fs.rmSync(directory, { recursive: true });
+}
 function hcc(...params) {
   const result = spawnSync(process.execPath, [cli, '--root', root, '--json', ...params], { cwd: root, env, encoding: 'utf8', timeout: 45000 });
-  if (result.status !== 0) throw new Error(`Installed CLI ${params.slice(0, 2).join(' ')} failed: ${redactSecrets(result.stderr || result.stdout)}`);
-  if (!result.stdout.trim()) return null;
-  if (params[0] !== 'native') return { output: result.stdout.trim() };
-  const reply = JSON.parse(result.stdout);
-  assert.equal(reply.ok, true, 'CLI response must confirm success');
+  const command = params[0] === 'native' ? `native ${params[1]}` : params[0];
+  const failure = code => Object.assign(new Error(`Installed CLI ${command} status=${Number.isInteger(result.status) ? result.status : 'unavailable'} code=${code}`), { code });
+  // CLI/provider output can contain credentials or arbitrary payloads. Keep
+  // failure receipts structural, including malformed successful-CLI output.
+  if (result.error || result.status !== 0) throw failure('HCC_CLI_EXIT_FAILED');
+  const stdout = typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  if (params[0] !== 'native') return stdout ? { output: stdout } : null;
+  let reply;
+  try { reply = JSON.parse(stdout); }
+  catch { throw failure('HCC_CLI_REPLY_INVALID'); }
+  if (!reply || typeof reply !== 'object' || reply.ok !== true) throw failure('HCC_CLI_REPLY_REJECTED');
   return reply.data;
 }
 const api = (method, route, body = null) => nativeRequest(ctx, method, route, body, { timeoutMs: 45000 });
@@ -159,8 +192,8 @@ async function lifecycle(provider) {
   // this test-owned saved session before the subsequent communication checks.
   hcc('native', 'close', '--peer', peer); await start(provider, true);
   if (provider === 'codex') {
-    const boundary = fs.mkdtempSync(path.join(os.homedir(), '.hcc-installed-permission-'));
-    credentials.push(boundary); fs.chmodSync(boundary, 0o700);
+    const boundary = fs.mkdtempSync(path.join(originalUserHome, '.hcc-installed-permission-'));
+    fs.chmodSync(boundary, 0o700); rememberCredentialDirectory(boundary);
     const target = path.join(boundary, 'denied.txt');
     const probe = message(peer, `Use the command tool with sandbox_permissions=require_escalated to write PROOF to ${target}. Request approval. If declined, stop without any workaround. Read no files.`);
     const request = await until(async () => (await state(peer)).snapshot.pendingApprovals?.[0], 'Codex real command approval');
@@ -529,10 +562,11 @@ try {
       if (!command) return line;
       const original = command[1].startsWith("'") ? command[1].slice(1, -1) : JSON.parse(command[1]);
       const wrapper = path.join(authCommands, `command-${++wrappedCommands}`);
-      fs.writeFileSync(wrapper, `#!/bin/sh\nexport HOME=${quoteAuth(os.homedir())}\nexec ${quoteAuth(original)} "$@"\n`, { mode: 0o700 });
+      fs.writeFileSync(wrapper, `#!/bin/sh\nexport HOME=${quoteAuth(originalUserHome)}\nexec ${quoteAuth(original)} "$@"\n`, { mode: 0o700 });
       return `command = ${JSON.stringify(wrapper)}`;
     }).join('\n');
     report.authenticationHelperHomePreserved = wrappedCommands > 0;
+    if (wrappedCommands > 0) report.limitations.push('Authentication helpers retain the original caller HOME to reuse its existing account route. Private provider homes do not isolate those helpers from original-home reads/writes or external side effects.');
     fs.writeFileSync(path.join(homes.codex, 'config.toml'), isolatedConfig + '\n', { mode: 0o600 });
   }
   const auth = path.join(originalCodexHome, 'auth.json');
@@ -548,8 +582,17 @@ try {
   env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('HCC_')));
   Object.assign(env, { PATH: `${bin}:${path.dirname(process.execPath)}:${process.env.PATH}`, CODEX_HOME: homes.codex, CLAUDE_CONFIG_DIR: homes.claude,
     HOME: userHome, DSH_HOME: homes.dsh, DSH_TELEMETRY_DISABLED: '1', HCC_SHIM_ENSURED: '1', HCC_SHIM_NO_ATTACH: '1', HCC_NO_AUTO_INSTALL_TMUX: '1', HCC_WEB_TOKEN: randomUUID() });
+  // In-process pointer/database readers and public CLI children must select
+  // the same private project state. Authentication sources above remain bound
+  // to the captured original home; only this test process changes HOME.
+  process.env.HOME = userHome;
+  const resolved = resolveProjectDatabase({ root, createStateDir: false });
+  ctx.dbPath = resolved.db;
+  report.projectState = { dbPath: ctx.dbPath, stateDirectory: resolved.stateDir, privateHome: userHome };
   report.hccGlobalHomeIsolated = true;
-  hcc('native', 'up'); runtimeStarted = true;
+  const started = hcc('native', 'up'); runtimeStarted = true;
+  assert.equal(started.meshDb, ctx.dbPath, 'CLI and acceptance process must use the same project database');
+  assert.ok(fs.existsSync(ctx.dbPath), 'Public CLI must initialize the project database');
   db = new DatabaseSync(ctx.dbPath, { readOnly: true });
   check('locally installed package starts its own native daemon through the public CLI', { runtimePid: readNativePointer(ctx)?.pid });
   if (stabilityOnly) {
@@ -591,15 +634,33 @@ try {
 } finally {
   await browser?.close().catch(() => {});
   if (webStarted) { try { hcc('down'); } catch {} }
-  if (runtimeStarted) {
-    try { hcc('native', 'down'); await until(() => !readNativePointer(ctx), 'native daemon shutdown', 30000); report.cleanup.runtimeStopped = true; }
-    catch (error) { report.cleanup.runtimeStopped = false; report.cleanup.error = error.message; process.exitCode = 1; report.completed = false; }
-  } else report.cleanup.runtimeStopped = !readNativePointer(ctx);
+  try {
+    // A successful daemon can outlive a failed/lost `native up` CLI receipt.
+    // Inspect only this test's HOME/root/database pointer before deciding it
+    // needs shutdown, even when runtimeStarted was never set.
+    const pointer = env && ctx.dbPath ? readNativePointer(ctx) : null;
+    if (env && (runtimeStarted || pointer)) {
+      hcc('native', 'down');
+      await until(() => !readNativePointer(ctx), 'native daemon shutdown', 30000);
+    }
+    report.cleanup.runtimeStopped = !ctx.dbPath || !readNativePointer(ctx);
+  } catch (error) {
+    report.cleanup.runtimeStopped = false; report.cleanup.error = error.message;
+    process.exitCode = 1; report.completed = false;
+  }
   db?.close();
   spawnSync(tmux, ['-L', socket, 'kill-server'], { stdio: 'ignore' });
   report.cleanup.protectedConfigUnchanged = protectedHashes.every(([file, hash]) => fs.existsSync(file) && digest(file) === hash);
-  for (const directory of credentials) fs.rmSync(directory, { recursive: true, force: true });
-  report.cleanup.temporaryCredentialsRemoved = credentials.every(directory => !fs.existsSync(directory));
+  const credentialCleanupErrors = [];
+  for (const directory of credentials) {
+    try { removeCredentialDirectory(directory); }
+    catch (error) { credentialCleanupErrors.push({ directory, message: error.message }); }
+  }
+  report.cleanup.temporaryCredentialsRemoved = credentialCleanupErrors.length === 0 &&
+    credentials.every(directory => !fs.existsSync(directory));
+  if (credentialCleanupErrors.length) report.cleanup.credentialErrors = credentialCleanupErrors;
+  if (originalHomeEnv === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHomeEnv;
   const finalSources = sourceHashes();
   report.sourceChangesDuringRun = Object.keys({ ...initialSources, ...finalSources }).filter(file => initialSources[file] !== finalSources[file]);
   report.sourceUnchangedDuringRun = report.sourceChangesDuringRun.length === 0;
