@@ -134,6 +134,29 @@ jobs:
           process.exitCode = result.status ?? 1;
           NODE
 
+      - name: Verify idle inbox wakeup with the selected package and official runtime
+        id: inbox_wakeup
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/inbox-wakeup.log"
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const official = path.join(root, 'official');
+          const unpacked = path.join(root, 'unpacked', 'package');
+          // Both modes require the selected package's script. Its isolated
+          // official runtime uses a local model fixture and no session/prompt.
+          const env = { PATH: process.env.PATH, LANG: 'C.UTF-8', SHELL: '/bin/sh',
+            HOME: path.join(root, 'home'), TMPDIR: root, DSH_TELEMETRY_DISABLED: '1' };
+          const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-inbox-acceptance.mjs'),
+            '--dsh-install', official, '--output', path.join(root, 'evidence', 'inbox-wakeup.json')],
+            { cwd: unpacked, env, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
       - name: Verify selected package with the installed public CLI
         id: acceptance
         timeout-minutes: 30
@@ -188,7 +211,17 @@ jobs:
                 permissionRequests: value.requests?.length })), cleanup: receipt.cleanup, sourceChanges: receipt.sourceChanges })).slice(-6000);
             console.log('::error title=Candidate approval layers::' + text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A'));
           }
-          for (const name of ['official-install.log', 'installed-acceptance.log', 'approval-layers.log']) {
+          const inboxFile = path.join(evidence, 'inbox-wakeup.json');
+          if (fs.existsSync(inboxFile)) {
+            const receipt = JSON.parse(fs.readFileSync(inboxFile, 'utf8'));
+            const text = JSON.stringify(redactSecrets({ completed: receipt.completed, error: receipt.error,
+              checks: receipt.checks?.map(value => ({ name: value.name, passed: value.passed })),
+              cleanup: receipt.cleanup, changedSources: receipt.changedSources,
+              realModelCalls: receipt.realModelCalls, explicitPromptRequests: receipt.explicitPromptRequests,
+              modelRequests: receipt.modelRequests })).slice(-6000);
+            console.log('::error title=Idle inbox wakeup::' + text.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A'));
+          }
+          for (const name of ['official-install.log', 'installed-acceptance.log', 'approval-layers.log', 'inbox-wakeup.log']) {
             const file = path.join(evidence, name);
             if (!fs.existsSync(file)) continue;
             const text = redactSecrets(fs.readFileSync(file, 'utf8').split('\n').slice(-60).join('\n')).slice(-6000);
@@ -207,6 +240,7 @@ jobs:
           HCC_INSTALL_OUTCOME: ${{ steps.install.outcome }}
           HCC_ACCEPTANCE_OUTCOME: ${{ steps.acceptance.outcome }}
           HCC_APPROVAL_LAYERS_OUTCOME: ${{ steps.approval_layers.outcome }}
+          HCC_INBOX_WAKEUP_OUTCOME: ${{ steps.inbox_wakeup.outcome }}
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
@@ -222,6 +256,7 @@ jobs:
             officialInstall: process.env.HCC_INSTALL_OUTCOME,
             installedAcceptance: process.env.HCC_ACCEPTANCE_OUTCOME,
             candidateApprovalLayers: process.env.HCC_APPROVAL_LAYERS_OUTCOME,
+            inboxWakeup: process.env.HCC_INBOX_WAKEUP_OUTCOME,
             modelCallsRequested: false, npmPublicationRequested: false,
             scope: 'CI runner only; no employee-device or genuine business acceptance'
           }, null, 2) + '\n');

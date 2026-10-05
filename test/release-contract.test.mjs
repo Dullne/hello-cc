@@ -8,7 +8,7 @@ import { isPrereleaseVersion } from '../lib/release/release-notes.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
-const currentRelease = '1.1.0-rc.4';
+const currentRelease = '1.1.0-rc.5';
 const nodePtyVersion = '1.2.0-beta.15';
 
 const englishDocs = ['README.md', 'docs/README.md', 'docs/commands.md', 'docs/guide.md'];

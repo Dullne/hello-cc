@@ -2,12 +2,12 @@
 
 消息入库、进入模型上下文和完成回复是不同状态。`hcc native` 启动的自有 worker 与桌面已有会话也是不同连接。
 
-本轮新增入口位于源码候选，尚未发布或安装。在该源码目录中使用 Node.js 24+，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`；全局已安装版本不一定包含这些命令。
+以下入口从 `1.1.0-rc.5` 预览版本加入，要求 Node.js 24+。使用现有 `preview` 渠道安装；从源码运行时，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`。较早的已安装版本不包含这些命令。
 
 | 对象 | 当前实现 | 验证边界 |
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis 插件在原 live Agent 中收件并唤醒 | 固定官方运行时＋本地确定性模型，尚不代表已安装桌面真实模型验收 |
-| Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；目前完成协议与 Mod API 模拟测试 |
+| Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；协议测试和官方 2.1.289 严格静态校验已通过，桌面实测待完成 |
 | Codex App | 显式 app-server socket 的只读检查 | 不发 prompt、不恢复会话，尚未证明端点归属桌面 |
 
 ## DeepSeek Harness
@@ -48,7 +48,7 @@ hcc --root /absolute/project app claude serve --session-id EXISTING_SESSION_ID
 /reload-plugins
 ```
 
-Desktop 也提供 **＋ → Plugins → Add plugin**。生成器使用每次唯一的本地 marketplace 名称，防止复用旧桥接缓存。HCC 不自动安装、升级或改账号／全局配置。生成的插件可用官方 `claude plugin validate <pluginDirectory> --strict` 检查；本轮未取得新版校验器的成功回执。
+Desktop 也提供 **＋ → Plugins → Add plugin**。生成器使用每次唯一的本地 marketplace 名称，防止复用旧桥接缓存。HCC 不自动安装、升级或改账号／全局配置。生成的 `hcc-session-link` 插件及其 marketplace 已通过官方 Claude Code 2.1.289 的 `claude plugin validate <directory> --strict` 校验。该静态校验不代替目标 Desktop 的版本检查和实机验收。
 
 原会话不能同时由其他 HCC hooks/native/Mod 适配器持有。连接成功后，从其他 peer 发送：
 

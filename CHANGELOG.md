@@ -16,6 +16,45 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.5
+
+### Summary
+
+This preview adds desktop Agent communication adapters: idle inbox wakeup for
+existing DeepSeek Harness Agents, an opt-in bridge for one Claude Desktop Code
+session, and a read-only probe for an explicitly selected Codex endpoint.
+It continues the existing preview channel.
+
+### Highlights
+
+- Wake an idle live Harness Agent with external HCC messages through the official
+  followup API. Poll every second by default; set `inboxPollMs` to `0` to disable
+  idle wakeup. Preserve admission decisions and acknowledge only exact committed
+  context. Self messages, rejected input and reload gaps cannot create retry loops.
+- Generate a private Claude Desktop Mod with `hcc app claude serve`. Bind it to
+  one project and existing session; record replies and acknowledgements together
+  only after the matching main turn completes. Requires an embedded Claude Code
+  engine of at least 2.1.287 and explicit plugin loading in that session.
+- Preserve uncertain Claude deliveries across disconnects and restarts. Ordinary
+  hooks cannot replay those inputs or replace an active Mod owner. Read-only
+  inbox queries retain the unresolved messages for inspection.
+- Inspect an explicitly supplied Codex Unix socket with `hcc app codex probe`.
+  The probe does not start, resume or send to a thread, and does not establish
+  that Desktop owns that endpoint. Codex Desktop sending remains unavailable.
+- Include Chinese and English capability, setup and acceptance guidance. Keep
+  the existing native CLI workers and their ownership boundaries.
+
+### Validation
+
+The implementation passed 1,825 local unit tests (two platform/privilege skips),
+all 13 regression stages and five checks against the official Harness runtime
+with deterministic localhost model responses. Merged-source CI also passed
+Linux/macOS regression, Web and installed Harness package acceptance. These
+checks do not establish real-model Desktop interoperability across all three
+Apps. The generated Claude plugin and marketplace pass the official 2.1.289
+strict validator. Device-specific results have separate receipts; the minimum
+Desktop engine version remains a prerequisite.
+
 ## 1.1.0-rc.4
 
 ### Summary

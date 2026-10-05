@@ -3,14 +3,15 @@
 Message persistence, model context admission and completed replies are separate
 states. HCC-owned native workers do not take over existing Desktop chats.
 
-These additions are an unpublished, uninstalled source candidate. With Node.js
-24+ in this checkout, replace `hcc` below with `node ./bin/hcc.mjs`; the globally
-installed version may not include these commands.
+These commands are introduced in preview version `1.1.0-rc.5` and require
+Node.js 24+. Use the existing `preview` installation channel. From this source
+checkout, replace `hcc` below with `node ./bin/hcc.mjs`; older installed versions
+do not include these commands.
 
 | Surface | Implementation | Evidence boundary |
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis tools and idle inbox wakeup on live Agents | Pinned official runtime with a deterministic localhost model, not installed Desktop/model acceptance |
-| Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol and Mod API fixture tests |
+| Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol tests and official 2.1.289 strict static validation passed; Desktop acceptance pending |
 | Codex App | Read-only explicit app-server socket probe | No prompt/resume or verified Desktop endpoint ownership |
 
 ## DeepSeek Harness
@@ -57,8 +58,10 @@ peer ID. Explicitly load it in the original Desktop Code session:
 
 Desktop also supports **+ → Plugins → Add plugin**. Each generated marketplace
 has a unique name/version. HCC does not install/upgrade plugins or modify global
-settings/accounts. `claude plugin validate <pluginDirectory> --strict` is the
-official static check; no successful new-version validator receipt is claimed.
+settings/accounts. The generated `hcc-session-link` plugin and marketplace
+both passed official Claude Code 2.1.289 `claude plugin validate <directory>
+--strict`. This static check does not establish target Desktop compatibility
+or replace device acceptance.
 
 The target must not already have another HCC hooks/native/Mod owner. Once it
 connects, send through the existing bus:

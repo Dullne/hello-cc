@@ -51,7 +51,7 @@ async function harness(f, { version = '2.1.287', loseAcceptedResponse = false, s
     prompt: { submit: ({ text }) => {
       if (submitError) throw new Error('host synchronously refused this call');
       return (async () => {
-        const accepted = await fire('prompt.submit', { text, origin: { kind: 'plugin', name: 'hcc-claude-app' }, wait: false });
+        const accepted = await fire('prompt.submit', { text, origin: { kind: 'plugin', name: 'hcc-session-link' }, wait: false });
         if (accepted.drop) return accepted;
         if (dropPrompt) return { drop: 'another hook refused the prompt' };
         return new Promise(resolve => submitted.push({ text, resolve }));
@@ -137,8 +137,11 @@ test('generated marketplace identifies its contained plugin and cannot reuse ano
     const manifest = JSON.parse(fs.readFileSync(path.join(plugin.directory, '.claude-plugin/plugin.json'), 'utf8'));
     assert.equal(fs.statSync(manifestPath).mode & 0o777, 0o600);
     assert.equal(marketplace.name, plugin.marketplace);
+    assert.ok(marketplace.description);
+    assert.equal(plugin.name, 'hcc-session-link');
     assert.equal(marketplace.plugins[0].name, plugin.name);
     assert.equal(manifest.name, plugin.name);
+    assert.deepEqual(manifest.author, { name: 'hello-cc' });
     assert.equal(manifest.version, plugin.version);
     assert.equal(path.resolve(plugin.marketplaceDirectory, marketplace.plugins[0].source), plugin.directory);
     assert.equal(JSON.stringify(marketplace).includes(f.bridge.pluginConfig.secret), false);
@@ -238,7 +241,7 @@ test('abort and session changes remain incomplete, never pass a queued prompt to
   await h.pumpUntil(() => f.bridge.getRequest('abort').status === 'aborted');
   const queued = f.bridge.send({ sessionId: 'real-session-1', requestId: 'old-session', text: 'never inject elsewhere' });
   h.current.id = 'replacement-session';
-  const dropped = await h.fire('prompt.submit', { text: queued.prompt, origin: { kind: 'plugin', name: 'hcc-claude-app' } });
+  const dropped = await h.fire('prompt.submit', { text: queued.prompt, origin: { kind: 'plugin', name: 'hcc-session-link' } });
   assert.ok(dropped.drop);
   await h.pumpUntil(() => !f.bridge.list()[0].ready);
   assert.equal(f.bridge.getRequest('old-session').status, 'uncertain');
