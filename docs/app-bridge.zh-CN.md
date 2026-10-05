@@ -2,13 +2,13 @@
 
 消息入库、进入模型上下文和完成回复是不同状态。`hcc native` 启动的自有 worker 与桌面已有会话也是不同连接。
 
-以下入口从 `1.1.0-rc.5` 预览版本加入，要求 Node.js 24+。使用现有 `preview` 渠道安装；从源码运行时，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`。较早的已安装版本不包含这些命令。
+以下入口从 `1.1.0-rc.5` 预览版本加入，要求 Node.js 24+。使用现有 `preview` 渠道安装；从源码运行时，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`。Codex 会话内协作需要 `1.1.0-rc.7`；较早版本不包含这些协作命令。
 
 | 对象 | 当前实现 | 验证边界 |
 | --- | --- | --- |
-| DeepSeek Harness App / Web | Cordis 插件在原 live Agent 中收件并唤醒 | 固定官方运行时＋本地确定性模型，尚不代表已安装桌面真实模型验收 |
+| DeepSeek Harness App / Web | Cordis 插件在原 live Agent 中收件并唤醒 | 2026-10-06 原安装 Desktop、官方 DSH 0.2.0-rc.2、`deepseek-official/deepseek-flash` 实测空闲 bus 唤醒：0 次 prompt API、1 条回复、1 次 ACK |
 | Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；协议测试和官方 2.1.289 严格静态校验已通过，桌面实测待完成 |
-| Codex App | 显式 app-server socket 的只读检查 | 不发 prompt、不恢复会话，尚未证明端点归属桌面 |
+| Codex App | 原会话终端协作和可选 MCP 插件，另保留只读 socket 检查 | 每次调用核对线程票据；支持活动会话内等待，不支持完全空闲自动唤醒。插件加载与 Hook 信任另做设备验证 |
 
 ## DeepSeek Harness
 
@@ -66,6 +66,36 @@ Mod 使用官方 `$.prompt.submit()` 并保留 Mod 来源。只有精确匹配�
 
 ## Codex App
 
+先为选定项目启用协作并生成本地插件市场：
+
+```sh
+hcc --root /absolute/project --json app codex setup --plugin-dir /absolute/new-marketplace
+```
+
+返回的市场名与插件名每次唯一。在 App 中添加这个本地市场并安装插件，再批准其 `UserPromptSubmit` Hook。配置不含会话票据，使用执行 setup 的准确 Node/HCC 路径；安装位置移动或升级后重新生成。setup 成功不代表 App 已加载插件或信任 Hook。
+
+当前原 App 会话可立即通过自己的终端工具协作：
+
+```sh
+hcc --root /absolute/project --json app codex call --tool hcc_inbox
+hcc --root /absolute/project --json app codex call --tool hcc_message_send \
+  --arguments '{"to":"OTHER_PEER","body":"请检查当前改动。"}'
+hcc --root /absolute/project --json app codex call --tool hcc_inbox_wait \
+  --arguments '{"timeout_ms":45000}'
+hcc --root /absolute/project --json app codex call --tool hcc_message_reply \
+  --arguments '{"message_id":123,"receipt":"从收件结果取得的完整receipt","body":"检查完成，本地验证通过。"}'
+```
+
+这些命令使用本次终端调用的 `CODEX_THREAD_ID`，要求 `Codex Desktop` 来源标记；不启动 CLI 模型，不恢复线程，不控制其他 App 会话。新登记且未领任务的 peer 为 `idle`，后续查询保留已有任务状态，不会仅凭票据仍有效就把模型标为正在运行。
+
+使用 MCP 时，在同一个 App 会话执行 `app codex session` 取得一小时有效的私有 `session_token`。13 个工具每次都要求票据，并另行核对宿主提供的 `_meta.threadId`。常驻 MCP 进程的启动环境不作为每次调用的身份。`_meta.sessionId` 与 Hook 的 `session_id` 被父会话及子代理共享，不能据此选收件箱，因此 Hook 只注入本会话取票／取件指引。票据不要写进聊天回复、消息或验收材料。`app codex disable` 撤销该项目全部票据；重新启用不恢复旧票据，也不接管其他 transport 的 owner。
+
+`hcc_inbox`／`hcc_inbox_wait` 均不自动 ACK。确认已读时，用准确消息 ID 和 receipt 调用 `hcc_message_ack`；`hcc_message_reply` 在一个事务中记录关联回复并 ACK，相同重试返回原回复。它们都不代表任务完成。对 `kind=reply` 的消息只消费上下文，勿自动再次回复。peer 消息不构成用户授权。其余工具沿用 HCC 的任务、状态、交接、锁及本地证据规则。同连接等待允许其他会话并发发送，取消时结束等待。
+
+等待最多 45 秒，必须由原 App 会话主动调用，不能唤醒已经完全空闲的聊天。官方 `Stop` Hook 可以延续正在结束的 turn，但不是外部空闲唤醒入口；本适配器不使用该事件，避免把共享 session ID 误配给子线程。
+
+另外仍保留端点诊断：
+
 ```sh
 hcc --root /absolute/project --json app codex probe \
   --socket /absolute/path/to/known-control.sock --thread EXISTING_THREAD_ID
@@ -75,6 +105,6 @@ hcc --root /absolute/project --json app codex probe \
 
 `loaded: null` 表示尚未确认。即使 loaded 为 true，`writable` 和 `desktopEndpointVerified` 也保持 false，因为该结果不能证明桌面正在使用同一执行器。
 
-公开 `thread/resume` 既可加入 live thread，也可冷恢复会话，没有“只能附着已加载会话”的原子条件。当前实现不把先检查再 resume 的竞争窗口当成纯附着。应用内聊天工具也不自动构成 HCC 外部程序的公开入口。
+公开 `thread/resume` 既可加入 live thread，也可冷恢复会话，没有“只能附着已加载会话”的原子条件。这不意味着直接 `turn/start` 必须恢复：本次核对的官方 handler 只取得已加载线程，无 resume 分支，可能启动新 turn 或追加到活动 turn。外部直接发送仍缺少原 App 所有且受支持的端点，以及连接、订阅和授权约定；应用内聊天工具不自动构成 HCC 外部公开接口。
 
-参考依据为本机官方 CLI 0.144.6 的帮助与 schema 快照，以及本机官方源码树 `d109393270432531ac0010542ae7973801e0d9d7` 的 app-server README／协议定义。未证明源码树与 CLI 构建版本完全对应，也未完成官方网页在线复核。`app-server proxy` 传输 WebSocket 握手和帧，不是 native adapter 的 stdio JSONL。
+2026-10-06 的依据明确区分 Homebrew CLI 0.144.6 与当前 App 26.930.21537（12776）内嵌 CLI 0.159.0-alpha.12.1；后者已离线导出稳定及实验 schema。官方源码另固定为 `823ea830c0fd418b09ff02d36cad9a1fff66465b`，不声称源码与内嵌二进制逐字对应。参见官方 [MCP 每次调用的 metadata 实现](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/core/src/mcp_tool_call.rs#L1395-L1428) 和 [turn handler](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/app-server/src/request_processors/turn_processor.rs#L374-L388)。OpenAI Docs 官方页面已尝试在线重查：从 `developers.openai.com` 重定向到 `learn.chatgpt.com` 后返回 HTTP 403，正文未能验证。`app-server proxy` 传输 WebSocket 握手和帧，不是 native adapter 的 stdio JSONL。

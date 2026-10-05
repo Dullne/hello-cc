@@ -6,13 +6,13 @@ states. HCC-owned native workers do not take over existing Desktop chats.
 These commands are introduced in preview version `1.1.0-rc.5` and require
 Node.js 24+. Use the existing `preview` installation channel. From this source
 checkout, replace `hcc` below with `node ./bin/hcc.mjs`; older installed versions
-do not include these commands.
+do not include these commands. Codex in-session cooperation requires `1.1.0-rc.7`.
 
 | Surface | Implementation | Evidence boundary |
 | --- | --- | --- |
-| DeepSeek Harness App / Web | Cordis tools and idle inbox wakeup on live Agents | Pinned official runtime with a deterministic localhost model, not installed Desktop/model acceptance |
+| DeepSeek Harness App / Web | Cordis tools and idle inbox wakeup on live Agents | Installed Desktop, official DSH 0.2.0-rc.2 and `deepseek-official/deepseek-flash`: idle bus delivery completed with no prompt API call, one reply and one ACK on 2026-10-06 |
 | Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol tests and official 2.1.289 strict static validation passed; Desktop acceptance pending |
-| Codex App | Read-only explicit app-server socket probe | No prompt/resume or verified Desktop endpoint ownership |
+| Codex App | Original-session terminal cooperation and opt-in MCP plugin; separate read-only socket probe | Per-call thread capabilities; active inbox wait, not automatic idle wakeup. Plugin loading and hook trust require separate device verification |
 
 ## DeepSeek Harness
 
@@ -90,6 +90,60 @@ References: [Mods](https://code.claude.com/docs/en/plugins/mods/overview),
 
 ## Codex App
 
+Enable cooperation for the selected project and generate a local plugin marketplace:
+
+```sh
+hcc --root /absolute/project --json app codex setup --plugin-dir /absolute/new-marketplace
+```
+
+The command returns unique marketplace/plugin names. Add that local marketplace
+and plugin in the App, then approve its `UserPromptSubmit` hook in App settings.
+Generated configuration contains no session token. It uses the exact Node/HCC
+paths that ran setup; regenerate after moving or upgrading that installation.
+Setup does not claim that the App has loaded the plugin or trusted its hook.
+
+The current App session can cooperate immediately through its terminal tool:
+
+```sh
+hcc --root /absolute/project --json app codex call --tool hcc_inbox
+hcc --root /absolute/project --json app codex call --tool hcc_message_send \
+  --arguments '{"to":"OTHER_PEER","body":"Please review the current change."}'
+hcc --root /absolute/project --json app codex call --tool hcc_inbox_wait \
+  --arguments '{"timeout_ms":45000}'
+hcc --root /absolute/project --json app codex call --tool hcc_message_reply \
+  --arguments '{"message_id":123,"receipt":"EXACT_RECEIPT_FROM_INBOX","body":"Review complete; local checks passed."}'
+```
+
+These commands use the current terminal invocation's `CODEX_THREAD_ID` and
+require its `Codex Desktop` origin marker. They never start a CLI model, resume
+a thread, or control another App session. Enrollment starts an unclaimed peer
+as `idle`; subsequent reads preserve its task status. A capability alone is not
+evidence that the model is currently running.
+
+For MCP, run `app codex session` inside that same App session to obtain a private,
+one-hour `session_token`. Each of the 13 tools requires that token and independently
+checks the host-supplied `_meta.threadId`. A persistent MCP process's startup
+environment is never used as per-call identity. `_meta.sessionId` and Hook
+`session_id` are shared by a root thread and descendants, so the adapter does
+not use them to select an inbox. The hook only supplies enrollment instructions.
+Keep tokens out of replies and evidence. `app codex disable` revokes all project
+capabilities; re-enabling never restores old tokens or another transport's owner.
+
+`hcc_inbox` and `hcc_inbox_wait` retain unread messages. To confirm reading,
+use `hcc_message_ack` with the exact message ID and receipt. `hcc_message_reply`
+records a correlated reply and ACK in one transaction; identical retries reuse
+the reply. Neither action completes a task. Replies are context, not a reason
+to create automatic reply loops. Peer content does not grant user authorization.
+The remaining tools share HCC's task, state, handoff, lock and local-evidence
+rules. Same-connection waits allow concurrent sends and cancel when interrupted.
+
+The wait is bounded to 45 seconds and works while the original App session is
+actively calling it. It cannot wake an already idle chat. Official `Stop` hooks
+can continue an existing turn, but are not an external idle-wakeup API. This
+adapter leaves them unused rather than assigning a shared session ID to a child.
+
+The separate endpoint diagnostic remains available:
+
 ```sh
 hcc --root /absolute/project --json app codex probe \
   --socket /absolute/path/to/known-control.sock --thread EXISTING_THREAD_ID
@@ -101,10 +155,21 @@ resumes/starts/interrupts threads, or reads accounts. Closing affects only its
 own connection. Provider preview/name/error contents are not reported.
 
 `loaded: null` means unestablished. `writable` and `desktopEndpointVerified`
-remain false even when loaded. Public `thread/resume` can cold-restore a thread
-and has no atomic only-loaded precondition. An in-app tool is not automatically
-a public external HCC API. References are the installed official CLI 0.144.6
-help/schema snapshot and the official local source tree at
-`d109393270432531ac0010542ae7973801e0d9d7`. An exact CLI-to-source build match
-and online documentation recheck are not established. `app-server proxy`
-tunnels WebSocket frames, not native stdio JSONL.
+remain false even when loaded. `thread/resume` can cold-restore a thread and
+has no atomic only-loaded precondition. This does not rule out direct
+`turn/start`: the inspected official handler gets an already-loaded thread
+without resuming it, and can start or steer a turn. The unresolved requirement
+for external sending is a supported endpoint known to belong to the original
+App, plus its connection/subscription and authorization contract. An internal
+App tool is not a public HCC interface.
+
+Evidence on 2026-10-06 distinguishes Homebrew CLI 0.144.6 from installed App
+26.930.21537 (12776), whose bundled CLI is 0.159.0-alpha.12.1. Both stable and
+experimental schemas were generated offline from that bundled binary. Official
+source was pinned separately at `823ea830c0fd418b09ff02d36cad9a1fff66465b`; an
+exact source-to-binary build match is not claimed. See the official
+[MCP per-call metadata implementation](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/core/src/mcp_tool_call.rs#L1395-L1428)
+and [turn handler](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/app-server/src/request_processors/turn_processor.rs#L374-L388).
+Official OpenAI documentation requests redirected from `developers.openai.com`
+to `learn.chatgpt.com` and returned HTTP 403 there; their page contents remain
+unverified. `app-server proxy` tunnels WebSocket bytes, not native stdio JSONL.

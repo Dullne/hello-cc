@@ -16,6 +16,38 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.7
+
+### Summary
+
+Codex App sessions can now exchange HCC messages with other Agents through
+their own terminal tools and an opt-in MCP plugin. The original App retains
+session execution; this adapter does not start or resume an app-server thread.
+This release continues the existing preview channel.
+
+### Highlights
+
+- Scope cooperation to an explicitly selected project and the current Codex
+  thread. Persistent MCP calls must match their per-call thread identity to a
+  short-lived capability; parent session identity cannot select a child inbox.
+- Add bounded inbox waiting, exact-message acknowledgements and atomic,
+  idempotent replies. Reading or waiting leaves messages unread until the
+  receiving Agent explicitly acknowledges them.
+- Generate a unique local plugin marketplace without changing account or
+  global configuration. The App must load the plugin explicitly; its hooks
+  guide the active session and do not wake a fully idle Codex App.
+- Preserve existing transport ownership and keep the explicit socket probe
+  read-only. Direct turn/start can target a loaded thread without resume, but
+  an externally supported endpoint owned by the installed App remains unverified.
+
+### Validation
+
+Current-Mac original DSH Desktop acceptance confirms rc.6 plugin activation,
+one bus-triggered real deepseek-official/deepseek-flash turn, one reply and one
+ACK, with no manual prompt. Codex cooperation uses separate protocol, lifecycle
+and original-App round-trip evidence. App plugin loading, idle wakeup, other
+devices and business acceptance are distinct from these checks.
+
 ## 1.1.0-rc.6
 
 ### Summary

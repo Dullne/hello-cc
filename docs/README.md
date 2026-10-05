@@ -42,4 +42,4 @@ authenticated selection of any existing server directory are accepted risks.
 - [Architecture](architecture.md): target project layout, module boundaries,
   dependency direction, and staged migration plan.
 
-- [Desktop Agent communication](app-bridge.md): DSH idle wakeup, Claude Desktop Mod and read-only Codex probes.
+- [Desktop Agent communication](app-bridge.md): DSH idle wakeup, Codex in-session cooperation and read-only endpoint probes, and the optional Claude Desktop Mod.

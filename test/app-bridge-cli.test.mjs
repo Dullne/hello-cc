@@ -11,7 +11,7 @@ function fixture(t) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const root = path.join(directory, 'project'), privateHome = path.join(directory, 'home');
   fs.mkdirSync(root, { mode: 0o700 }); fs.mkdirSync(privateHome, { mode: 0o700 });
-  const env = { PATH: process.env.PATH, HOME: privateHome, LANG: 'C.UTF-8' };
+  const env = { PATH: process.env.PATH, HOME: privateHome, LANG: 'C.UTF-8', NODE_NO_WARNINGS: '1' };
   const run = args => spawnSync(process.execPath, [cli, '--root', root, '--json', ...args], { env, encoding: 'utf8', timeout: 5000 });
   return { root, directory, env, run };
 }
