@@ -11,9 +11,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { DatabaseSync } from 'node:sqlite';
 import { checkDshRuntime } from '../lib/integrations/dsh-cordis.mjs';
 import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
+import { readAcceptanceRows } from './helpers/sqlite-observer.mjs';
 
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
@@ -44,7 +44,7 @@ const traceFile = path.join(sandbox, 'events.jsonl');
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const sources = ['lib/integrations/dsh-cordis.mjs', 'lib/integrations/dsh-inbox.mjs',
   'lib/integrations/dsh-collaboration.mjs', 'lib/core/coordination/messages.mjs',
-  'lib/coordination-state.mjs', 'scripts/dsh-inbox-acceptance.mjs'];
+  'lib/coordination-state.mjs', 'scripts/dsh-inbox-acceptance.mjs', 'scripts/helpers/sqlite-observer.mjs'];
 const receipt = { schemaVersion: 1, startedAt: new Date().toISOString(), baseline: '0.2.0-rc.2',
   mode: 'Official Cordis Agent runtime; deterministic local model; isolated sessions; no Desktop UI',
   realModelCalls: false, explicitPromptRequests: 0, permissions: [], checks: [], completed: false,
@@ -67,8 +67,7 @@ function rows(root, sql, ...values) {
     databases.set(root, childNode(['--input-type=module', '-e',
       `import { projectDbPath } from ${JSON.stringify(module)}; console.log(projectDbPath(process.argv[1]));`, root], root));
   }
-  const db = new DatabaseSync(databases.get(root), { readOnly: true });
-  try { return db.prepare(sql).all(...values); } finally { db.close(); }
+  return readAcceptanceRows(databases.get(root), sql, ...values);
 }
 const events = () => fs.existsSync(traceFile)
   ? fs.readFileSync(traceFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];

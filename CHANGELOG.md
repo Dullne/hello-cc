@@ -16,6 +16,29 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.6
+
+### Summary
+
+This preview makes the official Harness inbox acceptance observer tolerate
+brief SQLite locks while another process updates the same isolated database.
+It continues the existing preview channel and retains the rc.5 desktop bridge.
+
+### Highlights
+
+- Bound read-only acceptance queries with a busy timeout instead of failing
+  immediately on transient contention. Preserve failures for invalid queries
+  and locks that outlast the bound.
+- Keep the rc.5 archive and tag immutable, including its original macOS
+  acceptance failure receipt. This change does not alter product database
+  policy, replay messages, or expand desktop endpoint access.
+
+### Validation
+
+An independent SQLite writer exercises a short held lock and the observer's
+bounded wait. The release also retains separate source, installed-package,
+official-runtime and actual Desktop acceptance boundaries.
+
 ## 1.1.0-rc.5
 
 ### Summary
