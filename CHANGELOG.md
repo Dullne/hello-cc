@@ -16,6 +16,24 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.8
+
+### Summary
+
+Background tmux display refreshes no longer block the shared HTTP runtime while
+waiting for terminal snapshots. This preserves responsive Agent coordination
+when a tmux display command is slow, and continues the existing preview channel.
+
+### Highlights
+
+- Bound asynchronous background snapshots, keep one request in flight per
+  session, and preserve the previous display when capture fails or times out.
+- Discard stale results after a session stops, changes panes or is rebound;
+  terminal display refresh does not replace process ownership checks.
+- Retain the rc.7 original-App cooperation path and add delayed-tmux regression
+  coverage. A reproduced synchronous display stall motivated this repair; the
+  exact server-side cause of the earlier macOS CI timeout remains unconfirmed.
+
 ## 1.1.0-rc.7
 
 ### Summary
