@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createDshCollaboration } from '../lib/integrations/dsh-collaboration.mjs';
 import { createDshCordisPlugin } from '../lib/integrations/dsh-cordis.mjs';
+import { createDshInbox } from '../lib/integrations/dsh-inbox.mjs';
 import { ensureDshIntegration, inspectDshIntegration } from '../lib/integrations/dsh.mjs';
 import { initSchema } from '../lib/db/schema.mjs';
 
@@ -161,6 +162,49 @@ test('bounded context and tool outputs leave truncated messages unread', async t
   assert.equal(read(a, 'SELECT * FROM message_reads').length, 0);
 });
 
+test('50 self-sent messages cannot hide an external idle wake or enter its committed ACK batch', t => {
+  const root = project(t), a = session(t, root, 'external-inbox/A'), b = session(t, root, 'external-inbox/B');
+  const db = new DatabaseSync(a.ctx.dbPath);
+  let externalId;
+  try {
+    const insert = db.prepare('INSERT INTO messages(sender, recipient, body, created_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 50; index++) insert.run(a.peer, index % 2 ? 'all' : a.peer, `SELF_BACKLOG_${index}`, index);
+    insert.run(b.peer, 'some-other-peer', 'FOREIGN_RECIPIENT_MUST_NOT_APPEAR', 50);
+    externalId = Number(insert.run(b.peer, a.peer, 'EXTERNAL_MESSAGE_BEHIND_50_SELF_MESSAGES', 51).lastInsertRowid);
+  } finally { db.close(); }
+  assert.equal(a.snapshot().messages.length, 5);
+  assert.match(a.snapshot().text, /SELF_BACKLOG/);
+  const external = a.snapshot({ externalOnly: true });
+  assert.deepEqual(external.messages.map(message => message.id), [externalId]);
+  assert.match(external.text, /EXTERNAL_MESSAGE_BEHIND_50_SELF_MESSAGES/);
+  assert.doesNotMatch(external.text, /SELF_BACKLOG|FOREIGN_RECIPIENT_MUST_NOT_APPEAR/);
+
+  const queued = [], agent = { session: { header: { id: a.sessionId, cwd: root } }, status: 'idle',
+    inbox: { nextTurn: queued, nextStep: [], get hasPending() { return queued.length > 0; } },
+    followup(message) { queued.push(message); } };
+  let tick;
+  const inbox = createDshInbox({
+    ctx: { agents: { list: () => [agent], get: id => id === a.sessionId ? agent : undefined } },
+    ensure: candidate => { assert.equal(candidate, agent); return a; },
+    contextMessage: text => ({ id: 'external-delivery', role: 'user', source: { kind: 'hello-cc' },
+      content: [{ type: 'text', text }] }),
+    pollMs: 1000, schedule: callback => { tick = callback; }, unschedule() {}
+  });
+  cleanup(t, () => inbox.dispose());
+  tick(); tick(); assert.equal(queued.length, 1);
+  assert.equal(read(a, 'SELECT * FROM message_reads').length, 0);
+  const message = queued.shift(); agent.status = 'running';
+  inbox.claimed(agent, message);
+  const decision = inbox.step(agent, { kind: 'enter', messages: [message] }, [message]);
+  assert.equal(decision.messages.length, 1);
+  assert.doesNotMatch(decision.messages[0].content[0].text, /SELF_BACKLOG/);
+  inbox.commit(agent.session, { type: 'user/message', data: message });
+  assert.deepEqual(read(a, 'SELECT message_id, peer FROM message_reads'), [{ message_id: externalId, peer: a.peer }]);
+  assert.equal(a.snapshot({ externalOnly: true }).hasUnread, false);
+  assert.equal(a.snapshot().messages.length, 5, 'normal busy context keeps its original inbox semantics');
+  agent.status = 'idle'; inbox.idle(agent); tick(); assert.equal(queued.length, 0);
+});
+
 test('cancelled Agent tools perform no business mutation', async t => {
   const a = session(t, project(t), 'cancelled');
   const controller = new AbortController(); controller.abort(new Error('cancelled by owner'));
@@ -309,5 +353,20 @@ test('plugin compatibility or invalid bounds fail before registering listeners o
   assert.throws(() => createDshCordisPlugin({ checkRuntime() { throw new Error('wrong version'); } })(ctx), /wrong version/);
   assert.equal(ctx.catalogue.size, 0);
   assert.throws(() => createDshCordisPlugin({ checkRuntime() {} })(ctx, { maxContextChars: 128 }), /2048/);
+  for (const inboxPollMs of [-1, 1, 99, 60001, 1.5]) {
+    assert.throws(() => createDshCordisPlugin({ checkRuntime() {} })(ctx, { inboxPollMs }), /inboxPollMs/);
+  }
   assert.equal(ctx.catalogue.size, 0);
+});
+
+test('pre-step delayed across plugin disposal cannot retain the old context authority', async t => {
+  const root = project(t), ctx = fakeContext(), agent = fakeAgent(root, 'dispose/admission');
+  createDshCordisPlugin({ checkRuntime() {} })(ctx, { inboxPollMs: 0 });
+  await ctx.emit('agent/created', { agent, signal });
+  let release;
+  const waiting = ctx.waterfall('agent/pre-step', { agent, signal, messages: [] },
+    () => new Promise(resolve => { release = resolve; }));
+  await ctx.dispose();
+  release({ kind: 'enter', messages: [] });
+  await assert.rejects(waiting, /disposed/);
 });

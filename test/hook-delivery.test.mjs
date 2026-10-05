@@ -15,6 +15,8 @@ function fixture() {
   db.exec(`
     CREATE TABLE peers (id TEXT PRIMARY KEY);
     INSERT INTO peers VALUES ('codex-a');
+    CREATE TABLE peer_bindings (peer TEXT PRIMARY KEY, provider TEXT,
+      provider_session_id TEXT, runtime_session_id TEXT, transport TEXT, runtime_target TEXT);
     CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
     CREATE TABLE message_reads (
       message_id INTEGER NOT NULL, peer TEXT NOT NULL, read_at INTEGER NOT NULL,

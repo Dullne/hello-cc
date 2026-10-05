@@ -6,6 +6,8 @@ export interface DshCollaborationConfig {
   maxContextChars?: number;
   /** Bounded lossless-JSON tool presentation, 2048-64000 characters. Default 16000. */
   maxToolChars?: number;
+  /** Idle inbox poll interval, 100-60000 ms. Default 1000; 0 disables automatic idle wakeup. */
+  inboxPollMs?: number;
 }
 export const name: 'hello-cc-dsh-collaboration';
 export const inject: readonly ['agents', 'tools', 'sessions'];

@@ -39,3 +39,5 @@ provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime 
   迁移计划。
 
 `design.md` 和 `implementation.md` 目前只有英文版。
+
+- [桌面 Agent 通信](app-bridge.zh-CN.md)：DSH 空闲唤醒、Claude Desktop Mod 与 Codex 只读检查。
