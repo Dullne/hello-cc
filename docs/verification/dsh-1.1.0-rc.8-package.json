@@ -1,10 +1,10 @@
 {
   "version": "1.1.0-rc.8",
   "filename": "logicseek-hello-cc-1.1.0-rc.8.tgz",
-  "shasum": "c8ae44a770ecd0f7e8210dc455281aee278ab09a",
-  "integrity": "sha512-OycM7vNW3sY+oJdbwDi6USMBI7IP84N9g55fIYIyIPi2SVkURW59VL2vS2OW5oFGkF0/8SBtKXgnUlnvsgO4qg==",
+  "shasum": "148045d31bf5b316d95b4076fed8294c8cfde949",
+  "integrity": "sha512-RbelO7vZOZ7rdN/bLfTSVGokTam22JqGCSFjPKTPVhpCeBxQM21PFRDLlz9xkHFjocT/hb0F7TmbQp6LXICqNQ==",
   "tag": "preview",
-  "sha256": "d1d008f4277a4f85bbf8f3dea3482d3c49ed653f9019b579c80358770612beab",
+  "sha256": "864078b37872e358cb769118b8dad1c5267e1138f4750eaf7fa2c7c8f4c91887",
   "fileCount": 296,
   "files": {
     "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
@@ -197,7 +197,7 @@
     "scripts/regression-cookie-expiry.mjs": "63da99737ec78150ce22eebc725a1784203bcc310ec3bb221a379bf7e1c99e90",
     "scripts/regression-http-transport.mjs": "c1f64b5ada6d7dfe0fad82507ceb6a8886021f67dcc7d8780d4616b827cf26f0",
     "scripts/regression-terminal-marker.mjs": "4a7cb28f393eb0d69da0a3b857958339f90e3a6fe1335aa242bc57748262951a",
-    "scripts/regression.mjs": "a291ad2815f6b095df50ab09117f5512ae2d864756c59d69614477cfb3b5413b",
+    "scripts/regression.mjs": "71d33021ca338d5537340f02381a445276b8b1668cb1e512fb5fb14c4031a906",
     "lib/release-notes.mjs": "9178a84224f6e74479fc6bc9bad0fe0df112f33cb9ca6cb589892723d0202224",
     "lib/release/release-notes.mjs": "d6f6a19cd569ec1f6fa69a93b39a37de29363fd4304522846dcfb701f64b8f05",
     "scripts/release-notes.mjs": "9a3ab579e26e16d6e221dcec0b5998b89a9c4aa24abc510474dcd50fc5b792ca",

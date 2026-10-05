@@ -7127,9 +7127,10 @@ async function syntaxAndHelp() {
   // skip the old hccSource-based migration fanout check (code moved to lib/db/connection.mjs)
   const migrationFanoutSource = '';
   const tmuxStreamSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'), 'utf8');
+  // Display refresh responsiveness and stale-frame suppression are exercised
+  // behaviorally in tmux-display-http/refresh.test.mjs.
   for (const expected of [
-    "runTmux(['pipe-pane', '-t', session.pane]);",
-    "broadcast(session, { type: 'replace', data: refreshTmuxSnapshot(session) });"
+    "runTmux(['pipe-pane', '-t', session.pane]);"
   ]) {
     if (!tmuxStreamSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
