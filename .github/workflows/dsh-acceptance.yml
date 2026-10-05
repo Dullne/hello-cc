@@ -134,29 +134,6 @@ jobs:
           process.exitCode = result.status ?? 1;
           NODE
 
-      - name: Verify idle inbox wakeup with the selected package and official runtime
-        id: inbox_wakeup
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/inbox-wakeup.log"
-          import path from 'node:path';
-          import { spawnSync } from 'node:child_process';
-          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
-          const official = path.join(root, 'official');
-          const unpacked = path.join(root, 'unpacked', 'package');
-          // Both modes require the selected package's script. Its isolated
-          // official runtime uses a local model fixture and no session/prompt.
-          const env = { PATH: process.env.PATH, LANG: 'C.UTF-8', SHELL: '/bin/sh',
-            HOME: path.join(root, 'home'), TMPDIR: root, DSH_TELEMETRY_DISABLED: '1' };
-          const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-inbox-acceptance.mjs'),
-            '--dsh-install', official, '--output', path.join(root, 'evidence', 'inbox-wakeup.json')],
-            { cwd: unpacked, env, stdio: 'inherit' });
-          if (result.error) throw result.error;
-          process.exitCode = result.status ?? 1;
-          NODE
-
       - name: Verify selected package with the installed public CLI
         id: acceptance
         timeout-minutes: 30
@@ -184,6 +161,64 @@ jobs:
             official, '--tarball', tarball, '--output-dir', path.join(root, 'evidence', 'installed'),
             '--npm-cache', path.join(root, 'npm-cache'), '--pnpm-store', path.join(root, 'pnpm-store')],
             { cwd: unpacked, env, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
+      - name: Verify idle inbox wakeup with the installed selected package and official runtime
+        id: inbox_wakeup
+        if: steps.acceptance.outcome == 'success'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/inbox-wakeup.log"
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { createHash } from 'node:crypto';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const official = path.join(root, 'official');
+          const unpacked = path.join(root, 'unpacked', 'package');
+          const { tarball } = JSON.parse(fs.readFileSync(path.join(root, 'candidate.json')));
+          const receipt = JSON.parse(fs.readFileSync(path.join(root, 'evidence', 'installed', 'dsh-installed-receipt.json')));
+          const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          assert.equal(receipt.passed, true, 'Installed CLI acceptance must succeed before inbox acceptance');
+          assert.equal(receipt.package?.sha256, hash(tarball), 'Installed receipt must match the selected tarball');
+          assert.ok(typeof receipt.packageInstallPrefix === 'string' && path.isAbsolute(receipt.packageInstallPrefix),
+            'Installed acceptance must identify its isolated package prefix');
+          const installed = fs.realpathSync(path.join(receipt.packageInstallPrefix, 'node_modules', '@logicseek', 'hello-cc'));
+          function packageHashes(directory, installedTree = false) {
+            const hashes = {};
+            function visit(relative) {
+              for (const entry of fs.readdirSync(path.join(directory, relative), { withFileTypes: true })) {
+                // npm may place dependency installations under the package.
+                // They are not part of the selected tarball's source tree.
+                if (installedTree && !relative && entry.name === 'node_modules') continue;
+                const file = path.join(relative, entry.name);
+                if (entry.isDirectory()) visit(file);
+                else {
+                  assert.ok(entry.isFile(), `Unsupported package entry: ${file}`);
+                  hashes[file] = hash(path.join(directory, file));
+                }
+              }
+            }
+            visit('');
+            return hashes;
+          }
+          const selectedHashes = packageHashes(unpacked);
+          assert.deepEqual(packageHashes(installed, true), selectedHashes,
+            'Installed package files and hashes must match the selected package');
+          console.log(JSON.stringify({ check: 'selected tarball and installed package provenance',
+            sha256: receipt.package.sha256, fileCount: Object.keys(selectedHashes).length }));
+          // Run where npm installed the dependencies, after comparing every
+          // selected package file. Both modes use this same verified package.
+          const env = { PATH: process.env.PATH, LANG: 'C.UTF-8', SHELL: '/bin/sh',
+            HOME: path.join(root, 'home'), TMPDIR: root, DSH_TELEMETRY_DISABLED: '1' };
+          const result = spawnSync(process.execPath, [path.join(installed, 'scripts', 'dsh-inbox-acceptance.mjs'),
+            '--dsh-install', official, '--output', path.join(root, 'evidence', 'inbox-wakeup.json')],
+            { cwd: installed, env, stdio: 'inherit' });
           if (result.error) throw result.error;
           process.exitCode = result.status ?? 1;
           NODE
