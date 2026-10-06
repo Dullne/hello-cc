@@ -20,6 +20,12 @@ Below, `hcc` means a CLI containing these changes. An older global installation 
 
 macOS 1.0.5 upgrades use a stable boot-session identity. Follow the [process identity migration notes](macos-process-identity.md) and restart owned runtimes normally.
 
+Project state may resolve to private v2 storage. The `.hello-cc` paths below are
+logical project-state paths; managed setup and session routing use the resolved
+store. Stop Harness and other state writers before a migration. Existing private
+v1 bindings require the explicit historical-root inspection and upgrade receipt
+flow in [Project directory identity and private state](private-state.md).
+
 ## Choose An Entry Point
 
 | Entry | Use | Lifecycle owner |

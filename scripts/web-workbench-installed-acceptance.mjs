@@ -49,7 +49,7 @@ function hashes() {
     if (fs.statSync(filename).isDirectory()) for (const name of fs.readdirSync(filename).sort()) walk(path.join(relative, name));
     else result[relative] = sha256(filename);
   };
-  for (const name of ['bin', 'lib', 'scripts', 'package.json', 'package-lock.json']) walk(name);
+  for (const name of ['bin', 'lib', 'native', 'scripts', 'package.json', 'package-lock.json']) walk(name);
   return result;
 }
 const receipt = {
@@ -78,6 +78,16 @@ try {
   run(install.command, install.parameters, 'install');
   const installed = path.join(prefix, 'node_modules', '@logicseek', 'hello-cc');
   assert.equal(JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8')).version, metadata.version);
+  receipt.nativeHelpers = [];
+  for (const target of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64']) {
+    const relative = `native/bin/${target}/hcc-cwd-handoff`;
+    const entry = metadata.files.find(file => file.path === relative);
+    assert.ok(entry && (entry.mode & 0o111) && !(entry.mode & 0o022), 'Safe packaged helper missing: ' + target);
+    const installedHelper = path.join(installed, relative);
+    assert.equal(sha256(installedHelper), sha256(path.join(repo, relative)), 'Installed helper differs from source: ' + target);
+    receipt.nativeHelpers.push({ target, sha256: sha256(installedHelper), mode: entry.mode });
+  }
+  receipt.checks.push('four executable native helpers match their packed and installed source bytes');
   const publicCli = path.join(prefix, 'node_modules', '.bin', 'hcc');
   assert.equal(fs.realpathSync(publicCli), path.join(installed, 'bin', 'hcc.mjs'));
   const help = run(publicCli, ['--help'], 'public-cli', { cwd: prefix });

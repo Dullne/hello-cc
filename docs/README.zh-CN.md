@@ -14,6 +14,8 @@ provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime 
 - [用户指南](guide.zh-CN.md)：安装、启动、Web 控制台、协作语义、工作流、稳定
   peer 身份和环境变量行为。
 - [命令参考](commands.zh-CN.md)：公共命令的紧凑清单，以及每组命令的用途。
+- [项目目录身份与私有状态](private-state.zh-CN.md)：状态位置、v2 分代、冷停机
+  迁移回执、暂停新启动和 Codex 历史身份。
 - [DeepSeek Harness 接入](dsh.zh-CN.md)：项目配置、hooks/Cordis 协作、ACP worker、
   可安装 bundle 与会话路由边界。
 - [Native 后台 worker](native.zh-CN.md)：后台 worker 所有权、provider adapter、

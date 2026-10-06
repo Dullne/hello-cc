@@ -207,6 +207,8 @@ generic session-isolation assumptions.
 - [User Guide](docs/guide.md): setup, Web console, workflows, coordination
   semantics, and environment behavior.
 - [Command Reference](docs/commands.md): compact public command list.
+- [Project directory identity and private state](docs/private-state.md): v2
+  bindings, replacement generations, offline upgrades and verified Codex history.
 - [DeepSeek Harness](docs/dsh.md): hooks/Cordis collaboration, ACP workers,
   project setup and Web launch, with real-model and local-package acceptance evidence.
 - [Native Workers](docs/native.md): HCC-owned Codex, Claude SDK, and dsh ACP

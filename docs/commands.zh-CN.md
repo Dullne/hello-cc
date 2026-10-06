@@ -19,6 +19,20 @@ hcc uninstall [--purge --yes]
 只有在确定也要删除当前项目的 `.hello-cc` 数据和指导块时，才加
 `--purge --yes`。
 
+## 离线状态迁移
+
+```text
+hcc --root DIR migrate-state --offline --yes
+hcc --root DIR --json migrate-state --inspect-private-binding
+hcc --root DIR migrate-state --upgrade-private-binding --offline --yes --assert-historical-root --expect-receipt=SHA256
+```
+
+第一条命令将保留的项目局部状态制作快照，迁入私有目录。后两条用于检查并
+明确升级已有私有 v1 目录绑定。升级前独立核实历史根目录、备份状态，并停止
+全部写入者；检查回执不证明当前目录就是历史根。发布中断时保留封锁标记，
+经核实的重试完成后才恢复访问。恢复边界、v2 替换目录分代和
+`HCC_PINNED_LAUNCH_MODE=hold` 见[项目目录身份与私有状态](private-state.zh-CN.md)。
+
 ## 只读诊断
 
 ```text

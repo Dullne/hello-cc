@@ -21,6 +21,22 @@ hcc uninstall [--purge --yes]
 hooks, shims, and the shell PATH entry; add `--purge --yes` only when you also want to remove the
 current project's `.hello-cc` data and guidance blocks.
 
+## Offline State Migration
+
+```text
+hcc --root DIR migrate-state --offline --yes
+hcc --root DIR --json migrate-state --inspect-private-binding
+hcc --root DIR migrate-state --upgrade-private-binding --offline --yes --assert-historical-root --expect-receipt=SHA256
+```
+
+The first command snapshots retained project-local state into private storage.
+The other two inspect and explicitly upgrade an existing private v1 directory
+binding. Independently verify the historical root, back up its state and stop
+all writers before an upgrade; the inspection receipt is not historical-root
+proof. Interrupted publication stays fenced until a reviewed retry completes.
+See [Project directory identity and private state](private-state.md) for recovery
+boundaries, v2 replacement generations and `HCC_PINNED_LAUNCH_MODE=hold`.
+
 ## Read-only Diagnostics
 
 ```text

@@ -11,6 +11,9 @@ import crypto from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { recordCodexThreadRoot } from '../lib/core/sessions/codex-thread-root.mjs';
+import { createEventHelpers } from '../lib/db/events.mjs';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
@@ -5697,6 +5700,19 @@ async function multiProjectWebWorkflow() {
   await stopSession(claudeResume.id);
 
   const codexResumeName = `web-codex-resume-${testId}`;
+  const unverifiedCodexResume = await runtimeFetch('/api/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'codex', mode: 'resume', resume: codexResumeName })
+  }, { root });
+  const unverifiedCodexBody = await unverifiedCodexResume.json();
+  if (unverifiedCodexResume.ok || unverifiedCodexBody.error?.code !== 'CODEX_HISTORY_UNVERIFIED') {
+    fail(`path-only Codex history was accepted: ${JSON.stringify(unverifiedCodexBody)}`);
+  }
+  // This disposable fixture explicitly models a first-party root receipt;
+  // matching cwd text alone must not authorize the resume above.
+  withMeshDb((db) => recordCodexThreadRoot(db, createEventHelpers().addEvent,
+    codexResumeName, captureSelectedCwdSnapshot(root), 'regression-fixture'));
   const codexResume = await startProvider({ kind: 'codex', mode: 'resume', resume: codexResumeName });
   const expectedCodexPeer = `codex-${shortHash(codexResumeName)}`;
   if (!codexResume.command.includes(`codex resume ${codexResumeName}`)) {
@@ -5736,11 +5752,15 @@ async function multiProjectWebWorkflow() {
     fail(`resumable API omitted named codex resume session:\n${JSON.stringify(resumableRows, null, 2)}`);
   }
 
-  const codexLast = await startProvider({ kind: 'codex', mode: 'last' });
-  if (codexLast.command !== 'codex resume --last') {
-    fail(`web codex last command wrong:\n${JSON.stringify(codexLast, null, 2)}`);
+  const codexLastResponse = await runtimeFetch('/api/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'codex', mode: 'last' })
+  }, { root });
+  const codexLastBody = await codexLastResponse.json();
+  if (codexLastResponse.ok || codexLastBody.error?.code !== 'CODEX_HISTORY_ID_REQUIRED') {
+    fail(`Codex --last was accepted without a provable thread ID: ${JSON.stringify(codexLastBody)}`);
   }
-  await stopSession(codexLast.id);
 
   const claudeContinue = await startProvider({ kind: 'claude', mode: 'continue' });
   if (claudeContinue.command !== 'claude --continue') {
@@ -7801,8 +7821,13 @@ async function syntaxAndHelp() {
       HOME: scanHome
     };
     const scanOutput = run(process.execPath, [hccBin, '--root', scanRealRoot, 'scan'], { env: scanEnv });
-    if (!scanOutput.includes('claude') || !scanOutput.includes('scan-realpath')) {
-      fail(`scan did not match discovered hccRoot through realpath comparison:\n${scanOutput}`);
+    if (scanOutput.includes('scan-realpath-session') || scanOutput.includes('scan-realpath')) {
+      fail(`scan attributed path-only Claude history to the selected project:\n${scanOutput}`);
+    }
+    run(process.execPath, [hccBin, '--root', scanRealRoot, 'scan', '--register'], { env: scanEnv });
+    const registered = run(process.execPath, [hccBin, '--root', scanRealRoot, 'peer', 'list'], { env: scanEnv });
+    if (registered.includes('scan-realpath')) {
+      fail(`scan registered path-only Claude history as a live peer:\n${registered}`);
     }
   } finally {
     try { fs.rmSync(scanHome, { recursive: true, force: true }); } catch {}

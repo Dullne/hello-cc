@@ -17,6 +17,8 @@ authenticated selection of any existing server directory are accepted risks.
   workflow, stable peer identity, and environment behavior.
 - [Command Reference](commands.md): compact list of public commands and the
   intended use of each command group.
+- [Project directory identity and private state](private-state.md): state locations,
+  v2 generations, cold migration receipts, launch holds and Codex history identity.
 - [DeepSeek Harness](dsh.md): project setup, hooks/Cordis collaboration, ACP workers,
   installable bundles, and session routing boundaries.
 - [Native Workers](native.md): owned background workers, provider adapters,

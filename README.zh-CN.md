@@ -186,6 +186,8 @@ hcc task done --id 1 --summary "Done"
 - [文档目录](docs/README.zh-CN.md)：全部用户文档和实现文档入口。
 - [用户指南](docs/guide.zh-CN.md)：安装、Web 控制台、协作流程、协作语义和环境变量行为。
 - [命令参考](docs/commands.zh-CN.md)：紧凑公共命令清单。
+- [项目目录身份与私有状态](docs/private-state.zh-CN.md)：v2 绑定、替换目录分代、
+  离线升级及已核实的 Codex 历史边界。
 - [DeepSeek Harness 接入](docs/dsh.zh-CN.md)：hooks/Cordis 协作、ACP worker、
   项目配置与 Web 启动；附真实模型和本地包验收记录。
 - [Native 后台 worker](docs/native.zh-CN.md)：HCC 持有的 Codex、Claude SDK、dsh ACP

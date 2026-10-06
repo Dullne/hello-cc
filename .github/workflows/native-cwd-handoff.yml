@@ -1,0 +1,132 @@
+name: Native cwd handoff package
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-15
+          - target: darwin-x64
+            os: macos-15-intel
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: linux-x64
+            os: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install repository dependencies
+        run: npm ci
+      - name: Install tmux on macOS CI runner
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: Install tmux on Linux CI runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+      - name: Build platform helper (Linux statically linked)
+        run: npm run build:native:cwd-handoff
+      - name: Test direct directory-FD handoff
+        run: HCC_NATIVE_CWD_HANDOFF_REQUIRED=1 HCC_NATIVE_CWD_HANDOFF_EXTENDED_TESTS=1 node --test test/native-cwd-handoff.test.mjs
+      - name: Require real tmux and packaged helper before integration test
+        run: |
+          tmux -V
+          node --input-type=module -e "import { trustedCwdHandoffBinary } from './lib/process/tmux-cwd-handoff.mjs'; trustedCwdHandoffBinary()"
+      - name: Test actual tmux -P pane PID and A-to-B replacement
+        run: node --test --test-name-pattern='actual isolated tmux pane inherits' test/tmux-pinned-launch.test.mjs
+      - name: Test Linux binary in musl-based Alpine
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --volume "$PWD:/workspace:ro" --workdir /workspace \
+            -e HCC_NATIVE_CWD_HANDOFF_REQUIRED=1 \
+            node:24-alpine node --test test/native-cwd-handoff.test.mjs
+      - name: Preserve executable mode in build artifact
+        run: tar -czf cwd-handoff-${{ matrix.target }}.tar.gz native/bin/${{ matrix.target }}/hcc-cwd-handoff
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cwd-handoff-${{ matrix.target }}
+          path: cwd-handoff-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  package:
+    name: Assemble four-platform npm tarball
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cwd-handoff-*
+          path: artifacts
+          merge-multiple: true
+      - name: Restore prebuilt helpers
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            tar -xzf "artifacts/cwd-handoff-$target.tar.gz"
+          done
+      - name: Verify binary formats and npm tarball contents
+        run: npm run release:native:pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-npm-package
+          path: logicseek-hello-cc-*.tgz
+          if-no-files-found: error
+
+  installed:
+    name: Installed acceptance (${{ matrix.target }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-15
+          - target: darwin-x64
+            os: macos-15-intel
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: linux-x64
+            os: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-npm-package
+          path: native-npm-package
+      - name: Install the assembled npm tarball without scripts
+        run: npm install --omit=dev --ignore-scripts --prefix "$RUNNER_TEMP/hcc-native-installed" ./native-npm-package/logicseek-hello-cc-*.tgz
+      - name: Test the installed platform helper
+        run: |
+          HCC_NATIVE_CWD_HANDOFF_REQUIRED=1 \
+          HCC_NATIVE_CWD_HANDOFF_BINARY="$RUNNER_TEMP/hcc-native-installed/node_modules/@logicseek/hello-cc/native/bin/${{ matrix.target }}/hcc-cwd-handoff" \
+          node --test test/native-cwd-handoff.test.mjs

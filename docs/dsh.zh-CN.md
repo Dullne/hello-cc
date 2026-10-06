@@ -20,6 +20,11 @@ node /absolute/path/to/hello-cc/bin/hcc.mjs --root /path/to/project dsh web -- -
 
 macOS 从 1.0.5 起使用稳定的启动周期标记。升级时按[进程身份迁移说明](macos-process-identity.md)正常重启所管理的运行时，保留身份无法比较的旧进程。
 
+项目状态可以解析到私有 v2 目录。下文 `.hello-cc` 路径表示逻辑项目状态位置；
+受管理 setup 和会话路由使用解析后的状态目录。迁移前应停止 Harness 和其他
+状态写入者。已有私有 v1 绑定必须经过明确核实历史根目录的检查与回执升级流程，
+详见[项目目录身份与私有状态](private-state.zh-CN.md)。
+
 ## 选择入口
 
 | 入口 | 适用场景 | 会话由谁持有 |

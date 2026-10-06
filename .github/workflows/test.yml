@@ -51,6 +51,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build and verify native cwd handoff helpers
+        run: |
+          npm run build:native:cwd-handoff
+          npm run release:native:verify
+
       - name: Create a private home for runtime tests
         run: |
           node --input-type=module <<'NODE'

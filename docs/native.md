@@ -16,6 +16,25 @@ multiple pending inbox messages into the same turn. ACP resume and session close
 depend on the extensions the provider advertises. HCC does not claim that an ACP
 resume replays the original conversation transcript.
 
+## Runtime ownership and directory identity
+
+The runtime retains its file-lock ownership guard and adds a durable SQLite
+owner fence. The owner records runtime generation, mesh database, private-state
+generation, root directory identity and process PID/start token/command hash.
+Native writes and derived hook/scoped MCP writes recheck that owner under the
+shared writer fence. A live or unverified owner blocks takeover; a successor can
+claim released state or an owner proven to have exited. Directory replacement
+and stale executor capabilities cannot authorize writes to the successor.
+
+Old runtime pointers without a directory identity receipt or owner fence are
+rejected with `PROJECT_PATH_CHANGED` or `NATIVE_OWNER_UNVERIFIED`, respectively.
+Stop the old runtime using its running build and confirm exit before starting a new one. Native
+provider processes use their scoped HCC MCP tools; ordinary `hcc` commands from
+that environment are rejected with `NATIVE_CLI_SCOPE_REQUIRED`. These checks
+retain the existing sandbox-policy and expected-runtime-generation rules.
+See [Project directory identity and private state](private-state.md) for v1
+binding upgrade receipts and replacement generations.
+
 ## Session fork and retries with the original ID
 
 `hcc native fork --parent codex-reviewer --peer codex-branch` invokes the provider's
@@ -221,7 +240,8 @@ resolve the reported problem and retry `native down`.
 
 Worker events retain semantic output and completion evidence; token deltas are
 not persisted as delivery receipts. The runtime keeps local state under
-`<project>/.hello-cc/native/` and coordination records in the selected HCC
+`<resolved-project-state>/native/` (project-local or private storage described
+above) and coordination records in the selected HCC
 database. Runtime control is a local authenticated API, separate from the
 browser terminal transport. Treat its local runtime pointer and log as private
 project state.

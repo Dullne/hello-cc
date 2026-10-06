@@ -14,6 +14,23 @@ Native 模式运行由 HCC 创建并持有的后台 worker。共享 peer、任�
 不代表 host 会把多条待处理消息塞进同一个 turn。ACP 的 resume 和 session close
 取决于 provider 声明的扩展；不能把 ACP resume 等同于重放原始会话历史。
 
+## Runtime 所有权与目录身份
+
+Runtime 保留原有 file-lock owner 保护，并增加持久化的 SQLite owner 校验。
+owner 保存 runtime generation、mesh 数据库、私有状态 generation、根目录身份
+以及进程 PID、启动标记和命令哈希。Native 写入及派生 hook/scoped MCP 写入在
+同一个 writer fence 中复核 owner。存活或无法核实的 owner 阻止接管；后继进程
+只能接管已释放或已证实退出的 owner。目录替换或旧执行器 capability 不能授权
+写入后继状态。
+
+旧 runtime pointer 缺少目录身份回执或 owner fence 时分别被
+`PROJECT_PATH_CHANGED` 或 `NATIVE_OWNER_UNVERIFIED` 拒绝。
+先用正在运行的旧版本停止它，确认退出后再启动新版本。Native provider 子进程
+通过其 scoped HCC MCP 工具协作；在该环境中直接调用普通 `hcc` 命令会收到
+`NATIVE_CLI_SCOPE_REQUIRED`。原 sandbox policy 和 expected runtime generation
+规则继续生效。v1 绑定升级回执和替换目录分代见
+[项目目录身份与私有状态](private-state.zh-CN.md)。
+
 ## 会话 fork 与原 ID 重试
 
 `hcc native fork --parent codex-reviewer --peer codex-branch` 使用 provider 自身的
@@ -188,7 +205,8 @@ HCC 不为只读 worker 注入自有的任务／锁／结果写操作 MCP，也�
 `status.shutdown_error` 报告错误；处理所报问题后，再次执行 `native down`。
 
 事件保留语义输出和完成证据，不把 token delta 持久化为投递回执。runtime 状态位于
-`<project>/.hello-cc/native/`，协作记录仍写入所选 HCC 数据库。控制接口是独立于 Web
+`<解析后的项目状态目录>/native/`，可以是项目局部或上方说明的私有状态；协作记录
+仍写入所选 HCC 数据库。控制接口是独立于 Web
 终端传输的本地认证 API；其 runtime pointer 和日志属于项目私有状态。
 
 ## 如何理解投递回执
