@@ -16,6 +16,67 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0-rc.9
+
+### Summary
+
+This preview binds project state, managed launches and Web/native sessions to
+the selected directory's filesystem identity. Replacing a directory at the
+same pathname no longer authorizes reuse of its old state or Codex history.
+It continues the existing npm preview channel and adds packaged native helpers
+for authenticated tmux directory-descriptor handoff.
+
+### Highlights
+
+- Introduce private-state v2 bindings with positive directory birth-time
+  receipts and separate replacement generations. Preserve the original store;
+  historical v1 upgrades require independent root verification, a matching
+  inspection receipt and an explicit offline drain. Interrupted upgrades remain
+  fenced until a reviewed retry completes.
+- Pass an already-open directory descriptor to the authorized tmux pane through
+  a native broker/client, validating kernel peer identity and the bound receipt
+  before launch. Ship Darwin/Linux arm64/x64 helpers, static Linux binaries and
+  build/package checks; a missing trusted helper rejects the launch without a
+  pathname fallback. `HCC_PINNED_LAUNCH_MODE=hold` pauses new guarded sessions.
+- Recheck selected-directory identity before CLI launches, hook registration
+  and managed discovery. Persist Codex thread-to-root receipts and require an
+  explicit verified thread for terminal resume/fork; pathname-only histories
+  and managed `--last` launches cannot establish that binding.
+- Add a durable Native owner record alongside the existing file-lock guard.
+  Native, hook and scoped MCP mutations recheck runtime/state generations and
+  process identity under the writer fence. Journal CLI submissions before
+  admission and recover with the original ID; uncertain provider execution is
+  not automatically replayed. Retain sandbox and expected-generation checks.
+- Bind Web project/session keys, Codex history and file/context operations to
+  the selected directory and database. Preserve active sessions' original
+  bindings when a replacement is explicitly selected. Keep tmux ownership and
+  cleanup conditional, reject invalid routes before state resolution, and make
+  user-question answers require current control and an explicit submit action.
+- Document the migration, ownership and historical-session boundaries in
+  Chinese and English. Add four-platform helper build/installed-package CI and
+  verify executable modes and source stamps in the frozen npm package.
+- Add bounded, structured shim-registration diagnostics that distinguish
+  provider entry, persisted binding/pane evidence and peer-list database
+  fallback. Public diagnostics retain fixture-owned booleans and finite enums.
+- Keep separate ACL cache entries for Number and BigInt filesystem stats.
+  Alternating validation paths reuse unchanged results while preserving exact
+  inode and change-time checks; permission and ACL changes still force a fresh
+  inspection in both representations.
+
+### Validation
+
+The rc.9 source passed 1,992 local unit tests with three platform/privilege
+skips and all 13 regression stages. The integration browser baseline passed
+45 checks each for source and temporary npm installations. These checks use real
+HTTP, WebSocket and SQLite with simulated providers, cover desktop and 390px
+layouts, and retain separate cleanup and source-hash receipts.
+
+Native helper formats, executable permissions, C-source stamps and packed-file
+hashes are checked separately from platform execution. Final source-commit CI,
+the immutable rc.9 archive and tag acceptance retain their own receipts.
+These checks do not establish real-model calls, device upgrades or business
+acceptance. Existing released archives and their evidence remain unchanged.
+
 ## 1.1.0-rc.8
 
 ### Summary
