@@ -73,6 +73,7 @@ const evidence = {
   schemaVersion: 1, dir, packageRoot: repo, packageVersion: JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version,
   node: process.version, platform: process.platform, checks: [], screenshots: [], errors: [], console: [], expectedErrors: [], cleanup: {},
   sourceFiles: hashes(), browser: 'Playwright 1.62.1; isolated headless context; repeatable CI runner',
+  browserFallbackReason: 'Browser plugin not available',
   mode: 'Simulated native adapters; actual HTTP, SQLite, native service and browser; no models or credentials',
   startedAt: new Date().toISOString(), success: false
 };
@@ -168,6 +169,82 @@ async function checkSharedSplit(page) {
     check('real split panes share one project GET while keeping response copies, drafts and action tokens independent');
   } finally { page.off('request', track); }
 }
+async function userQuestionChecks(page) {
+  await select(page, 'qa-claude');
+  // Selecting a session opens a viewer; an interactive answer needs an
+  // explicit lease claim through the same visible control as ordinary users.
+  if (!await page.evaluate(() => window.hccHandoff.canControl)) {
+    assert.equal(await page.locator('#nativeSend').isDisabled(), true);
+    await page.locator('#claimControlBtn').click();
+  }
+  await page.waitForFunction(() => window.hccHandoff.active === 'qa-claude' && window.hccHandoff.canControl);
+  const adapter = adapters.get('claude');
+  const answer = 'FORM_FIXTURE_ANSWER_DO_NOT_PERSIST';
+  const request = { kind: 'userInput', method: 'item/tool/requestUserInput', requestId: 'qa-user-question',
+    executorId: adapter.state.executorId, sessionId: adapter.state.sessionId, turnId: 'qa-question-turn',
+    params: { questions: [{ id: 'fixture-answer', header: 'Acceptance question',
+      question: 'Enter the test-owned answer, then explicitly send it.', isSecret: true }] } };
+  adapter.state.capabilities.userInput = true;
+  adapter.state.pendingApprovals = [request];
+  const responses = adapter.responses?.length || 0;
+  await page.locator('#nativeRead').click();
+  const form = page.locator('#nativeApprovals form.hcc-interaction-form');
+  await form.waitFor({ state: 'visible' });
+  const showQuestion = async () => {
+    // Use the product's response jump so the question and its field are both
+    // visible without disturbing a user's retained conversation position.
+    await page.locator('#nativeApprovalJump').click();
+    const label = form.locator('label'), paragraph = form.locator('p');
+    // At 390px the retained conversation area is short. The jump focuses the
+    // answer control; scroll its full label into the reading area as a user can.
+    await label.scrollIntoViewIfNeeded();
+    assert.ok((await label.innerText()).includes('Acceptance question'));
+    assert.equal(await paragraph.innerText(), 'Enter the test-owned answer, then explicitly send it.');
+    const [labelBox, questionBox, scrollBox] = await Promise.all([
+      label.boundingBox(), paragraph.boundingBox(), page.locator('#nativeScroll').boundingBox()
+    ]);
+    assert.ok(labelBox && questionBox && scrollBox);
+    assert.ok(labelBox.y >= scrollBox.y && questionBox.y + questionBox.height <= scrollBox.y + scrollBox.height,
+      'The question header and text must remain visible with its answer field');
+  };
+  await showQuestion();
+  const field = form.locator('[data-answer="0"]');
+  assert.ok(await field.getAttribute('name'));
+  assert.equal(await form.getAttribute('autocomplete'), 'off');
+  await field.fill(answer);
+  await page.evaluate(() => {
+    window.__qaQuestionSubmits = [];
+    document.addEventListener('submit', event => {
+      if (event.target.matches('form.hcc-interaction-form')) window.__qaQuestionSubmits.push(event.defaultPrevented);
+    });
+  });
+  const initialUrl = page.url();
+  await field.press('Enter');
+  await page.waitForFunction(() => window.__qaQuestionSubmits.length > 0);
+  assert.deepEqual(await page.evaluate(() => window.__qaQuestionSubmits), [true]);
+  assert.equal(page.url(), initialUrl);
+  assert.equal(adapter.responses?.length || 0, responses, 'Enter must not answer an executor request');
+  await showQuestion();
+  await shot(page, 'desktop-user-question-form');
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2), true);
+  await showQuestion();
+  await shot(page, 'mobile-user-question-form');
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  assert.equal(await page.evaluate(() => window.hccHandoff.active), 'qa-claude');
+  assert.equal(await page.evaluate(() => window.hccHandoff.canControl), true);
+  const submit = page.locator('#nativeApprovals [data-decision="accept"]');
+  assert.equal(await submit.isDisabled(), false, 'Only the current controller can answer this request');
+  await submit.click();
+  await form.waitFor({ state: 'detached' });
+  assert.equal(adapter.responses.length, responses + 1);
+  assert.deepEqual(adapter.responses.at(-1).answers, { 'fixture-answer': { answers: [answer] } });
+  assert.equal(await page.evaluate(answer =>
+    [...Object.values(localStorage), ...Object.values(sessionStorage)].some(value => value.includes(answer)), answer), false);
+  check('user-question forms retain named fields, suppress Enter navigation, and send only after an explicit answer without browser storage');
+  await select(page, 'qa-codex');
+}
+
 async function extendedChecks(page, context) {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await select(page, 'qa-codex');
@@ -187,6 +264,7 @@ async function extendedChecks(page, context) {
   await page.waitForFunction(() => window.hccHandoff.canControl);
   check('actual WebSocket reconnect restores missing output without replaying unsent input');
   await automaticReconnectChecks(page);
+  await userQuestionChecks(page);
 
   const observerContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await observerContext.addInitScript(browserInstrumentation);
@@ -355,7 +433,7 @@ try{
  service=await startNativeService(ctx,deps,{pollMs:1000000,afterUserSubmissionMeshCommit:retryFault.afterMeshCommit,adapterFactory:async(provider,options)=>{
   const peer=options.env.HCC_PEER;
   const state={provider,status:'idle',sessionId:peer,turnId:null,executorId:options.executorId,capabilities:{send:true,interrupt:true,close:true,resume:true}};
-  const adapter={opens:[],snapshot:()=>structuredClone(state),capabilities:state.capabilities,async open(input={}){this.opens.push(structuredClone(input));if(input.sessionId)state.sessionId=input.sessionId;return this.snapshot();},async send(input){this.sent=(this.sent||0)+1;state.status='running';state.turnId='qa-turn';this.active=input;return{status:'queued',turnId:state.turnId};},async interrupt(){state.status='idle';state.turnId=null;},async close(){state.status='closed';},emit(value){options.onEvent({provider,sessionId:state.sessionId,turnId:'qa-turn',...value});},state};
+  const adapter={opens:[],snapshot:()=>structuredClone(state),capabilities:state.capabilities,async open(input={}){this.opens.push(structuredClone(input));if(input.sessionId)state.sessionId=input.sessionId;return this.snapshot();},async send(input){this.sent=(this.sent||0)+1;state.status='running';state.turnId='qa-turn';this.active=input;return{status:'queued',turnId:state.turnId};},async interrupt(){state.status='idle';state.turnId=null;},async respond(input){this.responses ||= [];this.responses.push(structuredClone(input));state.pendingApprovals=[];return {status:'submitted',requestId:input.requestId};},async close(){state.status='closed';},emit(value){options.onEvent({provider,sessionId:state.sessionId,turnId:'qa-turn',...value});},state};
   adapters.set(provider,adapter);adaptersByPeer.set(peer,adapter);return adapter;
  }});
  for(const provider of ['codex','claude','dsh'])await api('POST','/workers',{peer:'qa-'+provider,provider});

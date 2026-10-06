@@ -22,6 +22,7 @@ import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createPtySessions } from '../lib/web/pty-sessions.mjs';
 import { createTaskResults } from '../lib/web/task-results.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 
 // Production HTTP routing, ownership stores, and native loopback protocol;
 // provider adapters are in-memory fakes, with no CLI, model, or tmux calls.
@@ -219,6 +220,33 @@ test('POST sessions creates and returns each native provider view without termin
   const listed = await f.request('/api/sessions');
   assert.equal(listed.body.sessions.length, 3);
 });
+
+test('Web PTY Codex history launch requires an explicit root-bound thread before spawn', async t => {
+  const f = await fixture(t);
+  for (const input of [
+    { mode: 'last' },
+    { mode: 'resume', resume: 'legacy-thread' },
+    { command: 'codex fork legacy-thread', binding: {
+      provider: 'codex', resume_mode: 'fork', resume_arg: 'legacy-thread', command: 'codex fork legacy-thread'
+    } }
+  ]) {
+    const rejected = await f.request('/api/sessions', { backend: 'pty', kind: 'codex', ...input });
+    assert.equal(rejected.status, 409, JSON.stringify(rejected.body));
+    assert.ok(['CODEX_HISTORY_ID_REQUIRED', 'CODEX_HISTORY_UNVERIFIED'].includes(rejected.body.error.code));
+    assert.equal(f.ptySpawns.length, 0, 'history rejection must precede a PTY spawn');
+  }
+  const source = 'verified-thread';
+  const original = captureSelectedCwdSnapshot(f.ctx.root);
+  f.db.prepare('INSERT INTO events(type,actor,payload,created_at) VALUES(?,?,?,?)').run(
+    'codex.thread.root-bound', source,
+    JSON.stringify({ version: 1, thread_id: source, root: {
+      canonical: original.canonical, identity: original.identity }, origin: 'new' }), 1);
+  const allowed = await f.request('/api/sessions', { backend: 'pty', kind: 'codex',
+    mode: 'resume', resume: source });
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
+  assert.equal(f.ptySpawns.length, 1);
+});
+
 
 test('project defaults HTTP uses revision CAS, rejects cross-origin writes and applies only to new native sessions', async t => {
   const f = await fixture(t); fs.mkdirSync(path.join(f.ctx.root, 'work'));
@@ -590,9 +618,9 @@ test('history GC preserves native dedup, task evidence, and the executor receipt
   const recorded = await f.request('/api/sessions/native-a/results',
     { ...controller, taskId: 1, title: 'GC must retain evidence', status: 'passed', evidence: ['log'] });
   assert.equal(recorded.status, 200);
-  const durable = ['native.web.submission.pending', 'task.result.recorded', 'codex.executor.started'];
+  const durable = ['native.web.submission.pending', 'task.result.recorded', 'codex.executor.started', 'codex.thread.root-bound'];
   const before = f.db.prepare('SELECT id,type,payload FROM events ORDER BY id').all().filter(row => durable.includes(row.type));
-  assert.equal(before.length, 3);
+  assert.equal(before.length, 5);
   f.db.prepare("INSERT INTO events(type,payload,created_at) VALUES('diagnostic','{}',1)").run();
   const snapshot = createHistoryGcSnapshot(f.db, 2000, { categories: ['events'] });
   try {

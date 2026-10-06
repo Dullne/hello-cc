@@ -4,12 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { contextForProject, projectDbPath, runtimePath } from '../lib/runtime/paths.mjs';
+import { contextForProject, projectDbPath, projectRegistryPath, runtimePath } from '../lib/runtime/paths.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 import { createAutoAttach } from '../lib/web/auto-attach.mjs';
 import { createProjectContexts } from '../lib/web/project-contexts.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { privateProjectStateDir } from '../lib/runtime/private-state.mjs';
+import { tmuxManagedSessionName } from '../lib/terminal/tmux.mjs';
 
 function fixture(t) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-project-db-'));
@@ -46,15 +48,29 @@ function fixture(t) {
   return { sandbox, root, otherRoot, alias, ctx, projects, sessions, serializer, connections };
 }
 
-function requestProject(projects, target, headers = {}) {
-  return projects.projectFromRequest({ headers }, new URL(target, 'http://localhost:8787'));
+function requestProject(projects, target, headers = {}, options = {}) {
+  return projects.projectFromRequest({ headers }, new URL(target, 'http://localhost:8787'), options);
 }
 
-async function postProject(routes, body) {
-  const req = Readable.from([JSON.stringify(body)]);
+async function getProjectRoute(routes, target, headers = {}, method = 'GET') {
+  const req = Readable.from([]);
+  req.method = method;
+  req.url = target;
+  req.headers = { host: 'localhost:8787', 'x-hcc-api-version': '2', 'x-hcc-browser': '1', ...headers };
+  req.socket = { remoteAddress: '127.0.0.1', encrypted: false };
+  const res = { status: null, body: '', writeHead(status) { this.status = status; },
+    end(value = '') { this.body = String(value); } };
+  await routes.handleWebRequest(req, res);
+  return { status: res.status, body: JSON.parse(res.body) };
+}
+
+async function postProject(routes, body, { headers = {}, beforeBody = null } = {}) {
+  const req = Readable.from(beforeBody
+    ? (async function* () { beforeBody(); yield JSON.stringify(body); })()
+    : [JSON.stringify(body)]);
   req.method = 'POST';
   req.url = '/api/projects';
-  req.headers = { host: 'localhost:8787', 'x-hcc-api-version': '2' };
+  req.headers = { host: 'localhost:8787', 'x-hcc-api-version': '2', ...headers };
   req.socket = { remoteAddress: '127.0.0.1', encrypted: false };
   const res = {
     status: null,
@@ -148,36 +164,46 @@ test('POST /api/projects defaults to the selected root DB and validates explicit
   assert.equal(rejected.status, 403);
   assert.equal(rejected.body.error.code, 'PROJECT_PATH_FORBIDDEN');
   assert.equal(fs.existsSync(outside), false);
-  const freshRoot = path.join(f.sandbox, 'not-selected');
+
+  const freshRoot = path.join(f.sandbox, 'outside-before-create');
   fs.mkdirSync(freshRoot);
-  const denied = await postProject(routes, { root: freshRoot, db: outside });
-  assert.equal(denied.status, 403);
-  assert.equal(fs.existsSync(path.join(freshRoot, '.hello-cc')), false,
-    'invalid database selection must not create project state');
+  const freshRejected = await postProject(routes, { root: freshRoot, db: outside });
+  assert.equal(freshRejected.status, 403);
+  assert.equal(freshRejected.body.error.code, 'PROJECT_PATH_FORBIDDEN');
+  assert.equal(fs.existsSync(path.join(freshRoot, '.hello-cc')), false);
+  assert.equal(fs.existsSync(privateProjectStateDir(freshRoot)), false);
 });
 
-test('browser HTTP and WebSocket requests carry the selected directory identity', (t) => {
+test('invalid B database cannot publish a generation fence before rejection', {
+  skip: process.platform === 'win32'
+}, async t => {
   const f = fixture(t);
-  const target = `/api/projects/select?root=${encodeURIComponent(f.otherRoot)}`;
-  const selected = f.projects.projectFromRequest({ method: 'POST', headers: {} },
-    new URL(target, 'http://localhost:8787'), { requireIdentity: true });
-  const identity = f.projects.selectedProjectIdentity(selected);
-  const api = new URL(`/api/runtime?root=${encodeURIComponent(f.otherRoot)}`, 'http://localhost:8787');
-  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, api,
-    { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
-  assert.equal(f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
-    api, { requireIdentity: true }).root, selected.root);
-  const ws = new URL(`/ws/terminal/peer?root=${encodeURIComponent(f.otherRoot)}&browser=1&root_identity=${identity}`,
-    'http://localhost:8787');
-  assert.equal(f.projects.projectFromRequest({ headers: {} }, ws).root, selected.root);
-  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': 'different' } }, ws),
-    { code: 'PROJECT_PATH_CHANGED' });
-  fs.renameSync(f.otherRoot, `${f.otherRoot}-moved`);
-  fs.mkdirSync(f.otherRoot);
-  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
-    api, { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
-  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, ws), { code: 'PROJECT_PATH_CHANGED' });
-  assert.equal(f.connections.length, 0, 'identity checks must not open a project database');
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'token', cookieSessionOk: () => false,
+    connectWebProject: () => ({ close() {} }), getProcessIdentity: () => null,
+    getActualPort: () => 8787, now: () => 1,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_FORBIDDEN' ? 403 : 500
+  });
+  const first = await postProject(routes, { root: f.otherRoot });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const oldStore = privateProjectStateDir(f.otherRoot);
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-old`);
+  fs.mkdirSync(f.otherRoot, { mode: 0o777 });
+  fs.chmodSync(f.otherRoot, 0o777);
+  const outside = path.join(f.sandbox, 'outside-B.db');
+  const rejected = await postProject(routes, { root: f.otherRoot, db: outside });
+  assert.equal(rejected.status, 403);
+  assert.equal(rejected.body.error.code, 'PROJECT_PATH_FORBIDDEN');
+  assert.equal(fs.existsSync(`${oldStore}.generations`), false);
+  assert.equal(JSON.parse(fs.readFileSync(`${oldStore}.authority.json`, 'utf8')).fence, undefined);
+  assert.equal(fs.existsSync(outside), false);
+  const oldStoreDb = await postProject(routes, {
+    root: f.otherRoot, db: path.join(oldStore, 'mesh.db')
+  });
+  assert.equal(oldStoreDb.status, 403);
+  assert.equal(fs.existsSync(`${oldStore}.generations`), false);
 });
 
 test('a selected Web project cannot reconnect or expose its old managed session after A is rebound to B', {
@@ -234,6 +260,385 @@ test('a CLI-carried root identity cannot select replacement B through the Web AP
   assert.equal(freshlySelected.root, fs.realpathSync(f.otherRoot));
 });
 
+test('automatic Web startup-root selection never adopts B after A is replaced', {
+  skip: process.platform === 'win32'
+}, (t) => {
+  const f = fixture(t);
+  f.ctx.initialRootIdentity = captureSelectedCwdSnapshot(f.root);
+  const moved = path.join(f.sandbox, 'original-startup-root');
+  fs.renameSync(f.root, moved);
+  fs.mkdirSync(f.root);
+  const defaultRequest = { headers: {}, method: 'POST' };
+  for (const target of ['/api/projects/select', '/api/projects/select?root=',
+    '/api/projects/select?project=', '/api/projects/select?root=&project=']) {
+    assert.throws(() => f.projects.projectFromRequest(defaultRequest,
+      new URL(target, 'http://localhost:8787'), { requireIdentity: true }), {
+      code: 'PROJECT_PATH_CHANGED'
+    }, target);
+  }
+  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root': '' }, method: 'POST' },
+    new URL('/api/projects/select', 'http://localhost:8787'), { requireIdentity: true }), {
+    code: 'PROJECT_PATH_CHANGED'
+  });
+  assert.equal(fs.existsSync(path.join(f.root, '.hello-cc')), false);
+
+  // An actual selection that names the new directory remains available.
+  const selected = f.projects.projectFromRequest(defaultRequest,
+    new URL(`/api/projects/select?root=${encodeURIComponent(f.root)}`, 'http://localhost:8787'),
+    { requireIdentity: true });
+  assert.equal(selected.root, fs.realpathSync(f.root));
+  assert.equal(selected.rootIdentity.identity.ino, fs.statSync(f.root, { bigint: true }).ino.toString());
+});
+
+test('browser selection issues an identity, stale HTTP and WS fail closed, and explicit re-selection accepts B', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'token', cookieSessionOk: () => false,
+    sessionsForProject: f.serializer.sessionsForProject, getProcessIdentity: () => null,
+    getActualPort: () => 8787, now: () => 1,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const root = encodeURIComponent(f.otherRoot);
+  const selected = await getProjectRoute(routes, `/api/projects/select?root=${root}`, {}, 'POST');
+  assert.equal(selected.status, 200, JSON.stringify(selected.body));
+  const canonicalRoot = fs.realpathSync(f.otherRoot);
+  assert.equal(selected.body.current.root, canonicalRoot);
+  const originalIdentity = selected.body.project_identity;
+  assert.equal(typeof originalIdentity, 'string');
+  assert.deepEqual(JSON.parse(Buffer.from(originalIdentity, 'base64url').toString()), {
+    canonical: canonicalRoot, identity: captureSelectedCwdSnapshot(f.otherRoot).identity
+  });
+  const browserHeaders = { 'x-hcc-root-identity': originalIdentity };
+  assert.equal((await getProjectRoute(routes, `/api/runtime?root=${root}`, browserHeaders)).status, 200);
+  const missing = await getProjectRoute(routes, `/api/runtime?root=${root}`);
+  assert.equal(missing.status, 409, JSON.stringify(missing.body));
+  assert.equal(missing.body.error.code, 'PROJECT_PATH_CHANGED');
+
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-original`);
+  const replacement = path.join(f.sandbox, 'replacement');
+  fs.mkdirSync(replacement);
+  fs.symlinkSync(replacement, f.otherRoot, 'dir');
+  for (const target of [`/api/runtime?root=${root}`, `/api/projects?root=${root}`]) {
+    const stale = await getProjectRoute(routes, target, browserHeaders);
+    assert.equal(stale.status, 409, JSON.stringify(stale.body));
+    assert.equal(stale.body.error.code, 'PROJECT_PATH_CHANGED');
+  }
+  const wsUrl = `/ws/terminal/unused?root=${root}&browser=1&root_identity=${originalIdentity}`;
+  assert.throws(() => requestProject(f.projects, wsUrl), { code: 'PROJECT_PATH_CHANGED' });
+  assert.throws(() => requestProject(f.projects, `/ws/terminal/unused?root=${root}&browser=1`), {
+    code: 'PROJECT_PATH_CHANGED'
+  });
+
+  const reselected = await getProjectRoute(routes, `/api/projects/select?root=${root}`, {}, 'POST');
+  assert.equal(reselected.status, 200, JSON.stringify(reselected.body));
+  assert.notEqual(reselected.body.project_identity, originalIdentity);
+  assert.equal((await getProjectRoute(routes, `/api/runtime?root=${root}`,
+    { 'x-hcc-root-identity': reselected.body.project_identity })).status, 200);
+  assert.equal(requestProject(f.projects,
+    `/ws/terminal/unused?root=${root}&browser=1&root_identity=${reselected.body.project_identity}`).root,
+    fs.realpathSync(f.otherRoot));
+  assert.equal(f.connections.length, 0, 'identity checks must not open a project DB');
+});
+
+test('explicit browser selection retains same-origin CSRF protection for cookie sessions', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'cookie', cookieSessionOk: () => true,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const target = `/api/projects/select?root=${encodeURIComponent(f.otherRoot)}`;
+  const crossSite = await getProjectRoute(routes, target, { origin: 'https://elsewhere.example' }, 'POST');
+  assert.equal(crossSite.status, 403);
+  assert.equal(crossSite.body.error.code, 'CSRF_ORIGIN');
+  const noOrigin = await getProjectRoute(routes, target, {}, 'POST');
+  assert.equal(noOrigin.status, 403);
+  assert.equal(noOrigin.body.error.code, 'CSRF_ORIGIN');
+  const sameOrigin = await getProjectRoute(routes, target, { origin: 'http://localhost:8787' }, 'POST');
+  assert.equal(sameOrigin.status, 200, JSON.stringify(sameOrigin.body));
+  assert.ok(sameOrigin.body.project_identity);
+});
+
+test('an unknown top-level cookie navigation cannot create another project state', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'cookie', cookieSessionOk: () => true,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const identity = Buffer.from(JSON.stringify(captureSelectedCwdSnapshot(f.otherRoot))).toString('base64url');
+  const stateDir = path.dirname(projectDbPath(f.otherRoot));
+  assert.equal(fs.existsSync(stateDir), false);
+  const response = await getProjectRoute(routes,
+    `/notfound?root=${encodeURIComponent(f.otherRoot)}&root_identity=${identity}`,
+    { 'x-hcc-api-version': undefined, 'x-hcc-browser': undefined });
+  assert.equal(response.status, 404);
+  assert.equal(response.body.error.code, 'NOT_FOUND');
+  assert.equal(fs.existsSync(stateDir), false);
+});
+
+test('an unknown versioned API route cannot create project state or registry activity', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'cookie', cookieSessionOk: () => true,
+    sessionsForProject: f.serializer.sessionsForProject, getProcessIdentity: () => null,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'BAD_REQUEST' ? 400 :
+      error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const identity = Buffer.from(JSON.stringify(captureSelectedCwdSnapshot(f.otherRoot))).toString('base64url');
+  const stateDir = path.dirname(projectDbPath(f.otherRoot));
+  const registry = projectRegistryPath();
+  const registryBefore = fs.existsSync(registry) ? fs.readFileSync(registry) : null;
+  assert.equal(fs.existsSync(stateDir), false);
+  for (const [pathname, method] of [
+    ['/api/notfound', 'GET'], ['/api/runtime/stop', 'GET'],
+    ['/api/sessions/peer/unknown', 'GET'], ['/api/agent-defaults/extra', 'GET'],
+    ['/api/sessions/peer/native/unknown', 'GET'],
+    ['/api/sessions/peer/native/%75nknown', 'GET'],
+    ['/api/sessions/%ZZ/native/state', 'GET'],
+    ['/api/sessions/peer/codex/unknown', 'GET'],
+    ['/api/sessions/peer/codex/%ZZ', 'GET'],
+    ['/api/sessions/%ZZ/results', 'GET'],
+    ['/api/sessions/peer/results', 'DELETE'],
+    ['/api/peers/peer/actions/unknown', 'GET'],
+    ['/api/peers/peer/actions/unknown', 'POST'],
+    ['/api/peers/%ZZ/actions/status', 'GET'],
+    ['/api/native/history/peer', 'POST'],
+    ['/api/native/history/peer/resume', 'GET'],
+    ['/api/native/history/%ZZ', 'GET'],
+    ['/api/codex/threads/thread/fork', 'GET'],
+    ['/api/codex/threads/thread', 'POST'],
+    ['/api/codex/threads/%ZZ', 'GET']
+  ]) {
+    const response = await getProjectRoute(routes,
+      `${pathname}?root=${encodeURIComponent(f.otherRoot)}&root_identity=${identity}`,
+      { 'x-hcc-browser': undefined, ...(method !== 'GET' ? { origin: 'http://localhost:8787' } : {}) }, method);
+    assert.equal(response.status, 404, `${method} ${pathname}`);
+    assert.equal(response.body.error.code, 'NOT_FOUND');
+    assert.equal(fs.existsSync(stateDir), false, pathname);
+    assert.deepEqual(fs.existsSync(registry) ? fs.readFileSync(registry) : null, registryBefore, pathname);
+  }
+  for (const [pathname, method] of [
+    ['/api/peers/peer/actions/status', 'POST'],
+    ['/api/peers/peer/actions/task_next', 'GET']
+  ]) {
+    const response = await getProjectRoute(routes,
+      `${pathname}?root=${encodeURIComponent(f.otherRoot)}&root_identity=${identity}`,
+      { 'x-hcc-browser': undefined, ...(method === 'POST' ? { origin: 'http://localhost:8787' } : {}) }, method);
+    assert.equal(response.status, 405, `${method} ${pathname}`);
+    assert.equal(response.body.error.code, 'METHOD_NOT_ALLOWED');
+    assert.equal(fs.existsSync(stateDir), false, pathname);
+    assert.deepEqual(fs.existsSync(registry) ? fs.readFileSync(registry) : null, registryBefore, pathname);
+  }
+  for (const [pathname, method] of [
+    ...['account', 'login', 'logout', 'refreshToken', '%61ccount'].map(action =>
+      [`/api/sessions/peer/codex/${action}`, 'POST']),
+    ['/api/agent-defaults', 'POST']
+  ]) {
+    const response = await getProjectRoute(routes,
+      `${pathname}?root=${encodeURIComponent(f.otherRoot)}&root_identity=${identity}`,
+      { 'x-hcc-browser': undefined, ...(method === 'GET' ? {} : { origin: 'http://localhost:8787' }) }, method);
+    assert.equal(response.status, 400, `${method} ${pathname}`);
+    assert.equal(response.body.error.code, 'BAD_REQUEST');
+    assert.equal(fs.existsSync(stateDir), false, pathname);
+    assert.deepEqual(fs.existsSync(registry) ? fs.readFileSync(registry) : null, registryBefore, pathname);
+  }
+  const supported = await getProjectRoute(routes,
+    `/api/runtime?root=${encodeURIComponent(f.otherRoot)}&root_identity=${identity}`,
+    { 'x-hcc-browser': undefined });
+  assert.equal(supported.status, 200, JSON.stringify(supported.body));
+  assert.equal(supported.body.root, fs.realpathSync(f.otherRoot));
+});
+
+test('cookie API and WebSocket requests require project identity without a browser self-marker', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'cookie', cookieSessionOk: () => true,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const root = encodeURIComponent(f.otherRoot);
+  const unmarked = { 'x-hcc-browser': undefined };
+  const selectHeaders = { ...unmarked, origin: 'http://localhost:8787' };
+  const selected = await getProjectRoute(routes, `/api/projects/select?root=${root}`, selectHeaders, 'POST');
+  assert.equal(selected.status, 200, JSON.stringify(selected.body));
+  const originalIdentity = selected.body.project_identity;
+  assert.equal((await getProjectRoute(routes, `/api/projects?root=${root}`, unmarked)).status, 409);
+  assert.equal((await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { ...unmarked, 'x-hcc-root-identity': originalIdentity })).status, 200);
+
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-original`);
+  const replacement = path.join(f.sandbox, 'replacement');
+  fs.mkdirSync(replacement);
+  fs.symlinkSync(replacement, f.otherRoot, 'dir');
+  const stale = await getProjectRoute(routes, `/api/projects?root=${root}`, unmarked);
+  assert.equal(stale.status, 409, JSON.stringify(stale.body));
+  assert.equal(stale.body.error.code, 'PROJECT_PATH_CHANGED');
+  assert.equal((await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { ...unmarked, 'x-hcc-root-identity': originalIdentity })).status, 409);
+  assert.throws(() => requestProject(f.projects, `/ws/terminal/unused?root=${root}`,
+    {}, { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
+
+  const reselected = await getProjectRoute(routes, `/api/projects/select?root=${root}`, selectHeaders, 'POST');
+  assert.equal(reselected.status, 200, JSON.stringify(reselected.body));
+  assert.notEqual(reselected.body.project_identity, originalIdentity);
+  assert.equal((await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { ...unmarked, 'x-hcc-root-identity': reselected.body.project_identity })).status, 200);
+  assert.equal(requestProject(f.projects, `/ws/terminal/unused?root=${root}`,
+    { 'x-hcc-root-identity': reselected.body.project_identity }, { requireIdentity: true }).root,
+    fs.realpathSync(f.otherRoot));
+  assert.equal(f.connections.length, 0, 'rejected requests must not open a project DB');
+});
+
+test('explicit browser reselection provisions private B without exposing private A state', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'cookie', cookieSessionOk: () => true,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409
+      : error?.code === 'PROJECT_PATH_FORBIDDEN' ? 403 : 500
+  });
+  const root = encodeURIComponent(f.otherRoot);
+  const headers = { origin: 'http://localhost:8787', 'x-hcc-browser': undefined };
+  const original = await getProjectRoute(routes, `/api/projects/select?root=${root}`, headers, 'POST');
+  assert.equal(original.status, 200, JSON.stringify(original.body));
+  const oldContext = requestProject(f.projects, `/api/runtime?root=${root}`,
+    { 'x-hcc-root-identity': original.body.project_identity });
+  const oldSession = { id: 'shared-peer', peerId: 'shared-peer', root: oldContext.root,
+    ctx: oldContext, status: 'running', type: 'tmux' };
+  f.sessions.set(f.serializer.sessionKey(oldContext, oldSession.id), oldSession);
+  const oldStore = privateProjectStateDir(f.otherRoot);
+  fs.writeFileSync(path.join(oldStore, 'A-only'), 'private history', { mode: 0o600 });
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-old`);
+  fs.mkdirSync(f.otherRoot, { mode: 0o777 });
+  fs.chmodSync(f.otherRoot, 0o777);
+  const stale = await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { 'x-hcc-root-identity': original.body.project_identity, 'x-hcc-browser': undefined });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.error.code, 'PROJECT_PATH_CHANGED');
+  const fresh = await getProjectRoute(routes, `/api/projects/select?root=${root}`, headers, 'POST');
+  assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+  assert.notEqual(fresh.body.project_identity, original.body.project_identity);
+  const newStore = privateProjectStateDir(f.otherRoot);
+  assert.notEqual(newStore, oldStore);
+  assert.equal(fresh.body.current.db, path.join(newStore, 'mesh.db'));
+  const freshContext = requestProject(f.projects, `/api/runtime?root=${root}`,
+    { 'x-hcc-root-identity': fresh.body.project_identity });
+  assert.notEqual(f.serializer.sessionKey(oldContext, oldSession.id),
+    f.serializer.sessionKey(freshContext, oldSession.id));
+  assert.notEqual(tmuxManagedSessionName(oldContext, oldSession.id),
+    tmuxManagedSessionName(freshContext, oldSession.id));
+  assert.equal(f.projects.getSession(freshContext, oldSession.id), null);
+  assert.equal(f.sessions.get(f.serializer.sessionKey(oldContext, oldSession.id)), oldSession);
+  assert.equal(fs.readFileSync(path.join(oldStore, 'A-only'), 'utf8'), 'private history');
+  assert.equal(fs.existsSync(path.join(newStore, 'A-only')), false);
+  const current = await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { 'x-hcc-root-identity': fresh.body.project_identity, 'x-hcc-browser': undefined });
+  assert.equal(current.status, 200, JSON.stringify(current.body));
+});
+
+test('POST /api/projects body can explicitly reselect B after the startup root A is replaced', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  fs.chmodSync(f.root, 0o777);
+  f.ctx.initialRootIdentity = captureSelectedCwdSnapshot(f.root);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'token', cookieSessionOk: () => false,
+    connectWebProject: () => ({ close() {} }), getProcessIdentity: () => null,
+    getActualPort: () => 8787, now: () => 1,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409
+      : error?.code === 'PROJECT_PATH_FORBIDDEN' ? 403 : 500
+  });
+  const first = await postProject(routes, { root: f.root });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const oldStore = privateProjectStateDir(f.root);
+  fs.writeFileSync(path.join(oldStore, 'A-only'), 'preserved', { mode: 0o600 });
+  fs.renameSync(f.root, `${f.root}-old`);
+  fs.mkdirSync(f.root, { mode: 0o777 });
+  fs.chmodSync(f.root, 0o777);
+  const stale = await postProject(routes, { root: f.root }, {
+    headers: { 'x-hcc-root-identity': first.body.project_identity }
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.error.code, 'PROJECT_PATH_CHANGED');
+  assert.equal(fs.existsSync(`${oldStore}.generations`), false);
+  const next = await postProject(routes, { root: f.root });
+  assert.equal(next.status, 200, JSON.stringify(next.body));
+  const newStore = privateProjectStateDir(f.root);
+  assert.notEqual(newStore, oldStore);
+  assert.equal(next.body.project.db, path.join(newStore, 'mesh.db'));
+  assert.equal(fs.readFileSync(path.join(oldStore, 'A-only'), 'utf8'), 'preserved');
+  assert.equal(fs.existsSync(path.join(newStore, 'A-only')), false);
+});
+
+test('token-authenticated CLI project requests remain compatible without browser identity', {
+  skip: process.platform === 'win32'
+}, async t => {
+  const f = fixture(t);
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'token', cookieSessionOk: () => false,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const root = encodeURIComponent(f.otherRoot);
+  const response = await getProjectRoute(routes, `/api/projects?root=${root}`,
+    { 'x-hcc-browser': undefined });
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.current.root, fs.realpathSync(f.otherRoot));
+  assert.equal(requestProject(f.projects, `/ws/terminal/unused?root=${root}`).root,
+    fs.realpathSync(f.otherRoot));
+});
+
+test('CLI project registration rejects a root replaced while its request body arrives', {
+  skip: process.platform === 'win32'
+}, async (t) => {
+  const f = fixture(t);
+  fs.chmodSync(f.otherRoot, 0o700); // Exercise the project-local state route, without a private authority marker.
+  const original = captureSelectedCwdSnapshot(f.otherRoot);
+  const carried = Buffer.from(JSON.stringify({ canonical: original.canonical,
+    identity: original.identity })).toString('base64url');
+  const routes = createHttpRoutes({
+    ctx: f.ctx, ...f.projects, token: 'local-token', host: '127.0.0.1', port: 8787,
+    useTls: false, trustProxy: false, webAuthMode: () => 'token', cookieSessionOk: () => false,
+    connectWebProject: () => ({ close() {} }), now: () => 1,
+    PRODUCT_NAME: 'hello-cc', VERSION: 'test',
+    webErrorStatus: error => error?.code === 'PROJECT_PATH_CHANGED' ? 409 : 500
+  });
+  const response = await postProject(routes, { root: f.otherRoot }, {
+    headers: { 'x-hcc-root': f.otherRoot, 'x-hcc-root-identity': carried },
+    beforeBody() {
+      fs.renameSync(f.otherRoot, `${f.otherRoot}-original`);
+      fs.mkdirSync(f.otherRoot);
+    }
+  });
+  assert.equal(response.status, 409, JSON.stringify(response.body));
+  assert.equal(response.body.error.code, 'PROJECT_PATH_CHANGED');
+});
+
 test('idle Web projects downgrade their held directory descriptor and reacquire it on selection', {
   skip: process.platform === 'win32'
 }, (t) => {
@@ -277,6 +682,30 @@ test('managed sessions from one project database are not reused under another DB
   assert.equal(f.serializer.sessionsForProject(second).includes(session), false);
   assert.equal(f.projects.getSession(second, session.id), null);
   assert.equal(f.projects.getSession(first, session.id), session);
+});
+
+test('browser HTTP and WebSocket requests carry the selected directory identity', (t) => {
+  const f = fixture(t);
+  const target = `/api/projects/select?root=${encodeURIComponent(f.otherRoot)}`;
+  const selected = f.projects.projectFromRequest({ method: 'POST', headers: {} },
+    new URL(target, 'http://localhost:8787'), { requireIdentity: true });
+  const identity = f.projects.selectedProjectIdentity(selected);
+  const api = new URL(`/api/runtime?root=${encodeURIComponent(f.otherRoot)}`, 'http://localhost:8787');
+  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, api,
+    { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
+    api, { requireIdentity: true }).root, selected.root);
+  const ws = new URL(`/ws/terminal/peer?root=${encodeURIComponent(f.otherRoot)}&browser=1&root_identity=${identity}`,
+    'http://localhost:8787');
+  assert.equal(f.projects.projectFromRequest({ headers: {} }, ws).root, selected.root);
+  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': 'different' } }, ws),
+    { code: 'PROJECT_PATH_CHANGED' });
+  fs.renameSync(f.otherRoot, `${f.otherRoot}-moved`);
+  fs.mkdirSync(f.otherRoot);
+  assert.throws(() => f.projects.projectFromRequest({ headers: { 'x-hcc-root-identity': identity } },
+    api, { requireIdentity: true }), { code: 'PROJECT_PATH_CHANGED' });
+  assert.throws(() => f.projects.projectFromRequest({ headers: {} }, ws), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(f.connections.length, 0, 'identity checks must not open a project database');
 });
 
 test('background adoption retains its startup context after idle descriptor eviction and reselection', {

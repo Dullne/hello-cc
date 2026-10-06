@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,14 +7,16 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
+import { resolvePeerEvidence } from '../lib/core/peers/evidence.mjs';
 import { createEventHelpers } from '../lib/db/events.mjs';
 import { initSchema, tx } from '../lib/db/schema.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import { createTmuxSessions } from '../lib/web/tmux-sessions.mjs';
 import { shellQuoteArg } from '../lib/format.mjs';
 
-function fixture(t, { command = 'node', onStreamStart } = {}) {
+function fixture(t, { command = 'node', onStreamStart, paneInfo, inspectProcess, scheduleExitPoller } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-dsh-attach-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const ctx = { root, dbPath: path.join(root, 'mesh.db') };
   const connect = () => {
     const db = new DatabaseSync(ctx.dbPath);
@@ -33,6 +36,7 @@ function fixture(t, { command = 'node', onStreamStart } = {}) {
     'fixture_command=' + shellQuoteArg(command),
     String.raw`printf '%s\0' "$#" "$@" >> ` + shellQuoteArg(fakeTmux + '.calls'),
     'case "${1-}" in',
+    '  hcc-fixture-ready) exit 0 ;;',
     '  display-message)',
     '    last=""; for arg do last="$arg"; done',
     `    if [ "$last" = '#{session_name}' ]; then printf '%s' service;`,
@@ -42,6 +46,13 @@ function fixture(t, { command = 'node', onStreamStart } = {}) {
     String.raw`  *) printf '%s\n' "Unexpected tmux operation: $*" >&2; exit 1 ;;`,
     'esac'
   ].join('\n'), { mode: 0o755 });
+  // First execution of a newly written macOS executable may take seconds.
+  // Initialize the test-owned script before applying the product's 5s tmux
+  // command deadline; its invocation log still contains only product calls.
+  const ready = spawnSync(fakeTmux, ['hcc-fixture-ready'], { encoding: 'utf8', timeout: 30000 });
+  assert.equal(ready.error, undefined, 'tmux fixture must initialize');
+  assert.equal(ready.status, 0, 'tmux fixture must be ready');
+  fs.rmSync(fakeTmux + '.calls', { force: true });
   const oldPath = process.env.PATH;
   process.env.PATH = root + path.delimiter + oldPath;
   const now = () => 1000;
@@ -64,6 +75,9 @@ function fixture(t, { command = 'node', onStreamStart } = {}) {
     resolveSessionPeerId: (_db, session) => session.peerId || session.id,
     canonicalRoot: (value) => path.resolve(value),
     liveProcessIdentity: identity,
+    ...(paneInfo ? { tmuxPaneInfo: paneInfo } : {}),
+    ...(inspectProcess ? { inspectProcessIdentity: inspectProcess } : {}),
+    ...(scheduleExitPoller ? { scheduleTmuxExitPoller: scheduleExitPoller } : {}),
     tmuxSessionCreationToken: () => 'created-one',
     tmuxSessionId: () => '$1',
     strictTmuxClientObservation: () => ({ state: 'known', count: 0 }),
@@ -82,7 +96,6 @@ function fixture(t, { command = 'node', onStreamStart } = {}) {
     for (const session of streams) if (session.exitPoller) clearInterval(session.exitPoller);
     if (oldPath === undefined) delete process.env.PATH;
     else process.env.PATH = oldPath;
-    fs.rmSync(root, { recursive: true, force: true });
   });
   const add = (id, kind, transport = 'hook', target = null) => read((db) => {
     peers.upsertPeer(db, { id, kind, role: 'original-owner', worktree: root, pid: 77, status: 'working' });
@@ -106,6 +119,43 @@ function fixture(t, { command = 'node', onStreamStart } = {}) {
 }
 
 const unsupported = (error) => error.code === 'DSH_SESSION_CONTROL_UNSUPPORTED' && /hcc dsh web/.test(error.message);
+
+for (const [label, observation, expectedEvidence] of [
+  ['live', { state: 'live', identity: { pid: 77, startToken: 'start-77', commandHash: 'a'.repeat(64) } }, 'live'],
+  ['unknown', { state: 'unknown', identity: null }, 'unknown']
+]) {
+  test(`lost tmux pane with ${label} original process keeps durable peer evidence after Web detach`, (t) => {
+    let tick;
+    const f = fixture(t, {
+      paneInfo() { throw Object.assign(new Error("can't find pane: %service"), { code: 'TMUX_ERROR' }); },
+      inspectProcess: () => observation,
+      scheduleExitPoller(callback) { tick = callback; return { scheduled: true }; }
+    });
+    const attached = f.runtime.attachTmuxSession({ id: `lost-${label}`, pane: '%service', kind: 'shell' });
+    const before = f.state();
+    assert.equal(before.peers[0].status, 'running');
+    tick(); tick();
+    assert.equal(attached.status, 'running');
+    tick();
+    const after = f.state();
+    assert.equal(attached.status, 'detached');
+    assert.equal(f.sessions.size, 0);
+    assert.equal(after.peers[0].status, 'detached');
+    assert.equal(after.peer_bindings[0].runtime_target, null);
+    assert.deepEqual(after.events.map((event) => event.type), ['tmux.session.attached', 'tmux.session.detached']);
+    assert.deepEqual(
+      [after.peers[0].pid, after.peers[0].pid_start_token, after.peers[0].pid_command_hash],
+      [before.peers[0].pid, before.peers[0].pid_start_token, before.peers[0].pid_command_hash]
+    );
+    const storedIdentity = {
+      pid: after.peers[0].pid,
+      startToken: after.peers[0].pid_start_token,
+      commandHash: after.peers[0].pid_command_hash
+    };
+    assert.equal(resolvePeerEvidence({ peer: after.peers[0],
+      processes: [{ storedIdentity, current: observation }] }).state, expectedEvidence);
+  });
+}
 
 for (const transport of ['native', 'app-server']) {
   test(`${transport} ownership rejects terminal adoption before pane access or force replacement`, t => {

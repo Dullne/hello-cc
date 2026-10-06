@@ -149,6 +149,50 @@ test('App Server refuses thread path handoffs after the selected directory is re
   }
 });
 
+test('App Server refuses new and steered turns after the selected directory is rebound', async t => {
+  for (const method of ['turn/start', 'turn/steer']) {
+    await t.test(method, async subtest => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-turn-path-'));
+      subtest.after(() => fs.rmSync(base, { recursive: true, force: true }));
+      const selected = path.join(base, 'selected');
+      const original = path.join(base, 'original');
+      fs.mkdirSync(selected);
+      const s = fakeServer(subtest, { cwd: selected });
+      try {
+        await s.adapter.startThread();
+        if (method === 'turn/steer') await s.adapter.startTurn('thread-1', 'first turn');
+        fs.renameSync(selected, original);
+        fs.mkdirSync(selected);
+        const submit = method === 'turn/start'
+          ? () => s.adapter.startTurn('thread-1', 'must not run')
+          : () => s.adapter.steer('thread-1', 'turn-1', 'must not steer');
+        await assert.rejects(submit(), { code: 'PROJECT_PATH_CHANGED' });
+        assert.equal(s.calls.filter(call => call.method === method).length, 0);
+      } finally { await s.adapter.close(); }
+    });
+  }
+});
+
+test('App Server does not approve an old turn after its directory is rebound', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-approval-path-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const selected = path.join(base, 'selected');
+  const original = path.join(base, 'original');
+  fs.mkdirSync(selected);
+  const s = fakeServer(t, { cwd: selected });
+  try {
+    await running(s);
+    const request = approval(s, 'rebound-approval');
+    fs.renameSync(selected, original);
+    fs.mkdirSync(selected);
+    await assert.rejects(s.adapter.approve({ ...request, decision: 'accept' }),
+      { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(s.calls.some(call => call.id === 'rebound-approval'), false);
+    await s.adapter.approve({ ...request, decision: 'decline' });
+    assert.deepEqual(s.calls.find(call => call.id === 'rebound-approval')?.result, { decision: 'decline' });
+  } finally { await s.adapter.close(); }
+});
+
 test('App Server keeps the selected cwd when callers supply a different thread cwd', async t => {
   const s = fakeServer(t);
   await s.adapter.startThread({ cwd: '/different-root' });

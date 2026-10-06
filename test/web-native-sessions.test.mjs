@@ -16,11 +16,31 @@ import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
-import { createNativeStore, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
+import { createNativeStore, nativePaths, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 import { createAgentDefaults } from '../lib/web/agent-defaults.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { createSessionSync } from '../lib/web/browser/session-sync.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
+
+// Web bridge tests exercise real HTTP and durable SQLite ownership. Native
+// listener admission has dedicated runtime/file-lock tests; keep these fixtures
+// independent of ephemeral listeners acquiring a hashed port after preflight.
+function createFixtureOwnership() {
+  const owners = new Map();
+  return target => {
+    const key = path.join(fs.realpathSync.native(path.dirname(target)), path.basename(target));
+    if (owners.has(key)) throw Object.assign(new Error('Fixture native owner already held'), { code: 'ERR_FILE_LOCK_BUSY' });
+    const owner = Symbol('fixture native owner');
+    owners.set(key, owner);
+    return Object.freeze({
+      canonicalTarget: key,
+      assertHeld() {
+        if (owners.get(key) !== owner) throw Object.assign(new Error('Fixture native owner released'), { code: 'ERR_FILE_LOCK_LOST' });
+      },
+      release() { if (owners.get(key) === owner) owners.delete(key); }
+    });
+  };
+}
 
 // Real project SQLite and authenticated loopback native protocol, fake owned
 // provider adapters. No model, account, external terminal, or tmux is invoked.
@@ -43,7 +63,8 @@ async function fixture(t, configuration = {}) {
   const deps = { ...events, ...bindings, ...peers, ...messages,
     connect, detectBranch: () => '', liveProcessIdentity: () => inspectProcessIdentity(process.pid).identity };
   const adapters = new Map(), created = [], bridges = [];
-  const options = { pollMs: 60000, adapterFactory: async (provider, options) => {
+  const options = { pollMs: 60000, acquireOwnership: createFixtureOwnership(),
+    adapterFactory: async (provider, options) => {
     const peer = options.env.HCC_PEER;
     if (configuration[peer]?.codexRpc) {
       const adapter = createCodexAdapter({ ...options, rpcFactory: () => configuration[peer].codexRpc });
@@ -121,6 +142,15 @@ function controlledCodexRpc() {
   return { rpc, calls, started, release: () => release() };
 }
 
+// Pointer replacement fixtures update the persistent owner receipt as well:
+// the new daemon protocol refuses a pointer that lacks matching durable ownership.
+function replaceOwnedNativePointer(ctx, pointer) {
+  const owner = new DatabaseSync(nativePaths(ctx).db);
+  try { owner.prepare('UPDATE native_owner SET generation=? WHERE singleton=1').run(pointer.generation); }
+  finally { owner.close(); }
+  writeNativePointer(ctx, pointer);
+}
+
 // A real authenticated loopback daemon stand-in for admission compatibility.
 // Any unexpected mutation reaches this server and is recorded; it never starts
 // a provider or changes a stored worker.
@@ -139,7 +169,7 @@ async function withRuntimeStandIn(f, { version, replaceStatusRead } = {}, run) {
     if (!authorized) { response.writeHead(401); response.end(JSON.stringify({ ok: false, error: { code: 'NATIVE_UNAUTHORIZED' } })); return; }
     if (request.method === 'GET' && request.url === '/status') {
       if (++statusReads === replaceStatusRead) {
-        writeNativePointer(f.ctx, { ...original, port: server.address().port, generation: 'web-policy-successor-runtime' });
+        replaceOwnedNativePointer(f.ctx, { ...original, port: server.address().port, generation: 'web-policy-successor-runtime' });
       }
       response.end(JSON.stringify({ ok: true, data: status }));
       return;
@@ -148,10 +178,10 @@ async function withRuntimeStandIn(f, { version, replaceStatusRead } = {}, run) {
     response.end(JSON.stringify({ ok: false, error: { code: 'UNEXPECTED_MUTATION' } }));
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-  writeNativePointer(f.ctx, { ...original, port: server.address().port, generation: status.generation });
+  replaceOwnedNativePointer(f.ctx, { ...original, port: server.address().port, generation: status.generation });
   try { await run(requests); }
   finally {
-    writeNativePointer(f.ctx, original);
+    replaceOwnedNativePointer(f.ctx, original);
     await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
   }
 }
@@ -261,7 +291,7 @@ test('Web mutation keeps the runtime generation checked by its preceding state r
     const value = await nativeRequest(ctx, method, route, body, options);
     if (replace && method === 'GET' && route.startsWith('/workers/a/state')) {
       replace = false;
-      writeNativePointer(ctx, { ...original, generation: 'web-action-successor-runtime' });
+      replaceOwnedNativePointer(ctx, { ...original, generation: 'web-action-successor-runtime' });
     }
     return value;
   });
@@ -272,8 +302,9 @@ test('Web mutation keeps the runtime generation checked by its preceding state r
       { code: 'NATIVE_OWNER_CHANGED' });
     assert.equal(readNativePointer(f.ctx).generation, 'web-action-successor-runtime');
     assert.deepEqual(f.adapters.get('a').sent, []);
+    replaceOwnedNativePointer(f.ctx, original);
     assert.equal((await f.api('GET', '/deliveries')).length, 0);
-  } finally { writeNativePointer(f.ctx, original); }
+  } finally { replaceOwnedNativePointer(f.ctx, original); }
 });
 
 for (const viaReadAction of [false, true]) for (const applyFreshFirst of [false, true]) {

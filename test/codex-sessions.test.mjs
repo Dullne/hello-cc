@@ -9,10 +9,11 @@ import { initSchema } from '../lib/db/schema.mjs';
 import { createEventHelpers } from '../lib/db/events.mjs';
 import { createPeerHelpers } from '../lib/core/peers/peer-helpers.mjs';
 import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
+import { pruneOldEventsPreservingTmuxAuthority } from '../lib/core/coordination/event-retention.mjs';
 import { createCodexSessions } from '../lib/web/codex-sessions.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { nextSessionId } from '../lib/web/runtime.mjs';
-import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
+import { captureSelectedCwdIdentity, captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 
 function fixture(t, hooks = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-manager-'));
@@ -162,12 +163,21 @@ function fixture(t, hooks = {}) {
         peer: 'old-owner', provider: 'codex', provider_session_id: 'old-thread',
         transport: 'tmux', runtime_session_id: 'old-owner', runtime_target: '%old'
       });
+      events.addEvent(db, 'codex.thread.root-bound', 'old-thread', null, {
+        version: 1, thread_id: 'old-thread', root: captureSelectedCwdSnapshot(ctx.root), origin: 'new'
+      });
     });
     evidence.set('old-owner', state);
   }
 
+  function bindHistory(threadId, project = ctx, selectedRoot = project.root) {
+    read(db => events.addEvent(db, 'codex.thread.root-bound', threadId, null, {
+      version: 1, thread_id: threadId, root: captureSelectedCwdSnapshot(selectedRoot), origin: 'new'
+    }), project);
+  }
+
   return {
-    ctx, manager, adapters, calls, broadcasts, read, oldOwner, scopedConfigs,
+    ctx, manager, adapters, calls, broadcasts, read, oldOwner, bindHistory, scopedConfigs,
     project(name) {
       const projectRoot = path.join(root, name);
       fs.mkdirSync(projectRoot);
@@ -204,11 +214,26 @@ test('new structured session persists a real peer, thread binding, and executor 
   const receipt = f.events().find((event) => event.type === 'codex.executor.started');
   assert.equal(receipt.payload.executor_id, 'executor-1');
   assert.equal(receipt.payload.thread_id, 'thread-1');
+  const rootReceipt = f.events().find(event => event.type === 'codex.thread.root-bound');
+  assert.equal(rootReceipt.payload.version, 1);
+  assert.equal(rootReceipt.payload.thread_id, 'thread-1');
+  assert.deepEqual(rootReceipt.payload.root.identity, captureSelectedCwdSnapshot(f.ctx.root).identity);
   assert.equal(f.adapters[0].options.cwd, f.ctx.root);
   assert.equal(f.adapters[0].options.env.HCC_PEER, session.id);
   assert.equal(f.adapters[0].options.env.HCC_ROOT, f.ctx.root);
   assert.equal(f.adapters[0].options.env.HCC_DB, f.ctx.dbPath);
+  assert.deepEqual(f.scopedConfigs[0].input.rootIdentity.identity,
+    captureSelectedCwdSnapshot(f.ctx.root).identity);
   assert.equal(f.calls.filter((call) => call.method === 'startTurn').length, 0);
+});
+
+test('new thread origin survives event GC and a manager restart', async t => {
+  const f = fixture(t);
+  await f.start(f.manager());
+  f.read(db => pruneOldEventsPreservingTmuxAuthority(db, 2000));
+  assert.equal(f.events().filter(event => event.type === 'codex.thread.root-bound').length, 1);
+  const rebuilt = f.manager();
+  assert.equal((await rebuilt.readCodexThread(f.ctx, 'thread-1')).thread.id, 'thread-1');
 });
 
 test('session listing uses the pinned executor identity without copying retained conversation state', async (t) => {
@@ -268,6 +293,7 @@ test('a synchronously failed adapter factory leaves no reserved session and perm
   let fail = true;
   const error = new Error('adapter initialization failed');
   const f = fixture(t, { adapterFactory: () => { if (fail) throw error; } });
+  f.bindHistory('unowned-thread');
   const m = f.manager();
   await assert.rejects(f.start(m, { mode: 'resume', resume: 'unowned-thread', handoffConfirmed: true }),
     (actual) => actual === error);
@@ -329,9 +355,11 @@ test('binding failure rolls back peer registration and executor receipt as one t
   await assert.rejects(f.start(m), (actual) => actual === error);
   assert.equal(f.read((db) => db.prepare('SELECT COUNT(*) AS n FROM peers').get().n), 0);
   assert.equal(f.read((db) => db.prepare('SELECT COUNT(*) AS n FROM peer_bindings').get().n), 0);
-  assert.equal(f.events().length, 0);
+  assert.deepEqual(f.events().map(event => event.type), ['codex.thread.root-bound']);
   assert.equal(m.sessions.size, 0);
   assert.equal(f.calls.filter((call) => call.method === 'close').length, 1);
+  assert.equal((await f.manager().readCodexThread(f.ctx, 'thread-1')).thread.id, 'thread-1',
+    'a provider-created orphan remains attributable even if peer registration failed');
 });
 
 test('concurrent new sessions reserve separate runtime IDs before thread startup finishes', async (t) => {
@@ -350,7 +378,7 @@ test('concurrent new sessions reserve separate runtime IDs before thread startup
   assert.equal(f.read((db) => db.prepare('SELECT COUNT(*) AS n FROM peer_bindings').get().n), 2);
 });
 
-test('transport loss retains global thread ownership until the disconnected executor actually exits', async (t) => {
+test('transport loss retains global thread ownership and does not migrate history to another project', async (t) => {
   let finishClose;
   const closing = new Promise((resolve) => { finishClose = resolve; });
   t.after(() => finishClose());
@@ -375,15 +403,12 @@ test('transport loss retains global thread ownership until the disconnected exec
   finishClose();
   await f.adapters[0].close();
   assert.equal(f.adapters[0].snapshot().processExited, true);
-  const resumed = await f.start(m, resume);
-  assert.equal(resumed.status, 'running');
-  assert.equal(resumed.root, otherProject.root);
-  assert.equal(resumed.binding.provider_session_id, original.binding.provider_session_id);
-  assert.equal(f.adapters.length, 2);
-  assert.equal(f.read((db) => db.prepare('SELECT COUNT(*) AS n FROM peer_bindings').get().n, otherProject), 1);
+  await assert.rejects(f.start(m, resume), { code: 'CODEX_HISTORY_UNVERIFIED' });
+  assert.equal(f.adapters.length, 1);
+  assert.equal(f.read((db) => db.prepare('SELECT COUNT(*) AS n FROM peer_bindings').get().n, otherProject), 0);
 });
 
-test('explicit stop keeps global thread ownership while close is pending and releases it after completion', async (t) => {
+test('explicit stop keeps global thread ownership and does not reassign its history to another project', async (t) => {
   let finishClose;
   const closing = new Promise((resolve) => { finishClose = resolve; });
   t.after(() => finishClose());
@@ -405,9 +430,8 @@ test('explicit stop keeps global thread ownership while close is pending and rel
   await stopped;
   assert.equal(original.executorReleased, true);
   assert.equal(f.adapters[0].snapshot().processExited, true);
-  const resumed = await f.start(m, resume);
-  assert.equal(resumed.status, 'running');
-  assert.equal(resumed.binding.provider_session_id, original.binding.provider_session_id);
+  await assert.rejects(f.start(m, resume), { code: 'CODEX_HISTORY_UNVERIFIED' });
+  assert.equal(f.adapters.length, 1);
   assert.equal(f.calls.filter((call) => call.method === 'close').length, 1);
 });
 
@@ -507,12 +531,45 @@ test('history listing filters foreign cwd and reading reuses a live executor wit
     { id: 'thread-1', cwd: params.cwd }, { id: 'foreign', cwd: os.tmpdir() }
   ], nextCursor: 'cursor-2' }) });
   const m = f.manager(), session = await f.start(m);
+  f.bindHistory('history-only');
   const listed = await m.listCodexThreads(f.ctx, { limit: 10 });
   assert.equal(listed.threads.length, 1); assert.equal(listed.threads[0].managedSessionId, session.id);
   assert.equal(listed.nextCursor, 'cursor-2');
   assert.equal((await m.readCodexThread(f.ctx, 'history-only')).thread.id, 'history-only');
   assert.equal(f.adapters.length, 1);
   assert.equal(f.calls.filter(call => call.method === 'resumeThread' || call.method === 'startTurn').length, 0);
+});
+
+test('unverified legacy history is not adopted from current cwd for list, read, fork or resume', async t => {
+  const f = fixture(t, { listThreads: ({ params }) => ({ data: [
+    { id: 'legacy-thread', cwd: params.cwd }
+  ], nextCursor: null }) });
+  const m = f.manager();
+  const listed = await m.listCodexThreads(f.ctx);
+  assert.deepEqual(listed.threads, []);
+  assert.equal(listed.unverifiedCount, 1);
+  const adapterCount = f.adapters.length;
+  await assert.rejects(m.readCodexThread(f.ctx, 'legacy-thread'), { code: 'CODEX_HISTORY_UNVERIFIED' });
+  await assert.rejects(m.forkCodexThread(f.ctx, 'legacy-thread', { confirmed: true }),
+    { code: 'CODEX_HISTORY_UNVERIFIED' });
+  await assert.rejects(f.start(m, { mode: 'resume', resume: 'legacy-thread', handoffConfirmed: true }),
+    { code: 'CODEX_HISTORY_UNVERIFIED' });
+  assert.equal(f.adapters.length, adapterCount, 'unverified history must be rejected before a new executor');
+});
+
+test('conflicting thread root receipts fail closed without hiding unrelated valid history', async t => {
+  const f = fixture(t, { listThreads: ({ params }) => ({ data: [
+    { id: 'thread-1', cwd: params.cwd }, { id: 'valid-thread', cwd: params.cwd }
+  ], nextCursor: null }) });
+  await f.start(f.manager());
+  f.bindHistory('valid-thread');
+  const other = f.project('other');
+  f.bindHistory('thread-1', f.ctx, other.root);
+  const m = f.manager();
+  const listed = await m.listCodexThreads(f.ctx);
+  assert.deepEqual(listed.threads.map(thread => thread.id), ['valid-thread']);
+  assert.equal(listed.unverifiedCount, 1);
+  await assert.rejects(m.readCodexThread(f.ctx, 'thread-1'), { code: 'CODEX_HISTORY_BINDING_INVALID' });
 });
 
 test('history listing does not label an old inode executor as managed by a replacement root', async t => {
@@ -522,11 +579,13 @@ test('history listing does not label an old inode executor as managed by a repla
   f.ctx.rootIdentity = captureSelectedCwdIdentity(f.ctx.root);
   const m = f.manager();
   const oldSession = await f.start(m);
+  assert.equal(f.scopedConfigs[0].input.rootIdentity, f.ctx.rootIdentity);
   const moved = `${f.ctx.root}-moved`;
   fs.renameSync(f.ctx.root, moved);
   fs.mkdirSync(f.ctx.root);
   const replacement = { root: f.ctx.root, dbPath: f.ctx.dbPath,
     rootIdentity: captureSelectedCwdIdentity(f.ctx.root) };
+  f.read(db => initSchema(db), replacement);
   t.after(() => {
     f.ctx.rootIdentity.release();
     replacement.rootIdentity.release();
@@ -534,10 +593,19 @@ test('history listing does not label an old inode executor as managed by a repla
   });
 
   const listed = await m.listCodexThreads(replacement);
-  assert.equal(listed.threads.length, 1);
-  assert.equal(listed.threads[0].managedSessionId, null);
+  assert.equal(listed.threads.length, 0);
+  assert.equal(listed.unverifiedCount, 1);
+  await assert.rejects(m.readCodexThread(replacement, 'thread-1'), { code: 'CODEX_HISTORY_UNVERIFIED' });
+  await assert.rejects(m.forkCodexThread(replacement, 'thread-1', { confirmed: true }), { code: 'CODEX_HISTORY_UNVERIFIED' });
+  await assert.rejects(m.startCodexSession({ projectCtx: replacement, kind: 'codex', mode: 'resume',
+    resume: 'thread-1', handoffConfirmed: true }), { code: 'THREAD_IN_USE' });
   assert.equal(oldSession.status, 'running', 'rejecting reuse must not stop the old executor');
   await assert.rejects(m.codexAction(oldSession, 'read', {}), { code: 'PROJECT_PATH_CHANGED' });
+  const originalSnapshot = oldSession.adapter.snapshot;
+  oldSession.status = 'exited'; oldSession.executorReleased = true;
+  oldSession.adapter.snapshot = () => ({ ...originalSnapshot(), processExited: true });
+  await assert.rejects(m.startCodexSession({ projectCtx: replacement, kind: 'codex', mode: 'resume',
+    resume: 'thread-1', handoffConfirmed: true }), { code: 'CODEX_HISTORY_UNVERIFIED' });
 });
 
 test('history listing reports a root rebound during thread validation instead of an empty result', async t => {
@@ -562,6 +630,7 @@ test('history listing reports a root rebound during thread validation instead of
 
 test('history read without a running adapter closes its temporary executor and rejects foreign cwd', async t => {
   const f = fixture(t, { peekThread: () => ({ cwd: os.tmpdir() }) }), m = f.manager();
+  f.bindHistory('foreign-history');
   await assert.rejects(m.readCodexThread(f.ctx, 'foreign-history'), { code: 'PROJECT_PATH_FORBIDDEN' });
   assert.equal(f.calls.filter(call => call.method === 'close').length, 1);
   assert.equal(f.calls.filter(call => call.method === 'startThread' || call.method === 'resumeThread' || call.method === 'startTurn').length, 0);
@@ -615,12 +684,17 @@ test('a fork helper whose exit is not confirmed cannot spawn the resume executor
     return { thread: { id: 'saved-fork', cwd: f.ctx.root } };
   } });
   const m = f.manager();
+  f.bindHistory('old-thread');
   await assert.rejects(m.forkCodexThread(f.ctx, 'old-thread', { confirmed: true }), { code: 'CODEX_EXECUTOR_CLOSE_UNCONFIRMED' });
+  assert.equal(f.events().filter(event => event.type === 'codex.thread.root-bound' &&
+    event.payload.thread_id === 'saved-fork').length, 1,
+  'fork origin must be durable before the temporary executor closes');
   assert.equal(f.adapters.length, 1); assert.equal(f.calls.filter(call => call.method === 'resumeThread').length, 0);
 });
 
 test('resume refuses to migrate a foreign project thread into this project', async t => {
   const f = fixture(t, { peekThread: () => ({ cwd: os.tmpdir() }) }), m = f.manager();
+  f.bindHistory('foreign');
   await assert.rejects(f.start(m, { mode: 'resume', resume: 'foreign', handoffConfirmed: true }), { code: 'PROJECT_PATH_FORBIDDEN' });
   assert.equal(f.calls.filter(call => call.method === 'resumeThread').length, 0);
 });

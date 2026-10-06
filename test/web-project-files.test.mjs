@@ -5,11 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
+import fsSync from 'node:fs';
 import { createHash } from 'node:crypto';
 import { CliError } from '../lib/shared/errors.mjs';
 import { PROJECT_FILE_LIMITS, listProjectFiles, previewProjectFile, projectContentRevision,
   inspectProjectFileStatus, prepareProjectFileParent, verifyProjectFileParent } from '../lib/web/project-files.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
+import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
 
 async function fixture(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hcc-project-files-')));
@@ -26,7 +28,7 @@ async function fixture(t) {
 test('single-level project trees sort directories first, retain build artifacts and hide private/cache/link entries', async t => {
   const f = await fixture(t);
   for (const name of ['dist', 'build', 'src', '.git', '.hello-cc', '.hcc', '.codex', '.claude', '.dsh', '.ssh', '.aws', 'node_modules', '.cache', '.next']) await f.directory(name);
-  for (const name of ['z.txt', 'a.txt', '.env', '.env.local', 'app.env', '.npmrc', '.netrc', 'client.key', 'client.key.backup', 'credentials.json', 'service-account.json', 'terraform.tfstate']) await f.file(name, 'data');
+  for (const name of ['z.txt', 'a.txt', '.env', '.env.local', '.env_prod', 'env_prod', 'app.env', '.npmrc', '.netrc', 'client.key', 'client.key.backup', 'credentials.json', 'auth.backup.json', 'auth.json.bak', 'service-account.json', 'terraform.tfstate']) await f.file(name, 'data');
   await f.file('src/main.js', 'hello');
   await fs.symlink(path.join(f.root, 'src'), path.join(f.root, 'linked-src'));
   await fs.link(path.join(f.root, 'a.txt'), path.join(f.root, 'hardlink.txt'));
@@ -52,8 +54,8 @@ test('invalid and excluded paths are refused by listing and direct preview', asy
     await assert.rejects(listProjectFiles(f.root, relative), { code: 'PROJECT_FILE_BAD_PATH' });
     await assert.rejects(previewProjectFile(f.root, relative), { code: 'PROJECT_FILE_BAD_PATH' });
   }
-  for (const relative of ['.env', '.ENV.local', 'app.env', '.envrc', '.git/config', 'src/.aws/config', 'node_modules/a.txt',
-    '.ssh/id_rsa', 'config/secrets.json', 'credentials.txt', 'auth.json', 'client.pem', 'client.key.backup', 'terraform.tfstate.backup']) {
+  for (const relative of ['.env', '.ENV.local', '.env_prod', 'env_prod', 'app.env', '.envrc', '.git/config', 'src/.aws/config', 'node_modules/a.txt',
+    '.ssh/id_rsa', 'config/secrets.json', 'credentials.txt', 'auth.json', 'auth.backup.json', 'auth.json.bak', 'client.pem', 'client.key.backup', 'terraform.tfstate.backup']) {
     await assert.rejects(listProjectFiles(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
     await assert.rejects(previewProjectFile(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
   }
@@ -231,16 +233,85 @@ test('a file changed during a bounded FD read is refused before publishing the r
   finally { fs.open = original; }
 });
 
-test('a directory changed during enumeration is refused before exposing a stale tree', async t => {
+test('a directory changed before pinned enumeration is refused', async t => {
+  if (process.platform === 'win32') return t.skip('Pinned directory enumeration is POSIX-only');
   const f = await fixture(t); await f.file('result/a.txt', 'data');
-  const target = path.join(f.root, 'result'), original = fs.opendir;
-  fs.opendir = async (...args) => {
-    const directory = await original(...args);
-    if (args[0] === target) { await fs.rename(target, target + '-old'); await fs.mkdir(target); }
-    return directory;
+  const target = path.join(f.root, 'result'), original = fsSync.realpathSync.native;
+  fsSync.realpathSync.native = (...args) => {
+    if (args[0] === target) { fsSync.renameSync(target, target + '-old'); fsSync.mkdirSync(target); }
+    return original(...args);
   };
-  try { await assert.rejects(listProjectFiles(f.root, 'result'), { code: 'PROJECT_FILE_CHANGED' }); }
-  finally { fs.opendir = original; }
+  try { await assert.rejects(listProjectFiles(f.root, 'result'), { code: 'PROJECT_PATH_CHANGED' }); }
+  finally { fsSync.realpathSync.native = original; }
+});
+
+test('tree listing never enumerates a rebound project root between checks', async t => {
+  if (process.platform === 'win32') return t.skip('Windows retains the legacy read-only pathname listing');
+  const f = await fixture(t), selected = path.join(f.root, 'selected');
+  const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
+  const root = path.join(selected, 'project');
+  await fs.mkdir(root, { recursive: true }); await fs.mkdir(path.join(replacement, 'project'), { recursive: true });
+  await fs.writeFile(path.join(root, 'owned.txt'), 'a');
+  await fs.writeFile(path.join(replacement, 'project', 'foreign.txt'), 'b');
+  const rootIdentity = captureSelectedCwdIdentity(root);
+  const original = fs.opendir;
+  let redirected = false;
+  fs.opendir = async (...args) => {
+    if (args[0] !== root) return original(...args);
+    redirected = true;
+    await fs.rename(selected, parked); await fs.rename(replacement, selected);
+    const directory = await original(...args);
+    return {
+      async *[Symbol.asyncIterator]() {
+        try { for await (const entry of directory) yield entry; }
+        finally { await fs.rename(selected, replacement); await fs.rename(parked, selected); }
+      },
+      close: () => directory.close()
+    };
+  };
+  try {
+    const result = await listProjectFiles(root, '', { rootIdentity });
+    assert.deepEqual(result.entries.map(entry => entry.name), ['owned.txt']);
+    assert.equal(redirected, false);
+  } finally { fs.opendir = original; rootIdentity.release(); }
+});
+
+test('tree listing binds its root before the first await without a supplied identity', async t => {
+  if (process.platform === 'win32') return t.skip('Windows retains the legacy read-only pathname listing');
+  const f = await fixture(t), selected = path.join(f.root, 'selected');
+  const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
+  const root = path.join(selected, 'stable-parent', 'project');
+  await fs.mkdir(root, { recursive: true });
+  await fs.mkdir(path.join(replacement, 'stable-parent', 'project'), { recursive: true });
+  await fs.writeFile(path.join(root, 'owned.txt'), 'a');
+  await fs.writeFile(path.join(replacement, 'stable-parent', 'project', 'foreign.txt'), 'b');
+  const originalRealpath = fs.realpath, originalLstat = fs.lstat;
+  let swapped = false, restored = false, rootStats = 0;
+  fs.realpath = async (...args) => {
+    const result = await originalRealpath(...args);
+    if (!swapped && args[0] === root) {
+      swapped = true;
+      fsSync.renameSync(selected, parked); fsSync.renameSync(replacement, selected);
+    }
+    return result;
+  };
+  fs.lstat = async (...args) => {
+    const result = await originalLstat(...args);
+    if (args[0] === root && ++rootStats === 3) {
+      fsSync.renameSync(selected, replacement); fsSync.renameSync(parked, selected);
+      restored = true;
+    }
+    return result;
+  };
+  try {
+    await assert.rejects(listProjectFiles(root), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(swapped, true);
+  } finally {
+    fs.realpath = originalRealpath; fs.lstat = originalLstat;
+    if (swapped && !restored) {
+      fsSync.renameSync(selected, replacement); fsSync.renameSync(parked, selected);
+    }
+  }
 });
 
 test('file API retains auth, project selection and JSON-only response boundaries', async t => {

@@ -42,7 +42,9 @@ test('concurrent web starts converge on one healthy background runtime', {
   timeout: 90_000,
   skip: process.platform === 'win32'
 }, async (t) => {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-start-race-'));
+  // The background CLI records canonical paths (/private/var on macOS), so
+  // cleanup must match that same spelling when looking up its process.
+  const sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-start-race-')));
   const home = path.join(sandbox, 'home');
   const root = path.join(sandbox, 'project');
   fs.mkdirSync(home);
@@ -72,6 +74,9 @@ test('concurrent web starts converge on one healthy background runtime', {
     for (const pid of ownedPids) {
       const observed = inspectProcessIdentity(pid);
       if (observed.state !== 'live') continue;
+      const beforeSignal = inspectProcessIdentity(pid);
+      if (beforeSignal.state !== 'live' ||
+          compareProcessIdentity(observed.identity, beforeSignal.identity) !== 'live') continue;
       try { process.kill(pid, 'SIGTERM'); } catch {}
       const exited = await waitForProcessIdentityExit(observed.identity, { timeoutMs: 2_000 });
       if (exited.state === 'dead') continue;

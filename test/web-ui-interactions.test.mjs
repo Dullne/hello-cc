@@ -214,3 +214,25 @@ test('blocked popups and invalid URL requests leave acceptance unavailable', () 
     assert.deepEqual(JSON.parse(JSON.stringify(ui.payload(request, null, 'cancel'))), { decision: 'cancel' });
   }
 });
+
+
+test('user questions have named controls and implicit form submission never navigates or responds', () => {
+  const handlers = new Map(), window = {};
+  const context = { window, URL, document: { addEventListener: (name, callback) => handlers.set(name, callback) } };
+  vm.runInNewContext(interactionPanelScript(), context);
+  const request = { kind: 'userInput', params: { questions: [
+    { id: 'answer', question: 'Fixture question', isSecret: true }
+  ] } };
+  const html = window.hccInteractions.form(request, 'owner:request', esc, value => value);
+  assert.match(html, /<form class="hcc-interaction-form" autocomplete="off">/);
+  assert.match(html, /type="password"[^>]*name="owner:request:answer:0"/);
+  let prevented = 0;
+  handlers.get('submit')({ target: { matches: selector => selector === '.hcc-interaction-form' },
+    preventDefault: () => prevented++ });
+  assert.equal(prevented, 1);
+  handlers.get('submit')({ target: { matches: () => false }, preventDefault: () => prevented++ });
+  assert.equal(prevented, 1, 'unrelated page forms keep their ordinary behavior');
+  const payload = window.hccInteractions.payload(request,
+    { querySelector: selector => selector.startsWith('[data-answer') ? { value: 'fixture answer' } : null }, 'accept');
+  assert.equal(payload.answers.answer.answers[0], 'fixture answer');
+});
