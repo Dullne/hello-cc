@@ -9,6 +9,8 @@
   },
   "files": [
     "bin/",
+    "native/bin/",
+    "native/cwd-handoff/",
     "lib/",
     "scripts/",
     "assets/",
@@ -35,7 +37,11 @@
     "test:regression": "node ./scripts/regression.mjs",
     "test:web": "node ./scripts/web-workbench-acceptance.mjs",
     "test:web:installed": "node ./scripts/web-workbench-installed-acceptance.mjs",
-    "codex:protocol": "node ./scripts/codex-protocol.mjs"
+    "codex:protocol": "node ./scripts/codex-protocol.mjs",
+    "build:native:cwd-handoff": "node ./scripts/build-cwd-handoff.mjs",
+    "release:native:verify": "node ./scripts/verify-cwd-handoff-package.mjs",
+    "release:native:pack": "node ./scripts/pack-cwd-handoff.mjs",
+    "prepublishOnly": "npm run release:native:verify"
   },
   "repository": {
     "type": "git",

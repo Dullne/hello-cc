@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { preparePinnedCwdLaunch } from '../lib/process/pinned-cwd.mjs';
+import { launchEnvironmentFingerprint } from '../lib/core/sessions/launch.mjs';
+import { preparePinnedCwdLaunch, spawnPinnedCwdProcess } from '../lib/process/pinned-cwd.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 
 function fixture(t) {
@@ -46,6 +47,65 @@ test('pinned launch runs an ordinary command in the selected directory', (t) => 
   const result = launchMarker(binding);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, 'OLD');
+});
+
+test('launch hold rejects new sessions without downgrading a prepared launch', (t) => {
+  const { trusted, selected } = fixture(t);
+  const binding = preparePinnedCwdLaunch(selected, process.execPath,
+    ['-e', 'process.stdout.write(require("node:fs").readFileSync("marker", "utf8"))'],
+    { bootstrapCwd: trusted });
+  const heldEnv = { HCC_PINNED_LAUNCH_MODE: 'hold' };
+  assert.throws(() => preparePinnedCwdLaunch(selected, process.execPath, ['-e', ''],
+    { bootstrapCwd: trusted, env: heldEnv }), { code: 'PINNED_LAUNCH_PAUSED' });
+  assert.throws(() => spawnPinnedCwdProcess(process.execPath, ['-e', ''],
+    { cwd: selected, env: heldEnv }, () => { throw new Error('must not spawn'); }),
+  { code: 'PINNED_LAUNCH_PAUSED' });
+  assert.deepEqual(fs.readdirSync(trusted), []);
+  const result = launchMarker(binding);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'OLD');
+  const maintenance = preparePinnedCwdLaunch(selected, process.execPath, ['-e', ''],
+    { bootstrapCwd: trusted, env: heldEnv, purpose: 'maintenance' });
+  maintenance.release();
+  assert.throws(() => preparePinnedCwdLaunch(selected, process.execPath, ['-e', ''],
+    { bootstrapCwd: trusted, env: { HCC_PINNED_LAUNCH_MODE: 'legacy' } }),
+  { code: 'PINNED_LAUNCH_MODE_INVALID' });
+});
+
+test('launch hold does not change an existing session fingerprint', () => {
+  assert.equal(
+    launchEnvironmentFingerprint({ PATH: '/usr/bin', HCC_PINNED_LAUNCH_MODE: 'pinned' }),
+    launchEnvironmentFingerprint({ PATH: '/usr/bin', HCC_PINNED_LAUNCH_MODE: 'hold' })
+  );
+});
+
+test('parent launch hold survives a provider environment that strips HCC variables', (t) => {
+  const { trusted, selected } = fixture(t);
+  const previous = process.env.HCC_PINNED_LAUNCH_MODE;
+  process.env.HCC_PINNED_LAUNCH_MODE = 'hold';
+  try {
+    assert.throws(() => preparePinnedCwdLaunch(selected, process.execPath, ['-e', ''],
+      { bootstrapCwd: trusted, env: { PATH: '/usr/bin:/bin' } }),
+    { code: 'PINNED_LAUNCH_PAUSED' });
+    const maintenance = preparePinnedCwdLaunch(selected, process.execPath, ['-e', ''],
+      { bootstrapCwd: trusted, env: { PATH: '/usr/bin:/bin' }, purpose: 'maintenance' });
+    maintenance.release();
+  } finally {
+    if (previous === undefined) delete process.env.HCC_PINNED_LAUNCH_MODE;
+    else process.env.HCC_PINNED_LAUNCH_MODE = previous;
+  }
+});
+
+test('pinned launch survives fifty start/exit cycles without a pathname fallback', (t) => {
+  const { trusted, selected } = fixture(t);
+  for (let cycle = 0; cycle < 50; cycle += 1) {
+    const binding = preparePinnedCwdLaunch(selected, process.execPath,
+      ['-e', 'process.stdout.write(require("node:fs").readFileSync("marker", "utf8"))'],
+      { bootstrapCwd: trusted });
+    const result = launchMarker(binding);
+    assert.equal(result.status, 0, `cycle ${cycle}: ${result.stderr}`);
+    assert.equal(result.stdout, 'OLD', `cycle ${cycle}`);
+  }
 });
 
 test('pinned launch rejects B captured after the caller selected A', (t) => {
