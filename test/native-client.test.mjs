@@ -7,11 +7,17 @@ import test from 'node:test';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
-import { writeNativePointer } from '../lib/runtime/native/store.mjs';
+import { claimNativeOwner, writeNativePointer } from '../lib/runtime/native/store.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { inspectProcessIdentity } from '../lib/process/identity.mjs';
 
 async function fixture(t, handler) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-client-'));
   const ctx = { root: sandbox, dbPath: path.join(sandbox, '.hello-cc', 'mesh.db') };
+  const rootIdentity = captureSelectedCwdSnapshot(sandbox);
+  const ownerIdentity = inspectProcessIdentity(process.pid).identity;
+  const generation = 'test-client-generation';
+  const owner = claimNativeOwner(ctx, { rootIdentity, identity: ownerIdentity, generation });
   const requests = [];
   const server = http.createServer(async (request, response) => {
     let raw = '';
@@ -23,11 +29,13 @@ async function fixture(t, handler) {
   t.after(async () => {
     server.closeAllConnections();
     if (server.listening) await new Promise((resolve) => server.close(resolve));
+    owner.release(); owner.db.close();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
   const token = 'test-local-bearer-'.repeat(4);
   writeNativePointer(ctx, { root: fs.realpathSync(sandbox), meshDb: ctx.dbPath,
-    port: server.address().port, token, generation: 'test-client-generation', pid: process.pid });
+    rootIdentity, port: server.address().port, token, generation, pid: process.pid,
+    ownerIdentity, ownerVersion: 2, stateGeneration: owner.stateGeneration });
   return { ctx, server, token, requests };
 }
 
@@ -126,7 +134,7 @@ test('native client unreachable runtime keeps mutation uncertainty and reports a
   }
   const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-offline-'));
   t.after(() => fs.rmSync(missingRoot, { recursive: true, force: true }));
-  await assert.rejects(nativeRequest({ root: missingRoot, dbPath: path.join(missingRoot, 'mesh.db') }, 'GET', '/status'),
+  await assert.rejects(nativeRequest({ root: missingRoot, dbPath: path.join(missingRoot, '.hello-cc', 'mesh.db') }, 'GET', '/status'),
     { code: 'NATIVE_RUNTIME_OFFLINE' });
 });
 
@@ -134,6 +142,10 @@ test('native client unreachable runtime keeps mutation uncertainty and reports a
 test('native client keeps reads and writes usable after a synchronous pause outlives a pooled socket', async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-client-idle-'));
   const ctx = { root: sandbox, dbPath: path.join(sandbox, '.hello-cc', 'mesh.db') };
+  const rootIdentity = captureSelectedCwdSnapshot(sandbox);
+  const ownerIdentity = inspectProcessIdentity(process.pid).identity;
+  const generation = 'test-client-idle-generation';
+  const owner = claimNativeOwner(ctx, { rootIdentity, identity: ownerIdentity, generation });
   // The daemon runs independently while the caller is blocked in synchronous
   // CLI work, so its idle socket can close before the caller processes EOF.
   const child = spawn(process.execPath, ['--input-type=module', '-e', `
@@ -155,12 +167,14 @@ test('native client keeps reads and writes usable after a synchronous pause outl
       child.kill('SIGTERM');
       await exited;
     }
+    owner.release(); owner.db.close();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
   const [ready] = await once(child.stdout, 'data');
   writeNativePointer(ctx, { root: fs.realpathSync(sandbox), meshDb: ctx.dbPath,
     port: JSON.parse(ready.toString().trim()).port, token: 'test-local-bearer-'.repeat(4),
-    generation: 'test-client-idle-generation', pid: child.pid });
+    rootIdentity, generation, pid: process.pid, ownerIdentity, ownerVersion: 2,
+    stateGeneration: owner.stateGeneration });
   for (const method of ['GET', 'POST']) {
     await nativeRequest(ctx, 'GET', '/status');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);

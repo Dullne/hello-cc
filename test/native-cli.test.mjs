@@ -1,3 +1,7 @@
+import { prepareCliSubmission } from '../lib/runtime/native/cli-submissions.mjs';
+import { nativePaths } from '../lib/runtime/native/store.mjs';
+import os from 'node:os';
+import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -199,7 +203,7 @@ async function fixture(t) {
       await wait(() => [...processes.keys()].filter(alive), (pids) => !pids.length, 'fixture process cleanup');
     } finally { fs.rmSync(sandbox, { recursive: true, force: true }); }
   });
-  return { root, home, dbPath, pointer, binary, raw, run, fail, trace, start, wait, withDb, waitDelivery, waitStopped };
+  return { root, home, dbPath, pointer, binary, env, raw, run, fail, trace, start, wait, withDb, waitDelivery, waitStopped };
 }
 
 test('native CLI help, lifecycle and saved resume use only the owned stdio process', { skip: process.platform === 'win32' }, async (t) => {
@@ -428,4 +432,235 @@ test('native CLI preserves read-only sandbox on resume and declines escalation r
     '--resume', 'last', '--sandbox', 'workspace-write');
   assert.notEqual(mismatch.status, 0);
   assert.equal(f.trace().filter(row => row.kind === 'started').length, count);
+});
+
+
+test('native CLI launch hold refuses start before spawning the runtime or provider', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.env.HCC_PINNED_LAUNCH_MODE = 'hold';
+  f.fail('PINNED_LAUNCH_PAUSED', 'native', 'start', '--peer', 'held', '--provider', 'codex', '--binary', f.binary);
+  assert.equal(fs.existsSync(f.pointer), false);
+  assert.deepEqual(f.trace(), []);
+  if (fs.existsSync(f.dbPath)) {
+    f.withDb(db => {
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM peers WHERE id='held'").get().n, 0);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 0);
+    });
+  }
+});
+
+
+test('native CLI journals generated submission IDs before sending and exposes local receipts', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const args = ['native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'same intentional request'];
+  const first = f.run(...args);
+  const second = f.run(...args);
+  assert.notEqual(first.submission_id, second.submission_id);
+  assert.notEqual(first.message_id, second.message_id);
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const journalDir = path.join(path.dirname(nativePaths(ctx).dir), 'native-cli-submissions');
+  const saved = JSON.parse(fs.readFileSync(path.join(journalDir, `submission-${first.submission_id}.json`), 'utf8'));
+  assert.equal(saved.mesh_db_relative, 'mesh.db');
+  const journal = f.run('native', 'submissions', '--peer', 'native-worker');
+  assert.equal(journal.length, 2);
+  for (const receipt of [first, second]) {
+    const entry = journal.find(row => row.submission_id === receipt.submission_id);
+    assert.equal(entry.peer, 'native-worker');
+    assert.equal(entry.from, 'coordinator');
+    assert.equal(entry.confirmation, 'received');
+    assert.deepEqual(entry.receipt, { message_id: receipt.message_id,
+      submission_id: receipt.submission_id, state: receipt.state });
+  }
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='same intentional request'").get().n, 2));
+  f.run('native', 'down');
+  await f.waitStopped();
+  assert.equal(f.run('native', 'submissions', '--peer', 'native-worker').length, 2,
+    'local submission IDs remain inspectable when the native runtime is offline');
+});
+
+
+test('prepared CLI submission survives a lost response and refuses a changed manual retry', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const input = { peer: 'native-worker', from: 'coordinator', taskId: null, body: 'one recoverable request' };
+  const prepared = prepareCliSubmission(ctx, input);
+  assert.equal(f.run('native', 'submissions')[0].confirmation, 'unconfirmed');
+  f.withDb(db => assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0));
+  for (const args of [
+    ['--peer', 'other-worker', '--from', input.from, '--body', input.body],
+    ['--peer', input.peer, '--from', 'other-sender', '--body', input.body],
+    ['--peer', input.peer, '--from', input.from, '--body', input.body, '--task', '1'],
+    ['--peer', input.peer, '--from', input.from, '--body', 'changed before first POST']
+  ]) {
+    f.fail('NATIVE_SUBMISSION_MISMATCH', 'native', 'send', ...args,
+      '--submission-id', prepared.submission_id);
+  }
+  f.withDb(db => assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0));
+  const first = await nativeRequest(ctx, 'POST', '/send', { ...input, submissionId: prepared.submission_id });
+  assert.equal(f.run('native', 'submissions')[0].confirmation, 'unconfirmed');
+  const retry = f.run('native', 'send', '--peer', input.peer, '--from', input.from,
+    '--body', input.body, '--submission-id', prepared.submission_id);
+  assert.equal(retry.message_id, first.message_id);
+  assert.equal(f.run('native', 'submissions')[0].receipt.message_id, first.message_id);
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='one recoverable request'").get().n, 1));
+});
+
+
+test('native CLI fails before sending when its private submission journal cannot be created', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const journal = path.join(path.dirname(nativePaths(ctx).dir), 'native-cli-submissions');
+  fs.writeFileSync(journal, 'blocked', { flag: 'wx', mode: 0o600 });
+  f.fail('PROJECT_PATH_FORBIDDEN', 'native', 'send', '--peer', 'native-worker',
+    '--from', 'coordinator', '--body', 'must not reach the bus');
+  f.withDb(db => assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0));
+});
+
+
+test('native CLI journal does not publish a partial record when its writer is killed', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const source = `
+    import fs from 'node:fs';
+    import { prepareCliSubmission } from ${JSON.stringify(new URL('../lib/runtime/native/cli-submissions.mjs', import.meta.url).href)};
+    const original = fs.writeFileSync;
+    fs.writeFileSync = (fd, value, ...args) => {
+      if (typeof fd === 'number' && typeof value === 'string' && value.includes('"submission_id"')) {
+        fs.writeSync(fd, value.slice(0, Math.ceil(value.length / 2)));
+        process.kill(process.pid, 'SIGKILL');
+      }
+      return original(fd, value, ...args);
+    };
+    prepareCliSubmission({ root: process.argv[1], dbPath: process.argv[2] },
+      { peer: 'native-worker', from: 'coordinator', taskId: null, body: 'not sent' });
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', source,
+    fs.realpathSync(f.root), fs.realpathSync(f.dbPath)], {
+    cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000
+  });
+  assert.equal(child.signal, 'SIGKILL', child.stderr || child.stdout);
+  assert.deepEqual(f.run('native', 'submissions'), []);
+  f.withDb(db => assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0));
+});
+
+
+test('native CLI journal repairs a published record left linked by a killed writer', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const baseline = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator', '--body', 'baseline');
+  const source = `
+    import fs from 'node:fs';
+    import { prepareCliSubmission } from ${JSON.stringify(new URL('../lib/runtime/native/cli-submissions.mjs', import.meta.url).href)};
+    const original = fs.linkSync;
+    fs.linkSync = (temporary, final) => {
+      original(temporary, final);
+      process.kill(process.pid, 'SIGKILL');
+    };
+    prepareCliSubmission({ root: process.argv[1], dbPath: process.argv[2] },
+      { peer: 'native-worker', from: 'coordinator', taskId: null, body: 'after link crash' });
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', source,
+    fs.realpathSync(f.root), fs.realpathSync(f.dbPath)], {
+    cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000
+  });
+  assert.equal(child.signal, 'SIGKILL', child.stderr || child.stdout);
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const journalDir = path.join(path.dirname(nativePaths(ctx).dir), 'native-cli-submissions');
+  const competingReader = `
+    import fs from 'node:fs';
+    import path from 'node:path';
+    import { listCliSubmissions } from ${JSON.stringify(new URL('../lib/runtime/native/cli-submissions.mjs', import.meta.url).href)};
+    const directory = process.argv[3], original = fs.readdirSync;
+    let reads = 0, removed = false;
+    fs.readdirSync = (target, ...args) => {
+      if (target === directory && ++reads === 2) {
+        const temporary = original(directory).find(name => name.startsWith('.submission-') && name.includes('.tmp.'));
+        if (temporary) { fs.unlinkSync(path.join(directory, temporary)); removed = true; }
+      }
+      return original(target, ...args);
+    };
+    const entries = listCliSubmissions({ root: process.argv[1], dbPath: process.argv[2] });
+    process.stdout.write(JSON.stringify({ entries, removed }));
+  `;
+  const reader = spawnSync(process.execPath, ['--input-type=module', '-e', competingReader,
+    ctx.root, ctx.dbPath, journalDir], { cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000 });
+  assert.equal(reader.status, 0, reader.stderr || reader.stdout);
+  const observed = JSON.parse(reader.stdout);
+  assert.equal(observed.removed, true);
+  const saved = observed.entries;
+  assert.equal(saved.length, 2);
+  assert.ok(saved.some(row => row.submission_id === baseline.submission_id && row.confirmation === 'received'));
+  const unconfirmed = saved.find(row => row.confirmation === 'unconfirmed');
+  assert.ok(unconfirmed);
+  assert.equal(fs.lstatSync(path.join(journalDir, `submission-${unconfirmed.submission_id}.json`)).nlink, 1);
+  const retry = f.run('native', 'send', '--peer', 'native-worker', '--from', 'coordinator',
+    '--body', 'after link crash', '--submission-id', unconfirmed.submission_id);
+  assert.equal(retry.submission_id, unconfirmed.submission_id);
+  assert.equal(f.run('native', 'submissions').find(row => row.submission_id === unconfirmed.submission_id).confirmation, 'received');
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='after link crash'").get().n, 1));
+});
+
+
+test('native CLI receipt publication accepts a matching concurrent winner without overwriting it', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const input = { peer: 'native-worker', from: 'coordinator', taskId: null, body: 'one receipt race' };
+  const prepared = prepareCliSubmission(ctx, input);
+  const receipt = await nativeRequest(ctx, 'POST', '/send', { ...input, submissionId: prepared.submission_id });
+  const source = `
+    import fs from 'node:fs';
+    import { recordCliSubmissionReceipt } from ${JSON.stringify(new URL('../lib/runtime/native/cli-submissions.mjs', import.meta.url).href)};
+    const original = fs.linkSync;
+    fs.linkSync = (temporary, final) => {
+      original(temporary, final);
+      return original(temporary, final);
+    };
+    recordCliSubmissionReceipt(JSON.parse(process.argv[1]), JSON.parse(process.argv[2]), JSON.parse(process.argv[3]));
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', source,
+    JSON.stringify(ctx), JSON.stringify(prepared), JSON.stringify(receipt)], {
+    cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000
+  });
+  assert.equal(child.status, 0, child.stderr || child.stdout);
+  const journal = f.run('native', 'submissions');
+  assert.equal(journal[0].receipt.message_id, receipt.message_id);
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='one receipt race'").get().n, 1));
+});
+
+
+test('native CLI keeps a prepared ID recoverable after a receipt writer is killed mid-write', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  f.start();
+  const ctx = { root: fs.realpathSync(f.root), dbPath: fs.realpathSync(f.dbPath) };
+  const input = { peer: 'native-worker', from: 'coordinator', taskId: null, body: 'receipt interrupted' };
+  const prepared = prepareCliSubmission(ctx, input);
+  const receipt = await nativeRequest(ctx, 'POST', '/send', { ...input, submissionId: prepared.submission_id });
+  const source = `
+    import fs from 'node:fs';
+    import { recordCliSubmissionReceipt } from ${JSON.stringify(new URL('../lib/runtime/native/cli-submissions.mjs', import.meta.url).href)};
+    const original = fs.writeFileSync;
+    fs.writeFileSync = (fd, value, ...args) => {
+      if (typeof fd === 'number' && typeof value === 'string' && value.includes('"message_id"')) {
+        fs.writeSync(fd, value.slice(0, Math.ceil(value.length / 2)));
+        process.kill(process.pid, 'SIGKILL');
+      }
+      return original(fd, value, ...args);
+    };
+    recordCliSubmissionReceipt(JSON.parse(process.argv[1]), JSON.parse(process.argv[2]), JSON.parse(process.argv[3]));
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', source,
+    JSON.stringify(ctx), JSON.stringify(prepared), JSON.stringify(receipt)], {
+    cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000
+  });
+  assert.equal(child.signal, 'SIGKILL', child.stderr || child.stdout);
+  assert.equal(f.run('native', 'submissions')[0].confirmation, 'unconfirmed');
+  const retried = f.run('native', 'send', '--peer', input.peer, '--from', input.from,
+    '--body', input.body, '--submission-id', prepared.submission_id);
+  assert.equal(retried.message_id, receipt.message_id);
+  assert.equal(f.run('native', 'submissions')[0].receipt.message_id, receipt.message_id);
+  f.withDb(db => assert.equal(db.prepare("SELECT COUNT(*) AS n FROM messages WHERE body='receipt interrupted'").get().n, 1));
 });

@@ -1,3 +1,5 @@
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import os from 'node:os';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -92,7 +94,7 @@ test('native receipts distinguish local submission from admission and confirm re
   a.emit({type:'status',status:'running',submissionId:a.active.submissionId,turnId:'turn-a'});
   assert.equal((await f.delivery('a')).state,'submitted');
   a.emit({type:'message',text:'real answer',submissionId:a.active.submissionId,turnId:'turn-a'});
-  assert.equal((await f.delivery('a')).state,'accepted'); a.complete();
+  assert.equal((await f.delivery('a')).state,'accepted'); a.complete({ text: 'real answer' });
   assert.equal((await f.delivery('a')).state,'completed');
   const reply=f.inspect.prepare("SELECT * FROM messages WHERE kind='reply'").get();
   assert.equal(reply.body,'real answer'); assert.equal(reply.reply_to,queued.message_id); assert.equal(reply.thread_id,queued.message_id);
@@ -972,4 +974,209 @@ test('native fork rejects missing or changing parent sandbox policy without adop
   try { missing.db.prepare('UPDATE workers SET sandbox=NULL WHERE peer=?').run('parent'); } finally { missing.close(); }
   await assert.rejects(f.api('POST', '/fork', { parent: 'parent', peer: 'another-child' }), { code: 'NATIVE_STATE_INVALID' });
   assert.equal(f.adapters.has('another-child'), false);
+});
+
+
+test('restart removes a pre-spawn worker reservation with no durable worker row', async t => {
+  let failAfterReservation = true;
+  const f = await fixture(t, {}, { afterWorkerReservation() {
+    if (failAfterReservation) {
+      failAfterReservation = false;
+      throw Object.assign(new Error('injected after reservation'), { code: 'INJECTED_CRASH_GAP' });
+    }
+  } });
+  await assert.rejects(f.start('a'), { code: 'INJECTED_CRASH_GAP' });
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peer_bindings WHERE peer='a'").get().n, 1);
+  assert.equal((await f.api('GET', '/status')).workers.length, 0);
+  assert.equal(f.adapters.has('a'), false);
+  await f.restart();
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peer_bindings WHERE peer='a'").get().n, 0);
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peers WHERE id='a'").get().n, 0);
+  assert.equal((await f.start('a')).peer, 'a');
+});
+
+
+test('reservation recovery preserves a binding changed by another owner', async t => {
+  const f = await fixture(t, {}, { afterWorkerReservation() {
+    throw Object.assign(new Error('injected after reservation'), { code: 'INJECTED_CRASH_GAP' });
+  } });
+  await assert.rejects(f.start('a'), { code: 'INJECTED_CRASH_GAP' });
+  f.inspect.prepare("UPDATE peer_bindings SET transport='tmux', runtime_target='foreign-pane' WHERE peer='a'").run();
+  await assert.rejects(f.restart(), { code: 'NATIVE_OWNER_UNVERIFIED' });
+  assert.equal(f.inspect.prepare("SELECT runtime_target FROM peer_bindings WHERE peer='a'").get().runtime_target,
+    'foreign-pane');
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peers WHERE id='a'").get().n, 1);
+});
+
+
+test('only a new native Codex thread in the selected root receives a Codex history receipt', async (t) => {
+  const f = await fixture(t);
+  await f.start('root');
+  const receipt = f.inspect.prepare("SELECT payload FROM events WHERE type='codex.thread.root-bound'").get();
+  assert.ok(receipt);
+  assert.equal(JSON.parse(receipt.payload).thread_id, 'session-root');
+  assert.equal(JSON.parse(receipt.payload).origin, 'native-new');
+  await f.api('POST', '/close', { peer: 'root' });
+  await f.start('root', { resume: 'last' });
+  const subdirectory = path.join(f.ctx.root, 'subdirectory');
+  fs.mkdirSync(subdirectory);
+  await f.start('subdirectory', { cwd: subdirectory });
+  assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM events WHERE type='codex.thread.root-bound'").get().n, 1);
+});
+
+
+test('the old native control token cannot submit to a replacement project root', async t => {
+  const f = await fixture(t);
+  await f.start('a');
+  const pointer = readNativePointer(f.ctx);
+  const original = `${f.ctx.root}-original`;
+  const replacement = `${f.ctx.root}-replacement`;
+  fs.renameSync(f.ctx.root, original);
+  fs.mkdirSync(f.ctx.root);
+  try {
+    const response = await fetch(`http://127.0.0.1:${pointer.port}/send`, {
+      method: 'POST', headers: { authorization: `Bearer ${pointer.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ peer: 'a', from: 'shell', body: 'must not reach replacement' })
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).error.code, 'PROJECT_PATH_CHANGED');
+    assert.equal(f.adapters.get('a').sent.length, 0);
+  } finally {
+    fs.renameSync(f.ctx.root, replacement);
+    fs.renameSync(original, f.ctx.root);
+    fs.rmSync(replacement, { recursive: true, force: true });
+  }
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0);
+});
+
+
+test('a live native worker refuses new submissions and queued turns after its cwd is replaced', async t => {
+  const f = await fixture(t);
+  const selected = path.join(f.ctx.root, 'selected');
+  const original = path.join(f.ctx.root, 'original');
+  fs.mkdirSync(selected);
+  await f.start('a', { cwd: selected });
+  const queued = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'before replacement' });
+  fs.renameSync(selected, original);
+  fs.mkdirSync(selected);
+  try {
+    await assert.rejects(f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'after replacement' }),
+      { code: 'PROJECT_PATH_CHANGED' });
+    await assert.rejects(f.api('POST', '/respond', { peer: 'a' }),
+      { code: 'PROJECT_PATH_CHANGED' });
+    await f.service.poll();
+    assert.equal(f.adapters.get('a').sent.length, 0);
+    assert.equal(f.adapters.get('a').closed, 0);
+    assert.equal((await f.api('GET', '/status')).workers[0].quarantined, true);
+    assert.equal((await f.delivery('a')).state, 'queued');
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads').get().n, 0);
+    assert.equal(queued.state, 'queued');
+  } finally {
+    fs.rmdirSync(selected);
+    fs.renameSync(original, selected);
+  }
+});
+
+
+test('a cwd replacement quarantines later native turns without discarding the active completion', async t => {
+  const f = await fixture(t);
+  const selected = path.join(f.ctx.root, 'selected');
+  const original = path.join(f.ctx.root, 'original');
+  fs.mkdirSync(selected);
+  await f.start('a', { cwd: selected });
+  await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'already admitted' });
+  await f.service.poll();
+  const adapter = f.adapters.get('a');
+  assert.equal(adapter.sent.length, 1);
+  fs.renameSync(selected, original);
+  fs.mkdirSync(selected);
+  try {
+    await f.service.poll();
+    assert.equal((await f.api('GET', '/status')).workers[0].quarantined, true);
+    adapter.complete();
+    assert.equal((await f.delivery('a')).state, 'completed');
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads').get().n, 1);
+    assert.equal(adapter.closed, 0);
+  } finally {
+    fs.rmdirSync(selected);
+    fs.renameSync(original, selected);
+  }
+});
+
+
+test('native service startup checks the original root after ownership-listen wait and before B state writes', async t => {
+  const f = await fixture(t);
+  await f.service.shutdown();
+  const initialRootIdentity = captureSelectedCwdSnapshot(f.ctx.root);
+  const starting = startNativeService({ ...f.ctx, initialRootIdentity }, f.deps, { pollMs: 60000 });
+  const original = `${f.ctx.root}-original`;
+  const replacement = `${f.ctx.root}-replacement`;
+  fs.renameSync(f.ctx.root, original);
+  fs.mkdirSync(f.ctx.root);
+  try {
+    await assert.rejects(starting, { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(fs.existsSync(path.join(f.ctx.root, '.hello-cc')), false);
+  } finally {
+    fs.renameSync(f.ctx.root, replacement);
+    fs.renameSync(original, f.ctx.root);
+    fs.rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+
+test('native launch hold rejects a worker before reserving its peer or opening an adapter', async (t) => {
+  const f = await fixture(t);
+  const previous = process.env.HCC_PINNED_LAUNCH_MODE;
+  const eventsBefore = f.inspect.prepare('SELECT COUNT(*) AS n FROM events').get().n;
+  process.env.HCC_PINNED_LAUNCH_MODE = 'hold';
+  try {
+    await assert.rejects(f.start('held'), { code: 'PINNED_LAUNCH_PAUSED' });
+    assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peers WHERE id='held'").get().n, 0);
+    assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM peer_bindings WHERE peer='held'").get().n, 0);
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM events').get().n, eventsBefore);
+    assert.equal(f.adapters.has('held'), false);
+    const store = createNativeStore(f.ctx);
+    try { assert.equal(store.worker('held'), null); } finally { store.close(); }
+  } finally {
+    if (previous === undefined) delete process.env.HCC_PINNED_LAUNCH_MODE;
+    else process.env.HCC_PINNED_LAUNCH_MODE = previous;
+  }
+});
+
+
+test('provider retries retain attempt traces and publish only authoritative completion without replay', async t => {
+  const f = await fixture(t); await f.start('a');
+  const first = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'FIRST' });
+  await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'SECOND' });
+  await f.service.poll(); const a = f.adapters.get('a');
+  const identity = { turnId: 'turn-a', submissionId: a.active.submissionId };
+  a.emit({ type: 'message', text: 'before reconnect', ...identity });
+  a.emit({ type: 'error', willRetry: true, error: { message: 'Reconnecting... 1/5' }, ...identity });
+  await f.service.poll();
+  const row = (await f.api('GET', '/deliveries?peer=a')).find(item => item.message_id === first.message_id);
+  assert.equal(row.state, 'accepted');
+  assert.equal(a.sent.length, 1, 'neither this prompt nor the next queued prompt is sent again');
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE message_id=?').get(first.message_id).n, 0);
+  a.emit({ type: 'message', text: 'after reconnect', ...identity });
+  a.complete({ text: 'after reconnect' }); a.complete({ text: 'after reconnect' });
+  const replies = f.inspect.prepare("SELECT * FROM messages WHERE reply_to=? AND kind='reply'").all(first.message_id);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].body, 'after reconnect');
+  assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE message_id=?').get(first.message_id).n, 1);
+  assert.equal((await f.api('GET', '/deliveries?peer=a')).find(item => item.message_id === first.message_id).state, 'completed');
+  await f.service.poll(); assert.equal(a.sent.length, 2, 'next prompt starts only after completion');
+});
+
+
+test('native completion without final text retains collected message output as a fallback', async t => {
+  const f = await fixture(t); await f.start('a');
+  const sent = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'collect output' });
+  await f.service.poll(); const a = f.adapters.get('a');
+  const identity = { turnId: 'turn-a', submissionId: a.active.submissionId };
+  a.emit({ type: 'message', text: 'first part', ...identity });
+  a.emit({ type: 'message', text: 'second part', ...identity });
+  a.complete({ text: undefined });
+  const reply = f.inspect.prepare("SELECT body FROM messages WHERE reply_to=? AND kind='reply'").get(sent.message_id);
+  assert.equal(reply.body, 'first part\n\nsecond part');
 });

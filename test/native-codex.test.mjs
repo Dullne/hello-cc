@@ -628,3 +628,77 @@ test('Codex verifies forked child read-only policy before exposing it or admitti
     await f.adapter.close();
   }
 });
+
+
+test('native Codex pins the original directory through the transport spawn boundary', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-codex-spawn-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const selected = path.join(base, 'selected');
+  const replacement = path.join(base, 'replacement');
+  const original = path.join(base, 'original');
+  fs.mkdirSync(selected);
+  fs.mkdirSync(replacement);
+  let swapped = false;
+  const env = { get PATH() {
+    if (!swapped) {
+      fs.renameSync(selected, original);
+      fs.renameSync(replacement, selected);
+      swapped = true;
+    }
+    return process.env.PATH;
+  } };
+  const adapter = createCodexAdapter({ binary: process.execPath, cwd: selected, env });
+  try {
+    await assert.rejects(adapter.open(), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(swapped, true);
+  } finally {
+    await adapter.close();
+    if (swapped) {
+      fs.renameSync(selected, replacement);
+      fs.renameSync(original, selected);
+    }
+  }
+});
+
+
+test('native Codex refuses the next turn after its selected directory is rebound', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-codex-next-turn-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const selected = path.join(base, 'selected');
+  const original = path.join(base, 'original');
+  fs.mkdirSync(selected);
+  const f = fixture(undefined, { cwd: selected });
+  await f.adapter.open();
+  fs.renameSync(selected, original);
+  fs.mkdirSync(selected);
+  try {
+    await assert.rejects(f.adapter.send({ text: 'must not reach the new directory' }),
+      { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(f.calls.filter(([method]) => method === 'turn/start').length, 0);
+  } finally {
+    await f.adapter.close();
+    fs.rmdirSync(selected);
+    fs.renameSync(original, selected);
+  }
+});
+
+
+test('Codex preserves explicit retry metadata and submission identity on error notifications', async () => {
+  const f = fixture();
+  await f.adapter.open();
+  await f.adapter.send({ text: 'recover this turn', submissionId: 'retry-submission' });
+  f.callbacks.onNotification('turn/started', { threadId: 'owned-thread', turn: { id: 'turn-1' } });
+  for (const willRetry of [true, false, undefined, 'true']) {
+    f.callbacks.onNotification('error', { threadId: 'owned-thread', turnId: 'turn-1',
+      error: { message: 'Reconnecting... 1/5' }, ...(willRetry === undefined ? {} : { willRetry }) });
+    const event = f.events.at(-1);
+    assert.equal(event.type, 'error');
+    assert.equal(event.submissionId, 'retry-submission');
+    assert.equal(event.turnId, 'turn-1');
+    assert.equal(event.willRetry, typeof willRetry === 'boolean' ? willRetry : undefined);
+    assert.equal(f.adapter.snapshot().turnId, 'turn-1');
+  }
+  f.callbacks.onNotification('turn/completed', { threadId: 'owned-thread', turn: { id: 'turn-1', status: 'completed' } });
+  assert.equal(f.events.find(event => event.type === 'completed').submissionId, 'retry-submission');
+  await f.adapter.close();
+});

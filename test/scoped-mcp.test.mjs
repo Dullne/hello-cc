@@ -9,9 +9,13 @@ import { Readable, Writable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { initSchema } from '../lib/db/schema.mjs';
+import { createConnectionHelpers } from '../lib/db/connection.mjs';
 import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { createScopedMcpConfig, loadScopedMcpBootstrap } from '../lib/mcp/scope.mjs';
+import { createScopedMcpTools } from '../lib/mcp/tools.mjs';
 import { serveMcpStdio } from '../lib/mcp/stdio.mjs';
+import { claimNativeOwner } from '../lib/runtime/native/store.mjs';
 
 const cliPath = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
 function fixture(t) {
@@ -28,10 +32,11 @@ function fixture(t) {
     VALUES(?,'codex','thread-scoped','app-server',?,1,1)`).run(peer, peer);
   db.prepare("INSERT INTO events(type,actor,payload,created_at) VALUES('codex.executor.started',?,?,1)")
     .run(peer, JSON.stringify({ executor_id: executorId }));
-  const capability = createScopedMcpConfig({ root, dbPath, peer, executorId, ownerIdentity });
+  const rootIdentity = captureSelectedCwdSnapshot(root);
+  const capability = createScopedMcpConfig({ root, dbPath, peer, executorId, ownerIdentity, rootIdentity });
   assert.equal(capability.config.args[0], fs.realpathSync(cliPath));
   t.after(() => { capability.dispose(); db.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  return { root, dbPath, db, peer, executorId, capability, ownerIdentity };
+  return { root, dbPath, db, peer, executorId, capability, ownerIdentity, rootIdentity };
 }
 
 async function client(t, f) {
@@ -156,6 +161,139 @@ test('a bare peer string, foreign root, tampered token and permissive bootstrap 
   assert.throws(() => loadScopedMcpBootstrap(ctx, f.peer, env), { code: 'MCP_SCOPE_INVALID' });
 });
 
+test('minting rejects a stale original root receipt before issuing a capability', t => {
+  const f = fixture(t);
+  const replacement = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-mcp-replacement-'));
+  t.after(() => fs.rmSync(replacement, { recursive: true, force: true }));
+  assert.throws(() => createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+    peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity }),
+  { code: 'MCP_SCOPE_INVALID' });
+  assert.throws(() => createScopedMcpConfig({ root: replacement, dbPath: f.dbPath,
+    peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
+    rootIdentity: f.rootIdentity }), { code: 'PROJECT_PATH_CHANGED' });
+});
+
+test('legacy capability without a launch root receipt is rejected', t => {
+  const f = fixture(t);
+  const bootstrapPath = f.capability.config.env.HCC_MCP_BOOTSTRAP_PATH;
+  const legacy = JSON.parse(fs.readFileSync(bootstrapPath, 'utf8'));
+  legacy.version = 1;
+  delete legacy.rootIdentity;
+  fs.writeFileSync(bootstrapPath, JSON.stringify(legacy));
+  assert.throws(() => loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, f.capability.config.env), { code: 'MCP_SCOPE_INVALID' });
+});
+
+test('a same-path replacement is rejected on load and before opening the replacement DB', async t => {
+  const f = fixture(t);
+  const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, f.capability.config.env);
+  const original = `${f.root}-original`;
+  fs.renameSync(f.root, original);
+  t.after(() => fs.rmSync(original, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(f.root, '.hello-cc'), { recursive: true });
+  fs.copyFileSync(path.join(original, '.hello-cc', 'mesh.db'), f.dbPath);
+  assert.throws(() => loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, f.capability.config.env), { code: 'MCP_SCOPE_INVALID' });
+  let connects = 0;
+  const tools = createScopedMcpTools({ ctx: { root: f.root, dbPath: f.dbPath }, authority,
+    connect() { connects += 1; throw new Error('replacement DB was opened'); },
+    touchPeer() {}, now: () => 1, addEvent() {} });
+  const result = await tools.call('hcc_inbox', {});
+  assert.equal(result.structuredContent.error.code, 'MCP_SCOPE_INVALID');
+  assert.equal(connects, 0);
+  const replacementIdentity = captureSelectedCwdSnapshot(f.root);
+  const replacement = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+    peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
+    rootIdentity: replacementIdentity });
+  t.after(() => replacement.dispose());
+  const current = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, replacement.config.env);
+  const replacementDb = new DatabaseSync(f.dbPath);
+  try { current.assertOwnership(replacementDb); }
+  finally { replacementDb.close(); }
+});
+
+test('a root swap after call admission still fails before DB connection', async t => {
+  const f = fixture(t);
+  const originalAuthority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, f.capability.config.env);
+  const original = `${f.root}-original`;
+  t.after(() => fs.rmSync(original, { recursive: true, force: true }));
+  let checked = false, connects = 0;
+  const authority = { ...originalAuthority, assertValid() {
+    originalAuthority.assertValid();
+    if (!checked) {
+      checked = true;
+      fs.renameSync(f.root, original);
+      fs.mkdirSync(path.join(f.root, '.hello-cc'), { recursive: true });
+      fs.copyFileSync(path.join(original, '.hello-cc', 'mesh.db'), f.dbPath);
+    }
+  } };
+  const tools = createScopedMcpTools({ ctx: { root: f.root, dbPath: f.dbPath }, authority,
+    connect() { connects += 1; throw new Error('replacement DB was opened'); },
+    touchPeer() {}, now: () => 1, addEvent() {} });
+  const result = await tools.call('hcc_inbox', {});
+  assert.equal(result.structuredContent.error.code, 'MCP_SCOPE_INVALID');
+  assert.equal(connects, 0);
+});
+
+test('the DB helper receives A identity even if a fresh child captured B', async t => {
+  const f = fixture(t);
+  const originalAuthority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, f.capability.config.env);
+  const replacement = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-mcp-rebind-'));
+  const original = `${f.root}-original`;
+  t.after(() => {
+    fs.rmSync(original, { recursive: true, force: true });
+    fs.rmSync(replacement, { recursive: true, force: true });
+  });
+  fs.mkdirSync(path.join(replacement, '.hello-cc'));
+  const replacementDb = path.join(replacement, '.hello-cc', 'mesh.db');
+  fs.copyFileSync(f.dbPath, replacementDb);
+  fs.chmodSync(replacementDb, 0o644);
+  const replacementSnapshot = captureSelectedCwdSnapshot(replacement);
+  const childCtx = { root: f.root, dbPath: f.dbPath, initialRootIdentity: {
+    requested: f.root, canonical: f.rootIdentity.canonical, identity: replacementSnapshot.identity } };
+  let checks = 0, opened = 0;
+  const authority = { ...originalAuthority, assertValid() {
+    originalAuthority.assertValid();
+    if (++checks === 2) {
+      fs.renameSync(f.root, original);
+      fs.renameSync(replacement, f.root);
+    }
+  } };
+  const { connect: realConnect } = createConnectionHelpers({ now: () => 1,
+    dedupePeerBindings() {}, redactedLogText: value => value });
+  const tools = createScopedMcpTools({ ctx: childCtx, authority,
+    connect(context, options) {
+      assert.deepEqual(context.initialRootIdentity.identity, f.rootIdentity.identity);
+      const db = realConnect(context, options);
+      opened += 1;
+      return db;
+    }, touchPeer() {}, now: () => 1, addEvent() {} });
+  const result = await tools.call('hcc_inbox', {});
+  assert.equal(result.structuredContent.error.code, 'PROJECT_PATH_CHANGED');
+  assert.equal(opened, 0);
+  assert.equal(fs.statSync(f.dbPath).mode & 0o777, 0o644);
+});
+
+test('retargeting an input alias does not revoke the unchanged canonical root', t => {
+  const f = fixture(t);
+  const alias = `${f.root}-alias`, other = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-mcp-other-'));
+  t.after(() => { fs.rmSync(alias, { force: true }); fs.rmSync(other, { recursive: true, force: true }); });
+  fs.symlinkSync(f.root, alias);
+  const capability = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+    peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
+    rootIdentity: captureSelectedCwdSnapshot(alias) });
+  t.after(() => capability.dispose());
+  fs.unlinkSync(alias);
+  fs.symlinkSync(other, alias);
+  const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
+    f.peer, capability.config.env);
+  authority.assertOwnership(f.db);
+});
+
 test('JSONL malformed/oversized frames flush errors and the next valid request succeeds', async () => {
   const replies = [];
   const output = new Writable({ write(bytes, _encoding, done) { replies.push(JSON.parse(String(bytes))); done(); } });
@@ -171,17 +309,86 @@ test('JSONL malformed/oversized frames flush errors and the next valid request s
 });
 
 test('native scoped MCP requires the unique worker binding and is revoked by worker replacement or close', t => {
-  const f = fixture(t), binding = { transport: 'native', runtimeSessionId: f.peer, runtimeTarget: 'native-owner' };
+  const f = fixture(t), nativeOwner = `native:test-generation:${f.peer}:00000000-0000-4000-8000-000000000001`,
+    binding = { transport: 'native', runtimeSessionId: f.peer, runtimeTarget: nativeOwner };
   const original = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath }, f.peer, f.capability.config.env);
   const identity = inspectProcessIdentity(process.pid).identity;
-  f.db.prepare("UPDATE peer_bindings SET transport='native',runtime_target=? WHERE peer=?").run('native-owner', f.peer);
-  const capability = createScopedMcpConfig({ ...{ root: f.root, dbPath: f.dbPath }, peer: f.peer, executorId: 'native-owner', ownerIdentity: identity, binding });
+  f.db.prepare("UPDATE peer_bindings SET transport='native',runtime_target=? WHERE peer=?").run(nativeOwner, f.peer);
+  const capability = createScopedMcpConfig({ ...{ root: f.root, dbPath: f.dbPath }, peer: f.peer, executorId: nativeOwner,
+    ownerIdentity: identity, rootIdentity: f.rootIdentity, binding });
   t.after(() => capability.dispose());
   const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath }, f.peer, capability.config.env);
   authority.assertOwnership(f.db); assert.throws(() => original.assertOwnership(f.db));
   f.db.prepare('UPDATE peer_bindings SET runtime_target=? WHERE peer=?').run('replacement-owner', f.peer);
   assert.throws(() => authority.assertOwnership(f.db), { code: 'MCP_SCOPE_INVALID' });
-  f.db.prepare('UPDATE peer_bindings SET runtime_target=? WHERE peer=?').run('native-owner', f.peer);
+  f.db.prepare('UPDATE peer_bindings SET runtime_target=? WHERE peer=?').run(nativeOwner, f.peer);
   capability.dispose(); assert.throws(() => authority.assertOwnership(f.db), { code: 'MCP_SCOPE_INVALID' });
-  assert.throws(() => createScopedMcpConfig({ ...{ root: f.root, dbPath: f.dbPath }, peer: f.peer, executorId: 'native-owner', ownerIdentity: identity, binding: { transport: 'native', runtimeSessionId: f.peer } }), { code: 'MCP_SCOPE_INVALID' });
+  assert.throws(() => createScopedMcpConfig({ ...{ root: f.root, dbPath: f.dbPath }, peer: f.peer, executorId: nativeOwner,
+    ownerIdentity: identity, rootIdentity: f.rootIdentity,
+    binding: { transport: 'native', runtimeSessionId: f.peer } }), { code: 'MCP_SCOPE_INVALID' });
+});
+
+test('native scoped MCP admits calls only while its persistent owner generation is active', async t => {
+  const f = fixture(t);
+  const generation = 'mcp-generation';
+  const nativeOwner = `native:${generation}:${f.peer}:00000000-0000-4000-8000-000000000002`;
+  f.db.prepare("UPDATE peer_bindings SET transport='native',runtime_target=? WHERE peer=?").run(nativeOwner, f.peer);
+  const guard = claimNativeOwner({ root: f.root, dbPath: f.dbPath }, {
+    rootIdentity: f.rootIdentity, identity: f.ownerIdentity, generation
+  });
+  const capability = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+    peer: f.peer, executorId: nativeOwner, ownerIdentity: f.ownerIdentity, rootIdentity: f.rootIdentity,
+    binding: { transport: 'native', runtimeSessionId: f.peer, runtimeTarget: nativeOwner } });
+  try {
+    const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath }, f.peer, capability.config.env);
+    const { connect } = createConnectionHelpers({ now: () => 1,
+      dedupePeerBindings() {}, redactedLogText: value => value });
+    const tools = createScopedMcpTools({ ctx: { root: f.root, dbPath: f.dbPath }, authority,
+      connect, touchPeer() {}, now: () => 1, addEvent() {} });
+    assert.equal((await tools.call('hcc_inbox', {})).isError, false);
+    const sent = await tools.call('hcc_message_send', { to: 'other', body: 'one fenced message' });
+    assert.equal(sent.isError, false);
+    const before = f.db.prepare('SELECT COUNT(*) AS count FROM messages').get().count;
+    guard.release();
+    const stale = await tools.call('hcc_message_send', { to: 'other', body: 'blocked after release' });
+    assert.equal(stale.isError, true);
+    assert.equal(stale.structuredContent.error.code, 'NATIVE_OWNER_UNVERIFIED');
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, before);
+  } finally {
+    capability.dispose();
+    guard.db.close();
+  }
+});
+
+test('native inherited CLI marker permits only the matching real MCP server', async t => {
+  const f = fixture(t);
+  const generation = 'stdio-generation';
+  const nativeOwner = `native:${generation}:${f.peer}:00000000-0000-4000-8000-000000000003`;
+  f.db.prepare("UPDATE peer_bindings SET transport='native',runtime_target=? WHERE peer=?").run(nativeOwner, f.peer);
+  const guard = claimNativeOwner({ root: f.root, dbPath: f.dbPath }, {
+    rootIdentity: f.rootIdentity, identity: f.ownerIdentity, generation
+  });
+  const capability = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+    peer: f.peer, executorId: nativeOwner, ownerIdentity: f.ownerIdentity, rootIdentity: f.rootIdentity,
+    binding: { transport: 'native', runtimeSessionId: f.peer, runtimeTarget: nativeOwner } });
+  const originalCapability = f.capability;
+  f.capability = { config: { ...capability.config,
+    env: { ...capability.config.env, HCC_NATIVE_OWNER: nativeOwner } } };
+  try {
+    const c = await client(t, f);
+    const result = await c.call('hcc_message_send', { to: 'other', body: 'real native MCP write' });
+    assert.equal(result.isError, false);
+    assert.equal(f.db.prepare('SELECT body FROM messages ORDER BY id DESC LIMIT 1').get().body,
+      'real native MCP write');
+    guard.release();
+    const stale = await c.call('hcc_message_send', { to: 'other', body: 'must not write' });
+    assert.equal(stale.structuredContent.error.code, 'NATIVE_OWNER_UNVERIFIED');
+    const exited = once(c.child, 'exit');
+    c.child.stdin.end();
+    await exited;
+  } finally {
+    f.capability = originalCapability;
+    capability.dispose();
+    guard.db.close();
+  }
 });

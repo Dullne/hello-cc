@@ -1,3 +1,5 @@
+import vm from 'node:vm';
+import { interactionPanelScript } from '../lib/web/ui-interactions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { redactCliArgs, redactSecrets } from '../lib/shared/redact.mjs';
@@ -137,4 +139,44 @@ test('HTML renderers reject missing, weak, or attribute-breaking nonces', () => 
     assert.throws(() => render({ nonce: '0123456789abcdef" onload="x' }), /valid CSP nonce/);
   }
   assert.throws(() => contentSecurityPolicy('short'), /valid CSP nonce/);
+});
+
+
+test('preserves boolean question privacy metadata across repeated redaction while masking credential values', () => {
+  const input = { params: { questions: [
+    { id: 'public', isSecret: false },
+    { id: 'private', isSecret: true, token: 'private-value' }
+  ] }, nested: [
+    { isSecret: 'private-value' }, { isSecret: { value: 'private-value' } },
+    { is_secret: false }, { ISSECRET: true }, { clientSecret: false }, { password: true }
+  ] };
+  const output = redactSecrets(input);
+  assert.deepEqual(output.params.questions, [
+    { id: 'public', isSecret: false },
+    { id: 'private', isSecret: true, token: REDACTED }
+  ]);
+  assert.deepEqual(output.nested, [
+    { isSecret: REDACTED }, { isSecret: REDACTED }, { is_secret: REDACTED },
+    { ISSECRET: REDACTED }, { clientSecret: REDACTED }, { password: REDACTED }
+  ]);
+  assert.deepEqual(redactSecrets(output), output);
+  assert.equal(input.params.questions[1].token, 'private-value');
+});
+
+
+test('redacted provider questions render ordinary and secret fields with their original input types', () => {
+  const request = { kind: 'userInput', params: { questions: [
+    { id: 'public', question: 'Public marker', isSecret: false },
+    { id: 'private', question: 'Private marker', isSecret: true }
+  ] } };
+  const context = { window: {}, document: {}, URL };
+  vm.runInNewContext(interactionPanelScript(), context);
+  const serialized = JSON.parse(JSON.stringify(redactSecrets(redactSecrets(request))));
+  const html = context.window.hccInteractions.form(serialized, 'redaction-roundtrip', String, en => en);
+  assert.match(html, /<form class="hcc-interaction-form"/);
+  assert.match(html, /data-answer="0" type="text"/);
+  assert.match(html, /data-answer="1" type="password"/);
+  const fields = [...html.matchAll(/<input\b([^>]*)>/g)];
+  assert.equal(fields.length, 2);
+  for (const [, attributes] of fields) assert.match(attributes, /\bname="[^"]+"/);
 });

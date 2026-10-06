@@ -378,3 +378,51 @@ test('legacy worker sandbox schema and compatibility backfill migrate atomically
   } finally { inspection.close(); }
   assert.equal(f.store().worker('saved').sandbox, 'workspace-write');
 });
+
+
+test('native pointer rejects a replacement directory even if the original pathname is restored before validation', t => {
+  const f = fixture(t);
+  const selected = f.ctx.root;
+  const original = path.join(f.sandbox, 'original');
+  const replacement = path.join(f.sandbox, 'replacement');
+  fs.mkdirSync(replacement);
+  const expected = captureSelectedCwdSnapshot(selected);
+  fs.renameSync(selected, original);
+  fs.renameSync(replacement, selected);
+  writeNativePointer(f.ctx, f.pointer({ rootIdentity: captureSelectedCwdSnapshot(selected) }));
+  fs.renameSync(selected, replacement);
+  fs.renameSync(original, selected);
+  let accesses = 0;
+  const swappingCtx = {
+    dbPath: f.ctx.dbPath,
+    initialRootIdentity: expected,
+    get root() {
+      accesses++;
+      if (accesses === 1) {
+        fs.renameSync(selected, original);
+        fs.renameSync(replacement, selected);
+      } else if (accesses === 2) {
+        fs.renameSync(selected, replacement);
+        fs.renameSync(original, selected);
+      }
+      return selected;
+    }
+  };
+  try {
+    assert.throws(() => readNativePointer(swappingCtx), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(accesses, 2);
+  } finally {
+    if (fs.existsSync(original)) {
+      fs.renameSync(selected, replacement);
+      fs.renameSync(original, selected);
+    }
+  }
+});
+
+
+test('native pointer without a root receipt is not authorized by a selected project identity', t => {
+  const f = fixture(t);
+  writeNativePointer(f.ctx, f.pointer());
+  assert.throws(() => readNativePointer({ ...f.ctx,
+    initialRootIdentity: captureSelectedCwdSnapshot(f.ctx.root) }), { code: 'PROJECT_PATH_CHANGED' });
+});

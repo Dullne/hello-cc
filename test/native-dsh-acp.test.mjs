@@ -68,6 +68,7 @@ test('ACP opens an owned runtime and independent workspace/session identities wi
   assert.equal(DSH_ACP_BASELINE_VERSION, '0.2.0-rc.2');
   assert.deepEqual(f.callbacks.args, ['--profile', 'acp']);
   assert.equal(f.callbacks.cwd, TEST_CWD);
+  assert.equal(f.callbacks.expectedIdentity.canonical, TEST_CWD);
   assert.equal(snapshot.sessionId, 'session-own');
   assert.equal(snapshot.status, 'idle');
   assert.deepEqual(snapshot.capabilities, {
@@ -78,6 +79,36 @@ test('ACP opens an owned runtime and independent workspace/session identities wi
   assert.equal(f.events.filter((event) => event.type === 'completed').length, 0, 'an idle opened session is not task completion');
   await assert.rejects(f.adapter.open({ sessionId: 'another' }), { code: 'NATIVE_SESSION_MISMATCH' });
   await f.adapter.close();
+});
+
+test('native dsh pins the original directory through the transport spawn boundary', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-dsh-spawn-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const selected = path.join(base, 'selected');
+  const replacement = path.join(base, 'replacement');
+  const original = path.join(base, 'original');
+  fs.mkdirSync(selected);
+  fs.mkdirSync(replacement);
+  let swapped = false;
+  const env = { get PATH() {
+    if (!swapped) {
+      fs.renameSync(selected, original);
+      fs.renameSync(replacement, selected);
+      swapped = true;
+    }
+    return process.env.PATH;
+  } };
+  const adapter = createDshAcpAdapter({ binary: process.execPath, cwd: selected, env });
+  try {
+    await assert.rejects(adapter.open(), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(swapped, true);
+  } finally {
+    await adapter.close();
+    if (swapped) {
+      fs.renameSync(selected, replacement);
+      fs.renameSync(original, selected);
+    }
+  }
 });
 
 test('ACP refuses session creation or prompt after the selected directory is rebound', async t => {

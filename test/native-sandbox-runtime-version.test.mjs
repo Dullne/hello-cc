@@ -9,18 +9,26 @@ import { fileURLToPath } from 'node:url';
 import { inspectProcessIdentity, waitForLiveProcessIdentity, waitForProcessIdentityExit } from '../lib/process/identity.mjs';
 import { writeNativePointer, readNativePointer } from '../lib/runtime/native/store.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 
 const hccBin = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
 
-// An authenticated old-runtime stand-in deliberately ignores unknown request
-// fields, as the pre-sandbox daemon did. Any unexpected /workers request runs
+// An authenticated sandbox-protocol compatibility stand-in carries current
+// directory and owner receipts, while deliberately ignoring unknown worker
+// fields as the pre-sandbox daemon did. Any unexpected /workers request runs
 // a harmless marker executable, never Codex or another real provider.
 const legacyRuntimeSource = `
 import fs from 'node:fs';
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
+import { claimNativeOwner } from ${JSON.stringify(new URL('../lib/runtime/native/store.mjs', import.meta.url).href)};
+import { inspectProcessIdentity } from ${JSON.stringify(new URL('../lib/process/identity.mjs', import.meta.url).href)};
 const config = JSON.parse(fs.readFileSync(process.env.HCC_LEGACY_FIXTURE_CONFIG, 'utf8'));
 const trace = entry => fs.appendFileSync(config.trace, JSON.stringify(entry) + '\\n');
+const ownerIdentity = inspectProcessIdentity(process.pid).identity;
+const claim = generation => claimNativeOwner({ root: config.root, dbPath: config.dbPath },
+  { rootIdentity: config.rootIdentity, identity: ownerIdentity, generation });
+let owner = claim(config.generation);
 let replacementPort;
 const makeServer = instance => http.createServer(async (request, response) => {
   const authorized = request.headers.authorization === 'Bearer ' + instance.token;
@@ -31,7 +39,15 @@ const makeServer = instance => http.createServer(async (request, response) => {
     // Deterministically replace the pointer before the checked GET finishes.
     // The replacement is a second old-protocol listener with another credential.
     if (instance.name === 'checked' && config.replaceOnStatus) {
+      // Model a complete owner change, not a pointer detached from its durable
+      // owner row. The checked response still reports the previous generation.
+      owner.release();
+      owner.db.close();
+      fs.rmSync(config.pointer);
+      owner = claim(config.replacementGeneration);
       const replacementPointer = { root: config.root, meshDb: config.dbPath,
+        rootIdentity: config.rootIdentity, ownerVersion: 2, ownerIdentity,
+        stateGeneration: owner.stateGeneration,
         generation: config.replacementGeneration, pid: process.pid, port: replacementPort, token: config.replacementToken };
       const temporary = config.pointer + '.fixture-swap';
       fs.writeFileSync(temporary, JSON.stringify(replacementPointer), { mode: 0o600 });
@@ -59,11 +75,11 @@ const replacement = config.replaceOnStatus ? makeServer({ name: 'replacement',
 const stop = () => {
   const servers = [server, replacement].filter(Boolean);
   let pending = servers.length;
-  for (const current of servers) { current.close(() => { if (!--pending) process.exit(0); }); current.closeAllConnections(); }
+  for (const current of servers) { current.close(() => { if (!--pending) { owner.release(); owner.db.close(); process.exit(0); } }); current.closeAllConnections(); }
 };
 process.on('message', value => { if (value === 'stop') stop(); });
 process.on('disconnect', stop);
-const listen = () => server.listen(0, '127.0.0.1', () => process.send({ port: server.address().port, pid: process.pid }));
+const listen = () => server.listen(0, '127.0.0.1', () => process.send({ port: server.address().port, pid: process.pid, stateGeneration: owner.stateGeneration }));
 if (replacement) replacement.listen(0, '127.0.0.1', () => { replacementPort = replacement.address().port; listen(); });
 else listen();
 `;
@@ -80,7 +96,8 @@ async function fixture(t, options = {}) {
   const provider = path.join(fixtureDir, 'marker-provider.mjs');
   fs.writeFileSync(provider, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(providerTrace)}, 'started\\n');\n`, { mode: 0o600 });
   const configFile = path.join(fixtureDir, 'fixture.json');
-  const config = { root: ctx.root, dbPath: ctx.dbPath, token: randomBytes(32).toString('hex'),
+  const rootIdentity = captureSelectedCwdSnapshot(ctx.root);
+  const config = { root: ctx.root, dbPath: ctx.dbPath, rootIdentity, token: randomBytes(32).toString('hex'),
     generation: 'legacy-fixture-generation', trace: traceFile, provider,
     pointer: path.join(ctx.root, '.hello-cc', 'native', 'runtime.json'),
     replacementGeneration: 'replacement-fixture-generation', replacementToken: randomBytes(32).toString('hex'),
@@ -119,6 +136,7 @@ async function fixture(t, options = {}) {
   assert.equal(identity.state, 'live', 'fixture process identity must be captured');
   ownedIdentity = identity.identity;
   writeNativePointer(ctx, { root: ctx.root, meshDb: ctx.dbPath, generation: config.generation,
+    rootIdentity, ownerVersion: 2, ownerIdentity: ownedIdentity, stateGeneration: started.stateGeneration,
     pid: child.pid, port: started.port, token: config.token });
   const raw = (...args) => spawnSync(process.execPath, [hccBin, '--root', root, '--json', ...args], {
     cwd: root, env, encoding: 'utf8', timeout: 15_000

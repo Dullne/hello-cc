@@ -1,3 +1,4 @@
+import { inspectProcessIdentity } from '../lib/process/identity.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { createNativeLauncher } from '../lib/runtime/native/launcher.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
-import { readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
+import { claimNativeOwner, nativePaths, readNativePointer, writeNativePointer } from '../lib/runtime/native/store.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
@@ -101,7 +102,7 @@ test('native daemon never starts on a replacement root between capture and child
       return f.spawnProcess(command, args, options);
     }
   });
-  await assert.rejects(ensure(f.ctx), { code: 'NATIVE_RUNTIME_START_FAILED' });
+  await assert.rejects(ensure(f.ctx), { code: 'PROJECT_PATH_CHANGED' });
   assert.equal(replaced, true);
   assert.equal(readNativePointer(f.ctx), null);
 });
@@ -119,13 +120,28 @@ test('native launcher rejects a root replaced after the CLI selected it', async 
 
 test('native launcher refuses a stopping or mismatched daemon instead of spawning a replacement', async t => {
   const f = await fixture(t);
+  const rootIdentity = captureSelectedCwdSnapshot(f.ctx.root);
   writeNativePointer(f.ctx, { root: f.ctx.root, meshDb: f.ctx.dbPath, pid: process.pid,
+    rootIdentity,
     port: 1, token: 'x'.repeat(64), generation: 'test-generation' });
   let calls = 0;
   const ensure = createNativeLauncher({ spawnProcess() { assert.fail('must not replace an existing daemon'); },
     request: async () => { calls++; return { root: f.ctx.root, meshDb: f.ctx.dbPath, generation: 'test-generation', stopping: true }; } });
-  await assert.rejects(ensure(f.ctx), { code: 'NATIVE_RUNTIME_STOPPING' });
-  assert.equal(calls, 1);
-  const wrong = createNativeLauncher({ request: async () => ({ root: os.tmpdir(), meshDb: f.ctx.dbPath, generation: 'wrong' }) });
-  await assert.rejects(wrong(f.ctx), { code: 'NATIVE_RESPONSE_INVALID' });
+  await assert.rejects(ensure(f.ctx), { code: 'NATIVE_OWNER_UNVERIFIED' });
+  assert.equal(calls, 0);
+  fs.rmSync(nativePaths(f.ctx).pointer);
+  const ownerIdentity = inspectProcessIdentity(process.pid).identity;
+  const owner = claimNativeOwner(f.ctx, { rootIdentity, identity: ownerIdentity, generation: 'test-generation' });
+  try {
+    writeNativePointer(f.ctx, { root: f.ctx.root, meshDb: f.ctx.dbPath, pid: process.pid,
+      rootIdentity, ownerIdentity, ownerVersion: 2, stateGeneration: owner.stateGeneration,
+      port: 1, token: 'x'.repeat(64), generation: 'test-generation' });
+    await assert.rejects(ensure(f.ctx), { code: 'NATIVE_RUNTIME_STOPPING' });
+    assert.equal(calls, 1);
+    const wrong = createNativeLauncher({ request: async () => ({ root: os.tmpdir(), meshDb: f.ctx.dbPath, generation: 'wrong' }) });
+    await assert.rejects(wrong(f.ctx), { code: 'NATIVE_RESPONSE_INVALID' });
+  } finally {
+    fs.rmSync(nativePaths(f.ctx).pointer, { force: true });
+    owner.release(); owner.db.close();
+  }
 });

@@ -5,6 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
+import { nativeWorkerEnv } from '../lib/integrations/native/index.mjs';
+import { assertHookRootIdentity } from '../lib/core/sessions/hook-root-identity.mjs';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 
 function outputQueue() {
   const items = [];
@@ -266,7 +269,8 @@ test('Claude SDK receives only the complete owned-worker coordination environmen
   const sdk = fakeSdk();
   const worker = {
     HCC_ROOT: '/project', HCC_DB: '/project/.hello-cc/native-mesh.db',
-    HCC_PEER: 'owned-claude', HCC_NATIVE_OWNER: 'native:generation:owned-claude'
+    HCC_PEER: 'owned-claude', HCC_NATIVE_OWNER: 'native:generation:owned-claude',
+    HCC_HOOK_ROOT_IDENTITY: '{"version":1,"test":"launch-time-root"}'
   };
   const adapter = createClaudeAdapter({ query: sdk.query, env: {
     ...worker, HCC_WEB_TOKEN: 'parent-token', HCC_RUNTIME_URL: 'parent-url',
@@ -285,7 +289,25 @@ test('Claude SDK receives only the complete owned-worker coordination environmen
   await explicitAdapter.send({ text: 'task' });
   assert.equal(explicitSdk.args.options.env.HCC_PEER, 'owned-claude');
   assert.equal(explicitSdk.args.options.env.HCC_NATIVE_OWNER, worker.HCC_NATIVE_OWNER);
+  assert.equal(explicitSdk.args.options.env.HCC_HOOK_ROOT_IDENTITY, worker.HCC_HOOK_ROOT_IDENTITY);
   await explicitAdapter.close();
+});
+
+test('native Claude SDK receives the real root receipt for first-party hook checks', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-claude-hook-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const ctx = { root, dbPath: path.join(root, 'mesh.db'), initialRootIdentity: captureSelectedCwdSnapshot(root) };
+  const env = nativeWorkerEnv({ PATH: process.env.PATH, HCC_WEB_TOKEN: 'parent-secret' }, ctx,
+    'claude-worker', 'native:owned');
+  const sdk = fakeSdk();
+  const adapter = createClaudeAdapter({ query: sdk.query, cwd: root, env });
+  try {
+    await adapter.send({ text: 'hook receipt' });
+    const passed = sdk.args.options.env;
+    assert.deepEqual(assertHookRootIdentity(root, passed.HCC_HOOK_ROOT_IDENTITY).identity,
+      ctx.initialRootIdentity.identity);
+    assert.equal(passed.HCC_WEB_TOKEN, undefined);
+  } finally { await adapter.close(); }
 });
 
 test('Claude interrupt does not release an unconsumed queued prompt or mislabel a later completion', async () => {
@@ -563,7 +585,7 @@ async function isolatedDefaultSdk(t, moduleSource) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const installed = path.join(directory, 'hcc'), project = path.join(directory, 'project');
   const base = fileURLToPath(new URL('../lib/', import.meta.url));
-  for (const name of ['integrations/native/claude.mjs', 'integrations/native/interactions.mjs', 'integrations/native/telemetry.mjs', 'integrations/mcp-url-elicitation.mjs', 'process/selected-cwd-identity.mjs']) {
+  for (const name of ['integrations/native/claude.mjs', 'integrations/native/interactions.mjs', 'integrations/native/telemetry.mjs', 'integrations/mcp-url-elicitation.mjs', 'process/selected-cwd-identity.mjs', 'core/sessions/hook-root-identity.mjs']) {
     const target = path.join(installed, 'lib', name); fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(base, name), target);
   }
