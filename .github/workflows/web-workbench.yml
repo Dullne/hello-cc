@@ -3,7 +3,7 @@ name: Web workbench acceptance
 on:
   pull_request:
   push:
-    branches: [master, 'codex/web-workbench-*']
+    branches: [master, 'codex/web-workbench-*', 'codex/local-change-integration-*']
   workflow_dispatch:
 
 permissions:

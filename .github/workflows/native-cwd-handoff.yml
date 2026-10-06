@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - 'codex/local-change-integration-*'
   pull_request:
   workflow_dispatch:
 

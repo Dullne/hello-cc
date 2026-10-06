@@ -10,6 +10,7 @@ on:
       - codex/dsh-macos-boot-identity
       - codex/dsh-stop-diagnostics
       - codex/dsh-stop-confirmation
+      - 'codex/local-change-integration-*'
   pull_request:
 
 permissions:
