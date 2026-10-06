@@ -16,6 +16,52 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.0
+
+### Summary
+
+This stable release promotes the multi-provider Web workbench, native Agent
+coordination and project-identity protections developed through rc.9 to the
+npm `latest` channel. Its runtime code is unchanged from rc.9; the stable
+version has its own immutable package, tag and release acceptance receipts.
+
+### Highlights
+
+- Coordinate Codex, Claude and DeepSeek Harness sessions from the Web workbench
+  with project Agent defaults, structured conversations and tool/approval/user
+  input views. Retain terminal and App Server modes, guarded forks, retained
+  drafts, file previews, reconnect and snapshot-gap recovery.
+- Bind project state, managed launches, Web/native sessions and Codex history
+  to the selected directory's filesystem identity. Replacement directories
+  receive separate generations. Private-state v1 migration requires independent
+  root verification and an explicit offline drain; old stores remain preserved.
+- Ship authenticated directory-descriptor handoff helpers for Darwin and Linux
+  on arm64 and x64, with static Linux binaries, executable-mode and source-stamp
+  checks. Missing trusted helpers reject guarded launches without a pathname
+  fallback; operators can pause new launches with `HCC_PINNED_LAUNCH_MODE=hold`.
+- Fence Native, hook and scoped MCP mutations by current ownership, process and
+  runtime/state generations. Journal submissions before admission, recover
+  original IDs and avoid automatically replaying uncertain provider execution.
+- Add opt-in original-App cooperation adapters while retaining the App's own
+  execution. Harness idle-inbox wakeup and Claude hooks/plugins are separate
+  provider paths; a fully idle original Codex App is not automatically awakened.
+- Keep background terminal snapshots asynchronous and bounded, and retain
+  separate ACL cache entries for Number and BigInt stats. Preserve exact inode,
+  change-time and ACL checks, and bounded shim-registration diagnostics.
+
+### Validation
+
+The unchanged rc.9 runtime passed 1,992 local unit tests with three
+platform/privilege skips, all 13 regression stages and 45 browser checks per
+source/temporary installation. Its master CI passed 14 jobs and its immutable
+release/tag CI passed three jobs on their first attempts.
+
+The 1.1.0 version, frozen package, installed-provider checks and final commit/tag
+CI retain separate release receipts. Simulated-provider browser checks remain
+separate from real model calls. CI/platform execution does not establish every
+employee-device, provider, cross-device recovery or business workflow. Existing
+preview archives and their evidence remain unchanged.
+
 ## 1.1.0-rc.9
 
 ### Summary
