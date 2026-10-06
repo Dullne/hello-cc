@@ -83,6 +83,25 @@ test('Agent tools and context bind raw session IDs to separate projects and peer
   assert.equal(read(a, 'SELECT sender FROM messages')[0].sender, a.peer);
 });
 
+test('an existing Cordis authority cannot write through a replacement project directory', async t => {
+  const root = project(t);
+  const state = session(t, root, 'root-rebind');
+  const original = `${root}-original`;
+  fs.renameSync(root, original);
+  fs.mkdirSync(root);
+  fs.cpSync(path.join(original, '.hello-cc'), path.join(root, '.hello-cc'), { recursive: true });
+  try {
+    const result = await state.call('hcc_message_send', { to: state.peer, body: 'must not reach B' });
+    assert.equal(result.ok, false);
+    const db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'));
+    try { assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 0); }
+    finally { db.close(); }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.renameSync(original, root);
+  }
+});
+
 test('two concurrent Agents cannot claim one session and a hooks binding prevents double injection', t => {
   const root = project(t), a = createDshCollaboration({ sessionId: 'same', cwd: root });
   assert.throws(() => createDshCollaboration({ sessionId: 'same', cwd: root }), { code: 'DSH_COLLABORATION_CONFLICT' });
