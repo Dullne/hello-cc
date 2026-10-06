@@ -13,17 +13,17 @@
 
 <p align="center"><b>English</b> | <a href="README.zh-CN.md">中文</a></p>
 
-`hello-cc` is a local control plane for Claude Code, Codex, and other coding
-CLI sessions. It gives every terminal in one project a shared task board,
-mailbox, lock table, and browser console while keeping the real local terminal
-as the source of interaction.
+`hello-cc` is a local multi-agent workbench for Claude Code, Codex, and DeepSeek
+Harness. Start background Agents from the browser or continue managed local
+terminal sessions, with a shared project task board, mailbox, lock table, and
+handoffs.
 
 <p align="center">
-  <img src="assets/screenshots/web-console.png" width="900" alt="hello-cc Web console showing agent sessions, task state, locks, messages, and terminal output">
+  <img src="assets/screenshots/web-console.png" width="900" alt="hello-cc 1.1.0 Web workbench showing background Agents, a structured conversation, tool activity, and shared project state">
 </p>
 
 <p align="center">
-  <em>One local Web console for tmux-backed Claude Code, Codex, tasks, locks, messages, and handoffs.</em>
+  <em>One local workbench for Claude, Codex, and DeepSeek Harness: conversations, tools, approvals, and project coordination. Screenshot uses demo data.</em>
 </p>
 
 It is built for developers who run multiple AI coding agents in the same repo
@@ -37,6 +37,14 @@ pre-migration backup; downgrading that database is unsupported. Provider peer
 IDs now hash the full provider session value and old IDs are not remapped.
 Runtime API v2 and per-connection terminal action tokens are required.
 
+Version 1.1.0 also binds project state, managed launches, and verified Codex
+history to the selected directory's filesystem identity. Stable, trusted
+projects can use `<project>/.hello-cc/mesh.db`; projects requiring private state
+use `~/.hello-cc/projects/<canonical-root-hash>/mesh.db`, with separate generations
+for replacement directories. Existing private v1 bindings require a reviewed
+offline upgrade. See [project identity and private state](docs/private-state.md)
+before migrating or recovering an existing store.
+
 Liveness follows tmux/non-tmux process evidence: sleep or detachment does not
 kill a live session, and only unknown evidence receives the bounded 120-second
 grace. `hcc gc` retains history unless `--history` is explicit. `--tls` encrypts
@@ -46,12 +54,21 @@ LANs, and an authenticated browser may select any existing server directory.
 
 ## Highlights
 
-- **Shared project memory**: peers, tasks, messages, locks, handoffs, and
-  events are stored in `<project>/.hello-cc/mesh.db`.
-- **Real terminal control**: Web attaches to the same local tmux pane as your
-  terminal, not a separate browser-only shell.
-- **Claude/Codex awareness**: hooks inject live `hcc` state before model turns,
-  so agents can answer from current project state.
+- **Background Agents**: create Codex, Claude, and DeepSeek Harness workers
+  directly from Web; save a default provider, model, and working directory per
+  project.
+- **Structured conversations**: follow messages, tool activity, delivery receipts,
+  and supported approval or user-input requests in the same session.
+- **Local and Web workflows**: continue the same native worker through CLI and
+  Web, or attach to a managed local tmux pane. Advanced options also offer Codex
+  App Server sessions.
+- **Project files**: browse and preview files and generated artifacts, upload new
+  files, and edit supported text with version checks.
+- **Shared project memory**: peers, tasks, messages, locks, handoffs, and events
+  live in the project's SQLite bus, separate from other projects.
+- **Live agent coordination**: hooks and scoped MCP tools expose project tasks
+  and inboxes to connected agents; DeepSeek Harness also supports hooks and
+  Cordis integration.
 - **Conflict avoidance**: advisory locks and handoffs make multi-agent editing
   explicit.
 - **Explicit team splits**: `hcc team plan/start/status` turns one parallel
@@ -63,9 +80,10 @@ LANs, and an authenticated browser may select any existing server directory.
 
 ## Install And Manage
 
-hello-cc supports Linux and macOS. Node.js 24 or newer is required, and
-browser-controllable terminals require `tmux`. Native Windows shells are not
-currently supported; use WSL for a Linux-like environment.
+hello-cc supports Linux and macOS on arm64 and x64. Node.js 24 or newer is
+required. `hcc web` requires `tmux`, including when you plan to create background
+Agents from Web. Native Windows shells are not currently supported; use WSL
+and install the dependencies inside it.
 
 Linux has richer process auto-discovery through `/proc`. On macOS, use
 hello-cc shims or `hcc peer start` for reliable tmux-managed terminal sessions.
@@ -103,10 +121,18 @@ hcc --version
 hcc --help
 ```
 
+Install and authenticate the provider you want to use in the environment that
+runs hello-cc. Background Agents require an App Server-compatible Codex CLI,
+the optional Claude Agent SDK for Claude, or DeepSeek Harness with ACP support
+(the supported Harness baseline is `0.2.0-rc.2`). See
+[Native worker requirements](docs/native.md#requirements) for setup, including
+the Claude SDK installation command, and [DeepSeek Harness](docs/dsh.md) for its
+integration modes.
+
 If npm reports `EACCES`, use a Node version manager or a user-owned npm prefix;
 do not work around it with `sudo npm install -g`.
 
-Update an existing global install:
+Update an existing global install to the npm `latest` channel:
 
 ```bash
 hcc update
@@ -157,6 +183,25 @@ shims, starts or reuses the Web console, and returns the terminal to you.
 Use `hcc up` when you want local coordination commands without the Web console
 or shims.
 
+### Start A Background Agent
+
+1. Select the project in Web and click **New Agent**.
+2. Choose Codex, Claude, or DeepSeek Harness; **Background Agent** is the default.
+   The selected provider must already be installed and authenticated.
+3. Keep the project root or choose a directory inside it. Leave the model empty
+   to use the provider's configured default, then create the Agent.
+4. Send a prompt, follow the conversation and tool activity, and explicitly
+   respond to any supported approval or user-input requests.
+
+**Settings** saves project defaults for future background Agents. **History**
+browses retained workers and offers explicit resume for eligible closed workers.
+Closing the page or stopping Web leaves the independent native runtime and
+workers running; use **Close executor** or `hcc native close --peer <peer>`
+when you want to close a worker. See [Native Workers](docs/native.md#start-from-web)
+for lifecycle details.
+
+### Continue A Managed Local Terminal
+
 After the first shim install, open a new terminal or reload the rc file for
 your shell:
 
@@ -164,7 +209,7 @@ your shell:
 - zsh: `source ~/.zshrc`
 - fish: `source ~/.config/fish/config.fish`
 
-Start normal agent sessions from the project:
+Start normal Claude/Codex terminal sessions from the project:
 
 ```bash
 claude
@@ -175,10 +220,14 @@ codex resume <session-id>
 
 Those sessions become tmux-backed peers that can be seen and controlled from
 Web while remaining usable from the local terminal. The shims only use the
-current project's runtime file. If you start `claude` or `codex` in a directory
-where `hcc web` has not created `.hello-cc/runtime.json`, the shim falls back to
-the real provider CLI instead of using the global Web runtime or creating a new
-project database.
+runtime resolved for the current project, including its private state directory
+when applicable. Without a current-project Web runtime, they fall back to the
+real provider CLI; they do not use the global Web runtime to register unrelated
+directories or create project databases.
+
+Web controls HCC-managed workers and terminals. Cooperation with an existing
+provider desktop App uses separate opt-in adapters; see
+[Desktop Agent communication](docs/app-bridge.md) for the supported paths.
 
 ## Basic Workflow
 
@@ -213,6 +262,10 @@ generic session-isolation assumptions.
   project setup and Web launch, with real-model and local-package acceptance evidence.
 - [Native Workers](docs/native.md): HCC-owned Codex, Claude SDK, and dsh ACP
   workers, delivery receipts, permissions, and saved-session ownership.
+- [Web Workflows (Chinese)](docs/web-handoff.zh-CN.md): new Agents, project files,
+  structured interactions, history, and local/Web handoffs.
+- [Desktop Agent Communication](docs/app-bridge.md): opt-in cooperation with
+  original provider Apps and their execution boundaries.
 - [Changelog](CHANGELOG.md): release notes for published versions.
 - [Design Notes](docs/design.md): product boundaries and coordination model.
 - [Implementation Notes](docs/implementation.md): architecture and internal
