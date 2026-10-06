@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
+import { prevalidateProjectDatabaseLocation, resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import { shortHash } from '../lib/core/peers/format.mjs';
 import {
   tmuxManagedSessionName,
@@ -85,6 +85,19 @@ test('uses one managed tmux identity for lexical aliases of the same project roo
   );
 });
 
+test('a private replacement generation cannot match the historical tmux namespace', () => {
+  const root = tempDir('tmux-generation-root');
+  const historical = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
+  const replacement = { root, dbPath: path.join(root, '.hello-cc', 'projects',
+    `${'a'.repeat(64)}.generations`, 'b'.repeat(32), 'mesh.db') };
+  const oldName = tmuxManagedSessionName(historical, 'shared-peer');
+  const newName = tmuxManagedSessionName(replacement, 'shared-peer');
+  assert.notEqual(oldName, newName);
+  assert.equal(tmuxManagedSessionNameMatches(replacement, oldName, 'shared-peer', root), false);
+  assert.equal(tmuxManagedSessionPrefixMatches(replacement, oldName, root), false);
+  assert.equal(tmuxManagedSessionNameMatches(replacement, newName, 'shared-peer', root), true);
+});
+
 test('does not create a missing state directory unless explicitly requested', () => {
   const root = tempDir('no-create');
   const stateDir = path.join(root, '.hello-cc');
@@ -96,6 +109,44 @@ test('does not create a missing state directory unless explicitly requested', ()
   assert.equal(resolved.stateDir, path.join(resolved.root, '.hello-cc'));
   assert.equal(resolved.db, path.join(resolved.root, '.hello-cc', 'mesh.db'));
   assert.equal(fs.existsSync(stateDir), false);
+});
+
+test('database admission checks a missing nested path without creating state or tightening existing permissions', () => {
+  const root = tempDir('admission-read-only');
+  const stateDir = path.join(root, '.hello-cc');
+  const db = path.join(stateDir, 'custom', 'mesh.db');
+  const inspected = prevalidateProjectDatabaseLocation({ root, db });
+  assert.equal(inspected.requestedDb, path.join(fs.realpathSync(root), '.hello-cc', 'custom', 'mesh.db'));
+  assert.equal(fs.existsSync(stateDir), false);
+
+  fs.mkdirSync(stateDir, { mode: 0o755 });
+  fs.chmodSync(stateDir, 0o755);
+  prevalidateProjectDatabaseLocation({ root, db });
+  assert.equal(fs.statSync(stateDir).mode & 0o777, 0o755);
+  assert.equal(fs.existsSync(path.dirname(db)), false);
+});
+
+test('database admission refuses a nested symlink even when its target stays inside state', () => {
+  const root = tempDir('admission-link');
+  const stateDir = path.join(root, '.hello-cc');
+  const actual = path.join(stateDir, 'actual');
+  fs.mkdirSync(actual, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(actual, path.join(stateDir, 'custom'), 'dir');
+  assertForbidden(() => prevalidateProjectDatabaseLocation({
+    root, db: path.join(stateDir, 'custom', 'mesh.db')
+  }));
+  assert.deepEqual(fs.readdirSync(actual), []);
+  assert.equal(fs.lstatSync(path.join(stateDir, 'custom')).isSymbolicLink(), true);
+});
+
+test('database admission refuses an outside database before any state is created', () => {
+  const root = tempDir('admission-outside-root');
+  const outside = tempDir('admission-outside-target');
+  assertForbidden(() => prevalidateProjectDatabaseLocation({
+    root, db: path.join(outside, 'mesh.db')
+  }));
+  assert.equal(fs.existsSync(path.join(root, '.hello-cc')), false);
+  assert.deepEqual(fs.readdirSync(outside), []);
 });
 
 test('creates a missing state directory privately when requested', () => {

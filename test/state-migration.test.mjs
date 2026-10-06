@@ -8,7 +8,8 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { migrateLegacyProjectState } from '../lib/runtime/state-migration.mjs';
-import { ensurePrivateProjectStateDir, privateProjectStateDir } from '../lib/runtime/private-state.mjs';
+import { ensurePrivateProjectStateDir, privateProjectStateDir,
+  provisionPrivateProjectGeneration } from '../lib/runtime/private-state.mjs';
 import { ensureDshIntegration, inspectDshIntegration } from '../lib/integrations/dsh.mjs';
 
 const hccBin = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
@@ -106,6 +107,28 @@ test('explicit offline migration snapshots WAL and nested SQLite, keeps source u
   assert.deepEqual(fs.readdirSync(f.source).sort(), originalListing);
   assert.deepEqual(fs.readFileSync(mesh), originalDb);
   assert.deepEqual(fs.readFileSync(`${mesh}-wal`), originalWal);
+});
+
+test('offline migration targets B generation without touching historical private A', t => {
+  const f = fixture(t);
+  fs.rmSync(f.source, { recursive: true });
+  fs.chmodSync(f.root, 0o777);
+  const oldDir = ensurePrivateProjectStateDir(f.root, { create: true });
+  fs.writeFileSync(path.join(oldDir, 'A-only'), 'preserved', { mode: 0o600 });
+  fs.renameSync(f.root, `${f.root}-old`);
+  fs.mkdirSync(f.root, { mode: 0o777 });
+  fs.chmodSync(f.root, 0o777);
+  fs.mkdirSync(f.source, { mode: 0o700 });
+  database(path.join(f.source, 'mesh.db'),
+    "CREATE TABLE b_data(value TEXT); INSERT INTO b_data VALUES ('B-only')");
+  const next = provisionPrivateProjectGeneration(f.root);
+  assert.equal(fs.existsSync(next), false);
+  const result = migrateLegacyProjectState(f.root, offlineOptions());
+  assert.equal(result.stateDir, next);
+  assert.equal(readCount(path.join(next, 'mesh.db'), 'b_data'), 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(next, '.project-root.json'), 'utf8')).version, 2);
+  assert.equal(fs.readFileSync(path.join(oldDir, 'A-only'), 'utf8'), 'preserved');
+  assert.equal(fs.existsSync(path.join(oldDir, 'mesh.db')), false);
 });
 
 test('migration is fail-closed without both confirmation and caller offline assertion', (t) => {

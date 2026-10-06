@@ -357,8 +357,9 @@ test('a pending marker with an empty private directory completes initialization 
   fs.mkdirSync(f.state, { mode: 0o700 });
   const stat = fs.statSync(f.root, { bigint: true });
   fs.writeFileSync(`${f.state}.authority.json`, JSON.stringify({
-    version: 1, canonicalRoot: fs.realpathSync(f.root),
-    dev: stat.dev.toString(), ino: stat.ino.toString(), kind: 'pending'
+    version: 2, canonicalRoot: fs.realpathSync(f.root),
+    dev: stat.dev.toString(), ino: stat.ino.toString(),
+    birthtimeNs: stat.birthtimeNs.toString(), kind: 'pending'
   }), { mode: 0o600 });
   const init = run(f, ['init', '--no-guidance']);
   assert.equal(init.status, 0, init.stderr || init.stdout);
@@ -374,8 +375,9 @@ test('an interrupted pending init can be explicitly purged without deleting a la
   fs.mkdirSync(f.state, { recursive: true, mode: 0o700 });
   const stat = fs.statSync(f.root, { bigint: true });
   fs.writeFileSync(`${f.state}.authority.json`, JSON.stringify({
-    version: 1, canonicalRoot: fs.realpathSync(f.root),
-    dev: stat.dev.toString(), ino: stat.ino.toString(), kind: 'pending'
+    version: 2, canonicalRoot: fs.realpathSync(f.root),
+    dev: stat.dev.toString(), ino: stat.ino.toString(),
+    birthtimeNs: stat.birthtimeNs.toString(), kind: 'pending'
   }), { mode: 0o600 });
   const blocked = run(f, ['init', '--no-guidance']);
   assert.notEqual(blocked.status, 0);
