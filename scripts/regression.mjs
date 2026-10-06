@@ -56,6 +56,7 @@ const diagnosticSecrets = new Set();
 const fixtureFailures = new WeakSet();
 const fixtureCommandFailures = new WeakMap();
 const fixtureHttpFailures = new WeakMap();
+const fixtureShimRegistrationFailures = new WeakMap();
 const managedTmuxSessions = new Set();
 
 const env = {
@@ -98,6 +99,9 @@ export function fixtureFailureError(message, commandResult = null, diagnosticOpe
   fixtureFailures.add(error);
   const command = fixtureCommandResult(commandResult, diagnosticOperation);
   if (command) fixtureCommandFailures.set(error, command);
+  if (diagnosticOperation === 'shim-registration') {
+    fixtureShimRegistrationFailures.set(error, fixtureShimRegistrationSummary(commandResult));
+  }
   return error;
 }
 
@@ -111,8 +115,45 @@ export function fixtureFailureDiagnostic(error) {
       : new Error('regression failure handler').stack.split('\n').slice(1, 7),
     ...(fixtureCommandFailures.has(error) ? { command: fixtureCommandFailures.get(error) } : {}),
     ...(fixtureHttpFailures.has(error) ? { http: fixtureHttpFailures.get(error) } : {}),
+    ...(fixtureShimRegistrationFailures.has(error)
+      ? { shimRegistration: fixtureShimRegistrationFailures.get(error) } : {}),
     ...(terminalMarker ? { terminalMarker } : {})
   };
+}
+
+export function fixtureShimRegistrationSummary(observation = {}) {
+  // Public annotations retain only fixture-owned booleans and finite enums.
+  // CLI tables, provider output, identifiers, paths and environment are excluded.
+  const bool = value => typeof value === 'boolean' ? value : null;
+  const member = (value, allowed) => allowed.includes(value) ? value : 'unknown';
+  const section = key => observation?.[key] && typeof observation[key] === 'object'
+    ? observation[key] : {};
+  const text = section('text'), persisted = section('persisted'), pane = section('pane');
+  return Object.freeze({
+    text: Object.freeze({ format: member(text.format, ['runtime', 'database']),
+      peerPresent: bool(text.peerPresent), tmuxPresent: bool(text.tmuxPresent), panePresent: bool(text.panePresent) }),
+    providerEntered: bool(observation?.providerEntered),
+    persisted: Object.freeze({ state: member(persisted.state, ['available', 'unavailable']),
+      peerPresent: bool(persisted.peerPresent), bindingPresent: bool(persisted.bindingPresent),
+      transport: member(persisted.transport, ['tmux', 'web-pty', 'native', 'app-server', 'claude-mod', 'hook', 'detected']),
+      targetMatches: bool(persisted.targetMatches), sessionMatches: bool(persisted.sessionMatches),
+      peerStatus: member(persisted.peerStatus, ['starting', 'running', 'idle', 'working', 'busy', 'active', 'exited', 'detached', 'stale', 'blocked', 'closed']),
+      processState: member(persisted.processState, ['live', 'dead', 'unknown']) }),
+    pane: Object.freeze({ state: member(pane.state, ['found', 'not-found', 'unavailable']),
+      dead: bool(pane.dead), processState: member(pane.processState, ['live', 'dead', 'unknown']),
+      command: member(pane.command, ['bash', 'sh', 'zsh', 'node', 'env', 'hcc-cwd-handoff']) }),
+    events: Object.freeze((Array.isArray(observation?.events) ? observation.events : [])
+      .filter(type => ['peer.start.requested', 'tmux.session.attached', 'tmux.session.detached',
+        'tmux.session.exited', 'tmux.session.gc', 'tmux.session.rebind_cleanup_pending'].includes(type)).slice(0, 8))
+  });
+}
+
+export function fixturePeerListFormat(list) {
+  if (typeof list !== 'string') return 'unknown';
+  const header = list.split(/\r?\n/, 1)[0].trim().split(/\s+/).join(' ');
+  if (header === 'id peer kind role status type pane provider resume session pid command') return 'runtime';
+  if (header === 'id kind role status age active branch') return 'database';
+  return 'unknown';
 }
 
 function fixtureHttpRoute(route) {
@@ -6591,6 +6632,43 @@ async function tmuxBackedStartWorkflow() {
   await assertTmuxGcPolicy();
 }
 
+function collectShimRegistrationObservation(peer, pane, list, providerLog) {
+  const observation = {
+    text: { format: fixturePeerListFormat(list), peerPresent: list.includes(peer),
+      tmuxPresent: list.includes('tmux'), panePresent: list.includes(pane) },
+    providerEntered: fs.existsSync(providerLog), persisted: { state: 'unavailable' },
+    pane: { state: 'unavailable' }, events: []
+  };
+  let db;
+  try {
+    db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { readOnly: true, timeout: 250 });
+    const savedPeer = db.prepare('SELECT status, pid FROM peers WHERE id = ?').get(peer);
+    const binding = db.prepare('SELECT transport, runtime_target, runtime_session_id FROM peer_bindings WHERE peer = ?').get(peer);
+    observation.persisted = { state: 'available', peerPresent: Boolean(savedPeer), bindingPresent: Boolean(binding),
+      transport: binding?.transport, targetMatches: binding?.runtime_target === pane,
+      sessionMatches: binding?.runtime_session_id === peer, peerStatus: savedPeer?.status,
+      processState: Number.isSafeInteger(savedPeer?.pid) && savedPeer.pid > 0
+        ? inspectProcessIdentity(savedPeer.pid).state : 'unknown' };
+    observation.events = db.prepare(`SELECT type FROM events
+      WHERE type IN ('peer.start.requested', 'tmux.session.attached', 'tmux.session.detached',
+        'tmux.session.exited', 'tmux.session.gc', 'tmux.session.rebind_cleanup_pending')
+      AND (actor = ? OR (json_valid(payload) AND json_extract(payload, '$.target_peer') = ?))
+      ORDER BY id DESC LIMIT 8`).all(peer, peer).map(event => event.type);
+  } catch { /* A failed inspection must not replace the original assertion. */ }
+  finally { try { db?.close(); } catch {} }
+  const result = spawnSync('tmux', ['display-message', '-p', '-t', pane,
+    '#{pane_id}|#{pane_dead}|#{pane_pid}|#{pane_current_command}'], {
+    env, encoding: 'utf8', timeout: 1000, maxBuffer: 1024, stdio: ['ignore', 'pipe', 'ignore']
+  });
+  const parts = String(result.stdout || '').trim().split('|');
+  if (result.status === 0 && parts[0] === pane && ['0', '1'].includes(parts[1])) {
+    const pid = /^\d+$/.test(parts[2] || '') ? Number(parts[2]) : null;
+    observation.pane = { state: 'found', dead: parts[1] === '1', command: parts[3],
+      processState: Number.isSafeInteger(pid) && pid > 0 ? inspectProcessIdentity(pid).state : 'unknown' };
+  } else if (result.status === 1) observation.pane = { state: 'not-found' };
+  return observation;
+}
+
 async function shimTmuxWorkflow() {
   if (!tmuxAvailable()) {
     log('[6/13] shim tmux-backed launch skipped (tmux not installed)');
@@ -6621,10 +6699,12 @@ async function shimTmuxWorkflow() {
     fail(`codex shim did not pass through exec:\n${codexExec}`);
   }
 
+  const shimProviderLog = path.join(outDir, 'shim-initial-provider');
   const shimEnv = {
     ...env,
     HCC_SHIM_NO_ATTACH: '1',
     HCC_FAKE_STAY_ALIVE: '1',
+    HCC_FAKE_LOG: shimProviderLog,
     HCC_NO_AUTO_INSTALL_TMUX: '1',
     HCC_REG_VALUE: 'shim-first'
   };
@@ -6635,7 +6715,8 @@ async function shimTmuxWorkflow() {
   const pane = parsePane(output);
   const list = hcc(['peer', 'list']);
   if (!list.includes(peer) || !list.includes('tmux') || !list.includes(pane)) {
-    fail(`shim peer missing from list:\n${list}`);
+    fail(`shim peer missing from list:\n${list}`,
+      collectShimRegistrationObservation(peer, pane, list, shimProviderLog), 'shim-registration');
   }
   const hookPreservePayload = JSON.stringify({
     session_id: 'hook-preserve-session',
