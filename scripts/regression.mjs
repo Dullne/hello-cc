@@ -57,6 +57,7 @@ const fixtureFailures = new WeakSet();
 const fixtureCommandFailures = new WeakMap();
 const fixtureHttpFailures = new WeakMap();
 const fixtureShimRegistrationFailures = new WeakMap();
+const fixtureTmuxGcFailures = new WeakMap();
 const managedTmuxSessions = new Set();
 
 const env = {
@@ -102,6 +103,9 @@ export function fixtureFailureError(message, commandResult = null, diagnosticOpe
   if (diagnosticOperation === 'shim-registration') {
     fixtureShimRegistrationFailures.set(error, fixtureShimRegistrationSummary(commandResult));
   }
+  if (diagnosticOperation === 'tmux-gc') {
+    fixtureTmuxGcFailures.set(error, fixtureTmuxGcSummary(commandResult));
+  }
   return error;
 }
 
@@ -117,8 +121,30 @@ export function fixtureFailureDiagnostic(error) {
     ...(fixtureHttpFailures.has(error) ? { http: fixtureHttpFailures.get(error) } : {}),
     ...(fixtureShimRegistrationFailures.has(error)
       ? { shimRegistration: fixtureShimRegistrationFailures.get(error) } : {}),
+    ...(fixtureTmuxGcFailures.has(error) ? { tmuxGc: fixtureTmuxGcFailures.get(error) } : {}),
     ...(terminalMarker ? { terminalMarker } : {})
   };
+}
+
+export function fixtureTmuxGcSummary(observation = {}) {
+  const reasons = ['stale_hcc_managed_session', 'stale_rebind_cleanup_failed_session',
+    'tmux_stored_evidence_incomplete', 'tmux_session_changed', 'tmux_session_reused',
+    'tmux_session_id_changed', 'tmux_root_unknown', 'tmux_root_changed', 'tmux_pane_changed',
+    'tmux_pane_not_dead', 'tmux_dead_process_pid_changed', 'tmux_process_not_confirmed_dead',
+    'tmux_process_changed', 'tmux_clients_unknown', 'tmux_has_clients',
+    'tmux_binding_subject_incomplete', 'tmux_binding_session_authority_changed',
+    'tmux_binding_root_authority_changed', 'tmux_binding_pane_authority_changed',
+    'tmux_owner_process_live', 'tmux_owner_process_incompatible', 'tmux_target_missing',
+    'not_hcc_managed_name', 'hcc_root_mismatch', 'duplicate_db_binding', 'runtime_managed',
+    'not_old_enough', 'old_runtime_target_changed'];
+  return Object.freeze(Object.fromEntries(['stale', 'peerFilter', 'deadBinding', 'deadEvent'].map(role => {
+    const value = observation?.[role];
+    return [role, Object.freeze({
+      candidate: typeof value?.candidate === 'boolean' ? value.candidate : null,
+      reason: reasons.includes(value?.reason) ? value.reason : 'unknown',
+      mode: ['dead_process', 'explicit_exit_live'].includes(value?.mode) ? value.mode : null
+    })];
+  })));
 }
 
 export function fixtureShimRegistrationSummary(observation = {}) {
@@ -1000,18 +1026,26 @@ async function assertTmuxGcPolicy() {
       HCC_REGRESSION_TMUX_FAIL_CLIENT_SESSIONS: [clientUnknownEventSession, clientUnknownBindingSession].join(' ')
     };
     const dryRun = hcc(['tmux', 'gc', '--older-than', '14'], { env: gcEnv });
+    const dryRunJson = hccJson(['tmux', 'gc', '--older-than', '14'], { env: gcEnv });
+    const gcObservation = Object.fromEntries(Object.entries({
+      stale: stalePeer, peerFilter: peerFilterPeer, deadBinding: deadBindingPeer, deadEvent: deadEventPeer
+    }).map(([role, peer]) => {
+      const candidate = dryRunJson.candidates.find(row => row.peer === peer);
+      const row = candidate || dryRunJson.skipped.find(row => row.peer === peer);
+      return [role, { candidate: Boolean(candidate), reason: row?.reason, mode: row?.gc_validation_mode }];
+    }));
     if (!gcOutputHasPeer(dryRun, stalePeer) || !dryRun.includes('stale_hcc_managed_session') ||
         !gcOutputHasPeer(dryRun, peerFilterPeer) ||
         !gcOutputHasPeer(dryRun, deadBindingPeer) ||
         !gcOutputHasPeer(dryRun, deadEventPeer) || !dryRun.includes('stale_rebind_cleanup_failed_session')) {
-      fail(`tmux gc dry-run did not list stale DB-proven managed session:\n${dryRun}`);
+      fail(`tmux gc dry-run did not list stale DB-proven managed session:\n${dryRun}\n${JSON.stringify(gcObservation)}`,
+        gcObservation, 'tmux-gc');
     }
     for (const protectedPeer of [reusedBindingPeer, clientUnknownBindingPeer, eventPeer, reusedEventPeer, reusedProcessEventPeer, clientUnknownEventPeer, rootEventPeer, legacyEventPeer]) {
       if (gcOutputHasPeer(dryRun, protectedPeer)) {
         fail(`tmux gc dry-run treated live/unknown event evidence as removable (${protectedPeer}):\n${dryRun}`);
       }
     }
-    const dryRunJson = hccJson(['tmux', 'gc', '--older-than', '14'], { env: gcEnv });
     const candidateModes = new Map(dryRunJson.candidates.map((candidate) => [candidate.peer, candidate.gc_validation_mode]));
     if (candidateModes.get(stalePeer) !== 'explicit_exit_live' ||
         candidateModes.get(deadBindingPeer) !== 'dead_process') {
