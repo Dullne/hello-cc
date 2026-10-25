@@ -16,6 +16,40 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.1
+
+### Summary
+
+This maintenance release completes native submission recovery and shutdown
+verification, improves ownership diagnostics, and tightens Web request and file
+boundaries while retaining the existing workbench and provider interfaces.
+
+### Highlights
+
+- Keep CLI submission listings separate for each coordination database in the
+  same project. Validate saved database bindings before filtering, and continue
+  rejecting same-ID retries against a different database. Document offline
+  receipt inspection and recovery with the original submission ID.
+- Give owned stdio providers time to handle EOF and reap their ordinary child
+  processes. Confirm process exit and stdio closure before reporting shutdown;
+  retain incomplete-cleanup receipts and explicit retry behavior. Preserve safe
+  loopback listener error codes and endpoints for ownership startup failures.
+- Require any supplied Origin to match for Web writes, including Bearer-authenticated
+  requests. Keep cookie writes dependent on affirmative same-origin evidence and
+  preserve CLI requests without Origin. Query tokens remain restricted to login
+  and browser session exchange.
+- Restore omitted regressions for provider reconnects, authoritative completion,
+  duplicate reply/ACK suppression, uncertain deliveries, directory replacement
+  before spawn and Claude hook root receipts.
+
+### Validation
+
+Focused native, ownership and real HTTP tests cover the repaired paths. Package
+and browser acceptance use isolated projects and provider fixtures; those checks
+are separate from real model, installed-device and business acceptance. The
+release retains its own immutable package and validation receipts, without
+changing previous release archives.
+
 ## 1.1.0
 
 ### Summary
