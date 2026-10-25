@@ -76,6 +76,9 @@ confirmation follows receipt inspection, and the retry must retain the original
 executor and body. Later draft edits are preserved. Executor or project changes
 disable the old retry. Missing durable pending records or expired messages are
 rejected rather than sent as new work.
+For Claude's first send, the same executor may confirm its initially absent
+session ID before a retry. That confirmation preserves the original submission;
+changed owners, generations, bodies or already-known session IDs remain rejected.
 
 ## Requirements
 
@@ -483,6 +486,23 @@ project for default resolution, without injecting its query function. The
 harness checks explicit approval and rejection and continuing the original
 session. It uses existing authentication/quota, cleans test provider homes and
 processes, and never attaches to existing user conversations.
+
+For repeatable Claude transcript-fork diagnosis, run the actual installed SDK
+and its CLI with a deterministic local Messages fixture:
+
+```sh
+node scripts/claude-fork-acceptance.mjs --fixture \
+  --claude-package /absolute/path/to/claude-agent-sdk \
+  --output /absolute/path/to/fork-receipt.json
+```
+
+It snapshots parent and child message hashes immediately after copying and
+before the first child query, then checks initial recall, branch isolation,
+child resume and a closed-parent fork. Failures retain available history hashes
+before removing the private project and provider home. This mode uses no model
+or credentials. Replace `--fixture` with `--run-live` to use existing routing/auth
+and provider quota; only the model reported in that receipt is verified. Neither
+mode can recover the cause of a historical failure whose transcripts were removed.
 
 
 `--provider dsh --dsh-bin /absolute/path/to/dsh` uses the installed public launcher

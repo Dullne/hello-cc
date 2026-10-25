@@ -64,6 +64,8 @@ Web 遇到未确认提交时提供“沿用原提交重试”。此操作需核�
 并保持原执行器身份与原正文；之后编辑的草稿会保留。执行器或项目变化时禁用原
 提交重试。没有匹配的持久 pending 记录、或原消息已被清理时拒绝重试；不会把
 原 ID 当作新工作发送。
+Claude 首次发送时尚未确认的 session ID，可由同一执行器在重试前完成确认，
+继续沿用原提交。owner、generation、正文或已知 session ID 的变化仍会被拒绝。
 
 ## 环境准备
 
@@ -408,6 +410,21 @@ Web 验证覆盖服务与 bridge 控制接口，尚不等于完整浏览器操�
 `--claude-package DIR` 可将已经安装的 SDK 包链接到隔离 worker 项目，由默认加载器
 解析，不注入 query 函数。脚本验证明确批准与拒绝、原会话续接，退出后关闭测试
 进程并清理临时 provider home；使用现有认证和调用额度。它不连接现有用户会话。
+
+Claude 转录分叉的可重复诊断可使用实际安装的 SDK 和其 CLI，配合本地确定性
+Messages 响应服务运行：
+
+```sh
+node scripts/claude-fork-acceptance.mjs --fixture \
+  --claude-package /absolute/path/to/claude-agent-sdk \
+  --output /absolute/path/to/fork-receipt.json
+```
+
+脚本在复制后、首次子查询前立即保存父子消息哈希，验证首次回忆、父子分支隔离、
+子会话恢复及关闭父会话后再分叉。失败时也先保存可读历史的摘要，再清理私有项目
+和 provider home。此模式不调用模型或使用真实凭据；改用 `--run-live` 会使用现有
+路由和认证并消耗额度，验收仅覆盖回执实际报告的模型。两种模式都不能恢复已清理
+转录的历史失败原因。
 
 `--provider dsh --dsh-bin /absolute/path/to/dsh` 使用已安装的公开 launcher 和现有
 `DEEPSEEK_API_KEY`。脚本在私有 ACP profile 中通过公开 `tools/pre-execute` 策略

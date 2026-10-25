@@ -5,6 +5,21 @@ import { DatabaseSync } from 'node:sqlite';
 
 const FAILURE_CODE = 'NATIVE_ACCEPTANCE_COMMIT_GAP';
 const hash = text => createHash('sha256').update(text).digest('hex');
+
+// Retain enough to distinguish a conflict from a lost response without
+// writing response text, drafts, authorization headers or action tokens.
+export function summarizeNativeRetryResponse(status, body) {
+  const bytes = Buffer.from(body);
+  const summary = { status, bytes: bytes.length, bodySha256: hash(bytes), format: 'non-json', code: null };
+  if (bytes.length <= 65536) {
+    try {
+      const value = JSON.parse(bytes.toString('utf8'));
+      summary.format = 'json';
+      if (typeof value?.error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value.error.code)) summary.code = value.error.code;
+    } catch { /* The hash still identifies an HTML, empty or malformed response. */ }
+  } else summary.format = 'oversized';
+  return summary;
+}
 function readMesh(dbPath, read) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try { return read(db); } finally { db.close(); }
@@ -62,12 +77,17 @@ export async function runNativeRetryChecks({ browser, base, token, root, dbPath,
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     await context.addInitScript(browserInstrumentation);
     const page = await context.newPage(); watch(page);
-    const requests = [], responses = [];
+    const requests = [], responses = [], responseDetails = [], responseReads = [];
     page.on('request', request => {
       if (request.method() === 'POST' && new URL(request.url()).pathname === route) requests.push(request.postDataJSON());
     });
     page.on('response', response => {
-      if (response.request().method() === 'POST' && new URL(response.url()).pathname === route) responses.push(response.status());
+      if (response.request().method() !== 'POST' || new URL(response.url()).pathname !== route) return;
+      responses.push(response.status());
+      const summary = { status: response.status(), format: 'unavailable', code: null };
+      responseDetails.push(summary);
+      responseReads.push(response.body().then(body => Object.assign(summary, summarizeNativeRetryResponse(response.status(), body)))
+        .catch(() => { summary.format = 'unavailable'; }));
     });
     let observerContext, workerStarted = false, failure;
     try {
@@ -147,17 +167,21 @@ export async function runNativeRetryChecks({ browser, base, token, root, dbPath,
       await shot(page, viewport.name + '-native-retry-reconciled');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2), true);
       assert.deepEqual(responses, [409, 200]);
+      await Promise.all(responseReads);
+      assert.equal(responseDetails[0].code, FAILURE_CODE);
+      assert.equal(responseDetails[1].format, 'json');
       receipt.scenarios.push({ viewport, peer, submissionId, messageId: message.message_id,
         owner: originalState.owner, generation: originalState.generation,
-        requestCount: requests.length, responseStatuses: responses, expectedFailure: FAILURE_CODE,
+        requestCount: requests.length, responseStatuses: responses, responseDetails, expectedFailure: FAILURE_CODE,
         originalBodySha256: hash(original), laterDraftPreserved: true, observerRetryBlocked: true,
         messages: counts.messages, durableIntents: counts.intents, pendingEvents: counts.pendingEvents,
         deliveries: active.deliveries.length, userOriginRetained: true, providerInputs: adapter.sent });
       check('native retry ' + viewport.name + ': original durable submission repairs once; edited draft and observer fence survive');
     } catch (error) {
       failure = error;
+      await Promise.all(responseReads);
       receipt.failure = { viewport: viewport.name, peer, message: error.message, requestCount: requests.length,
-        responseStatuses: responses, injected: retryFault.injected.filter(value => value.peer === peer) };
+        responseStatuses: responses, responseDetails, injected: retryFault.injected.filter(value => value.peer === peer) };
       try { await shot(page, viewport.name + '-native-retry-failure'); } catch { /* Preserve the original assertion. */ }
       throw error;
     } finally {

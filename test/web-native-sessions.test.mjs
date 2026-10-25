@@ -1633,3 +1633,89 @@ test('an uncertain Web receipt requires an explicit same-ID same-worker retry af
   assert.equal(f.adapters.get('a').sent.length, 0);
   assert.equal(rebuilt.session().nativeSnapshot().deliveries[0].submission_id, input.submissionId);
 });
+
+test('a lost first Claude send can retry its original ID after the same executor confirms its session', async t => {
+  const f = await fixture(t, { c: { unknownSession: true } });
+  await f.start('c', { provider: 'claude' });
+  let lost = false;
+  const web = f.bridge(async (...args) => {
+    const result = await nativeRequest(...args);
+    if (!lost && args[1] === 'POST' && args[2] === '/send') {
+      lost = true;
+      throw Object.assign(new Error('lost initial queue response'), { code: 'NATIVE_CLIENT_TIMEOUT', extra: { uncertain: true } });
+    }
+    return result;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const input = { text: 'one first Claude input', submissionId: 'claude_first_retry_001' };
+  await assert.rejects(web.nativeAction(web.session('c'), 'send', input), { code: 'NATIVE_CLIENT_TIMEOUT' });
+  assert.equal(f.receipts()[0].payload.provider_session_id, null);
+  const owner = web.session('c').nativeIdentity.owner;
+  await f.service.poll();
+  const adapter = f.adapters.get('c');
+  assert.equal(adapter.sent.length, 1);
+  adapter.state.sessionId = 'confirmed-first-claude-session'; adapter.complete();
+  await f.service.poll();
+  const restoredWeb = f.bridge(); await restoredWeb.discoverNativeSessions(f.ctx);
+  const view = restoredWeb.session('c');
+  assert.equal(view.nativeIdentity.owner, owner);
+  assert.equal(view.nativeIdentity.sessionId, 'confirmed-first-claude-session');
+  const pendingEvent = f.mesh.prepare("SELECT id,payload FROM events WHERE type='native.web.submission.pending'").get();
+  const originalPending = JSON.parse(pendingEvent.payload);
+  const missingSession = { ...originalPending }; delete missingSession.provider_session_id;
+  for (const changed of [missingSession,
+    { ...originalPending, provider_session_id: 'different-known-session' },
+    { ...originalPending, owner: 'different-owner' },
+    { ...originalPending, generation: 'different-generation' },
+    { ...originalPending, provider: 'codex' }]) {
+    f.mesh.prepare('UPDATE events SET payload=? WHERE id=?').run(JSON.stringify(changed), pendingEvent.id);
+    await assert.rejects(restoredWeb.nativeAction(view, 'send', { ...input, retry: true }), { code: 'NATIVE_SUBMISSION_MISMATCH' });
+  }
+  f.mesh.prepare('UPDATE events SET payload=? WHERE id=?').run(pendingEvent.payload, pendingEvent.id);
+  await assert.rejects(restoredWeb.nativeAction(view, 'send', { ...input, text: 'different', retry: true }),
+    { code: 'NATIVE_SUBMISSION_MISMATCH' });
+  const retried = await restoredWeb.nativeAction(view, 'send', { ...input, retry: true });
+  assert.equal(retried.submission_id, input.submissionId);
+  assert.equal(retried.message_id, f.mesh.prepare('SELECT message_id FROM native_user_submissions WHERE submission_id=?').get(input.submissionId).message_id);
+  assert.equal(retried.state, 'completed');
+  assert.equal((await restoredWeb.nativeAction(view, 'send', { ...input, retry: true })).message_id, retried.message_id);
+  await f.service.poll();
+  assert.equal(adapter.sent.length, 1);
+  assert.equal(f.mesh.prepare("SELECT COUNT(*) AS n FROM messages WHERE kind='ask'").get().n, 1);
+  await f.api('POST', '/close', { peer: 'c' });
+  await f.start('c', { provider: 'claude', resume: 'last' });
+  const replacement = f.bridge(); await replacement.discoverNativeSessions(f.ctx);
+  assert.notEqual(replacement.session('c').nativeIdentity.owner, owner);
+  await assert.rejects(replacement.nativeAction(replacement.session('c'), 'send', { ...input, retry: true }),
+    { code: 'NATIVE_SUBMISSION_MISMATCH' });
+  assert.equal(f.adapters.get('c').sent.length, 0);
+});
+
+test('the production Claude adapter first-init transition preserves a lost Web submission retry', async t => {
+  const sdk = controlledClaudeSdk();
+  const f = await fixture(t, { c: { claudeSdk: sdk } });
+  await f.start('c', { provider: 'claude' });
+  let lost = false;
+  const web = f.bridge(async (...args) => {
+    const result = await nativeRequest(...args);
+    if (!lost && args[1] === 'POST' && args[2] === '/send') {
+      lost = true; throw Object.assign(new Error('lost first Claude response'), { code: 'NATIVE_CLIENT_TIMEOUT' });
+    }
+    return result;
+  });
+  await web.discoverNativeSessions(f.ctx);
+  const input = { text: 'one SDK input', submissionId: 'claude_sdk_first_retry_001' };
+  await assert.rejects(web.nativeAction(web.session('c'), 'send', input), { code: 'NATIVE_CLIENT_TIMEOUT' });
+  assert.equal(web.session('c').nativeIdentity.sessionId, null);
+  await f.service.poll();
+  const consumed = await sdk.consume();
+  assert.equal(consumed.value.message.content.endsWith('\n' + input.text), true);
+  await sdk.initialize('confirmed-sdk-retry-session');
+  const restored = f.bridge(); await restored.discoverNativeSessions(f.ctx);
+  assert.equal(restored.session('c').nativeIdentity.sessionId, 'confirmed-sdk-retry-session');
+  const retried = await restored.nativeAction(restored.session('c'), 'send', { ...input, retry: true });
+  assert.equal(retried.submission_id, input.submissionId);
+  assert.equal(f.mesh.prepare("SELECT COUNT(*) AS n FROM messages WHERE kind='ask'").get().n, 1);
+  assert.equal((await f.api('GET', '/workers/c/state')).deliveries.length, 1);
+  assert.equal(f.receipts().filter(value => value.type === 'native.web.submission.pending').length, 1);
+});

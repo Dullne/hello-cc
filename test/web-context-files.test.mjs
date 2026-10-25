@@ -90,7 +90,7 @@ test('result, entry and elapsed-time budgets report incomplete listings without 
 });
 
 test('context listing never enumerates a rebound project root between checks', async t => {
-  if (process.platform === 'win32') return t.skip('Windows retains the legacy read-only pathname listing');
+  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
   const container = await fs.realpath(await fixture(t)), selected = path.join(container, 'selected');
   const replacement = path.join(container, 'replacement'), parked = path.join(container, 'parked');
   const root = path.join(selected, 'stable-parent', 'project');

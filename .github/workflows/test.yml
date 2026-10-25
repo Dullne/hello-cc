@@ -11,12 +11,28 @@ on:
       - codex/dsh-stop-diagnostics
       - codex/dsh-stop-confirmation
       - 'codex/local-change-integration-*'
+      - 'codex/native-remaining-fixes-*'
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
+  windows-file-access-guard:
+    name: Native Windows file access refusal
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # These focused tests use only Node built-ins. They verify refusal, not
+      # native Windows runtime support; supported Windows operation is in WSL.
+      - run: node --test test/web-files-platform.test.mjs
+
   regression:
     name: Regression (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

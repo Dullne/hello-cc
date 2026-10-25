@@ -246,7 +246,7 @@ test('a directory changed before pinned enumeration is refused', async t => {
 });
 
 test('tree listing never enumerates a rebound project root between checks', async t => {
-  if (process.platform === 'win32') return t.skip('Windows retains the legacy read-only pathname listing');
+  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
   const f = await fixture(t), selected = path.join(f.root, 'selected');
   const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
   const root = path.join(selected, 'project');
@@ -277,7 +277,7 @@ test('tree listing never enumerates a rebound project root between checks', asyn
 });
 
 test('tree listing binds its root before the first await without a supplied identity', async t => {
-  if (process.platform === 'win32') return t.skip('Windows retains the legacy read-only pathname listing');
+  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
   const f = await fixture(t), selected = path.join(f.root, 'selected');
   const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
   const root = path.join(selected, 'stable-parent', 'project');

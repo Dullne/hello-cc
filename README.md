@@ -84,6 +84,8 @@ hello-cc supports Linux and macOS on arm64 and x64. Node.js 24 or newer is
 required. `hcc web` requires `tmux`, including when you plan to create background
 Agents from Web. Native Windows shells are not currently supported; use WSL
 and install the dependencies inside it.
+File browsing, previews, status and context-file search refuse native Windows
+with `PROJECT_FILE_READ_UNAVAILABLE` (HTTP 503); there is no pathname-based fallback.
 
 Linux has richer process auto-discovery through `/proc`. On macOS, use
 hello-cc shims or `hcc peer start` for reliable tmux-managed terminal sessions.

@@ -62,6 +62,8 @@ unknown 证据获得最长 120 秒宽限。`hcc gc` 默认保留历史，必须�
 hello-cc 支持 Linux 和 macOS。需要 Node.js 24 或更新版本；`hcc web` 和受管
 终端需要 `tmux`。发行包包含 macOS/Linux arm64 与 x64 的目录交接 helper。
 当前不支持原生 Windows shell；Windows 用户建议使用 WSL。
+原生 Windows 上的文件浏览、预览、状态和上下文文件搜索会明确返回
+`PROJECT_FILE_READ_UNAVAILABLE`（HTTP 503），不再回退到不安全的路径读取。
 
 在运行 hello-cc 的同一环境中安装并登录所需 provider。Codex 后台 Agent 需要支持
 App Server 的 Codex CLI；DeepSeek Harness 后台 Agent 需要 DSH ACP runtime；
