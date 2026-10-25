@@ -114,7 +114,10 @@ test('context listing never enumerates a rebound project root between checks', a
     };
   };
   try {
-    const result = await listContextFiles(root, '', { rootIdentity });
+    // This assertion tests which directory is enumerated. The interactive
+    // 150 ms budget may legitimately truncate under concurrent CI load; its
+    // deadline behavior is covered independently above.
+    const result = await listContextFiles(root, '', { rootIdentity, timeBudgetMs: 5000 });
     assert.deepEqual(result.paths, ['owned.txt']);
     assert.equal(redirected, false);
   } finally { fs.opendir = original; rootIdentity.release(); }
