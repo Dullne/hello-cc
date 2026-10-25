@@ -50,6 +50,9 @@ boundaries while retaining the existing workbench and provider interfaces.
   before spawn and Claude hook root receipts. Add repeatable Claude transcript
   fork checks using the actual SDK and CLI with either local fixture responses
   or the caller's configured model route.
+- Distinguish missing dead-pane PID evidence from a changed PID during tmux GC.
+  Newer tmux versions can hide the PID after terminal exit; retain those sessions
+  and their database bindings, and verify both supported observation modes in CI.
 
 ### Validation
 

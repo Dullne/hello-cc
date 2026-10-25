@@ -143,6 +143,11 @@ hcc inject PEER TEXT [--no-enter]
 
 这些命令创建或接入 tmux-backed 终端，让 Web 控制台可以观察和操作它们。
 
+`hcc tmux gc --older-than 14` 预览数据库能证明归属的过期会话；添加 `--yes`
+才会删除符合条件的会话，`--peer PEER` 可限定目标。若 tmux 不再提供已退出
+pane 的 PID，GC 返回 `tmux_dead_process_pid_unknown`，保留会话及数据库绑定。
+仅凭会话年龄或 pane 已退出，不会获得自动删除权限。
+
 ## 消息
 
 ```text

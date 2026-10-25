@@ -158,6 +158,11 @@ hcc inject PEER TEXT [--no-enter]
 These commands create or attach tmux-backed terminals that can be viewed and
 controlled from the Web console.
 
+`hcc tmux gc --older-than 14` previews database-proven stale sessions; add `--yes`
+to delete eligible sessions, or `--peer PEER` to restrict the plan. If tmux omits
+the PID of an exited pane, GC reports `tmux_dead_process_pid_unknown` and retains
+both the session and its binding. Age and pane death alone do not authorize deletion.
+
 ## Messages
 
 ```text

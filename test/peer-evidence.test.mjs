@@ -723,6 +723,11 @@ test('tmux GC planning and apply accept only an exact confirmed-dead pane', asyn
     ok: false,
     reason: 'tmux_dead_process_pid_changed'
   });
+  for (const pane_pid of [null, undefined, '', 0, -1, NaN, '700']) {
+    assert.deepEqual(validate(stored, { ...observed, pane_pid }), {
+      ok: false, reason: 'tmux_dead_process_pid_unknown'
+    });
+  }
   assert.deepEqual(validate(stored, { ...observed, pane_dead: false }), {
     ok: false,
     reason: 'tmux_pane_not_dead'

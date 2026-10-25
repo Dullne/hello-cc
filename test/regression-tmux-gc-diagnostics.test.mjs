@@ -24,6 +24,8 @@ test('tmux GC diagnostics retain fixture roles and finite skip reasons without s
 });
 
 test('only the explicit fixture failure operation can attach GC diagnostics', () => {
+  assert.equal(fixtureTmuxGcSummary({ deadBinding: { candidate: false, reason: 'tmux_dead_process_pid_unknown' } })
+    .deadBinding.reason, 'tmux_dead_process_pid_unknown');
   for (const operation of [null, 'broadcast', 'PRIVATE_OPERATION']) {
     const error = fixtureFailureError('PRIVATE_MESSAGE', {}, operation);
     error.tmuxGc = fixtureTmuxGcSummary({});

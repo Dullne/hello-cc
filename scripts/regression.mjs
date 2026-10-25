@@ -130,7 +130,7 @@ export function fixtureTmuxGcSummary(observation = {}) {
   const reasons = ['stale_hcc_managed_session', 'stale_rebind_cleanup_failed_session',
     'tmux_stored_evidence_incomplete', 'tmux_session_changed', 'tmux_session_reused',
     'tmux_session_id_changed', 'tmux_root_unknown', 'tmux_root_changed', 'tmux_pane_changed',
-    'tmux_pane_not_dead', 'tmux_dead_process_pid_changed', 'tmux_process_not_confirmed_dead',
+    'tmux_pane_not_dead', 'tmux_dead_process_pid_unknown', 'tmux_dead_process_pid_changed', 'tmux_process_not_confirmed_dead',
     'tmux_process_changed', 'tmux_clients_unknown', 'tmux_has_clients',
     'tmux_binding_subject_incomplete', 'tmux_binding_session_authority_changed',
     'tmux_binding_root_authority_changed', 'tmux_binding_pane_authority_changed',
@@ -1009,6 +1009,17 @@ async function assertTmuxGcPolicy() {
   await waitFor(() => run('tmux', ['display-message', '-p', '-t', deadEventPane, '#{pane_dead}']).trim() === '1', 'dead event pane');
   await waitFor(() => run('tmux', ['display-message', '-p', '-t', clientUnknownEventPane, '#{pane_dead}']).trim() === '1', 'client-unknown dead event pane');
   await waitFor(() => run('tmux', ['display-message', '-p', '-t', deadBindingPane, '#{pane_dead}']).trim() === '1', 'dead binding pane');
+  // Recent tmux hides pane_pid after PTY closure. Keep the destructive guard
+  // strict: test deletion only when this host still supplies the original PID,
+  // and require an explicit safe skip otherwise. Never substitute a saved PID.
+  const retainsDeadPanePid = (pane, evidence) => {
+    const pid = Number(run('tmux', ['display-message', '-p', '-t', pane, '#{pane_pid}']).trim());
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    if (pid !== evidence.old_process_identity.pid) fail('dead tmux fixture process changed before GC');
+    return true;
+  };
+  const deadBindingGcAvailable = retainsDeadPanePid(deadBindingPane, deadBindingEvidence);
+  const deadEventGcAvailable = retainsDeadPanePid(deadEventPane, deadEventEvidence);
 
   const attachTmux = realTmuxBin ? `${sh(realTmuxBin)} -L ${sh(tmuxSocketName)}` : 'tmux';
   const client = spawnSync('tmux', ['new-session', '-d', '-s', `${tmuxSession}-gc-client`, '-e', `HCC_ROOT=${root}`, 'sh', '-lc', `unset TMUX; exec ${attachTmux} attach-session -t ${sh(attachedSession)}`], {
@@ -1036,10 +1047,16 @@ async function assertTmuxGcPolicy() {
     }));
     if (!gcOutputHasPeer(dryRun, stalePeer) || !dryRun.includes('stale_hcc_managed_session') ||
         !gcOutputHasPeer(dryRun, peerFilterPeer) ||
-        !gcOutputHasPeer(dryRun, deadBindingPeer) ||
-        !gcOutputHasPeer(dryRun, deadEventPeer) || !dryRun.includes('stale_rebind_cleanup_failed_session')) {
+        gcOutputHasPeer(dryRun, deadBindingPeer) !== deadBindingGcAvailable ||
+        gcOutputHasPeer(dryRun, deadEventPeer) !== deadEventGcAvailable ||
+        (deadEventGcAvailable && !dryRun.includes('stale_rebind_cleanup_failed_session'))) {
       fail(`tmux gc dry-run did not list stale DB-proven managed session:\n${dryRun}\n${JSON.stringify(gcObservation)}`,
         gcObservation, 'tmux-gc');
+    }
+    for (const [peer, available] of [[deadBindingPeer, deadBindingGcAvailable], [deadEventPeer, deadEventGcAvailable]]) {
+      if (!available && !dryRunJson.skipped.some(row => row.peer === peer && row.reason === 'tmux_dead_process_pid_unknown')) {
+        fail('tmux gc must retain dead panes whose process binding is unavailable', gcObservation, 'tmux-gc');
+      }
     }
     for (const protectedPeer of [reusedBindingPeer, clientUnknownBindingPeer, eventPeer, reusedEventPeer, reusedProcessEventPeer, clientUnknownEventPeer, rootEventPeer, legacyEventPeer]) {
       if (gcOutputHasPeer(dryRun, protectedPeer)) {
@@ -1048,7 +1065,7 @@ async function assertTmuxGcPolicy() {
     }
     const candidateModes = new Map(dryRunJson.candidates.map((candidate) => [candidate.peer, candidate.gc_validation_mode]));
     if (candidateModes.get(stalePeer) !== 'explicit_exit_live' ||
-        candidateModes.get(deadBindingPeer) !== 'dead_process') {
+        candidateModes.get(deadBindingPeer) !== (deadBindingGcAvailable ? 'dead_process' : undefined)) {
       fail(`tmux gc did not record strict binding validation modes:\n${JSON.stringify(dryRunJson.candidates, null, 2)}`);
     }
     if (runMaybe('tmux', ['has-session', '-t', staleSession]).status !== 0) {
@@ -1071,7 +1088,9 @@ async function assertTmuxGcPolicy() {
     }
 
     const removed = hcc(['tmux', 'gc', '--older-than', '14', '--yes'], { env: gcEnv });
-    if (!gcOutputHasPeer(removed, stalePeer) || !gcOutputHasPeer(removed, deadBindingPeer) || !gcOutputHasPeer(removed, deadEventPeer) ||
+    if (!gcOutputHasPeer(removed, stalePeer) ||
+        gcOutputHasPeer(removed, deadBindingPeer) !== deadBindingGcAvailable ||
+        gcOutputHasPeer(removed, deadEventPeer) !== deadEventGcAvailable ||
         gcOutputHasPeer(removed, reusedBindingPeer) || gcOutputHasPeer(removed, clientUnknownBindingPeer) ||
         gcOutputHasPeer(removed, eventPeer) || gcOutputHasPeer(removed, reusedEventPeer) ||
         gcOutputHasPeer(removed, reusedProcessEventPeer) || gcOutputHasPeer(removed, clientUnknownEventPeer) ||
@@ -1082,11 +1101,11 @@ async function assertTmuxGcPolicy() {
     if (runMaybe('tmux', ['has-session', '-t', staleSession]).status === 0) {
       fail('tmux gc --yes did not delete stale DB-proven managed session');
     }
-    if (runMaybe('tmux', ['has-session', '-t', deadBindingSession]).status === 0) {
-      fail('tmux gc --yes did not delete a truly dead exact binding session');
+    if ((runMaybe('tmux', ['has-session', '-t', deadBindingSession]).status !== 0) !== deadBindingGcAvailable) {
+      fail('tmux gc --yes must delete only a truly dead exact binding session with its original PID');
     }
-    if (runMaybe('tmux', ['has-session', '-t', deadEventSession]).status === 0) {
-      fail('tmux gc --yes did not delete a confirmed-dead rebind cleanup session listed by dry-run');
+    if ((runMaybe('tmux', ['has-session', '-t', deadEventSession]).status !== 0) !== deadEventGcAvailable) {
+      fail('tmux gc --yes must retain rebind cleanup sessions lacking a confirmed process binding');
     }
     for (const protectedSession of [reusedBindingSession, clientUnknownBindingSession, eventSession, reusedEventSession, reusedProcessEventSession, clientUnknownEventSession, rootEventSession, manualSession]) {
       if (runMaybe('tmux', ['has-session', '-t', protectedSession]).status !== 0) {
@@ -1121,7 +1140,8 @@ async function assertTmuxGcPolicy() {
       fail(`tmux gc changed attached-client binding:\n${JSON.stringify(attachedBinding, null, 2)}`);
     }
     const deadBinding = peerBindingRow(deadBindingPeer);
-    if (!deadBinding || deadBinding.transport !== 'detached' || deadBinding.runtime_target !== null) {
+    if (!deadBinding || deadBinding.transport !== (deadBindingGcAvailable ? 'detached' : 'tmux') ||
+        deadBinding.runtime_target !== (deadBindingGcAvailable ? null : deadBindingPane)) {
       fail(`tmux gc did not detach truly dead binding:\n${JSON.stringify(deadBinding, null, 2)}`);
     }
     for (const [peer, pane] of [
