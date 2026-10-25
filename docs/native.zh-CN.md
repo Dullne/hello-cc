@@ -54,6 +54,12 @@ fork；HCC 不用 transcript 重放冒充原生 fork。
 重试或 worker 恢复会补齐原记录，保留用户请求来源。已有 `uncertain` 投递不会
 因为重试被自动重放。
 
+未指定 ID 时，CLI 会先将自动生成的 ID 持久写入本地日志，再发送请求。
+使用 `hcc native submissions [--peer NAME]` 查看这些 ID 和已保存的队列回执；
+runtime 离线时也能查询，列表只包含当前选择的项目数据库。`unconfirmed` 表示
+没有保存队列回执，请求仍可能已发送。应先核对 deliveries，再沿用原 ID、peer、
+sender、task 和正文重试，避免提交一条新消息。
+
 Web 遇到未确认提交时提供“沿用原提交重试”。此操作需核对持久回执后明确确认，
 并保持原执行器身份与原正文；之后编辑的草稿会保留。执行器或项目变化时禁用原
 提交重试。没有匹配的持久 pending 记录、或原消息已被清理时拒绝重试；不会把
@@ -193,6 +199,7 @@ HCC 不为只读 worker 注入自有的任务／锁／结果写操作 MCP，也�
 | `hcc native fork` | 必须 `--parent NAME --peer NEW_NAME`；可选 `--model MODEL --binary PATH`；复制 HCC 持有的 Codex 或 Claude 会话到新 worker |
 | `hcc native send` | 必须 `--peer NAME --body TEXT`；可选 `--from NAME --task ID --submission-id ID`；返回持久消息/submission 回执 |
 | `hcc native deliveries` | 可选 `--peer NAME`，查看投递回执 |
+| `hcc native submissions` | 可选 `--peer NAME`，查看当前数据库的本地 submission ID 和队列回执，支持离线查询 |
 | `hcc native events` | 必须 `--peer NAME`；可选 `--after ID`，查看有界事件历史 |
 | `hcc native requests` | 必须 `--peer NAME`；查看与该执行器、会话、turn 绑定的待处理请求 |
 | `hcc native respond` | 必须 `--peer NAME --request ID --decision accept\|decline\|cancel`；权限子集、问题答案或 MCP 表单内容通过 `--response-file JSON` 提交 |
@@ -203,6 +210,16 @@ HCC 不为只读 worker 注入自有的任务／锁／结果写操作 MCP，也�
 `native down` 的回执只确认停止请求，不证明关闭已完成。需要检查 `native status`
 确认结果。若 provider 关闭失败，HCC 保留 runtime owner，并在
 `status.shutdown_error` 报告错误；处理所报问题后，再次执行 `native down`。
+
+HCC 先向自有 stdio provider 发送 EOF，让 provider 有机会自行清理，再按需升级为
+SIGTERM 和 SIGKILL。确认传输关闭需要直接进程退出且 stdio 管道全部关闭。
+若继承的管道仍被占用，`NATIVE_CLOSE_FAILED` 会报告 `NATIVE_STDIO_CLOSE_TIMEOUT`，
+runtime 保留所有权，等待明确重试。HCC 不会向已退出的 PID 发信号，也不会猜测
+脱离原连接的后代进程归属。
+
+所有权监听器遇到权限或资源故障时，报告 `NATIVE_OWNERSHIP_UNAVAILABLE`，包含
+限定范围的系统错误码、errno、syscall 和 loopback 端点。此类故障与已有 runtime
+占用分别报告，不会启动 provider，也不会作为普通锁竞争反复尝试绑定。
 
 事件保留语义输出和完成证据，不把 token delta 持久化为投递回执。runtime 状态位于
 `<解析后的项目状态目录>/native/`，可以是项目局部或上方说明的私有状态；协作记录

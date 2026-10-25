@@ -64,6 +64,13 @@ ID together. If the native delivery projection was not yet saved, retry or
 worker recovery repairs the original delivery while retaining local user
 origin. Retrying an existing `uncertain` delivery does not replay execution.
 
+When no ID is supplied, the CLI durably journals a generated ID before sending.
+Use `hcc native submissions [--peer NAME]` to inspect these IDs and saved receipts
+even while the runtime is offline. Listings are scoped to the selected project
+database. `unconfirmed` means that no queue receipt was saved; the request may
+already have been sent. Inspect deliveries and retry the original ID with the
+same peer, sender, task and body instead of submitting a new message.
+
 Web offers **Retry same submission** for an unconfirmed send. Explicit
 confirmation follows receipt inspection, and the retry must retain the original
 executor and body. Later draft edits are preserved. Executor or project changes
@@ -226,6 +233,7 @@ policy and cannot override it; the child is independently verified before use.
 | `hcc native fork` | Required `--parent NAME --peer NEW_NAME`; optional `--model MODEL --binary PATH`; forks an HCC-owned Codex or Claude session into a new worker |
 | `hcc native send` | Required `--peer NAME --body TEXT`; optional `--from NAME --task ID --submission-id ID`; returns a durable message/submission receipt |
 | `hcc native deliveries` | Optional `--peer NAME`; inspect delivery receipts |
+| `hcc native submissions` | Optional `--peer NAME`; inspect the selected database's locally journaled submission IDs and queue receipts, including offline |
 | `hcc native events` | Required `--peer NAME`; optional `--after ID`; inspect a bounded event history |
 | `hcc native requests` | Requires `--peer NAME`; inspect pending requests bound to this executor, session and turn |
 | `hcc native respond` | Requires `--peer NAME --request ID --decision accept\|decline\|cancel`; use `--response-file JSON` for permission subsets, answers or MCP form content |
@@ -237,6 +245,18 @@ The `native down` receipt confirms the stop request, not completed shutdown.
 Inspect `native status` to check the outcome. If provider shutdown fails, HCC
 retains runtime ownership and reports the error in `status.shutdown_error`;
 resolve the reported problem and retry `native down`.
+
+Owned stdio providers first receive EOF so they can finish cleanup themselves.
+HCC escalates to SIGTERM and SIGKILL if needed, and requires both direct process
+exit and closed stdio pipes before confirming transport shutdown. If an inherited
+pipe stays open, `NATIVE_CLOSE_FAILED` reports `NATIVE_STDIO_CLOSE_TIMEOUT`; HCC
+keeps runtime ownership for an explicit retry. It does not signal an already
+exited PID or guess ownership of detached descendants.
+
+An ownership listener permission or resource failure reports
+`NATIVE_OWNERSHIP_UNAVAILABLE` with a bounded OS error code, errno, syscall and
+loopback endpoint. These failures are distinct from an existing runtime owner
+and do not start a provider or retry the bind as ordinary lock contention.
 
 Worker events retain semantic output and completion evidence; token deltas are
 not persisted as delivery receipts. The runtime keeps local state under
