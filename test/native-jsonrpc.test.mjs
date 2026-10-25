@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { inspectProcessIdentity } from '../lib/process/identity.mjs';
 import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 
 // A real stdio peer, deliberately writing fragmented and interleaved frames.
@@ -102,6 +107,96 @@ async function transport(t, options = {}) {
   return rpc;
 }
 
+// A cooperative provider owns an ordinary shell job. The abandoned variant
+// exits without reaping it, leaving inherited stderr open after direct exit.
+const shellOwnerProgram = String.raw`
+const fs = require('node:fs'), path = require('node:path');
+const { spawn } = require('node:child_process');
+const { createInterface } = require('node:readline');
+const [root, mode] = process.argv.slice(1), pidFile = path.join(root, 'sleep.pid');
+const shell = spawn('/bin/sh', ['-c',
+  'trap \'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0\' TERM; sleep 30 & sleeper=$!; printf "%s" "$sleeper" > "$1"; wait "$sleeper"',
+  'owned-fixture', pidFile], { stdio: ['ignore', process.stdout, process.stderr] });
+shell.on('error', () => process.exit(29));
+createInterface({ input: process.stdin }).on('line', async line => {
+  const frame = JSON.parse(line);
+  while (!fs.existsSync(pidFile)) await new Promise(resolve => setTimeout(resolve, 5));
+  process.stdout.write(JSON.stringify({ id: frame.id, result: { shell: shell.pid,
+    sleep: Number(fs.readFileSync(pidFile, 'utf8')) } }) + '\n');
+  if (frame.method === 'exit-parent') setTimeout(() => process.exit(0), 10);
+});
+process.stdin.on('end', () => {
+  if (mode === 'abandon') return process.exit(0);
+  setTimeout(() => { shell.once('close', () => process.exit(0)); shell.kill('SIGTERM'); }, 60);
+});
+`;
+
+async function shellOwner(t, mode = 'cooperate') {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-rpc-owned-shell-'));
+  const rpc = new JsonRpcProcess({ binary: process.execPath, args: ['-e', shellOwnerProgram, root, mode],
+    cwd: root, env: process.env, closeEofGraceMs: 300, closeGraceMs: 100, closeKillTimeoutMs: 100 });
+  const descendants = [];
+  t.after(async () => {
+    // These identities come only from the fixture's ready response. Never
+    // search for or signal arbitrary orphan processes or process groups.
+    for (const expected of descendants) {
+      const current = inspectProcessIdentity(expected.pid);
+      if (current.state === 'live') {
+        assert.deepEqual(current.identity, expected);
+        process.kill(expected.pid, 'SIGTERM');
+        await until(() => inspectProcessIdentity(expected.pid).state !== 'live');
+      }
+    }
+    if (rpc.child?.pid && rpc.child.exitCode === null && rpc.child.signalCode === null) rpc.child.kill('SIGKILL');
+    if (rpc.child?.pid) await until(() => rpc.childClosed);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  await rpc.start();
+  const peers = await rpc.request('ready');
+  for (const pid of [peers.shell, peers.sleep]) {
+    const observation = inspectProcessIdentity(pid);
+    assert.equal(observation.state, 'live'); assert.ok(observation.identity);
+    descendants.push(observation.identity);
+  }
+  return { rpc, peers };
+}
+
+test('JSON-RPC EOF lets the provider reap its ordinary shell child without sending a signal',
+  { skip: process.platform === 'win32' }, async t => {
+    const { rpc, peers } = await shellOwner(t);
+    const signals = [], kill = rpc.child.kill.bind(rpc.child);
+    rpc.child.kill = signal => { signals.push(signal); return kill(signal); };
+    await rpc.close();
+    assert.deepEqual(signals, []);
+    assert.equal(rpc.child.exitCode, 0); assert.equal(rpc.childClosed, true);
+    assert.notEqual(inspectProcessIdentity(peers.shell).state, 'live');
+    assert.notEqual(inspectProcessIdentity(peers.sleep).state, 'live');
+  });
+
+test('JSON-RPC does not report success when direct exit leaves inherited stdio open',
+  { skip: process.platform === 'win32' }, async t => {
+    for (const alreadyExited of [false, true]) {
+      await t.test(alreadyExited ? 'already exited before close' : 'exits after EOF', async t => {
+        const { rpc, peers } = await shellOwner(t, 'abandon');
+        if (alreadyExited) { await rpc.request('exit-parent'); await until(() => rpc.child.exitCode !== null); }
+        const signals = [], kill = rpc.child.kill.bind(rpc.child);
+        rpc.child.kill = signal => { signals.push(signal); return kill(signal); };
+        const closing = rpc.close();
+        assert.equal(closing, rpc.close());
+        await assert.rejects(closing, error => {
+          assert.equal(error.code, 'NATIVE_CLOSE_FAILED');
+          assert.equal(error.extra.cause, 'NATIVE_STDIO_CLOSE_TIMEOUT');
+          assert.equal(error.extra.uncertain, true);
+          return true;
+        });
+        assert.equal(rpc.child.exitCode, 0); assert.equal(rpc.childClosed, false);
+        assert.equal(inspectProcessIdentity(peers.shell).state, 'live');
+        assert.equal(inspectProcessIdentity(peers.sleep).state, 'live');
+        assert.deepEqual(signals, []);
+      });
+    }
+  });
+
 test('JSON-RPC decodes split UTF-8 and dispatches multiple out-of-order responses and notifications', async (t) => {
   const notices = [];
   const rpc = await transport(t, { onNotification: (method, params) => notices.push({ method, params }) });
@@ -182,6 +277,7 @@ test('JSON-RPC close terminates its owned child and leaves another child usable'
   await pendingRejection;
   assert.equal(owned.closed, true);
   assert.ok(owned.child.exitCode !== null || owned.child.signalCode !== null);
+  assert.equal(owned.childClosed, true);
   assert.equal(exits.at(-1).expected, true);
   assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
   assert.equal(process.kill(independentPid, 0), true);
@@ -191,7 +287,7 @@ test('JSON-RPC close terminates its owned child and leaves another child usable'
 
 test('concurrent JSON-RPC closes share one promise and all wait for the real delayed exit', async (t) => {
   const exits = [];
-  const rpc = await transport(t, { onExit: (event) => exits.push(event) });
+  const rpc = await transport(t, { closeEofGraceMs: 40, onExit: (event) => exits.push(event) });
   await rpc.request('delayed-term');
   const first = rpc.close();
   const second = rpc.close();
@@ -209,7 +305,7 @@ test('concurrent JSON-RPC closes share one promise and all wait for the real del
 
 test('JSON-RPC close escalates an ignored SIGTERM and waits for SIGKILL exit evidence', async (t) => {
   const exits = [];
-  const rpc = await transport(t, { closeGraceMs: 40, closeKillTimeoutMs: 1000,
+  const rpc = await transport(t, { closeEofGraceMs: 20, closeGraceMs: 40, closeKillTimeoutMs: 1000,
     onExit: (event) => exits.push(event) });
   await rpc.request('ignore-term');
   const closing = rpc.close();
@@ -232,7 +328,8 @@ test('JSON-RPC close handles never-started and failed-spawn transports without w
 });
 
 test('JSON-RPC close reports signal failures and accepts an observed exit on retry', async (t) => {
-  const rpc = await transport(t);
+  const rpc = await transport(t, { closeEofGraceMs: 20 });
+  await rpc.request('ignore-term');
   const originalKill = rpc.child.kill.bind(rpc.child);
   rpc.child.kill = () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); };
   const closing = rpc.close();
@@ -252,7 +349,7 @@ test('JSON-RPC close reports signal failures and accepts an observed exit on ret
 
 for (const failure of ['signal', 'exit-timeout']) {
   test(`JSON-RPC close retries a live owned child after ${failure} failure`, async (t) => {
-    const rpc = await transport(t, { closeGraceMs: 20, closeKillTimeoutMs: 20 });
+    const rpc = await transport(t, { closeEofGraceMs: 20, closeGraceMs: 20, closeKillTimeoutMs: 20 });
     await rpc.request('ignore-term');
     const originalKill = rpc.child.kill.bind(rpc.child);
     rpc.child.kill = () => {
@@ -282,6 +379,15 @@ for (const failure of ['signal', 'exit-timeout']) {
   });
 }
 
+test('JSON-RPC close uses the recorded close receipt after an already finished process', async t => {
+  const rpc = await transport(t);
+  await assert.rejects(rpc.request('exit'), { code: 'NATIVE_PROCESS_EXITED' });
+  await until(() => rpc.childClosed);
+  rpc.child.kill = () => { assert.fail('an already closed process must not be signaled'); };
+  await rpc.close();
+  assert.equal(rpc.child.exitCode, 23);
+});
+
 test('JSON-RPC drains stderr larger than pipe capacity without corrupting stdout', async (t) => {
   const notices = [];
   const rpc = await transport(t, { onNotification: (method) => notices.push(method) });
@@ -294,6 +400,7 @@ test('JSON-RPC protocol failure observes failed cleanup without fabricating proc
   const errors = [];
   const exits = [];
   const rpc = await transport(t, {
+    closeEofGraceMs: 20,
     onError(error) {
       errors.push(error);
       return Promise.reject(new Error('consumer rejected error notification'));
@@ -348,4 +455,19 @@ test('JSON-RPC provider errors retain method and RPC evidence without killing a 
     return true;
   });
   assert.deepEqual(await rpc.request('echo', { good: true }), { good: true });
+});
+
+test('JSON-RPC refuses to spawn in a replacement for the selected directory', async t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-jsonrpc-root-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const selected = path.join(base, 'selected');
+  fs.mkdirSync(selected);
+  const expectedIdentity = captureSelectedCwdSnapshot(selected);
+  const rpc = new JsonRpcProcess({ binary: process.execPath, args: ['-e', 'process.exit(0)'],
+    cwd: selected, expectedIdentity });
+  t.after(() => rpc.close());
+  fs.renameSync(selected, path.join(base, 'original'));
+  fs.mkdirSync(selected);
+  await assert.rejects(rpc.start(), { code: 'PROJECT_PATH_CHANGED' });
+  assert.equal(rpc.child, null, 'the provider must not be spawned in the replacement directory');
 });

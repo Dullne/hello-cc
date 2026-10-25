@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 
 const TEST_CWD = process.cwd();
@@ -59,6 +60,7 @@ test('Codex opens its own stdio app-server with handshake and bounded permission
       sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'user' }] ]);
   assert.deepEqual(f.callbacks.args, ['app-server', '--stdio']);
   assert.equal(f.callbacks.binary, 'codex');
+  assert.equal(f.callbacks.expectedIdentity.canonical, fs.realpathSync(TEST_CWD));
   assert.equal(f.adapter.capabilities.fork, true);
   await assert.rejects(f.adapter.open(), { code: 'NATIVE_SESSION_ALREADY_OPEN' });
 });
@@ -647,10 +649,13 @@ test('native Codex pins the original directory through the transport spawn bound
     }
     return process.env.PATH;
   } };
-  const adapter = createCodexAdapter({ binary: process.execPath, cwd: selected, env });
+  let rpc;
+  const adapter = createCodexAdapter({ binary: process.execPath, cwd: selected, env,
+    rpcFactory(config) { rpc = new JsonRpcProcess(config); return rpc; } });
   try {
     await assert.rejects(adapter.open(), { code: 'PROJECT_PATH_CHANGED' });
     assert.equal(swapped, true);
+    assert.equal(rpc.child, null);
   } finally {
     await adapter.close();
     if (swapped) {
@@ -659,7 +664,6 @@ test('native Codex pins the original directory through the transport spawn bound
     }
   }
 });
-
 
 test('native Codex refuses the next turn after its selected directory is rebound', async t => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-codex-next-turn-'));
@@ -688,6 +692,9 @@ test('Codex preserves explicit retry metadata and submission identity on error n
   await f.adapter.open();
   await f.adapter.send({ text: 'recover this turn', submissionId: 'retry-submission' });
   f.callbacks.onNotification('turn/started', { threadId: 'owned-thread', turn: { id: 'turn-1' } });
+  f.callbacks.onNotification('error', { threadId: 'foreign-thread', turnId: 'turn-1', willRetry: true,
+    error: { message: 'foreign error' } });
+  assert.equal(f.events.some(event => event.type === 'error'), false);
   for (const willRetry of [true, false, undefined, 'true']) {
     f.callbacks.onNotification('error', { threadId: 'owned-thread', turnId: 'turn-1',
       error: { message: 'Reconnecting... 1/5' }, ...(willRetry === undefined ? {} : { willRetry }) });
@@ -695,10 +702,29 @@ test('Codex preserves explicit retry metadata and submission identity on error n
     assert.equal(event.type, 'error');
     assert.equal(event.submissionId, 'retry-submission');
     assert.equal(event.turnId, 'turn-1');
+    assert.equal(Object.hasOwn(event, 'willRetry'), typeof willRetry === 'boolean');
     assert.equal(event.willRetry, typeof willRetry === 'boolean' ? willRetry : undefined);
     assert.equal(f.adapter.snapshot().turnId, 'turn-1');
   }
   f.callbacks.onNotification('turn/completed', { threadId: 'owned-thread', turn: { id: 'turn-1', status: 'completed' } });
   assert.equal(f.events.find(event => event.type === 'completed').submissionId, 'retry-submission');
+  assert.equal(f.calls.filter(([method]) => method === 'turn/start').length, 1);
   await f.adapter.close();
+});
+
+test('Codex errors before admission retain the pending submission identity', async t => {
+  const f = fixture((method, params, callbacks) => {
+    if (method === 'turn/start') {
+      callbacks.onNotification('error', { threadId: params.threadId, turnId: 'turn-1',
+        willRetry: true, error: { message: 'reconnecting before admission' } });
+    }
+  });
+  t.after(() => f.adapter.close());
+  await f.adapter.open();
+  await f.adapter.send({ text: 'one request', submissionId: 'pending-submission' });
+  const [event] = f.events.filter(event => event.type === 'error');
+  assert.equal(event.submissionId, 'pending-submission');
+  assert.equal(event.turnId, 'turn-1');
+  assert.equal(event.willRetry, true);
+  assert.equal(f.calls.filter(([method]) => method === 'turn/start').length, 1);
 });

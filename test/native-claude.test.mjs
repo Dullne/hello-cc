@@ -241,6 +241,7 @@ test('Claude permission callback denies, emits approval evidence, and preserves 
     PATH: '/bin', HOME: '/home/test', ANTHROPIC_API_KEY: 'test-only-key',
     ANTHROPIC_BASE_URL: 'https://example.invalid', CLAUDE_CONFIG_DIR: '/config',
     CODEX_HOME: '/codex-config', HCC_PEER: 'parent', HCC_ROOT: '/parent',
+    HCC_HOOK_ROOT_IDENTITY: 'inherited-partial-root-receipt',
     CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'parent-session',
     CLAUDE_CODE_MESSAGING_SOCKET: '/parent/socket', CLAUDE_CODE_MESSAGING_TOKEN: 'parent-token',
     CODEX_THREAD_ID: 'parent-thread', TMUX_PANE: '%9'
@@ -258,7 +259,7 @@ test('Claude permission callback denies, emits approval evidence, and preserves 
   for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'HOME']) {
     assert.equal(config.env[key], sourceEnv[key]);
   }
-  for (const key of ['HCC_PEER', 'HCC_ROOT', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_THREAD_ID', 'TMUX_PANE']) {
+  for (const key of ['HCC_PEER', 'HCC_ROOT', 'HCC_HOOK_ROOT_IDENTITY', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_THREAD_ID', 'TMUX_PANE']) {
     assert.equal(config.env[key], undefined);
   }
   assert.equal(sourceEnv.HCC_PEER, 'parent', 'source environment must not be mutated');
@@ -285,7 +286,8 @@ test('Claude SDK receives only the complete owned-worker coordination environmen
   await adapter.close();
   const explicitSdk = fakeSdk();
   const explicitAdapter = createClaudeAdapter({ query: explicitSdk.query,
-    env: { HCC_PEER: 'parent', HCC_NATIVE_OWNER: 'parent-owner', PATH: '/bin' }, coordinationEnv: worker });
+    env: { HCC_PEER: 'parent', HCC_NATIVE_OWNER: 'parent-owner', PATH: '/bin',
+      HCC_HOOK_ROOT_IDENTITY: 'inherited-wrong-root' }, coordinationEnv: worker });
   await explicitAdapter.send({ text: 'task' });
   assert.equal(explicitSdk.args.options.env.HCC_PEER, 'owned-claude');
   assert.equal(explicitSdk.args.options.env.HCC_NATIVE_OWNER, worker.HCC_NATIVE_OWNER);
@@ -294,8 +296,10 @@ test('Claude SDK receives only the complete owned-worker coordination environmen
 });
 
 test('native Claude SDK receives the real root receipt for first-party hook checks', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-claude-hook-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-native-claude-hook-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = path.join(base, 'project');
+  fs.mkdirSync(root);
   const ctx = { root, dbPath: path.join(root, 'mesh.db'), initialRootIdentity: captureSelectedCwdSnapshot(root) };
   const env = nativeWorkerEnv({ PATH: process.env.PATH, HCC_WEB_TOKEN: 'parent-secret' }, ctx,
     'claude-worker', 'native:owned');
@@ -307,6 +311,10 @@ test('native Claude SDK receives the real root receipt for first-party hook chec
     assert.deepEqual(assertHookRootIdentity(root, passed.HCC_HOOK_ROOT_IDENTITY).identity,
       ctx.initialRootIdentity.identity);
     assert.equal(passed.HCC_WEB_TOKEN, undefined);
+    fs.renameSync(root, path.join(base, 'original'));
+    fs.mkdirSync(root);
+    assert.throws(() => assertHookRootIdentity(root, passed.HCC_HOOK_ROOT_IDENTITY),
+      { code: 'HOOK_ROOT_IDENTITY_MISMATCH' });
   } finally { await adapter.close(); }
 });
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { createDshAcpAdapter, DSH_ACP_BASELINE_VERSION } from '../lib/integrations/native/dsh-acp.mjs';
 
 const TEST_CWD = process.cwd();
@@ -68,6 +69,7 @@ test('ACP opens an owned runtime and independent workspace/session identities wi
   assert.equal(DSH_ACP_BASELINE_VERSION, '0.2.0-rc.2');
   assert.deepEqual(f.callbacks.args, ['--profile', 'acp']);
   assert.equal(f.callbacks.cwd, TEST_CWD);
+  assert.equal(f.callbacks.expectedIdentity.canonical, fs.realpathSync(TEST_CWD));
   assert.equal(f.callbacks.expectedIdentity.canonical, TEST_CWD);
   assert.equal(snapshot.sessionId, 'session-own');
   assert.equal(snapshot.status, 'idle');
@@ -98,10 +100,13 @@ test('native dsh pins the original directory through the transport spawn boundar
     }
     return process.env.PATH;
   } };
-  const adapter = createDshAcpAdapter({ binary: process.execPath, cwd: selected, env });
+  let rpc;
+  const adapter = createDshAcpAdapter({ binary: process.execPath, cwd: selected, env,
+    rpcFactory(config) { rpc = new JsonRpcProcess(config); return rpc; } });
   try {
     await assert.rejects(adapter.open(), { code: 'PROJECT_PATH_CHANGED' });
     assert.equal(swapped, true);
+    assert.equal(rpc.child, null);
   } finally {
     await adapter.close();
     if (swapped) {

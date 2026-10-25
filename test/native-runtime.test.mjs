@@ -1156,6 +1156,9 @@ test('provider retries retain attempt traces and publish only authoritative comp
   await f.service.poll();
   const row = (await f.api('GET', '/deliveries?peer=a')).find(item => item.message_id === first.message_id);
   assert.equal(row.state, 'accepted');
+  assert.equal(row.submission_id, identity.submissionId);
+  assert.equal(row.turn_id, identity.turnId);
+  assert.equal((await f.api('GET', '/deliveries?peer=a')).find(item => item.message_id !== first.message_id).state, 'queued');
   assert.equal(a.sent.length, 1, 'neither this prompt nor the next queued prompt is sent again');
   assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE message_id=?').get(first.message_id).n, 0);
   a.emit({ type: 'message', text: 'after reconnect', ...identity });
@@ -1169,14 +1172,71 @@ test('provider retries retain attempt traces and publish only authoritative comp
 });
 
 
-test('native completion without final text retains collected message output as a fallback', async t => {
-  const f = await fixture(t); await f.start('a');
-  const sent = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'collect output' });
-  await f.service.poll(); const a = f.adapters.get('a');
-  const identity = { turnId: 'turn-a', submissionId: a.active.submissionId };
-  a.emit({ type: 'message', text: 'first part', ...identity });
-  a.emit({ type: 'message', text: 'second part', ...identity });
-  a.complete({ text: undefined });
-  const reply = f.inspect.prepare("SELECT body FROM messages WHERE reply_to=? AND kind='reply'").get(sent.message_id);
-  assert.equal(reply.body, 'first part\n\nsecond part');
-});
+for (const finalText of [undefined, '']) {
+  test(`native completion with ${finalText === undefined ? 'missing' : 'empty'} final text retains buffered output`, async t => {
+    const f = await fixture(t); await f.start('a');
+    const sent = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'collect output' });
+    await f.service.poll(); const a = f.adapters.get('a');
+    const identity = { turnId: 'turn-a', submissionId: a.active.submissionId };
+    a.emit({ type: 'message', text: 'first part', ...identity });
+    a.emit({ type: 'message', text: 'second part', ...identity });
+    a.complete({ text: finalText });
+    const reply = f.inspect.prepare("SELECT body FROM messages WHERE reply_to=? AND kind='reply'").get(sent.message_id);
+    assert.equal(reply.body, 'first part\n\nsecond part');
+  });
+}
+
+for (const firstText of ['final reply', 'discarded pre-reconnect answer']) {
+  test(`Codex reconnect completion publishes its final reply once after ${firstText}`, async t => {
+    let notify;
+    let startedTurns = 0;
+    const rpc = {
+      async start() {}, async notify() {}, async close() {},
+      async request(method) {
+        if (method === 'initialize') return {};
+        if (method === 'thread/start') return { thread: { id: 'reconnect-thread', turns: [] } };
+        if (method === 'turn/start') { startedTurns++; return { turn: { id: 'reconnect-turn' } }; }
+        assert.fail(`unexpected RPC method: ${method}`);
+      }
+    };
+    const f = await fixture(t, { a: { rpcFactory(config) { notify = config.onNotification; return rpc; } } });
+    await f.start('a');
+    const sent = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'one request' });
+    await f.service.poll();
+    const scope = { threadId: 'reconnect-thread', turnId: 'reconnect-turn' };
+    notify('item/completed', { ...scope, item: { type: 'agentMessage', id: 'before-reconnect', text: firstText } });
+    notify('error', { ...scope, willRetry: true, error: { message: 'Reconnecting... 1/5' } });
+    assert.equal((await f.delivery('a')).state, 'accepted');
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) n FROM message_reads WHERE message_id=?').get(sent.message_id).n, 0);
+    notify('item/completed', { ...scope, item: { type: 'agentMessage', id: 'after-reconnect', text: 'final reply' } });
+    notify('turn/completed', { ...scope, turn: { id: scope.turnId, status: 'completed' } });
+    notify('turn/completed', { ...scope, turn: { id: scope.turnId, status: 'completed' } });
+    const replies = f.inspect.prepare("SELECT * FROM messages WHERE reply_to=? AND kind='reply'").all(sent.message_id);
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].body, 'final reply');
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) n FROM message_reads WHERE message_id=?').get(sent.message_id).n, 1);
+    assert.equal((await f.delivery('a')).state, 'completed');
+    assert.equal(startedTurns, 1, 'provider retries must not resubmit the original turn');
+    const events = (await f.api('GET', '/workers/a/state')).events.map(event => event.payload);
+    assert.deepEqual(events.filter(event => event.type === 'message').map(event => event.text), [firstText, 'final reply'],
+      'retain both provider attempt messages as trace evidence');
+  });
+}
+
+for (const willRetry of [false, undefined, 'true']) {
+  test(`unconfirmed error with retry flag ${String(willRetry)} remains uncertain and cannot auto-replay`, async t => {
+    const f = await fixture(t); await f.start('a');
+    const sent = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'must not replay' });
+    const next = await f.api('POST', '/send', { peer: 'a', from: 'shell', body: 'stay queued' });
+    await f.service.poll(); const a = f.adapters.get('a');
+    a.emit({ type: 'error', error: { message: 'connection lost' }, turnId: 'turn-a',
+      submissionId: a.active.submissionId, ...(willRetry === undefined ? {} : { willRetry }) });
+    a.complete(); await f.service.poll();
+    const deliveries = await f.api('GET', '/deliveries?peer=a');
+    assert.equal(deliveries.find(row => row.message_id === sent.message_id).state, 'uncertain');
+    assert.equal(deliveries.find(row => row.message_id === next.message_id).state, 'queued');
+    assert.equal(a.sent.length, 1);
+    assert.equal(f.inspect.prepare("SELECT COUNT(*) AS n FROM messages WHERE reply_to=? AND kind='reply'").get(sent.message_id).n, 0);
+    assert.equal(f.inspect.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE message_id=?').get(sent.message_id).n, 0);
+  });
+}
