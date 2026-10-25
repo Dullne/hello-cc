@@ -38,17 +38,30 @@ boundaries while retaining the existing workbench and provider interfaces.
   requests. Keep cookie writes dependent on affirmative same-origin evidence and
   preserve CLI requests without Origin. Query tokens remain restricted to login
   and browser session exchange.
+- Preserve the original Web submission when the same Claude executor confirms
+  its first session ID after a lost send response. Keep worker, generation,
+  body and already-known session IDs fenced, and retain bounded HTTP retry
+  diagnostics without storing response text or credentials.
+- Refuse project file browsing, previews, status and context-file search on
+  native Windows before filesystem access. Return HTTP 503 with WSL guidance
+  instead of a pathname-based fallback; verify the guard on a Windows runner.
 - Restore omitted regressions for provider reconnects, authoritative completion,
   duplicate reply/ACK suppression, uncertain deliveries, directory replacement
-  before spawn and Claude hook root receipts.
+  before spawn and Claude hook root receipts. Add repeatable Claude transcript
+  fork checks using the actual SDK and CLI with either local fixture responses
+  or the caller's configured model route.
 
 ### Validation
 
-Focused native, ownership and real HTTP tests cover the repaired paths. Package
-and browser acceptance use isolated projects and provider fixtures; those checks
-are separate from real model, installed-device and business acceptance. The
-release retains its own immutable package and validation receipts, without
-changing previous release archives.
+Focused native, ownership and real HTTP tests cover the repaired paths. Installed
+package and browser acceptance use isolated projects and provider fixtures.
+Separate authenticated checks cover Codex, Claude and DSH replies, memory,
+close/resume and interruption, plus scoped communication between providers.
+Codex approval rejection and five deterministic official DSH approval scenarios
+are checked separately. Claude model checks establish the configured route,
+not access to an untested Anthropic model. These checks do not establish employee
+device, 24-hour endurance, capacity or business acceptance. The release retains
+its own immutable package and validation receipts without changing prior archives.
 
 ## 1.1.0
 

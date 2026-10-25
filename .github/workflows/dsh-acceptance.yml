@@ -9,6 +9,7 @@ on:
       - 'codex/web-workbench-*'
       - codex/dsh-macos-boot-identity
       - codex/dsh-stop-confirmation
+      - 'codex/local-change-integration-*'
     tags:
       - 'v*'
   pull_request:
