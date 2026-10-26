@@ -71,7 +71,9 @@ export function freezeAcceptancePackage({ root, repo = fileURLToPath(new URL('..
   const run = (command, args) => execFileSync(command, args, { cwd: repo, env: childEnv, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
   const npm = args => env.npm_execpath
     ? run(process.execPath, [env.npm_execpath, ...args]) : run('npm', args);
-  const metadata = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', path.join(root, 'candidate')]))[0];
+  // A parent npm publish --dry-run exports npm_config_dry_run. The preflight
+  // still needs real local archive bytes in order to verify the package.
+  const metadata = JSON.parse(npm(['pack', '--ignore-scripts', '--dry-run=false', '--json', '--pack-destination', path.join(root, 'candidate')]))[0];
   if (env.GITHUB_REF?.startsWith('refs/tags/v')) {
     assert.equal(mode, 'release', 'Version tags require immutable release acceptance');
     assert.equal(env.GITHUB_REF.slice('refs/tags/v'.length), metadata.version, 'Version tag must match the package version');

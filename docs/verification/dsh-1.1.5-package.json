@@ -1,10 +1,10 @@
 {
   "version": "1.1.5",
   "filename": "logicseek-hello-cc-1.1.5.tgz",
-  "shasum": "dc1c20e4d48517e1fc1883301057a5b531c43131",
-  "integrity": "sha512-IUmS2rqPNCgmTUobBPtlv5OmGGh2uooLg4WViJLZLVnJCdMOm1Wn8ugOEJk8fzccZst/f4WofBlFKTQL0Jdr2g==",
+  "shasum": "fd9b9bde890f42c89d2734dbb42b4cc1f4b092e0",
+  "integrity": "sha512-lZ2HRGmlvsDSm4MBPwPng4A9wxW+Rnjyv4SJ8bPwBVqUGgxk3yoW5K8BW+wtNVlqXJRdLElWJoOJW6A/oyLx9g==",
   "tag": "latest",
-  "sha256": "7921f911050bbbf426072209746fae22dc8ca21e49142f597c152ff7d7dce02d",
+  "sha256": "cbe8eed651c572a127a75807977fe09b53fa802441a3c3cea0dca8975a60e4d4",
   "fileCount": 316,
   "files": {
     "CHANGELOG.md": "65890075007126f0f65dcfde2ddd96332a535d24677f77a2eca211ca2a5f980d",
@@ -290,7 +290,7 @@
     "scripts/dsh-inbox-acceptance.mjs": "a5d3449fde853d621c452ebdd3ff35334eaec276f26fc00de275b98d2957fbcf",
     "scripts/dsh-installed-acceptance.mjs": "296174fd2cff52e96e3f6c883e5b578766d5f25190d9bf491bd6ff206bfd6228",
     "scripts/dsh-official-acceptance.mjs": "1396f4c2b4e292be2dea23cbf52dbf85922fecfeaac30751c1c3cc1146525967",
-    "scripts/dsh-package-provenance.mjs": "549d2ac357638c777993d5659da442ff6725d34026a701071955d26ad2112c2b",
+    "scripts/dsh-package-provenance.mjs": "3486a6c7f2d819ae8130d7882222570f846bd861d8d0511ea8912b2f2709ff2b",
     "scripts/dsh-web-startup-acceptance.mjs": "01d6b9f8ce51f1947f4a876360d2b64ca6683a2b206871cf61564db85f5a44e8",
     "scripts/github-release.mjs": "23f13bdb5eb83e1d5c6fa854138bb75e248f4704601f2687bd4af776f1e6e578",
     "scripts/helpers/gc-clock-observation.mjs": "27a81c707601b6ce9f74606622ac49783257458dfae051d8e725ea29f133ff3c",

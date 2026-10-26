@@ -123,10 +123,11 @@ function releaseFixture(t) {
   return { repo, env, archive, manifest };
 }
 
-test('release preflight verifies the immutable package without publishing or changing workflow outputs', t => {
+test('release preflight verifies immutable bytes during a parent npm dry run without changing workflow outputs', t => {
   const f = releaseFixture(t);
   const originalArchive = fs.readFileSync(f.archive), originalManifest = fs.readFileSync(f.manifest);
   fs.writeFileSync(f.env.GITHUB_OUTPUT, 'existing=value\n');
+  f.env.npm_config_dry_run = 'true';
   const receipt = checkReleaseArtifact({ ...f, version: 'v1.2.3' });
   assert.equal(receipt.mode, 'release');
   assert.equal(receipt.acceptanceTarget, 'immutable-release');
