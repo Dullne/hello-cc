@@ -7,6 +7,11 @@ import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 
 const TEST_CWD = process.cwd();
+const toolSpec = handler => ({ name: 'inspect', description: 'Inspect test data',
+  inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+  readOnly: true, handler });
+const toolOutput = text => ({ success: true, contentItems: [{ type: 'inputText', text }] });
+const toolParams = (extra = {}) => ({ threadId: 'owned-thread', turnId: 'turn-1', callId: 'call-1', tool: 'inspect', arguments: { value: 'data' }, ...extra });
 
 function fixture(handler = () => undefined, options = {}) {
   const events = [];
@@ -33,6 +38,94 @@ function fixture(handler = () => undefined, options = {}) {
     ...options, onEvent: (event) => events.push(event), rpcFactory(config) { callbacks = config; return rpc; } });
   return { adapter, calls, events, rpc, get callbacks() { return callbacks; }, get closeCount() { return closeCount; } };
 }
+
+test('native dynamic tools opt in through the official schema, fence execution and deduplicate side effects', async t => {
+  let calls = 0;
+  const f = fixture(undefined, { dynamicTools: [toolSpec(async (args, context) => {
+    calls++; assert.equal(context.sessionId, 'owned-thread'); assert.equal(context.turnId, 'turn-1');
+    assert.equal(typeof context.executorId, 'string'); assert.equal(context.signal.aborted, false);
+    return toolOutput(args.value);
+  })] });
+  t.after(() => f.adapter.close());
+  await f.adapter.open();
+  assert.equal(f.calls.find(([method]) => method === 'initialize')[1].capabilities.experimentalApi, true);
+  const spec = f.calls.find(([method]) => method === 'thread/start')[1].dynamicTools[0];
+  assert.equal(spec.type, 'function'); assert.equal(spec.handler, undefined); assert.equal(spec.readOnly, undefined);
+  await f.adapter.send({ text: 'Inspect', submissionId: 'submission-1' });
+  const params = toolParams();
+  const [a, b] = await Promise.all([f.callbacks.onRequest('item/tool/call', params, 0), f.callbacks.onRequest('item/tool/call', params, 1)]);
+  assert.deepEqual(a, toolOutput('data')); assert.deepEqual(a, b); assert.equal(calls, 1);
+  for (const changed of [{ arguments: { value: 'changed' } }, { tool: 'unknown' }, { threadId: 'foreign' }, { turnId: 'old' }]) {
+    assert.equal((await f.callbacks.onRequest('item/tool/call', toolParams(changed), 3)).success, false);
+  }
+  assert.equal(calls, 1);
+  assert.doesNotMatch(JSON.stringify([f.adapter.snapshot(), f.events]), /"value":"data"/);
+});
+
+test('read-only sessions exclude mutating tools and resumed tools still require a registered host handler', async t => {
+  const f = fixture(method => method === 'thread/start' ? readOnlyResponse() : undefined,
+    { dynamicTools: [{ ...toolSpec(() => { assert.fail('mutating tool executed'); }), readOnly: false }] });
+  t.after(() => f.adapter.close());
+  await f.adapter.open({ sandbox: 'read-only' });
+  assert.deepEqual(f.calls.find(([method]) => method === 'thread/start')[1].dynamicTools, []);
+  await f.adapter.send({ text: 'inspect' });
+  assert.equal((await f.callbacks.onRequest('item/tool/call', toolParams(), 1)).success, false);
+  const resumed = fixture(); t.after(() => resumed.adapter.close());
+  await resumed.adapter.open({ sessionId: 'owned-thread' }); await resumed.adapter.send({ text: 'inspect' });
+  assert.equal(Object.hasOwn(resumed.calls.find(([method]) => method === 'thread/resume')[1], 'dynamicTools'), false);
+  assert.equal((await resumed.callbacks.onRequest('item/tool/call', toolParams(), 2)).success, false);
+});
+
+test('dynamic tool interruption, close and timeouts abort host work without accepting late results', async t => {
+  for (const action of ['interrupt', 'close', 'timeout']) {
+    let signal, finish;
+    const f = fixture(undefined, { extensionTimeoutMs: 20, dynamicTools: [toolSpec((_args, context) => {
+      signal = context.signal; return new Promise(resolve => { finish = resolve; });
+    })] });
+    t.after(() => f.adapter.close());
+    await f.adapter.open(); await f.adapter.send({ text: 'Inspect', submissionId: 'submission-1' });
+    const pending = f.callbacks.onRequest('item/tool/call', toolParams(), 1);
+    await new Promise(resolve => setImmediate(resolve));
+    if (action !== 'timeout') await f.adapter[action]();
+    const result = await pending; assert.equal(result.success, false); assert.equal(signal.aborted, true);
+    finish(toolOutput('late-secret')); assert.doesNotMatch(JSON.stringify([f.events, f.adapter.snapshot(), result]), /late-secret/);
+  }
+});
+
+test('external auth refresh uses only the host callback, coalesces one account and hides credentials and failures', async t => {
+  let calls = 0, finish;
+  const f = fixture(undefined, { refreshAuthTokens: async (_params, context) => {
+    calls++; assert.equal(typeof context.executorId, 'string');
+    return new Promise(resolve => { finish = resolve; });
+  } });
+  t.after(() => f.adapter.close()); await f.adapter.open();
+  const params = { reason: 'unauthorized', previousAccountId: 'account-A' };
+  const a = f.callbacks.onRequest('account/chatgptAuthTokens/refresh', params, 0);
+  const b = f.callbacks.onRequest('account/chatgptAuthTokens/refresh', params, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(f.callbacks.onRequest('account/chatgptAuthTokens/refresh', { ...params, previousAccountId: 'account-B' }, 2), { code: 'CODEX_AUTH_REFRESH_UNAVAILABLE' });
+  finish({ accessToken: 'private-access-token', chatgptAccountId: 'account-A', unexpectedSecret: 'private-extra' });
+  assert.deepEqual(await a, { accessToken: 'private-access-token', chatgptAccountId: 'account-A' });
+  assert.deepEqual(await b, await a); assert.equal(calls, 1);
+  assert.doesNotMatch(JSON.stringify([f.adapter.snapshot(), f.events]), /private-access-token|account-A|private-extra/);
+  await assert.rejects(f.callbacks.onRequest('account/chatgptAuthTokens/refresh', params, 0), { code: 'CODEX_AUTH_REFRESH_UNAVAILABLE' });
+  const failing = fixture(undefined, { refreshAuthTokens: () => { throw new Error('private-access-token'); } });
+  t.after(() => failing.adapter.close()); await failing.adapter.open();
+  await assert.rejects(failing.callbacks.onRequest('account/chatgptAuthTokens/refresh', params, 1), error => error.code === 'CODEX_AUTH_REFRESH_UNAVAILABLE' && !error.message.includes('private-access-token'));
+});
+
+test('auth refresh cannot publish credentials after close or silently switch accounts', async t => {
+  let finish;
+  const f = fixture(undefined, { refreshAuthTokens: () => new Promise(resolve => { finish = resolve; }) });
+  t.after(() => f.adapter.close()); await f.adapter.open();
+  const operation = f.callbacks.onRequest('account/chatgptAuthTokens/refresh', { reason: 'unauthorized' }, 1);
+  const rejection = assert.rejects(operation, { code: 'CODEX_AUTH_REFRESH_UNAVAILABLE' });
+  await new Promise(resolve => setImmediate(resolve)); await f.adapter.close();
+  finish({ accessToken: 'private-late-token', chatgptAccountId: 'account-A' }); await rejection;
+  const switched = fixture(undefined, { refreshAuthTokens: () => ({ accessToken: 'token', chatgptAccountId: 'other' }) });
+  t.after(() => switched.adapter.close()); await switched.adapter.open();
+  await assert.rejects(switched.callbacks.onRequest('account/chatgptAuthTokens/refresh', { reason: 'unauthorized', previousAccountId: 'original' }, 0), { code: 'CODEX_AUTH_REFRESH_UNAVAILABLE' });
+});
 
 test('native Codex telemetry stays bound to its own thread and uses reported model and cumulative counters', async () => {
   const f = fixture(method => method === 'thread/start' ? {thread:{id:'owned-thread',turns:[]},model:'reported-model',approvalPolicy:'on-request'} : undefined);

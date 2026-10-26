@@ -17,6 +17,39 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.6
+
+### Summary
+
+Add guarded Codex host extension callbacks, explicit retained-history migration,
+and measurable long-running installed acceptance. Desktop bridge documentation
+now installs from the stable channel and records the observed Claude App limit.
+
+### Highlights
+
+- Opt-in dynamic host tools on owned Native/Web App Servers preserve executor,
+  thread, turn, call identity and per-thread read-only policy. Bound callbacks,
+  cancel late results and deduplicate calls without replay after failures.
+- External-token refresh is an in-process callback for existing auth hosts.
+  Account mismatches and expired results fail closed; credentials and raw
+  callback errors remain outside HCC state and approval flows. No login UI or
+  global authentication change is introduced.
+- Add offline `native history` and `native recover`: create a new session with a
+  durable context-only history link, retaining old identity, sandbox and unresolved
+  deliveries. Missing historical directory evidence is never fabricated.
+- Installed acceptance can space bounded model work across up to 24 real hours,
+  with owned recovery, a final live probe, atomic progress receipts, cancellation
+  cleanup and latency/throughput measurements at the tested three-worker load.
+
+### Validation
+
+Protocol, ownership, recovery and CLI tests cover cancellation, duplicate calls,
+secret-free refresh errors, account changes, per-thread sandbox policy and
+elapsed-time enforcement. Installed-model and frozen-package receipts are
+recorded separately. Claude Desktop acceptance is blocked on this device by
+the App's region-unavailable page. A configured soak duration is not evidence
+of a completed 24-hour run; stakeholder production acceptance remains separate.
+
 ## 1.1.5
 
 ### Summary

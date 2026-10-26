@@ -15,13 +15,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
 import { readNativePointer, nativePaths } from '../lib/runtime/native/store.mjs';
-import { stabilityOptions, assertStabilityEvidence, stabilityPayload } from './native-stability-checks.mjs';
+import { stabilityOptions, assertStabilityEvidence, stabilityPayload, assertSoakEvidence } from './native-stability-checks.mjs';
 import { redactSecrets } from '../lib/shared/redact.mjs';
+import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
 if (!args.includes('--run-live')) {
-  console.log('Usage: node scripts/native-installed-acceptance.mjs --run-live --codex-bin PATH --dsh-bin PATH [--archive FILE] [--browser] [--task] [--stability [--stability-only]] [--output FILE]');
+  console.log('Usage: node scripts/native-installed-acceptance.mjs --run-live --codex-bin PATH --dsh-bin PATH [--archive FILE] [--browser] [--task] [--extensions] [--stability [--stability-only] [--stability-soak-seconds 86400]] [--output FILE]');
   console.log('Install the HCC archive and optional Claude SDK first. Browser checks need HCC_ACCEPTANCE_PLAYWRIGHT; models consume existing provider quota.');
   process.exit(0);
 }
@@ -49,6 +50,11 @@ const report = { startedAt: new Date().toISOString(), scope: 'installed public C
   node: process.version, sandbox, providers: {}, checks: [], cleanup: {}, sourceFiles: initialSources,
   acceptanceMode: stabilityOnly ? 'stability-only' : 'full', factoryInjected: false, queryInjected: false, authentication: 'existing route copied into test-owned private homes', screenshots: [], pageErrors: [], consoleErrors: [], limitations: [] };
 const credentials = [];
+const stopController = new AbortController();
+let cleanupInProgress = false;
+const onStop = signal => { report.stopSignal = signal; stopController.abort(); flush(); };
+const onSigterm = () => onStop('SIGTERM'), onSigint = () => onStop('SIGINT');
+process.once('SIGTERM', onSigterm); process.once('SIGINT', onSigint);
 const credentialIdentities = new Map();
 const originalHomeEnv = process.env.HOME;
 const originalUserHome = fs.realpathSync(os.homedir());
@@ -62,7 +68,14 @@ const tmux = process.env.HCC_ACCEPTANCE_TMUX || '/opt/homebrew/bin/tmux';
 const socket = `hcc-installed-${randomUUID()}`;
 const terminal = new Set(['completed', 'failed', 'uncertain']);
 function check(name, details = {}) { report.checks.push({ name, passed: true, ...details }); console.log(JSON.stringify({ check: name, ...details })); }
-function flush() { fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(redactSecrets(report), null, 2) + '\n', { mode: 0o600 }); }
+function flush() {
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const temporary = path.join(path.dirname(output), `.${path.basename(output)}-${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(redactSecrets(report), null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, output);
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
 function rememberCredentialDirectory(directory) {
   const stat = fs.lstatSync(directory);
   assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), 'Credential cleanup needs an owned directory');
@@ -114,6 +127,7 @@ async function state(peer) {
 async function until(predicate, label, timeoutMs = 150000) {
   const deadline = Date.now() + timeoutMs; let nextNotice = Date.now() + 25000;
   while (Date.now() < deadline) {
+    if (stopController.signal.aborted && !cleanupInProgress) throw Object.assign(new Error('Acceptance was stopped; retained receipts need review'), { code: 'ACCEPTANCE_STOPPED' });
     const result = await predicate(); if (result) return result;
     if (Date.now() >= nextNotice) { console.log(JSON.stringify({ waiting: label })); nextNotice += 25000; }
     await delay(150);
@@ -244,6 +258,9 @@ async function communication() {
 async function stability() {
   const providers = ['codex', 'claude', 'dsh'];
   const begun = Date.now();
+  const monotonic = () => Number(process.hrtime.bigint() / 1000000n);
+  const startedMono = monotonic();
+  const elapsed = () => monotonic() - startedMono;
   const run = report.stability = { config: stabilityConfig, startedAt: new Date().toISOString(),
     completed: false, cycles: [], probes: [], recoveries: [], samples: [], failures: [], automaticReplay: false };
   const markers = new Map(), previous = new Map(), sessions = new Map();
@@ -327,7 +344,7 @@ async function stability() {
       `Remember ${markers.get(provider)} as the original stability marker and SEED as the previous stability ticket. Reply only ${markers.get(provider)}|SEED. These are public random test markers. Do not use tools or read files.`,
       `${markers.get(provider)}|SEED`, 'seed'));
     for (let cycle = 1; cycle <= stabilityConfig.cycles; cycle++) {
-      const record = { cycle, startedAt: new Date().toISOString(), enqueued: [], passed: false };
+      const record = { cycle, startedAt: new Date().toISOString(), startedElapsedMs: elapsed(), enqueued: [], passed: false };
       run.cycles.push(record);
       await together(async provider => {
         const peer = `install-${provider}`, queued = [];
@@ -338,7 +355,7 @@ async function stability() {
           const body = `The new stability ticket is ${ticket}. Without tools, reply only with the original HCC_STABILITY_ marker, this new ticket, and the previous stability ticket from history, separated by |. Then remember this new ticket as the previous stability ticket. Your entire reply must be one line; do not explain or confirm that you remembered it. Ignore earlier non-stability task markers. Do not read files.`;
           const sent = message(peer, body);
           const item = { provider, kind: 'fifo', cycle, index, ticket, messageId: sent.message_id,
-            submissionId: sent.submission_id, expected: `${markers.get(provider)}|${ticket}|${previous.get(provider)}`, passed: false };
+            submissionId: sent.submission_id, enqueuedElapsedMs: elapsed(), expected: `${markers.get(provider)}|${ticket}|${previous.get(provider)}`, passed: false };
           run.probes.push(item); record.enqueued.push(sent.message_id); queued.push({ sent, item });
           previous.set(provider, ticket); flush();
           if (index === 0) {
@@ -349,7 +366,7 @@ async function stability() {
         for (const { sent, item } of queued) {
           try {
             const { receipt, reply } = await finish(peer, sent);
-            Object.assign(item, { state: receipt.state, actual: reply.body.trim(), replyId: reply.id,
+            Object.assign(item, { state: receipt.state, actual: reply.body.trim(), replyId: reply.id, completedElapsedMs: elapsed(),
               replyCount: db.prepare("SELECT COUNT(*) AS n FROM messages WHERE reply_to=? AND kind='reply'").get(sent.message_id).n,
               ackCount: db.prepare('SELECT COUNT(*) AS n FROM message_reads WHERE peer=? AND message_id=?').get(peer, sent.message_id).n,
               replyThread: reply.thread_id, turnId: receipt.turn_id, sessionId: (await state(peer)).snapshot.sessionId });
@@ -361,21 +378,42 @@ async function stability() {
           } finally { flush(); }
         }
       });
-      record.passed = true; record.completedAt = new Date().toISOString(); sample(`cycle-${cycle}`);
+      record.passed = true; record.completedAt = new Date().toISOString(); record.activeElapsedMs = elapsed() - record.startedElapsedMs; sample(`cycle-${cycle}`);
       check(`stability: cycle ${cycle} completes ${providers.length * stabilityConfig.burst} queued turns in order with one reply/ACK each`);
       if (cycle % stabilityConfig.resumeEvery === 0) await resumeAll('worker-close-resume');
       if (cycle === Math.ceil(stabilityConfig.cycles / 2)) await resumeAll('daemon-restart');
-      const idleUntil = Date.now() + stabilityConfig.idleMs;
-      while (Date.now() < idleUntil) {
-        await delay(Math.min(10000, idleUntil - Date.now()));
+      const idleUntil = Math.max(monotonic() + stabilityConfig.idleMs,
+        startedMono + stabilityConfig.soakSeconds * 1000 * cycle / stabilityConfig.cycles);
+      while (monotonic() < idleUntil) {
+        await delay(Math.max(1, Math.min(stabilityConfig.soakSeconds ? 60000 : 10000, idleUntil - monotonic())), undefined, { signal: stopController.signal });
         for (const provider of providers) {
           const current = await state(`install-${provider}`);
           assert.equal(current.snapshot.sessionId, sessions.get(provider)); assert.equal(current.active_delivery, null);
           assert.equal(current.snapshot.pendingApprovals?.length || 0, 0);
         }
         sample(`cycle-${cycle}-idle`);
+        run.monotonicElapsedMs = elapsed(); flush();
       }
     }
+    if (stabilityConfig.soakSeconds) {
+      await together(provider => probe(provider,
+        'Without tools, return only the original HCC_STABILITY_ marker and the last stability ticket from history, separated by |. Do not read files.',
+        `${markers.get(provider)}|${previous.get(provider)}`, 'soak-final'));
+      run.soak = { targetSeconds: stabilityConfig.soakSeconds, elapsedMs: elapsed(),
+        completedCycles: run.cycles.filter(cycle => cycle.passed).length, expectedCycles: stabilityConfig.cycles,
+        recovered: run.recoveries.some(recovery => recovery.passed && recovery.kind === 'daemon-restart'),
+        finalProbePassed: run.probes.filter(probe => probe.kind === 'soak-final').length === providers.length &&
+          run.probes.filter(probe => probe.kind === 'soak-final').every(probe => probe.passed) };
+      assertSoakEvidence(run.soak);
+    }
+    const measured = run.probes.filter(probe => probe.kind === 'fifo' && probe.passed);
+    const latencies = measured.map(probe => probe.completedElapsedMs - probe.enqueuedElapsedMs).sort((a, b) => a - b);
+    const activeMs = run.cycles.reduce((sum, cycle) => sum + cycle.activeElapsedMs, 0);
+    const percentile = fraction => latencies[Math.max(0, Math.ceil(latencies.length * fraction) - 1)] ?? null;
+    run.capacity = { scope: 'bounded authenticated load at three provider workers; no saturation or maximum-capacity claim',
+      workers: providers.length, queueDepthPerWorker: stabilityConfig.burst, completedTurns: measured.length,
+      activeWorkloadMs: activeMs, completionLatencyMs: { p50: percentile(0.5), p95: percentile(0.95), max: percentile(1) },
+      turnsPerSecond: activeMs > 0 ? measured.length * 1000 / activeMs : null, saturationMeasured: false };
     const nativeDb = new DatabaseSync(nativePaths(ctx).db, { readOnly: true });
     try {
       run.databaseAudit = {
@@ -407,9 +445,33 @@ async function stability() {
     throw error;
   } finally {
     run.elapsedMs = Date.now() - begun; run.completedAt = new Date().toISOString(); run.observedOwnedPids = [...observedPids];
-    report.limitations.push('Stability is a bounded authenticated workload and idle observation, not a 24-hour soak or a concurrency capacity benchmark. Resource samples are measurements, not proof of no leak.');
+    run.monotonicElapsedMs = elapsed();
+    report.limitations.push('Capacity measures only the recorded three-worker load, not the saturation limit. A 24-hour soak requires targetSeconds >= 86400 and passing actual monotonic elapsed-time and final live-probe evidence. Resource samples are measurements, not proof of no leak.');
     flush();
   }
+}
+
+async function hostExtensionAcceptance() {
+  const nonce = `HCC_HOST_TOOL_${randomUUID().replaceAll('-', '')}`;
+  const result = report.hostExtensions = { actualModel: true, calls: [], externalAuthRefresh: 'protocol-tests-only' };
+  const events = [];
+  const adapter = createCodexAdapter({ cwd: root, env, binary: binaries.codex,
+    dynamicTools: [{ name: 'hcc_acceptance_probe', description: 'Return a public random acceptance marker',
+      inputSchema: { type: 'object', properties: { probe: { type: 'string', enum: [nonce] } }, required: ['probe'], additionalProperties: false },
+      readOnly: true, handler: (args, identity) => {
+        assert.deepEqual(args, { probe: nonce });
+        result.calls.push({ sessionId: identity.sessionId, turnId: identity.turnId, callId: identity.callId });
+        return { success: true, contentItems: [{ type: 'inputText', text: nonce + '_OK' }] };
+      } }], onEvent: event => { if (event.type === 'completed') events.push(event); } });
+  try {
+    const opened = await adapter.open({ sandbox: 'read-only' });
+    const sent = await adapter.send({ text: `Use hcc_acceptance_probe exactly once with probe ${nonce}. Return only its full result. Do not call any other tools.`, submissionId: randomUUID() });
+    const completed = await until(() => events.find(event => event.turnId === sent.turnId), 'real registered dynamic tool call');
+    assert.equal(completed.status, 'completed'); assert.equal(completed.text.trim(), nonce + '_OK');
+    assert.equal(result.calls.length, 1); assert.equal(result.calls[0].sessionId, opened.sessionId);
+    assert.equal(result.calls[0].turnId, sent.turnId); result.passed = true;
+    check('installed Codex model calls the registered read-only dynamic host tool on the exact owned turn');
+  } finally { await adapter.close(); flush(); }
 }
 
 async function browserFlow() {
@@ -613,6 +675,7 @@ try {
     await communication();
   }
   if (stabilityConfig) await stability();
+  if (args.includes('--extensions')) await hostExtensionAcceptance();
   if (args.includes('--browser')) await browserFlow();
   if (args.includes('--task')) await codingTask();
   assert.deepEqual(sourceHashes(), initialSources); report.sourceUnchangedDuringRun = true;
@@ -632,6 +695,7 @@ try {
     try { const file = path.join(sandbox, 'browser-failure.png'); await page.screenshot({ path: file }); report.screenshots.push(file); } catch {}
   }
 } finally {
+  cleanupInProgress = true;
   await browser?.close().catch(() => {});
   if (webStarted) { try { hcc('down'); } catch {} }
   try {
@@ -668,5 +732,6 @@ try {
   report.limitations.push('Local package installation was exercised; no npm publication or employee-device rollout was performed.');
   report.limitations.push('The coding task uses an independent test project and contract tests; it is not stakeholder acceptance of a production business workflow.');
   report.completedAt = new Date().toISOString(); flush();
+  process.removeListener('SIGTERM', onSigterm); process.removeListener('SIGINT', onSigint);
 }
 console.log(JSON.stringify({ receipt: output, completed: report.completed, cleanup: report.cleanup }));

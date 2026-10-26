@@ -272,8 +272,14 @@ hcc native start --peer codex-reviewer --provider codex --resume last
 
 新保存的 worker 还记录工作目录的文件系统身份；即使路径文字未变，恢复前也必须
 重新匹配该身份。缺少此证据的旧 worker 仍可在 HCC 历史中读取，但不能自动恢复；
-人工核验与关联流程尚未实现。Web 历史会先标为不可恢复，native 服务在实际接纳时
-再次校验。
+Web 历史会先标为不可恢复，native 服务在实际接纳时再次校验。1.1.4 增加人工迁移入口：
+
+```sh
+hcc native history --peer old-worker
+hcc native recover --peer old-worker --session EXACT_SAVED_ID --as new-worker --cwd /absolute/project
+```
+
+先检查历史并关闭旧 worker。`recover` 核对准确的 HCC 原 session 与 owner，创建独立新会话，保留原 sandbox，持久记录 `context-only` 历史关联；原记录、未知目录身份与未决投递全部保留。它不恢复或 fork 原 provider 会话，不复制旧消息或 ACK。核验后通过 `native send` 明确提交需要接续的上下文和任务。`history` 是离线只读入口，不启动 daemon；`--after` 可翻页查看保留事件。
 
 worker 获得明确的 `HCC_ROOT`、`HCC_DB`、`HCC_PEER`、`HCC_NATIVE_OWNER`。provider hook
 必须匹配该 peer 的 native transport owner。native hook 路径只刷新 owner 心跳和续
@@ -330,17 +336,17 @@ hcc native respond --peer codex-reviewer --request REQUEST_ID --decision cancel
 
 响应文件只允许 `permissions`、`scope`、`answers`、`content`；MCP 表单用 `content` 对象提交原字段名和类型，例如 `{"content":{"project":"demo","count":2,"enabled":false}}`。不能添加原请求没有的路径或
 网络权限；授予文件权限时必须保留原请求的 deny 条目。所有问题都需明确回答；
-请求参数被截断时，只能拒绝或取消。动态工具与账号 token 刷新尚未接入。
+请求参数被截断时，只能拒绝或取消。动态工具与外部 token 刷新通过下文的宿主专用 callback 接入，不经过这个人工响应文件。
 
 Codex MCP 工具审批使用 `mcpServer/elicitation/request`，与命令/文件审批的返回结构
 不同。HCC 对显式 MCP 工具确认提交单次 action/content，不写入 session/always 授权。
 标准 `form` 模式支持字符串、数值/整数、布尔值、单选和字符串枚举多选，包含标题、说明、默认建议值、必填项、长度/数值/选择数量范围及常用邮箱/URI/date/date-time 格式校验。可选字段只在勾选填写后发送；布尔值需明确选择是或否。字段数量上限 50、单字段选项上限 100、字符串上限 8192 个 UTF-16 单元，表单结构与应答内容各限 65536 字符。
 
-Web 刷新执行状态时在页面内存中保留填写内容；提交、请求消失或切换会话后清除，不写入浏览器存储、HCC 事件或投递回执。页面整体重载不会恢复这些答复。此约束针对 HCC 的交互应答路径；provider 自身记录及模型输出继续按其原有行为处理。服务端重复校验内容，审批继续绑定原 executor/session/turn/request；错误输入保留请求供修正。嵌套对象、任意数组、未知约束和 OpenAI 扩展表单模式仍不可批准，页面显示原因并提供拒绝/取消。此能力未改变动态工具或 token 刷新的接入边界。
+Web 刷新执行状态时在页面内存中保留填写内容；提交、请求消失或切换会话后清除，不写入浏览器存储、HCC 事件或投递回执。页面整体重载不会恢复这些答复。此约束针对 HCC 的交互应答路径；provider 自身记录及模型输出继续按其原有行为处理。服务端重复校验内容，审批继续绑定原 executor/session/turn/request；错误输入保留请求供修正。嵌套对象、任意数组、未知约束和 OpenAI 扩展表单模式仍不可批准，页面显示原因并提供拒绝/取消。动态工具与 token 刷新属于独立的[宿主 callback](codex-host-extensions.zh-CN.md)，不经过表单。
 
 带原 thread/turn 标识的 MCP `url` 请求现在可在 Web 打开授权页面。界面显示 MCP 服务和目标域名，当前控制者明确点击后先保留空白标签页；原执行器接受同一个请求后才跳转，过期或被拒绝的请求会关闭空白页。弹窗被拦截时保留待处理请求，允许弹窗后可重试。仅允许 HTTPS 或 loopback HTTP，拒绝带用户名/密码的 URL、其他协议、缺少 elicitation 标识或被截断的请求；拒绝/取消始终可用。新标签页不保留 opener 或 referrer。loopback 地址需在执行器所在电脑的浏览器访问，HCC 不把本地授权回调代理到另一台设备。
 
-打开只回传 `{ "action": "accept" }`，不代表身份认证完成。需在外部页面完成操作，再返回查看原任务的 provider 结果。HCC 不推测授权完成事件，也不在表单中收集凭证；授权 URL、设备码消息、elicitation 标识和元数据仅存在于实时待处理请求，不留在 HCC 交互事件或浏览器存储中。provider 自身日志/历史和外部授权浏览器仍按各自规则处理。账号登录、token 刷新、`openai/userVerification` 与外部授权完成 API 属于独立的未接入能力。
+打开只回传 `{ "action": "accept" }`，不代表身份认证完成。需在外部页面完成操作，再返回查看原任务的 provider 结果。HCC 不推测授权完成事件，也不在表单中收集凭证；授权 URL、设备码消息、elicitation 标识和元数据仅存在于实时待处理请求，不留在 HCC 交互事件或浏览器存储中。provider 自身日志/历史和外部授权浏览器仍按各自规则处理。账号登录、`openai/userVerification` 与外部授权完成 API 属于独立的未接入能力。外部 token 刷新仅由受限的[宿主 callback](codex-host-extensions.zh-CN.md) 处理。
 
 浏览器复现：设置 `HCC_ACCEPTANCE_PLAYWRIGHT` 指向 Playwright 模块，再执行 `node scripts/web-mcp-form-acceptance.mjs --run-browser`；`HCC_ACCEPTANCE_CHROME` 可指定 Chrome 路径。该脚本用模拟 provider、真实 HTTP/SQLite/native runtime 和隔离浏览器，不调用模型。表单验收见 `docs/verification/2026-10-02-mcp-form-web-validation.md`。
 
@@ -492,8 +498,16 @@ worker，在中点正常重启自有 daemon，再验证原 session 和历史。�
 
 默认 6 轮、每 worker 每轮 2 条、每轮空闲观察 30 秒、每 2 轮恢复。参数限制为
 1–24 轮、1–4 条、0–300000 毫秒和 1–24 轮恢复间隔；这些选项必须与
-`--stability` 一起使用。这是有界真实模型负载验收，不能代替 24 小时 soak、
-并发容量测量或内存泄漏证明。DSH 单次恢复成功也不能单独解释历史恢复波动。
+`--stability` 一起使用。回执增加三个 provider worker 在所选排队深度下的吞吐量及
+p50/p95/最大完成延迟；这些数据不证明最大容量或无内存泄漏。DSH 单次恢复成功
+也不能单独解释历史恢复波动。
+
+增加 `--stability-soak-seconds 86400` 可运行 24 小时验收。该参数范围 0–86400 秒、
+默认 0，至少需要两轮。脚本按单调时钟将负载分散到完整时长，保持原会话，空闲时
+每分钟检查状态；时长届满后必须再取得真实模型上下文回忆、全部恢复验证和最终
+数据库审计。JSON 回执持续记录进度、资源采样、失败与清理；配置 24 小时不等于
+已经通过。SIGINT/SIGTERM 会停止任务并清理自有进程和临时凭据副本。需保持电脑
+唤醒、脚本存活；中断后不自动恢复或重放。
 
 `--stability-only` 与 `--stability` 一起使用时，只建立三个真实会话并运行稳定性
 负载，跳过基础中断、命令审批和模型 MCP 通信场景；回执明确标记该范围。

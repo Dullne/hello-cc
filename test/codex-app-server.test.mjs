@@ -76,6 +76,44 @@ async function running(server) {
   await server.adapter.startTurn('thread-1', 'work');
 }
 
+test('Web host dynamic tool and external auth callbacks keep results outside approval events and snapshots', async t => {
+  let toolCalls = 0;
+  const f = fakeServer(t, { dynamicTools: [{ name: 'inspect', description: 'Host inspection', inputSchema: { type: 'object' },
+    readOnly: true, handler: async () => { toolCalls++; return { success: true, contentItems: [{ type: 'inputText', text: 'private-host-result' }] }; } }],
+    refreshAuthTokens: async () => ({ accessToken: 'private-refresh-token', chatgptAccountId: 'private-account' }) });
+  await running(f);
+  assert.equal(f.calls.find(call => call.method === 'thread/start').params.dynamicTools[0].type, 'function');
+  const params = { threadId: 'thread-1', turnId: 'turn-1', callId: 'call-1', tool: 'inspect', arguments: {} };
+  f.send({ id: 'tool', method: 'item/tool/call', params });
+  f.send({ id: 'auth', method: 'account/chatgptAuthTokens/refresh', params: { reason: 'unauthorized', previousAccountId: 'private-account' } });
+  await tick();
+  assert.equal(f.calls.find(call => call.id === 'tool' && call.result)?.result.success, true);
+  assert.equal(f.calls.find(call => call.id === 'auth' && call.result)?.result.accessToken, 'private-refresh-token');
+  assert.doesNotMatch(JSON.stringify([f.adapter.snapshot(), f.changes]), /private-host-result|private-refresh-token|private-account/);
+  await f.adapter.interrupt('thread-1', 'turn-1');
+  f.send({ id: 'late', method: 'item/tool/call', params: { ...params, callId: 'call-late' } }); await tick();
+  assert.equal(f.calls.find(call => call.id === 'late' && call.result)?.result.success, false); assert.equal(toolCalls, 1);
+});
+
+test('Web dynamic tools retain a separate read-only policy for each owned thread', async t => {
+  let calls = 0;
+  const f = fakeServer(t, { onRequest(message, { reply }) {
+    if (message.method === 'thread/start') {
+      reply(message, { thread: thread(message.params.sandbox === 'read-only' ? 'read-thread' : 'write-thread') }); return true;
+    }
+    if (message.method === 'turn/start') { reply(message, { turn: turn(message.params.threadId + '-turn') }); return true; }
+  }, dynamicTools: [{ name: 'mutate', description: 'Mutating host action', inputSchema: { type: 'object' }, readOnly: false,
+    handler: () => { calls++; return { success: true, contentItems: [] }; } }] });
+  await f.adapter.startThread({ sandbox: 'read-only' }); await f.adapter.startThread();
+  await f.adapter.startTurn('read-thread', 'Inspect'); await f.adapter.startTurn('write-thread', 'Work');
+  for (const id of ['read-thread', 'write-thread']) f.send({ id, method: 'item/tool/call', params: {
+    threadId: id, turnId: id + '-turn', callId: 'call-1', tool: 'mutate', arguments: {} } });
+  await tick();
+  assert.equal(f.calls.find(call => call.id === 'read-thread' && call.result).result.success, false);
+  assert.equal(f.calls.find(call => call.id === 'write-thread' && call.result).result.success, true);
+  assert.equal(calls, 1);
+});
+
 function approval(server, id = 'approval-1', extra = {}) {
   server.send({
     id, method: 'item/commandExecution/requestApproval',

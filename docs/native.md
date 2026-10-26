@@ -321,9 +321,22 @@ so do not open the same conversation concurrently outside the owned runtime.
 New saved workers also retain the filesystem identity of their working
 directory. Resume requires that identity to still match, even if the path
 spelling is unchanged. Older workers without that evidence remain readable in
-HCC history but are not automatically resumable; manual review and association
-are not yet implemented. Web history marks these records as unavailable before
-the native service rechecks at admission.
+HCC history but are not automatically resumable. Web history marks these records
+as unavailable before the native service rechecks at admission. Since 1.1.4,
+inspect and migrate retained history explicitly:
+
+```sh
+hcc native history --peer old-worker
+hcc native recover --peer old-worker --session EXACT_SAVED_ID --as new-worker --cwd /absolute/project
+```
+
+Close the original worker first. Recovery checks the exact HCC-owned source,
+creates a new provider session with the saved sandbox policy, and records a
+durable `context-only` history link. It preserves the old record, unknown
+identity and unresolved deliveries. It does not resume/fork the original session
+or replay/ACK old inputs. Review the retained history, then explicitly send the
+context and task to continue. `history` is offline/read-only and starts no daemon;
+`--after` pages through retained events.
 
 Native workers receive a worker-specific `HCC_ROOT`, `HCC_DB`, `HCC_PEER`, and
 `HCC_NATIVE_OWNER`. A provider hook must match the peer's native transport owner.
@@ -390,7 +403,7 @@ hcc native respond --peer codex-reviewer --request REQUEST_ID --decision cancel
 Only `permissions`, `scope`, `answers` and `content` are accepted in that file. For MCP forms, use the original field names and types, for example `{"content":{"project":"demo","count":2,"enabled":false}}`. Permissions
 can narrow the request but cannot add paths or network access; requested deny
 entries must be retained when granting filesystem access. Answer every question
-explicitly. Truncated requests can only be declined or cancelled. Nested schemas, dynamic tools and account-token refresh requests remain unsupported. Correlated MCP `url` requests are supported through the Web authorization entry described below.
+explicitly. Truncated requests can only be declined or cancelled. Nested form schemas remain unsupported. Dynamic tools and external-token refresh use the opt-in [host SDK callbacks](codex-host-extensions.md), outside human approval responses. Correlated MCP `url` requests are supported through the Web authorization entry described below.
 
 ## Current boundaries
 
@@ -440,7 +453,7 @@ persisting session/always authorization. Standard `form` requests support string
 
 Correlated MCP `url` requests display the authorization destination and an **Open authorization page** action. Only the current controller can submit it. HCC reserves a blank tab on the explicit click and navigates after the original executor accepts the exact request; stale requests close the blank tab. Popup blocking leaves the request pending. HTTPS and loopback HTTP are allowed; credentials in the URL, other schemes, missing elicitation identities and truncated requests block acceptance while retaining decline/cancel. The new tab has no opener or referrer. Loopback destinations require a browser on the executor computer; HCC does not proxy local login callbacks to another device.
 
-Opening sends only `{ "action": "accept" }` and is not proof of successful authentication. Complete the external flow, then return to the task and follow the provider result. HCC does not invent a completion event or collect credentials in its form. URLs, device messages, opaque elicitation ids and metadata remain in the live pending request only; HCC interaction events and browser storage do not retain them. Provider-owned logs/history and the destination browser retain their existing behavior. Account login, token refresh, `openai/userVerification` and external-flow completion APIs remain separate unsupported capabilities.
+Opening sends only `{ "action": "accept" }` and is not proof of successful authentication. Complete the external flow, then return to the task and follow the provider result. HCC does not invent a completion event or collect credentials in its form. URLs, device messages, opaque elicitation ids and metadata remain in the live pending request only; HCC interaction events and browser storage do not retain them. Provider-owned logs/history and the destination browser retain their existing behavior. Account login, `openai/userVerification` and external-flow completion APIs remain separate unsupported capabilities. External-token refresh has the restricted [host callback](codex-host-extensions.md).
 
 State refresh keeps edits in page memory. Submission, request removal or session changes clear them; a full page reload does not recover answers. HCC browser storage, events and delivery receipts do not retain form responses through the interaction-response path. Provider-owned history and model output retain their existing behavior. The owning server revalidates types and constraints and preserves executor/session/turn/request fencing. Nested objects, unrestricted arrays, unknown constraints and OpenAI extended form modes remain visibly unsupported with decline/cancel available.
 
@@ -588,9 +601,20 @@ not replayed automatically or reclassified as successful after a retry.
 Defaults are six cycles, two queued messages per worker per cycle, 30 seconds
 of idle observation per cycle, and worker resume every two cycles. Limits are
 1–24 cycles, 1–4 messages, 0–300000 idle milliseconds and a 1–24 cycle resume
-interval. These options require `--stability`. This is bounded authenticated
-work, not a 24-hour soak, capacity benchmark or proof of no memory leak. A
-successful DSH resume alone does not explain earlier context fluctuations.
+interval. These options require `--stability`. Receipts measure three-worker
+throughput and p50/p95/max completion latency at the chosen queue depth; they
+do not establish maximum capacity or absence of memory leaks. A successful DSH
+resume alone does not explain earlier context fluctuations.
+
+Add `--stability-soak-seconds 86400` for a 24-hour run. The option accepts
+0–86400 seconds (default 0) and needs at least two cycles. Workload cycles are
+spaced across actual monotonic elapsed time, retaining owned sessions and
+checking status every minute while idle. A final real model probe must recall
+the original context after the full interval and all recovery checks must pass.
+The live JSON receipt records progress, memory samples, failures and cleanup;
+setting a duration is not a passing result. SIGINT/SIGTERM cancel the run and
+clean up owned workers and temporary credential copies. Keep the host awake
+and the process alive; interrupted runs are not silently resumed or replayed.
 
 `--stability-only` requires `--stability`. It bootstraps three real sessions and
 runs stability work while skipping the baseline interruption, command approval

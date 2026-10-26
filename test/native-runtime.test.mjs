@@ -18,7 +18,7 @@ import { createMessageStore } from '../lib/core/coordination/messages.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
 import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
-import { readNativePointer, writeNativePointer, createNativeStore } from '../lib/runtime/native/store.mjs';
+import { readNativePointer, writeNativePointer, createNativeStore, nativePaths } from '../lib/runtime/native/store.mjs';
 import { acquireFileLock, createFileLockLease, fileLockEndpoint } from '../lib/shared/file-lock.mjs';
 import { createNativeTestRoot } from './helpers/native-root.mjs';
 import { createScopedMcpConfig } from '../lib/mcp/scope.mjs';
@@ -83,6 +83,54 @@ async function fixture(t, config = {}, serviceOptions = {}, launch = startNative
   return {ctx,inspect,deps,adapters,mcpCreations,api,start,delivery,get service(){return service;},
     async restart(){await service.shutdown(); service=await startNativeService(ctx,deps,options);}};
 }
+
+test('manual history recovery preserves unverified legacy records and unresolved deliveries in a separate new session', async t => {
+  const f = await fixture(t, { old: { echoSandbox: true }, recovered: { echoSandbox: true } });
+  const old = await f.start('old', { sandbox: 'read-only' });
+  await f.api('POST', '/send', { peer: 'old', from: 'shell', body: 'unfinished old task' });
+  await f.api('POST', '/close', { peer: 'old' });
+  const native = new DatabaseSync(nativePaths(f.ctx).db);
+  try {
+    native.prepare('UPDATE workers SET cwd_identity=NULL WHERE peer=?').run('old');
+    const before = native.prepare('SELECT * FROM workers WHERE peer=?').get('old');
+    const deliveries = native.prepare('SELECT * FROM deliveries WHERE peer=?').all('old');
+    const directory = path.join(f.ctx.root, 'new-location'); fs.mkdirSync(directory);
+    await assert.rejects(f.api('POST', '/recover', { source: 'old', sourceSessionId: 'foreign', peer: 'recovered', cwd: directory }), { code: 'NATIVE_SESSION_NOT_OWNED' });
+    const result = await f.api('POST', '/recover', { source: 'old', sourceSessionId: old.sessionId, peer: 'recovered', cwd: directory });
+    assert.notEqual(result.sessionId, old.sessionId); assert.equal(result.sandbox, 'read-only');
+    assert.equal(f.adapters.get('recovered').openInput.sessionId, undefined);
+    assert.equal(f.adapters.get('recovered').openInput.forkSessionId, undefined);
+    assert.deepEqual(f.adapters.get('recovered').sent, []);
+    assert.deepEqual(native.prepare('SELECT * FROM workers WHERE peer=?').get('old'), before);
+    assert.deepEqual(native.prepare('SELECT * FROM deliveries WHERE peer=?').all('old'), deliveries);
+    assert.equal(result.historyLink.historicalIdentityVerified, false);
+    assert.equal(result.historyLink.replayedDeliveries, 0);
+    const events = await f.api('GET', '/events?peer=recovered');
+    assert.equal(events.find(row => row.payload.type === 'historyLink').payload.sourceSessionId, old.sessionId);
+    assert.equal(native.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE peer=?').get('recovered').n, 0);
+    native.prepare('DELETE FROM provider_events WHERE peer=?').run('recovered');
+    await f.api('POST', '/close', { peer: 'recovered' });
+    await f.restart();
+    const retained = native.prepare('SELECT history_link FROM workers WHERE peer=?').get('recovered');
+    assert.equal(JSON.parse(retained.history_link).sourceSessionId, old.sessionId, 'history association survives log pruning, close and restart');
+  } finally { native.close(); }
+});
+
+test('history recovery refuses active, foreign and occupied peers and cleans a child after an ownership race', async t => {
+  const gate = deferred();
+  const f = await fixture(t, { child: { openGate: gate } });
+  const old = await f.start('old');
+  const input = { source: 'old', sourceSessionId: old.sessionId, peer: 'child', cwd: f.ctx.root };
+  await assert.rejects(f.api('POST', '/recover', input), { code: 'NATIVE_RECOVERY_NOT_READY' });
+  await f.api('POST', '/close', { peer: 'old' });
+  const operation = f.api('POST', '/recover', input);
+  const rejection = assert.rejects(operation, { code: 'NATIVE_OWNER_CHANGED' });
+  await until(() => f.adapters.has('child'));
+  f.inspect.prepare('UPDATE peer_bindings SET runtime_target=? WHERE peer=?').run('changed-owner', 'old');
+  gate.resolve(); await rejection;
+  assert.equal(f.adapters.get('child').closed, 1);
+  assert.equal(f.inspect.prepare('SELECT runtime_target FROM peer_bindings WHERE peer=?').get('old').runtime_target, 'changed-owner');
+});
 
 test('native receipts distinguish local submission from admission and confirm reply/ACK together', async(t)=>{
   const f=await fixture(t); await f.start('a');

@@ -206,6 +206,30 @@ async function fixture(t) {
   return { root, home, dbPath, pointer, binary, env, raw, run, fail, trace, start, wait, withDb, waitDelivery, waitStopped };
 }
 
+test('public native history and recover create a distinct owned session without rewriting the original', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  assert.deepEqual(f.run('native', 'history').workers, []);
+  assert.equal(fs.existsSync(f.pointer), false, 'history must not start a daemon');
+  const old = f.start('old-worker', ['--sandbox', 'read-only']);
+  f.run('native', 'close', '--peer', 'old-worker');
+  f.run('native', 'down'); await f.waitStopped();
+  const oldRecord = f.run('native', 'history', '--peer', 'old-worker').worker;
+  assert.equal(oldRecord.session_id, old.sessionId);
+  assert.equal(fs.existsSync(f.pointer), false);
+  const recovered = f.run('native', 'recover', '--peer', 'old-worker', '--session', old.sessionId,
+    '--as', 'new-worker', '--cwd', f.root, '--binary', f.binary);
+  assert.notEqual(recovered.sessionId, old.sessionId);
+  assert.equal(recovered.sandbox, 'read-only');
+  assert.equal(recovered.historyLink.mode, 'context-only');
+  assert.equal(recovered.historyLink.replayedDeliveries, 0);
+  const source = f.run('native', 'history', '--peer', 'old-worker').worker;
+  assert.equal(source.session_id, oldRecord.session_id); assert.equal(source.cwd_identity, oldRecord.cwd_identity);
+  const frames = f.trace().filter(row => row.kind === 'frame' && row.frame.method?.startsWith('thread/')).map(row => row.frame);
+  assert.deepEqual(frames.map(frame => frame.method), ['thread/start', 'thread/start']);
+  assert.equal(f.run('native', 'history', '--peer', 'new-worker').events.some(row => row.payload.type === 'historyLink'), true);
+  assert.equal(JSON.parse(f.run('native', 'history', '--peer', 'new-worker').worker.history_link).sourceSessionId, old.sessionId);
+});
+
 test('native CLI help, lifecycle and saved resume use only the owned stdio process', { skip: process.platform === 'win32' }, async (t) => {
   const f = await fixture(t);
   const help = f.raw('native', '--help');

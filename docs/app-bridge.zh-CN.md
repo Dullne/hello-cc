@@ -2,12 +2,12 @@
 
 消息入库、进入模型上下文和完成回复是不同状态。`hcc native` 启动的自有 worker 与桌面已有会话也是不同连接。
 
-以下入口从 `1.1.0-rc.5` 预览版本加入，要求 Node.js 24+。使用现有 `preview` 渠道安装；从源码运行时，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`。Codex 会话内协作需要 `1.1.0-rc.7`；较早版本不包含这些协作命令。
+以下入口已随稳定版发布，要求 Node.js 24+。安装当前稳定版：`npm install -g @logicseek/hello-cc@latest`；从源码运行时，可将下文的 `hcc` 替换为 `node ./bin/hcc.mjs`。桌面桥接从 `1.1.0-rc.5` 加入，Codex 会话内协作从 `1.1.0-rc.7` 加入，官方队列监听器需要 `1.1.3+`。
 
 | 对象 | 当前实现 | 验证边界 |
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis 插件在原 live Agent 中收件并唤醒 | 2026-10-06 原安装 Desktop、官方 DSH 0.2.0-rc.2、`deepseek-official/deepseek-flash` 实测空闲 bus 唤醒：0 次 prompt API、1 条回复、1 次 ACK |
-| Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；协议测试和官方 2.1.289 严格静态校验已通过，桌面实测待完成 |
+| Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；协议测试和官方 2.1.289 严格静态校验已通过；2026-10-26 本机 App 2.19675.1 显示地区不可用，尚未取得桌面模型回执 |
 | Codex App | 原会话终端协作、可选 MCP 插件与官方队列监听器，另保留只读 socket 检查 | 每次调用核对线程票据；可选监听器向当前 App 线程自动派送通知。原 App 空闲验收、插件加载与 Hook 信任分别保留设备证据 |
 
 ## DeepSeek Harness
@@ -138,4 +138,4 @@ hcc --root /absolute/project --json app codex probe \
 
 公开 `thread/resume` 既可加入 live thread，也可冷恢复会话，没有“只能附着已加载会话”的原子条件。这不意味着直接 `turn/start` 必须恢复：本次核对的官方 handler 只取得已加载线程，无 resume 分支，可能启动新 turn 或追加到活动 turn。外部直接发送仍缺少原 App 所有且受支持的端点，以及连接、订阅和授权约定；应用内聊天工具不自动构成 HCC 外部公开接口。
 
-2026-10-06 的依据明确区分 Homebrew CLI 0.144.6 与当前 App 26.930.21537（12776）内嵌 CLI 0.159.0-alpha.12.1；后者已离线导出稳定及实验 schema。官方源码另固定为 `823ea830c0fd418b09ff02d36cad9a1fff66465b`，不声称源码与内嵌二进制逐字对应。参见官方 [MCP 每次调用的 metadata 实现](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/core/src/mcp_tool_call.rs#L1395-L1428) 和 [turn handler](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/app-server/src/request_processors/turn_processor.rs#L374-L388)。OpenAI Docs 官方页面已尝试在线重查：从 `developers.openai.com` 重定向到 `learn.chatgpt.com` 后返回 HTTP 403，正文未能验证。`app-server proxy` 传输 WebSocket 握手和帧，不是 native adapter 的 stdio JSONL。
+2026-10-06 的依据明确区分 Homebrew CLI 0.144.6 与当前 App 26.930.21537（12776）内嵌 CLI 0.159.0-alpha.12.1；后者已离线导出稳定及实验 schema。官方源码另固定为 `823ea830c0fd418b09ff02d36cad9a1fff66465b`，不声称源码与内嵌二进制逐字对应。参见官方 [MCP 每次调用的 metadata 实现](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/core/src/mcp_tool_call.rs#L1395-L1428) 和 [turn handler](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/app-server/src/request_processors/turn_processor.rs#L374-L388)。OpenAI Docs 的 [App Server 正文](https://learn.chatgpt.com/docs/app-server) 已于 2026-10-26 成功读取，并对当前内嵌 CLI 导出实验 schema 复核；这不扩大队列监听器的版本与平台支持范围。`app-server proxy` 传输 WebSocket 握手和帧，不是 native adapter 的 stdio JSONL。

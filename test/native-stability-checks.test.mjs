@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { stabilityOptions, assertStabilityEvidence, stabilityPayload } from '../scripts/native-stability-checks.mjs';
+import { stabilityOptions, assertStabilityEvidence, stabilityPayload, assertSoakEvidence } from '../scripts/native-stability-checks.mjs';
 
 test('opt-in stability arguments bound model load and reject missing or contradictory settings', () => {
   assert.equal(stabilityOptions([]), null);
-  assert.deepEqual(stabilityOptions(['--stability']), { cycles: 6, burst: 2, idleMs: 30000, resumeEvery: 2 });
+  assert.deepEqual(stabilityOptions(['--stability']), { cycles: 6, burst: 2, idleMs: 30000, resumeEvery: 2, soakSeconds: 0 });
   assert.deepEqual(stabilityOptions(['--stability', '--stability-cycles', '8', '--stability-burst', '3', '--stability-idle-ms', '0', '--stability-resume-every', '4']),
-    { cycles: 8, burst: 3, idleMs: 0, resumeEvery: 4 });
+    { cycles: 8, burst: 3, idleMs: 0, resumeEvery: 4, soakSeconds: 0 });
   for (const args of [
     ['--stability-cycles', '2'],
+    ['--stability-soak-seconds', '86400'],
+    ['--stability', '--stability-soak-seconds', '86401'],
+    ['--stability', '--stability-cycles', '1', '--stability-soak-seconds', '1'],
     ['--stability-only'],
     ['--stability', '--stability-cycles'],
     ['--stability', '--stability-cycles', '--output'],
@@ -21,6 +24,16 @@ test('opt-in stability arguments bound model load and reject missing or contradi
     ['--stability', '--stability-resume-every', '0'],
     ['--stability', '--stability-cycles', '2', '--stability-cycles', '3']
   ]) assert.throws(() => stabilityOptions(args), { code: 'ERR_ASSERTION' });
+});
+
+test('a 24-hour soak requires elapsed time, every workload cycle, recovery and a final model probe', () => {
+  const valid = { targetSeconds: 86400, elapsedMs: 86400001, completedCycles: 6, expectedCycles: 6, recovered: true, finalProbePassed: true };
+  assertSoakEvidence(valid);
+  for (const change of [{ elapsedMs: 86399999 }, { completedCycles: 5 }, { expectedCycles: 1, completedCycles: 1 },
+    { recovered: false }, { finalProbePassed: false }, { targetSeconds: 0 }, { elapsedMs: NaN }]) {
+    assert.throws(() => assertSoakEvidence({ ...valid, ...change }), { code: 'ERR_ASSERTION' });
+  }
+  assert.equal(stabilityOptions(['--stability', '--stability-soak-seconds', '86400']).soakSeconds, 86400);
 });
 
 test('stability acceptance rejects duplicate replies, premature ACKs and lost or reordered context', () => {

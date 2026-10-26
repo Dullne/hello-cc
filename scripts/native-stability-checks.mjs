@@ -6,7 +6,8 @@ export function stabilityOptions(args) {
     ['--stability-cycles', 'cycles', 6, 1, 24],
     ['--stability-burst', 'burst', 2, 1, 4],
     ['--stability-idle-ms', 'idleMs', 30000, 0, 300000],
-    ['--stability-resume-every', 'resumeEvery', 2, 1, 24]
+    ['--stability-resume-every', 'resumeEvery', 2, 1, 24],
+    ['--stability-soak-seconds', 'soakSeconds', 0, 0, 86400]
   ];
   const enabled = args.includes('--stability');
   assert.ok(!args.includes('--stability-only') || enabled, '--stability-only requires --stability');
@@ -21,7 +22,15 @@ export function stabilityOptions(args) {
     assert.ok(Number.isSafeInteger(value) && value >= min && value <= max, `${flag} must be ${min}..${max}`);
     config[key] = value;
   }
+  assert.ok(!config.soakSeconds || config.cycles >= 2, 'A soak requires at least two workload cycles and recovery');
   return enabled ? config : null;
+}
+
+export function assertSoakEvidence({ targetSeconds, elapsedMs, completedCycles, expectedCycles, recovered, finalProbePassed }) {
+  assert.ok(Number.isSafeInteger(targetSeconds) && targetSeconds > 0);
+  assert.ok(Number.isFinite(elapsedMs) && elapsedMs >= targetSeconds * 1000, 'A soak needs actual monotonic elapsed time');
+  assert.equal(completedCycles, expectedCycles, 'All spaced workload cycles must complete');
+  assert.ok(expectedCycles >= 2 && recovered && finalProbePassed, 'Recovery and a final live model probe must pass');
 }
 
 export function stabilityPayload(text) {

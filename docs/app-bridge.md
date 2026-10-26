@@ -3,15 +3,16 @@
 Message persistence, model context admission and completed replies are separate
 states. HCC-owned native workers do not take over existing Desktop chats.
 
-These commands are introduced in preview version `1.1.0-rc.5` and require
-Node.js 24+. Use the existing `preview` installation channel. From this source
-checkout, replace `hcc` below with `node ./bin/hcc.mjs`; older installed versions
-do not include these commands. Codex in-session cooperation requires `1.1.0-rc.7`.
+These commands are included in stable releases and require Node.js 24+.
+Install stable with `npm install -g @logicseek/hello-cc@latest`. From this source
+checkout, replace `hcc` below with `node ./bin/hcc.mjs`. Desktop bridges were
+introduced in `1.1.0-rc.5`, Codex in-session cooperation in `1.1.0-rc.7`, and the
+official queue watcher requires `1.1.3+`.
 
 | Surface | Implementation | Evidence boundary |
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis tools and idle inbox wakeup on live Agents | Installed Desktop, official DSH 0.2.0-rc.2 and `deepseek-official/deepseek-flash`: idle bus delivery completed with no prompt API call, one reply and one ACK on 2026-10-06 |
-| Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol tests and official 2.1.289 strict static validation passed; Desktop acceptance pending |
+| Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol tests and official 2.1.289 strict static validation passed; installed App 2.19675.1 displayed region unavailability on 2026-10-26, so no Desktop model receipt is claimed |
 | Codex App | Original-session terminal cooperation, opt-in MCP plugin and official queue dispatcher; separate read-only socket probe | Per-call thread capabilities; optional watcher forwards notifications to the current App thread. Ordinary-idle consumption, plugin loading and hook trust have separate device receipts |
 
 ## DeepSeek Harness
@@ -226,6 +227,7 @@ source was pinned separately at `823ea830c0fd418b09ff02d36cad9a1fff66465b`; an
 exact source-to-binary build match is not claimed. See the official
 [MCP per-call metadata implementation](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/core/src/mcp_tool_call.rs#L1395-L1428)
 and [turn handler](https://github.com/openai/codex/blob/823ea830c0fd418b09ff02d36cad9a1fff66465b/codex-rs/app-server/src/request_processors/turn_processor.rs#L374-L388).
-Official OpenAI documentation requests redirected from `developers.openai.com`
-to `learn.chatgpt.com` and returned HTTP 403 there; their page contents remain
-unverified. `app-server proxy` tunnels WebSocket bytes, not native stdio JSONL.
+The [OpenAI Docs App Server page](https://learn.chatgpt.com/docs/app-server)
+was fetched successfully on 2026-10-26, with experimental schemas also exported
+from the current bundled CLI. This does not broaden the queue watcher version
+or platform allowlist. `app-server proxy` tunnels WebSocket bytes, not native stdio JSONL.
