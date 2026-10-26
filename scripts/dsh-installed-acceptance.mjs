@@ -27,7 +27,7 @@ if (live && !process.env.DEEPSEEK_API_KEY) throw new Error('Live acceptance requ
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const resolveOfficial = createRequire(path.join(path.resolve(install), 'package.json'));
 const binary = resolveOfficial.resolve('@deepseek-ai/dsh/lib/bin.js');
-checkDshRuntime(binary);
+const runtimeVersion = checkDshRuntime(binary);
 const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-dsh-installed-')));
 fs.chmodSync(directory, 0o700);
 const home = path.join(directory, 'home'), root = path.join(directory, 'project'), cordisRoot = path.join(directory, 'cordis-project');
@@ -40,7 +40,7 @@ const noModelEnv = { ...env, DEEPSEEK_API_KEY: 'isolated-no-model-placeholder' }
 const output = path.resolve(opt('--output-dir', directory));
 fs.mkdirSync(output, { recursive: true });
 const receiptPath = path.join(output, 'dsh-installed-receipt.json');
-const receipt = { startedAt: new Date().toISOString(), node: process.version, baseline: '0.2.0-rc.2', directory,
+const receipt = { startedAt: new Date().toISOString(), node: process.version, baseline: runtimeVersion, directory,
   validation: live ? 'installed public CLI, original authenticated DeepSeek model' : 'installed public CLI and official profile lifecycle; no model call',
   checks: [], artifacts: {}, cleanup: {}, limitations: ['No npm publication, global installation, employee device or genuine business task acceptance.'] };
 function check(name, data = {}) { receipt.checks.push({ name, passed: true, ...data }); flush(); console.log(JSON.stringify({ check: name, ...data })); }
@@ -128,7 +128,7 @@ try {
   let ptyText = ''; terminal.onData(text => { ptyText += text; });
   await new Promise(resolve => terminal.onExit(resolve)); assert.match(ptyText, /INSTALLED_PTY_READY/);
   check('fresh npm package installation and installed Node 24 PTY dependency load');
-  const sourceFiles = ['bin/hcc.mjs','lib/cli/commands/dsh.mjs','lib/cli/commands/native.mjs','lib/integrations/dsh.mjs','lib/integrations/dsh-cordis.mjs','lib/integrations/dsh-collaboration.mjs','lib/integrations/dsh.bundle.yml','lib/integrations/native/dsh-acp.mjs','lib/integrations/native/jsonrpc.mjs','lib/runtime/native/service.mjs','lib/runtime/native/client.mjs','lib/mcp/tools.mjs'];
+  const sourceFiles = ['bin/hcc.mjs','lib/cli/commands/dsh.mjs','lib/cli/commands/native.mjs','lib/integrations/dsh.mjs','lib/integrations/dsh-cordis.mjs','lib/integrations/dsh-versions.mjs','lib/integrations/dsh-collaboration.mjs','lib/integrations/dsh.bundle.yml','lib/integrations/native/dsh-acp.mjs','lib/integrations/native/jsonrpc.mjs','lib/runtime/native/service.mjs','lib/runtime/native/client.mjs','lib/mcp/tools.mjs'];
   receipt.installedSourceHashes = Object.fromEntries(sourceFiles.map(file => [file, hash(path.join(pkgDir, file))]));
   for (const file of sourceFiles) assert.equal(hash(path.join(repo, file)), receipt.installedSourceHashes[file], 'Installed runtime must match current source: ' + file);
   check('installed Cordis, ACP, MCP and native service match current source hashes');

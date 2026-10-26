@@ -4,7 +4,7 @@
 
 DeepSeek Harness（`dsh`）可以与 Claude Code、Codex 共用 hello-cc 的项目任务、消息、协作锁和交接。现在有三个入口：官方 hooks 兼容桥、原生 Cordis 协作插件，以及 hello-cc 持有的 ACP 后台 worker。
 
-运行时基线固定为 `@deepseek-ai/dsh@0.2.0-rc.2`，相关插件使用相同版本。需要 Node.js 24+，并确认 `PATH` 中的 `node` 也符合要求，因为 dsh 通过 `/usr/bin/env node` 启动。此版本提供 Web/headless/SDK/ACP profile，没有内置 TUI。
+支持的运行时为 `@deepseek-ai/dsh@0.2.0-rc.2` 和 `0.2.1-rc.3`，同一运行时的核心插件必须使用相同版本。hello-cc 1.1.2 起支持后者；升级 hello-cc 的全局 CLI 后，还需通过 `dsh plugin --profile desktop add @logicseek/hello-cc@1.1.2` 更新 Desktop profile。需要 Node.js 24+，并确认 `PATH` 中的 `node` 也符合要求，因为 dsh 通过 `/usr/bin/env node` 启动。这些版本提供 Web/headless/SDK/ACP profile，没有内置 TUI。
 
 支持 Linux 和 macOS；Windows 使用 WSL，不支持原生 Windows shell。容器验证与实际设备验收分别记录。
 
@@ -116,7 +116,7 @@ hcc native start --peer dsh-reviewer --provider dsh --binary /absolute/path/to/d
 
 ## 可安装 bundle 与验收
 
-包声明 `dsh.bundle`，overlay 位于 `lib/integrations/dsh.bundle.yml`，类型声明位于 `lib/integrations/dsh-cordis.d.ts`。元数据声明 `engines.dsh=0.2.0-rc.2`；插件还实际检查 agent/agent-loop/tools/session 包版本，遇到不匹配会在注册前拒绝启动。
+包声明 `dsh.bundle`，overlay 位于 `lib/integrations/dsh.bundle.yml`，类型声明位于 `lib/integrations/dsh-cordis.d.ts`。元数据声明 `engines.dsh=0.2.0-rc.2 || 0.2.1-rc.3`；插件还实际检查 agent/agent-loop/tools/session 包版本，遇到未经验证的版本或混用核心包版本会在注册前拒绝启动。无需设置版本豁免。
 
 本地项目 overlay 已可用。setup 的 managed manifest 记录 Cordis 模块位置；从源码切换到 npm 安装目录时会校验并迁移未编辑的配置，保留用户编辑过的文件。需要 profile 级安装时，先生成包含最新源码的 tarball，再通过官方包管理入口安装：
 

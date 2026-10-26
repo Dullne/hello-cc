@@ -16,6 +16,30 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.2
+
+### Summary
+
+Allow the hello-cc Cordis bundle to load on DeepSeek Harness 0.2.1-rc.3.
+The previous exact runtime requirement rejected installation on that Desktop
+release. Harness 0.2.0-rc.2 remains supported.
+
+### Highlights
+
+- Admit only the two verified Harness versions in package metadata and runtime
+  checks. Reject mixed agent, agent-loop, tools and session package versions
+  before registering collaboration tools.
+- Record the runtime actually used by Cordis, inbox and installed-package
+  acceptance. Exercise both supported versions in Linux and macOS CI.
+
+### Validation
+
+Version-fence tests cover both accepted releases, mixed core packages and an
+unverified prerelease. Official runtime checks exercise idle inbox wakeup,
+committed-context ACKs, replies, project isolation, admission rejection,
+tool permissions, Agent disposal and session resume with local model fixtures.
+Desktop activation and authenticated model communication have separate receipts.
+
 ## 1.1.1
 
 ### Summary

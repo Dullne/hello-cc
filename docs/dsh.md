@@ -4,7 +4,7 @@ English | [中文](dsh.zh-CN.md)
 
 DeepSeek Harness (`dsh`) shares hello-cc project tasks, messages, advisory locks and handoffs with Claude Code and Codex. The integration has three entry points: the official hooks bridge, a native Cordis collaboration plugin, and HCC-owned ACP workers.
 
-The tested runtime is `@deepseek-ai/dsh@0.2.0-rc.2`, with matching plugin versions. Use Node.js 24+ on `PATH` as well as for the parent CLI: the dsh executable uses `/usr/bin/env node`. This preview ships Web/headless/SDK/ACP profiles and no built-in TUI.
+Supported runtimes are `@deepseek-ai/dsh@0.2.0-rc.2` and `0.2.1-rc.3`, with matching core plugin versions in each runtime. The latter requires hello-cc 1.1.2 or later. After updating the global hello-cc CLI, update the Desktop profile with `dsh plugin --profile desktop add @logicseek/hello-cc@1.1.2`. Use Node.js 24+ on `PATH` as well as for the parent CLI: the dsh executable uses `/usr/bin/env node`. These previews ship Web/headless/SDK/ACP profiles and no built-in TUI.
 
 Supported hosts are Linux and macOS; on Windows use WSL. Native Windows shells are not supported. Device acceptance must be recorded separately from container verification.
 
@@ -115,7 +115,7 @@ The default launcher is `dsh` on PATH; use `--binary /absolute/path/to/dsh` when
 
 ## Bundle And Verification
 
-The package declares `dsh.bundle`, ships `lib/integrations/dsh.bundle.yml` and `dsh-cordis.d.ts`, and declares `engines.dsh=0.2.0-rc.2`. The plugin also checks the actual agent/agent-loop/tools/session package versions before registration.
+The package declares `dsh.bundle`, ships `lib/integrations/dsh.bundle.yml` and `dsh-cordis.d.ts`, and declares `engines.dsh=0.2.0-rc.2 || 0.2.1-rc.3`. The plugin also checks the actual agent/agent-loop/tools/session package versions before registration, rejecting unverified releases and mixed core versions. No version exemption is needed.
 
 Project overlays work directly from source. The managed manifest records the Cordis module location, allowing setup to verify and migrate unedited overlays when switching between source and npm installation directories; edited files are preserved. For profile installation, generate a tarball containing these changes and use the official package-management entry point:
 

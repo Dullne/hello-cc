@@ -12,7 +12,8 @@ export interface DshCollaborationConfig {
 export const name: 'hello-cc-dsh-collaboration';
 export const inject: readonly ['agents', 'tools', 'sessions'];
 export const DSH_CORDIS_VERSION: '0.2.0-rc.2';
-export function checkDshRuntime(anchor?: string): void;
+export const DSH_SUPPORTED_VERSIONS: readonly ['0.2.0-rc.2', '0.2.1-rc.3'];
+export function checkDshRuntime(anchor?: string): typeof DSH_SUPPORTED_VERSIONS[number];
 export function apply(ctx: Context, config?: DshCollaborationConfig): void;
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {

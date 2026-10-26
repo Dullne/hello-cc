@@ -23,7 +23,7 @@ const bundle = process.argv.includes('--bundle');
 if (live && !process.env.DEEPSEEK_API_KEY) throw new Error('Live acceptance requires an existing DEEPSEEK_API_KEY');
 const requireOfficial = createRequire(path.join(path.resolve(install), 'package.json'));
 const binary = requireOfficial.resolve('@deepseek-ai/dsh/lib/bin.js');
-checkDshRuntime(binary);
+const runtimeVersion = checkDshRuntime(binary);
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-dsh-cordis-acceptance-')));
 const rootA = path.join(sandbox, 'project A'), rootB = path.join(sandbox, 'project B');
@@ -33,11 +33,11 @@ const env = createDshEnvironment(process.env);
 Object.assign(env, { HOME: home, DSH_HOME: path.join(home, 'dsh'), DSH_TELEMETRY_DISABLED: '1',
   PATH: path.dirname(process.execPath) + path.delimiter + (env.PATH || '') });
 const marker = 'CORDIS_' + randomUUID().replaceAll('-', '').slice(0, 16);
-const receipt = { startedAt: new Date().toISOString(), baseline: '0.2.0-rc.2', node: process.version,
+const receipt = { startedAt: new Date().toISOString(), baseline: runtimeVersion, node: process.version,
   loading: bundle ? 'npm tarball installed into isolated ACP profile' : 'project overlay',
   validation: live ? 'original authenticated DeepSeek model' : 'deterministic local Messages model; real official Harness',
   sandbox, checks: [], cleanup: {}, sourceHashes: {} };
-for (const name of ['lib/integrations/dsh-cordis.mjs', 'lib/integrations/dsh-collaboration.mjs',
+for (const name of ['lib/integrations/dsh-cordis.mjs', 'lib/integrations/dsh-versions.mjs', 'lib/integrations/dsh-collaboration.mjs',
   'lib/mcp/tools.mjs', 'lib/integrations/native/jsonrpc.mjs', 'scripts/dsh-cordis-acceptance.mjs']) {
   receipt.sourceHashes[name] = createHash('sha256').update(fs.readFileSync(path.join(repo, name))).digest('hex');
 }

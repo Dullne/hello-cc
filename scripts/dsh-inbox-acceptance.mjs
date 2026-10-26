@@ -29,7 +29,7 @@ for (let i = 0; i < args.length; i += 2) {
 assert.ok(options['--dsh-install'], 'An existing official DSH installation is required');
 const requireOfficial = createRequire(path.join(path.resolve(options['--dsh-install']), 'package.json'));
 const officialBinary = requireOfficial.resolve('@deepseek-ai/dsh/lib/bin.js');
-checkDshRuntime(officialBinary);
+const runtimeVersion = checkDshRuntime(officialBinary);
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-dsh-inbox-')));
 const home = path.join(sandbox, 'home');
@@ -42,10 +42,10 @@ const output = path.resolve(options['--output'] || path.join(sandbox, 'receipt.j
 const marker = 'IDLE_' + randomUUID().replaceAll('-', '');
 const traceFile = path.join(sandbox, 'events.jsonl');
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-const sources = ['lib/integrations/dsh-cordis.mjs', 'lib/integrations/dsh-inbox.mjs',
+const sources = ['lib/integrations/dsh-cordis.mjs', 'lib/integrations/dsh-versions.mjs', 'lib/integrations/dsh-inbox.mjs',
   'lib/integrations/dsh-collaboration.mjs', 'lib/core/coordination/messages.mjs',
   'lib/coordination-state.mjs', 'scripts/dsh-inbox-acceptance.mjs', 'scripts/helpers/sqlite-observer.mjs'];
-const receipt = { schemaVersion: 1, startedAt: new Date().toISOString(), baseline: '0.2.0-rc.2',
+const receipt = { schemaVersion: 1, startedAt: new Date().toISOString(), baseline: runtimeVersion,
   mode: 'Official Cordis Agent runtime; deterministic local model; isolated sessions; no Desktop UI',
   realModelCalls: false, explicitPromptRequests: 0, permissions: [], checks: [], completed: false,
   sourceHashes: Object.fromEntries(sources.map(name => [name, hash(path.join(repo, name))])) };

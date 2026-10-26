@@ -6,6 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { DSH_BASELINE_VERSION, DSH_SUPPORTED_VERSIONS } from '../lib/integrations/dsh-versions.mjs';
 
 const ARCHIVED_BASELINE = 'docs/verification/dsh-1.0.3-package.json';
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -53,6 +54,8 @@ export function freezeAcceptancePackage({ root, repo = fileURLToPath(new URL('..
   mode, env = process.env }) {
   assert.ok(root, 'HCC_DSH_ACCEPTANCE_ROOT or --output-dir is required');
   assert.ok(['candidate', 'release'].includes(mode), 'Acceptance mode must be candidate or release');
+  const harness = env.HCC_DSH_RUNTIME_VERSION || DSH_BASELINE_VERSION;
+  assert.ok(DSH_SUPPORTED_VERSIONS.includes(harness), 'Acceptance requires a supported Harness runtime');
   root = path.resolve(root);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   // Require fresh output directories so an earlier extraction cannot supply
@@ -82,7 +85,7 @@ export function freezeAcceptancePackage({ root, repo = fileURLToPath(new URL('..
     schemaVersion: 2, createdAt: new Date().toISOString(),
     revision: run('git', ['rev-parse', 'HEAD']).trim(),
     platform: { os: process.platform, architecture: process.arch, node: process.version },
-    harness: '0.2.0-rc.2', pnpm: '12.8.1', npm: npm(['--version']).trim(),
+    harness, pnpm: '12.8.1', npm: npm(['--version']).trim(),
     mode, acceptanceTarget: selected.acceptanceTarget,
     archiveIntegrity: selected.archiveIntegrity, frozenContentMatch: selected.frozenContentMatch,
     repackedSha256: hash(candidateTarball),
