@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
-import { resolveAcceptanceMode, selectAcceptancePackage } from '../scripts/dsh-package-provenance.mjs';
+import { execFileSync } from 'node:child_process';
+import { checkReleaseArtifact, resolveAcceptanceMode, selectAcceptancePackage } from '../scripts/dsh-package-provenance.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 function fixture(t) {
@@ -83,3 +84,75 @@ for (const mode of ['candidate', 'release']) {
     assert.throws(() => selectAcceptancePackage({ ...f, mode }), /Stored release artifact must match/);
   });
 }
+
+function releaseFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-release-preflight-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, 'repo'), output = path.join(root, 'pack');
+  const unpacked = path.join(root, 'unpacked'), home = path.join(root, 'home');
+  for (const directory of [repo, output, unpacked, home]) fs.mkdirSync(directory);
+  const env = { ...process.env, HOME: home, GITHUB_REF: '',
+    NPM_CONFIG_CACHE: path.join(root, 'npm-cache'), NPM_CONFIG_USERCONFIG: path.join(home, '.npmrc'),
+    GITHUB_OUTPUT: path.join(root, 'github-output') };
+  const run = (command, args) => execFileSync(command, args, { cwd: repo, env, encoding: 'utf8' });
+  const npm = args => env.npm_execpath
+    ? run(process.execPath, [env.npm_execpath, ...args]) : run('npm', args);
+  fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({
+    name: '@logicseek/release-preflight-fixture', version: '1.2.3', files: ['bin/'],
+    bin: { fixture: 'bin/fixture.mjs' }
+  }) + '\n');
+  fs.mkdirSync(path.join(repo, 'bin'));
+  fs.writeFileSync(path.join(repo, 'bin', 'fixture.mjs'), '#!/usr/bin/env node\nconsole.log("fixture");\n', { mode: 0o755 });
+  run('git', ['init', '-q', '--template=']);
+  run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false',
+    '-c', 'user.name=Release fixture', '-c', 'user.email=fixture@example.invalid',
+    'commit', '-q', '--allow-empty', '-m', 'Release fixture']);
+  const metadata = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', output]))[0];
+  const archiveDir = path.join(repo, 'docs', 'verification');
+  fs.mkdirSync(archiveDir, { recursive: true });
+  const archive = path.join(archiveDir, metadata.filename);
+  fs.copyFileSync(path.join(output, metadata.filename), archive);
+  run('tar', ['-xzf', archive, '-C', unpacked]);
+  const manifest = path.join(archiveDir, 'dsh-1.2.3-package.json');
+  fs.writeFileSync(manifest, JSON.stringify({
+    version: metadata.version, filename: metadata.filename, sha256: hash(fs.readFileSync(archive)),
+    files: Object.fromEntries(metadata.files.map(file =>
+      [file.path, hash(fs.readFileSync(path.join(unpacked, 'package', file.path)))])),
+    fileModes: Object.fromEntries(metadata.files.map(file => [file.path, file.mode]))
+  }));
+  return { repo, env, archive, manifest };
+}
+
+test('release preflight verifies the immutable package without publishing or changing workflow outputs', t => {
+  const f = releaseFixture(t);
+  const originalArchive = fs.readFileSync(f.archive), originalManifest = fs.readFileSync(f.manifest);
+  fs.writeFileSync(f.env.GITHUB_OUTPUT, 'existing=value\n');
+  const receipt = checkReleaseArtifact({ ...f, version: 'v1.2.3' });
+  assert.equal(receipt.mode, 'release');
+  assert.equal(receipt.acceptanceTarget, 'immutable-release');
+  assert.equal(receipt.frozenContentMatch, true);
+  assert.equal(receipt.package.version, '1.2.3');
+  assert.equal(receipt.package.sha256, hash(originalArchive));
+  assert.equal(receipt.npmPublicationRequested, false);
+  assert.equal(receipt.registryReadbackPerformed, false);
+  assert.deepEqual(fs.readFileSync(f.archive), originalArchive);
+  assert.deepEqual(fs.readFileSync(f.manifest), originalManifest);
+  assert.equal(fs.readFileSync(f.env.GITHUB_OUTPUT, 'utf8'), 'existing=value\n');
+});
+
+test('release preflight rejects a package without its versioned manifest', t => {
+  const f = releaseFixture(t);
+  fs.unlinkSync(f.manifest);
+  assert.throws(() => checkReleaseArtifact(f), { code: 'ENOENT' });
+});
+
+test('release preflight rejects a requested version that differs from the package', t => {
+  const f = releaseFixture(t);
+  assert.throws(() => checkReleaseArtifact({ ...f, version: '1.2.4' }), /Requested release must match/);
+});
+
+test('release preflight rejects source drift after the archive was frozen', t => {
+  const f = releaseFixture(t);
+  fs.appendFileSync(path.join(f.repo, 'bin', 'fixture.mjs'), 'console.log("changed");\n');
+  assert.throws(() => checkReleaseArtifact(f), /Frozen release file differs: bin\/fixture.mjs/);
+});

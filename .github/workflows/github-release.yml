@@ -48,6 +48,9 @@ jobs:
       - name: Validate release notes
         run: npm run release:check -- --version "${{ steps.release.outputs.version }}"
 
+      - name: Verify immutable release package
+        run: npm run release:artifact:check -- --version "${{ steps.release.outputs.version }}"
+
       - name: Dry run release payload
         run: npm run release:github:dry-run -- --version "${{ steps.release.outputs.version }}"
 

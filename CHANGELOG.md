@@ -7,6 +7,7 @@ Before publishing, run:
 
 ```bash
 npm run release:check
+npm run release:artifact:check
 npm run release:notes
 npm run release:github:dry-run
 ```
@@ -15,6 +16,27 @@ Pushing a `v*` tag runs the GitHub Release workflow, which creates or updates
 the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
+
+## 1.1.5
+
+### Summary
+
+Require a verified immutable package before npm publication or GitHub Release
+creation so a missing release manifest fails before publication.
+
+### Highlights
+
+- Check the versioned frozen manifest, archive digest, packaged files and modes
+  before publishing. Reject a requested version that differs from the package.
+- Include the frozen npm archive and file manifest used by release-mode
+  DeepSeek Harness acceptance; preserve all previously published tags and files.
+- Keep the 1.1.4 runtime behavior, including opted-in App inbox listener recovery.
+
+### Validation
+
+Release preflight tests cover a matching immutable package, missing manifests,
+source drift and version mismatches. DeepSeek Harness 0.2.0-rc.2 and 0.2.1-rc.3
+are checked on Linux and macOS alongside repository, Web and native workflows.
 
 ## 1.1.4
 

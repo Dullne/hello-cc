@@ -8,7 +8,7 @@ import { isPrereleaseVersion } from '../lib/release/release-notes.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
-const currentRelease = '1.1.4';
+const currentRelease = /^## (\S+)$/m.exec(read('CHANGELOG.md'))?.[1];
 const nodePtyVersion = '1.2.0-beta.15';
 
 const englishDocs = ['README.md', 'docs/README.md', 'docs/commands.md', 'docs/guide.md'];
@@ -54,6 +54,7 @@ test('current release metadata and Docker verification contract stay pinned', ()
   const pkg = JSON.parse(read('package.json'));
   const lock = JSON.parse(read('package-lock.json'));
   const dockerfile = read('Dockerfile');
+  assert.ok(currentRelease, 'The changelog must identify the current release');
   assert.equal(pkg.version, currentRelease);
   assert.equal(lock.version, currentRelease);
   assert.equal(lock.packages[''].version, currentRelease);

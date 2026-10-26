@@ -1,6 +1,6 @@
 {
   "name": "@logicseek/hello-cc",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Local control plane for coordinating Claude Code, Codex, and other coding CLI sessions.",
   "type": "module",
   "bin": {
@@ -27,6 +27,7 @@
   "scripts": {
     "release:notes": "node ./scripts/release-notes.mjs",
     "release:check": "node ./scripts/release-notes.mjs --check",
+    "release:artifact:check": "node ./scripts/dsh-package-provenance.mjs --check-release",
     "release:github": "node ./scripts/github-release.mjs",
     "release:github:dry-run": "node ./scripts/github-release.mjs --dry-run",
     "smoke": "node ./bin/hcc.mjs --help",
@@ -41,7 +42,7 @@
     "build:native:cwd-handoff": "node ./scripts/build-cwd-handoff.mjs",
     "release:native:verify": "node ./scripts/verify-cwd-handoff-package.mjs",
     "release:native:pack": "node ./scripts/pack-cwd-handoff.mjs",
-    "prepublishOnly": "npm run release:native:verify"
+    "prepublishOnly": "npm run release:check && npm run release:artifact:check && npm run release:native:verify"
   },
   "repository": {
     "type": "git",

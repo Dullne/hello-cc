@@ -2,11 +2,13 @@
 // Harness, calling a model, changing an archive, or publishing a package.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DSH_BASELINE_VERSION, DSH_SUPPORTED_VERSIONS } from '../lib/integrations/dsh-versions.mjs';
+import { normalizeVersion } from '../lib/release/release-notes.mjs';
 
 const ARCHIVED_BASELINE = 'docs/verification/dsh-1.0.3-package.json';
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -103,17 +105,40 @@ export function freezeAcceptancePackage({ root, repo = fileURLToPath(new URL('..
   return receipt;
 }
 
+export function checkReleaseArtifact({ repo, env = process.env, version } = {}) {
+  const expectedVersion = version ? normalizeVersion(version) : null;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-release-artifact-check-'));
+  try {
+    const receipt = freezeAcceptancePackage({ repo, root, mode: 'release',
+      env: { ...env, GITHUB_OUTPUT: '' } });
+    if (expectedVersion) assert.equal(receipt.package.version, expectedVersion,
+      'Requested release must match the checked package version');
+    return receipt;
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
     const options = new Map();
-    for (let index = 2; index < process.argv.length; index += 2) {
-      const key = process.argv[index], value = process.argv[index + 1];
-      assert.ok(['--mode', '--output-dir'].includes(key) && value && !value.startsWith('--'), `Invalid option: ${key}`);
+    for (let index = 2; index < process.argv.length; index += 1) {
+      const key = process.argv[index];
+      if (key === '--check-release') { options.set(key, true); continue; }
+      const value = process.argv[++index];
+      assert.ok(['--mode', '--output-dir', '--version'].includes(key) && value && !value.startsWith('--'), `Invalid option: ${key}`);
       options.set(key, value);
     }
-    const mode = options.get('--mode') || resolveAcceptanceMode({ eventName: process.env.GITHUB_EVENT_NAME,
-      ref: process.env.GITHUB_REF, dispatchMode: process.env.HCC_DSH_DISPATCH_MODE });
-    console.log(JSON.stringify(freezeAcceptancePackage({ root: options.get('--output-dir') || process.env.HCC_DSH_ACCEPTANCE_ROOT, mode }), null, 2));
+    if (options.get('--check-release')) {
+      assert.ok(!options.has('--mode') && !options.has('--output-dir'),
+        '--check-release uses release mode and its own temporary directory');
+      console.log(JSON.stringify(checkReleaseArtifact({ version: options.get('--version') }), null, 2));
+    } else {
+      assert.ok(!options.has('--version'), '--version requires --check-release');
+      const mode = options.get('--mode') || resolveAcceptanceMode({ eventName: process.env.GITHUB_EVENT_NAME,
+        ref: process.env.GITHUB_REF, dispatchMode: process.env.HCC_DSH_DISPATCH_MODE });
+      console.log(JSON.stringify(freezeAcceptancePackage({ root: options.get('--output-dir') || process.env.HCC_DSH_ACCEPTANCE_ROOT, mode }), null, 2));
+    }
   } catch (error) {
     const details = String(error.stack || error.message || error).replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
     console.error(`::error::${details}`); process.exitCode = 1;
