@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis 插件在原 live Agent 中收件并唤醒 | 2026-10-06 原安装 Desktop、官方 DSH 0.2.0-rc.2、`deepseek-official/deepseek-flash` 实测空闲 bus 唤醒：0 次 prompt API、1 条回复、1 次 ACK |
 | Claude Desktop Code | 绑定一个已有会话的可选 Mod，以及 HCC 收件／自动回复 | 需要内嵌引擎 2.1.287+；协议测试和官方 2.1.289 严格静态校验已通过，桌面实测待完成 |
-| Codex App | 原会话终端协作和可选 MCP 插件，另保留只读 socket 检查 | 每次调用核对线程票据；支持活动会话内等待，不支持完全空闲自动唤醒。插件加载与 Hook 信任另做设备验证 |
+| Codex App | 原会话终端协作、可选 MCP 插件与官方队列监听器，另保留只读 socket 检查 | 每次调用核对线程票据；可选监听器向当前 App 线程自动派送通知。原 App 空闲验收、插件加载与 Hook 信任分别保留设备证据 |
 
 ## DeepSeek Harness
 
@@ -93,6 +93,23 @@ hcc --root /absolute/project --json app codex call --tool hcc_message_reply \
 `hcc_inbox`／`hcc_inbox_wait` 均不自动 ACK。确认已读时，用准确消息 ID 和 receipt 调用 `hcc_message_ack`；`hcc_message_reply` 在一个事务中记录关联回复并 ACK，相同重试返回原回复。它们都不代表任务完成。对 `kind=reply` 的消息只消费上下文，勿自动再次回复。peer 消息不构成用户授权。其余工具沿用 HCC 的任务、状态、交接、锁及本地证据规则。同连接等待允许其他会话并发发送，取消时结束等待。
 
 等待最多 45 秒，必须由原 App 会话主动调用，不能唤醒已经完全空闲的聊天。官方 `Stop` Hook 可以延续正在结束的 turn，但不是外部空闲唤醒入口；本适配器不使用该事件，避免把共享 session ID 误配给子线程。
+
+从 1.1.3 开始，可在当前 App 的终端工具中单独启动收件监听器：
+
+```sh
+hcc --root /absolute/project --json app codex watch \
+  --cli /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex \
+  --sqlite-home /absolute/codex-home --app-server-pid ORIGINAL_APP_SERVER_PID
+hcc --root /absolute/project --json app codex dispatch-status
+```
+
+`watch` 是需要持续运行的前台进程，默认每秒检查一次；`--poll-ms` 接受 100–60000。它只登记当前终端的 `CODEX_THREAD_ID`，不接受其他线程目标。当前验过源码的版本为 macOS Desktop CLI `0.164.0-alpha.11.1`；未知版本和其他平台拒绝启用。`--cli` 必须是原 App server 正在执行的同一个二进制，`--sqlite-home` 必须含有原 server 正持有的 `queue_1.sqlite`。进程、目录、二进制或队列文件身份变化时不派送。
+
+监听器只通过官方 `codex queue` 加入含消息 ID 的通知，不复制消息正文或票据，不直接写 Codex 数据库，不调用线程 start/resume/fork。它先保存派送意图；一次入队后等待收件会话明确 ACK 才继续下一封。超时、不明确结果或进程在提交途中退出会留下 `uncertain`，重启不会自动重发。`dispatch-status` 列出这些状态；不要把 `queued` 当成已读或已执行。
+
+收件通知给出准确安装路径的取件命令，使用 `hcc_inbox` 的 `message_id` 参数只读取对应消息，仍须显式 ACK。Ctrl-C 仅停止监听器；原 App、会话和未读消息保留。App 必须运行且线程处于已加载、未中断状态；关闭 App 或卸载线程后，不会替用户冷恢复。完全空闲验收必须观察发送时上一回合已经结束，再由原 App 在同一线程实际取件和调用工具，不能用一次入队回执代替。
+
+当前版本官方队列源码固定于 [6905ecede7816e91373e9eabda3f6b0368fc747b](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/tui/src/session_queue_commands.rs)，同版本 [watcher](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/ext/queue/src/service.rs) 每十秒处理外部变化。OpenAI Docs 的 [App Server 文档](https://learn.chatgpt.com/docs/app-server) 描述了通用生命周期；队列路径另以这个版本的官方源码核验。
 
 另外仍保留端点诊断：
 

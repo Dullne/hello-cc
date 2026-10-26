@@ -62,3 +62,17 @@ test('foreground bridge prints no secret and removes its generated plugin on shu
   assert.equal(code, 0, stderr);
   assert.equal(fs.existsSync(pluginDirectory), false);
 });
+
+test('Codex dispatcher requires the original App terminal and cannot target another thread or database', t => {
+  const f = fixture(t);
+  const outside = f.run(['app', 'codex', 'watch', '--cli', '/not-executed', '--sqlite-home', f.directory, '--app-server-pid', '1']);
+  assert.equal(JSON.parse(outside.stdout || outside.stderr).error.code, 'CODEX_APP_SCOPE_INVALID');
+  for (const args of [
+    ['app', 'codex', 'watch', '--thread', 'someone-else'],
+    ['--db', path.join(f.directory, 'foreign.db'), 'app', 'codex', 'watch'],
+    ['app', 'codex', 'dispatch-status', '--thread', 'someone-else']
+  ]) {
+    const result = f.run(args);
+    assert.equal(JSON.parse(result.stdout || result.stderr).error.code, 'BAD_ARGS');
+  }
+});

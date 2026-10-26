@@ -16,6 +16,33 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.3
+
+### Summary
+
+Forward unread HCC inbox notifications to the current original Codex App thread
+through an optional dispatcher and the official CLI queue. The App keeps
+ownership of model execution and must remain running with the thread loaded.
+
+### Highlights
+
+- Add `app codex watch` and `app codex dispatch-status`. Pin the selected project,
+  cooperation owner, original App processes, executable and shared queue file.
+  The first audited configuration is macOS Desktop CLI 0.164.0-alpha.11.1.
+- Persist dispatch intent before external submission. Serialize delivery until
+  explicit receiver ACK; retain uncertain submissions across failures and
+  restarts without automatic replay or duplicate acknowledgements.
+- Add exact-message `hcc_inbox` selection. Queue notifications contain message
+  IDs and scoped commands; peer message bodies and session tokens stay off the
+  external queue. Enqueue success does not establish original-App consumption.
+
+### Validation
+
+Targeted tests cover overlapping polls, explicit ACK, exact-message isolation,
+live-owner conflicts, crash recovery, shutdown draining, timeout uncertainty,
+CLI version rejection, shared queue identity and literal argument handling.
+Original-App ordinary-idle acceptance and publication have separate receipts.
+
 ## 1.1.2
 
 ### Summary

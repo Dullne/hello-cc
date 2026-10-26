@@ -12,7 +12,7 @@ do not include these commands. Codex in-session cooperation requires `1.1.0-rc.7
 | --- | --- | --- |
 | DeepSeek Harness App / Web | Cordis tools and idle inbox wakeup on live Agents | Installed Desktop, official DSH 0.2.0-rc.2 and `deepseek-official/deepseek-flash`: idle bus delivery completed with no prompt API call, one reply and one ACK on 2026-10-06 |
 | Claude Desktop Code tab | Opt-in Mod for one selected existing session, bus replies and correlated completion | Embedded Claude Code 2.1.287+; protocol tests and official 2.1.289 strict static validation passed; Desktop acceptance pending |
-| Codex App | Original-session terminal cooperation and opt-in MCP plugin; separate read-only socket probe | Per-call thread capabilities; active inbox wait, not automatic idle wakeup. Plugin loading and hook trust require separate device verification |
+| Codex App | Original-session terminal cooperation, opt-in MCP plugin and official queue dispatcher; separate read-only socket probe | Per-call thread capabilities; optional watcher forwards notifications to the current App thread. Ordinary-idle consumption, plugin loading and hook trust have separate device receipts |
 
 ## DeepSeek Harness
 
@@ -141,6 +141,43 @@ The wait is bounded to 45 seconds and works while the original App session is
 actively calling it. It cannot wake an already idle chat. Official `Stop` hooks
 can continue an existing turn, but are not an external idle-wakeup API. This
 adapter leaves them unused rather than assigning a shared session ID to a child.
+
+Since 1.1.3, start an optional dispatcher from the current App terminal:
+
+```sh
+hcc --root /absolute/project --json app codex watch \
+  --cli /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex \
+  --sqlite-home /absolute/codex-home --app-server-pid ORIGINAL_APP_SERVER_PID
+hcc --root /absolute/project --json app codex dispatch-status
+```
+
+Keep this foreground process running. Its default poll interval is 1000 ms;
+`--poll-ms` accepts 100–60000. It targets only the current `CODEX_THREAD_ID`.
+The audited configuration is macOS Desktop CLI `0.164.0-alpha.11.1`; other
+versions and platforms fail closed. The executable must be the same binary
+mapped by the original App server, which must hold the selected
+`queue_1.sqlite`. Process, project, executable and queue identities are guarded.
+
+The dispatcher submits a message-ID notification using official `codex queue`.
+It never copies peer bodies or tokens to that queue, writes Codex SQLite, or
+issues thread start/resume/fork. Durable intent precedes submission; only an
+explicit receiver ACK unblocks the next message. Timeouts, ambiguous results
+and interrupted submissions retain `uncertain` receipts without automatic
+replay. `dispatch-status` lists these receipts. Queued is not read or executed.
+
+Notifications include scoped commands from the exact HCC installation. The
+`hcc_inbox` `message_id` filter reads only the selected message without ACK.
+Ctrl-C stops only the watcher. The App must remain running with this thread
+loaded and uninterrupted; the dispatcher never cold-restores it. Ordinary-idle
+acceptance requires enqueue after the previous App turn completed, followed
+by real same-thread tool execution and ACK in the original App.
+
+The audited official [queue command](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/tui/src/session_queue_commands.rs)
+and ten-second [external watcher](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/ext/queue/src/service.rs)
+are pinned to `6905ecede7816e91373e9eabda3f6b0368fc747b`.
+The [OpenAI Docs App Server page](https://learn.chatgpt.com/docs/app-server)
+describes the general lifecycle; the queue path is audited separately in that
+version's official source.
 
 The separate endpoint diagnostic remains available:
 
