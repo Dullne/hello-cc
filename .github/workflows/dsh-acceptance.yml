@@ -75,7 +75,27 @@ jobs:
 
       - name: Freeze selected package and record candidate or release provenance
         id: package
-        run: node scripts/dsh-package-provenance.mjs
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          import { resolveAcceptanceMode } from './scripts/dsh-package-provenance.mjs';
+          const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          // A mainline verification-only commit can validate the same published
+          // archive without moving its tag or rebuilding the release package.
+          const archivedMainRelease = process.env.GITHUB_EVENT_NAME === 'push'
+            && process.env.GITHUB_REF === 'refs/heads/master'
+            && fs.existsSync(`docs/verification/dsh-${version}-package.json`);
+          const mode = archivedMainRelease ? 'release' : resolveAcceptanceMode({
+            eventName: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
+            dispatchMode: process.env.HCC_DSH_DISPATCH_MODE
+          });
+          console.log(`Selected ${mode} acceptance for ${version}`);
+          const result = spawnSync(process.execPath, ['scripts/dsh-package-provenance.mjs', '--mode', mode],
+            { stdio: 'inherit', env: process.env });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
 
       - name: Install pinned official Harness and pnpm
         id: install
