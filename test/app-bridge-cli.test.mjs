@@ -70,9 +70,13 @@ test('Codex dispatcher requires the original App terminal and cannot target anot
   for (const args of [
     ['app', 'codex', 'watch', '--thread', 'someone-else'],
     ['--db', path.join(f.directory, 'foreign.db'), 'app', 'codex', 'watch'],
-    ['app', 'codex', 'dispatch-status', '--thread', 'someone-else']
+    ['app', 'codex', 'dispatch-status', '--thread', 'someone-else'],
+    ['app', 'codex', 'auto-enable', '--thread', 'someone-else'],
+    ['app', 'codex', 'auto-disable', '--thread', 'someone-else']
   ]) {
     const result = f.run(args);
     assert.equal(JSON.parse(result.stdout || result.stderr).error.code, 'BAD_ARGS');
   }
+  const auto = f.run(['app', 'codex', 'auto-enable']);
+  assert.equal(JSON.parse(auto.stdout || auto.stderr).error.code, 'CODEX_APP_SCOPE_INVALID');
 });

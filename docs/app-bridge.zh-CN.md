@@ -111,6 +111,20 @@ hcc --root /absolute/project --json app codex dispatch-status
 
 当前版本官方队列源码固定于 [6905ecede7816e91373e9eabda3f6b0368fc747b](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/tui/src/session_queue_commands.rs)，同版本 [watcher](https://github.com/openai/codex/blob/6905ecede7816e91373e9eabda3f6b0368fc747b/codex-rs/ext/queue/src/service.rs) 每十秒处理外部变化。OpenAI Docs 的 [App Server 文档](https://learn.chatgpt.com/docs/app-server) 描述了通用生命周期；队列路径另以这个版本的官方源码核验。
 
+从 1.1.4 开始，可以在原 App 的当前线程内启用自动恢复：
+
+```sh
+hcc --root /absolute/project --json app codex auto-enable
+hcc --root /absolute/project --json app codex dispatch-status
+hcc --root /absolute/project --json app codex auto-disable
+```
+
+`auto-enable` 自动从本次终端的进程祖先识别原 App server、它正在执行的 CLI 及持有的队列文件，校验后只保存当前 `CODEX_THREAD_ID` 的启用设置，不保存 session token。该项目的 HCC MCP 启动后管理监听器；App 重启后，当插件重新连接 HCC MCP 时，会按新进程身份恢复已经单独启用的线程。需要使用包含此功能的 HCC MCP；正在运行的旧版 MCP 需要先正常重新连接一次。无需修改 Hook 定义或跳过信任审核。
+
+恢复要求同一项目 owner、同一 App 安装路径和队列目录，仍只接受上述已审阅的 CLI 版本。新二进制会重新检查版本、文件及进程映射；未知升级版本显示 `blocked`，不能靠自动恢复绕过兼容性审核。`dispatch-status` 同时显示当前监听进程和 `recovery` 设置；保存的启用设置不代表进程正在运行。已在运行的手动监听器保持原状，自动恢复显示冲突，等其正常停止后再接管派送租约。`auto-disable` 仅关闭当前线程的自动恢复与受管监听器，其他线程、消息历史和 MCP 工具保留。
+
+MCP 断开时会排空自己正在执行的派送并关闭受管监听器。进程异常退出时，由既有持久化记录阻止不明确派送重试；新 MCP 不会自动重发、ACK 或恢复线程。App 关闭时不派送，也不替用户加载未打开的线程。本机整 App 重启、特定升级版本和跨设备验收，应分别记录，不能由 MCP 重连或模拟测试替代。
+
 另外仍保留端点诊断：
 
 ```sh

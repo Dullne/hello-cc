@@ -165,6 +165,25 @@ explicit receiver ACK unblocks the next message. Timeouts, ambiguous results
 and interrupted submissions retain `uncertain` receipts without automatic
 replay. `dispatch-status` lists these receipts. Queued is not read or executed.
 
+In 1.1.4, run `app codex auto-enable` in the original App terminal to opt this
+exact current thread into recovery. The command discovers and verifies its
+original App ancestry, executable and shared queue directory; it stores no
+session token. The project's HCC MCP then manages the listener. When that MCP
+reconnects after an App restart, it validates fresh process identities and
+restores explicitly enabled threads for the same project owner and App paths.
+An already running older MCP must reconnect once to load this feature. No hook
+definition or trust setting is changed.
+
+`app codex auto-disable` stops this thread's managed listener and recovery;
+other threads, tools and mail remain. `dispatch-status` includes `recovery`
+settings separately from the live listener. A live manual watcher is preserved;
+recovery waits for its lease. The same audited CLI version fence still applies:
+an unreviewed upgrade is blocked. MCP shutdown drains its own in-flight dispatch
+and closes its listeners. Crashed or uncertain submissions are never replayed.
+This does not cold-restore threads or deliver while the App is closed. Actual
+whole-App restarts, individual CLI upgrades and cross-device acceptance require
+separate evidence; MCP reconnect and simulated tests do not establish them.
+
 Notifications include scoped commands from the exact HCC installation. The
 `hcc_inbox` `message_id` filter reads only the selected message without ACK.
 Ctrl-C stops only the watcher. The App must remain running with this thread

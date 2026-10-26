@@ -16,6 +16,31 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.1.4
+
+### Summary
+
+Restore explicitly enabled Codex App inbox listeners when their project HCC
+MCP reconnects, without manually supplying the new App server PID or queue home.
+
+### Highlights
+
+- Add per-thread `app codex auto-enable` and `auto-disable`, with recovery state
+  in `dispatch-status`. Discover the current original App through process
+  ancestry and its open queue file; store no session capability or mail body.
+- Revalidate the project owner, App installation, queue home, executable version
+  and fresh process identities on MCP startup. Preserve live manual listeners
+  and refuse unreviewed CLI versions or a different App installation.
+- Close managed listeners with MCP transport shutdown. Keep durable uncertain
+  submissions across reconnects without replay, implicit ACK or thread restore.
+
+### Validation
+
+Lifecycle tests cover MCP reconnection, per-thread opt-in and disable, ownership
+revocation, manual lease conflicts, exact runtime discovery and no replay after
+an ambiguous queue outcome. Whole-App restart and cross-device acceptance remain
+separate from these tests and from original-App MCP reconnect evidence.
+
 ## 1.1.3
 
 ### Summary
