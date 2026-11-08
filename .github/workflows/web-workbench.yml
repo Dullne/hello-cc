@@ -34,6 +34,8 @@ jobs:
       - name: Source workbench acceptance without models
         id: source_acceptance
         run: npm run test:web -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/source"
+      - name: Product page browser and authentication checks
+        run: npm run test:site
       - name: Pack, install and exercise the public CLI and browser assets
         id: installed_acceptance
         run: npm run test:web:installed -- --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT/installed"

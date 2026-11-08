@@ -81,12 +81,10 @@ jobs:
           import { spawnSync } from 'node:child_process';
           import { resolveAcceptanceMode } from './scripts/dsh-package-provenance.mjs';
           const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
-          // A mainline verification-only commit can validate the same published
-          // archive without moving its tag or rebuilding the release package.
-          const archivedMainRelease = process.env.GITHUB_EVENT_NAME === 'push'
-            && process.env.GITHUB_REF === 'refs/heads/master'
-            && fs.existsSync(`docs/verification/dsh-${version}-package.json`);
-          const mode = archivedMainRelease ? 'release' : resolveAcceptanceMode({
+          // Branch pushes validate the checkout, even while package.json still
+          // carries a released version. Tags and explicit release dispatches
+          // retain immutable archive validation; never rewrite a frozen release.
+          const mode = resolveAcceptanceMode({
             eventName: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF,
             dispatchMode: process.env.HCC_DSH_DISPATCH_MODE
           });

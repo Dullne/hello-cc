@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
-import { inspectProcessIdentity } from '../lib/process/identity.mjs';
+import { inspectProcessIdentity, waitForLiveProcessIdentity } from '../lib/process/identity.mjs';
 import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 
 // A real stdio peer, deliberately writing fragmented and interleaved frames.
@@ -113,16 +113,31 @@ const shellOwnerProgram = String.raw`
 const fs = require('node:fs'), path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createInterface } = require('node:readline');
-const [root, mode] = process.argv.slice(1), pidFile = path.join(root, 'sleep.pid');
+const [root, mode, publication] = process.argv.slice(1), pidFile = path.join(root, 'sleep.pid');
 const shell = spawn('/bin/sh', ['-c',
-  'trap \'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0\' TERM; sleep 30 & sleeper=$!; printf "%s" "$sleeper" > "$1"; wait "$sleeper"',
-  'owned-fixture', pidFile], { stdio: ['ignore', process.stdout, process.stderr] });
+  'trap \'kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; exit 0\' TERM; sleep 30 & sleeper=$!; if [ "$2" = delayed ]; then : > "$1"; sleep 0.1; fi; printf "%s" "$sleeper" > "$1"; wait "$sleeper"',
+  'owned-fixture', pidFile, publication], { stdio: ['ignore', process.stdout, process.stderr] });
 shell.on('error', () => process.exit(29));
 createInterface({ input: process.stdin }).on('line', async line => {
   const frame = JSON.parse(line);
-  while (!fs.existsSync(pidFile)) await new Promise(resolve => setTimeout(resolve, 5));
+  // Redirection creates the file before printf writes the PID. An empty file
+  // must not become PID 0 in the ready response.
+  let sleepPid;
+  const deadline = performance.now() + 3000;
+  while (!Number.isSafeInteger(sleepPid) || sleepPid <= 0) {
+    if (performance.now() >= deadline) {
+      // No ready response means the test has no descendant identities yet.
+      // Let the owned shell's trap reap its sleeper before reporting failure.
+      if (shell.exitCode !== null || shell.signalCode !== null) return process.exit(30);
+      shell.once('close', () => process.exit(30));
+      shell.kill('SIGTERM');
+      return;
+    }
+    if (fs.existsSync(pidFile)) sleepPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    if (!Number.isSafeInteger(sleepPid) || sleepPid <= 0) await new Promise(resolve => setTimeout(resolve, 5));
+  }
   process.stdout.write(JSON.stringify({ id: frame.id, result: { shell: shell.pid,
-    sleep: Number(fs.readFileSync(pidFile, 'utf8')) } }) + '\n');
+    sleep: sleepPid } }) + '\n');
   if (frame.method === 'exit-parent') setTimeout(() => process.exit(0), 10);
 });
 process.stdin.on('end', () => {
@@ -131,9 +146,9 @@ process.stdin.on('end', () => {
 });
 `;
 
-async function shellOwner(t, mode = 'cooperate') {
+async function shellOwner(t, mode = 'cooperate', publication = 'immediate') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-rpc-owned-shell-'));
-  const rpc = new JsonRpcProcess({ binary: process.execPath, args: ['-e', shellOwnerProgram, root, mode],
+  const rpc = new JsonRpcProcess({ binary: process.execPath, args: ['-e', shellOwnerProgram, root, mode, publication],
     cwd: root, env: process.env, closeEofGraceMs: 300, closeGraceMs: 100, closeKillTimeoutMs: 100 });
   const descendants = [];
   t.after(async () => {
@@ -154,12 +169,23 @@ async function shellOwner(t, mode = 'cooperate') {
   await rpc.start();
   const peers = await rpc.request('ready');
   for (const pid of [peers.shell, peers.sleep]) {
-    const observation = inspectProcessIdentity(pid);
+    // A newly forked child can still be entering exec when its PID is ready.
+    // Use the existing bounded identity probe; unknown never counts as live.
+    const observation = await waitForLiveProcessIdentity(pid, { timeoutMs: 3000 });
     assert.equal(observation.state, 'live'); assert.ok(observation.identity);
     descendants.push(observation.identity);
   }
   return { rpc, peers };
 }
+
+test('JSON-RPC fixture waits for a complete PID when publication starts with an empty file',
+  { skip: process.platform === 'win32' }, async t => {
+    const { rpc, peers } = await shellOwner(t, 'cooperate', 'delayed');
+    assert.ok(Number.isSafeInteger(peers.sleep) && peers.sleep > 0);
+    assert.equal(inspectProcessIdentity(peers.sleep).state, 'live');
+    await rpc.close();
+    assert.equal(rpc.childClosed, true);
+  });
 
 test('JSON-RPC EOF lets the provider reap its ordinary shell child without sending a signal',
   { skip: process.platform === 'win32' }, async t => {
