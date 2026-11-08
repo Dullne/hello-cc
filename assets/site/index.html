@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="hello-cc 是 Claude、Codex 和 DeepSeek Harness 的本地多 Agent 工作台。在一个界面中管理会话、共享任务、协调编辑与交接，让 AI 编程协作井然有序。"
+    />
+    <meta name="theme-color" content="#087f68" />
+    <title>hello-cc — 让 AI 各展所长，让协作井然有序</title>
+    <link rel="icon" href="/assets/site/logo.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/site/site.css" />
+    <script type="module" src="/assets/site/site.mjs"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <header class="site-header">
+      <div class="header-inner wrap">
+        <a class="brand" href="#" aria-label="hello-cc 首页"
+          ><img
+            src="/assets/site/logo.svg"
+            width="36"
+            height="36"
+            alt=""
+          /><span
+            >hello<span class="brand-hyphen">-</span>cc<span class="brand-dot"
+              >.</span
+            ></span
+          ></a
+        >
+        <button
+          class="menu-toggle"
+          aria-expanded="false"
+          aria-controls="navigation"
+          aria-label="打开导航"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" />
+          </svg>
+        </button>
+        <nav id="navigation" aria-label="主导航">
+          <a href="#capabilities">产品能力</a><a href="#workflow">协作方式</a
+          ><a href="#quickstart">快速开始</a>
+          <a
+            class="nav-source"
+            href="https://github.com/Dullne/hello-cc"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 17 17 7M7 7h10v10" /></svg
+          ></a>
+          <a class="button button-small" href="#quickstart"
+            >开始使用
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 12h14m-6-6 6 6-6 6" /></svg
+          ></a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="wrap hero-content">
+          <h1 id="hero-title">
+            让 AI 各展所长，<br /><span>让协作井然有序。</span>
+          </h1>
+          <p class="hero-description">
+            把 Claude、Codex 和 DeepSeek Harness 带进同一个工作台。<br
+              class="desktop-break"
+            />共享任务、同步进展、接力交付，让每个 Agent 都知道下一步。
+          </p>
+          <div class="hero-actions">
+            <a class="button" href="#quickstart"
+              >搭建你的 AI 工作台
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h14m-6-6 6 6-6 6" /></svg
+            ></a>
+            <a class="button button-secondary" href="#demo"
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="13" rx="2" />
+                <path d="M8 21h8m-4-4v4" /></svg
+              >看看如何协作</a
+            >
+          </div>
+          <p class="hero-note">
+            <span class="tiny-check" aria-hidden="true">✓</span> 本地运行
+            <span>·</span> 开源可控 <span>·</span> 保留熟悉的终端体验
+          </p>
+
+          <div class="demo-window" id="demo">
+            <div class="window-bar">
+              <span class="window-dots" aria-hidden="true"
+                ><i></i><i></i><i></i></span
+              ><span class="window-address"
+                ><svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="5" y="10" width="14" height="11" rx="2" />
+                  <path d="M8 10V7a4 4 0 0 1 8 0v3" /></svg
+                >hello-cc / workspace</span
+              ><span class="demo-label">交互示意</span>
+            </div>
+            <div class="workbench-header">
+              <span class="workbench-brand"
+                ><span aria-hidden="true">&gt;_</span> hello-cc</span
+              >
+              <div class="demo-tabs" role="tablist" aria-label="协作能力演示">
+                <button
+                  id="tab-agents"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="demo-panel"
+                  data-view="agents"
+                >
+                  Agent 工作台</button
+                ><button
+                  id="tab-tasks"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="demo-panel"
+                  tabindex="-1"
+                  data-view="tasks"
+                >
+                  共享任务</button
+                ><button
+                  id="tab-handoffs"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="demo-panel"
+                  tabindex="-1"
+                  data-view="handoffs"
+                >
+                  交接记录
+                </button>
+              </div>
+              <span class="local-status"><i></i> 本地工作区</span>
+            </div>
+            <div class="workbench-body">
+              <aside class="demo-sidebar" aria-label="示例 Agent">
+                <span class="small-label">PROJECT</span>
+                <div class="demo-project">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v10H3Z" />
+                  </svg>
+                  my-awesome-project
+                </div>
+                <div class="sidebar-heading">协作中的 Agent <span>3</span></div>
+                <div class="peer peer-selected">
+                  <span class="provider-avatar claude">C</span>
+                  <div><strong>Claude</strong><span>设计与实现</span></div>
+                  <i class="peer-dot"></i>
+                </div>
+                <div class="peer">
+                  <span class="provider-avatar codex">&gt;_</span>
+                  <div><strong>Codex</strong><span>测试与验证</span></div>
+                  <i class="peer-dot"></i>
+                </div>
+                <div class="peer">
+                  <span class="provider-avatar deepseek">D</span>
+                  <div>
+                    <strong>DeepSeek Harness</strong><span>代码审查</span>
+                  </div>
+                  <i class="peer-dot"></i>
+                </div>
+                <div class="sidebar-bottom">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <ellipse cx="12" cy="5" rx="8" ry="3" />
+                    <path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0" />
+                  </svg>
+                  项目共享状态 <span>SQLite</span>
+                </div>
+              </aside>
+              <div
+                class="demo-panel"
+                id="demo-panel"
+                role="tabpanel"
+                aria-labelledby="tab-agents"
+                tabindex="0"
+              >
+                <div class="panel-heading">
+                  <div>
+                    <span class="small-label">SHARED CONTEXT</span>
+                    <h3>各司其职，也彼此知情。</h3>
+                  </div>
+                  <span class="status-chip">协作示例</span>
+                </div>
+                <div class="conversation">
+                  <div class="message">
+                    <span class="provider-avatar claude">C</span>
+                    <div>
+                      <div class="message-heading">
+                        <strong>Claude</strong><span>实现</span>
+                      </div>
+                      <p>登录模块已完成。我会整理变更说明，交给 Codex 验证。</p>
+                      <span class="message-tag"
+                        ><svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M8 12h8m-4-4 4 4-4 4M4 4h16v16H4Z" />
+                        </svg>
+                        已创建交接记录</span
+                      >
+                    </div>
+                  </div>
+                  <div class="message">
+                    <span class="provider-avatar codex">&gt;_</span>
+                    <div>
+                      <div class="message-heading">
+                        <strong>Codex</strong><span>验证</span>
+                      </div>
+                      <p>
+                        收到交接。已认领测试任务，接下来检查登录与权限边界。
+                      </p>
+                    </div>
+                  </div>
+                  <div class="demo-event">
+                    <span class="tiny-check" aria-hidden="true">✓</span>
+                    进展、负责人和交接信息，在同一项目中共享。
+                  </div>
+                </div>
+                <div class="demo-input">
+                  <span>让每个 Agent 接上团队的上下文…</span
+                  ><span class="input-arrow" aria-hidden="true">↑</span>
+                </div>
+              </div>
+              <aside class="demo-state" aria-label="示例项目状态">
+                <div class="state-title">
+                  项目动态 <span class="live-dot"></span>
+                </div>
+                <span class="small-label">SHARED TASKS</span>
+                <div class="mini-task">
+                  <span class="task-icon complete">✓</span>
+                  <div>实现登录模块<small>Claude · 已完成</small></div>
+                </div>
+                <div class="mini-task">
+                  <span class="task-icon ongoing"></span>
+                  <div>验证登录流程<small>Codex · 进行中</small></div>
+                </div>
+                <div class="mini-task">
+                  <span class="task-icon waiting"></span>
+                  <div>
+                    审查权限边界<small>DeepSeek Harness · 待处理</small>
+                  </div>
+                </div>
+                <div class="lock-note">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="5" y="10" width="14" height="11" rx="2" />
+                    <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+                  </svg>
+                  <div>编辑有约定<small>用协作锁声明修改范围</small></div>
+                </div>
+                <div class="state-footer">一个项目，一份共享上下文。</div>
+              </aside>
+            </div>
+          </div>
+          <div class="demo-caption">
+            <span>基于真实能力的流程示意，演示数据不连接你的 Agent。</span
+            ><button class="text-link" id="open-screenshot">
+              查看实际控制台
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="providers wrap" aria-label="支持的 Agent">
+        <p>你熟悉的 Agent，<br />现在可以一起工作。</p>
+        <div class="provider-wordmark">
+          <span class="provider-symbol claude-symbol" aria-hidden="true"
+            >✳</span
+          >
+          Claude <small>CODE</small>
+        </div>
+        <div class="provider-wordmark">
+          <span class="terminal-symbol" aria-hidden="true">&gt;_</span> Codex
+        </div>
+        <div class="provider-wordmark deepseek-wordmark">
+          <span class="deepseek-symbol" aria-hidden="true">≈</span> DeepSeek
+          <small>HARNESS</small>
+        </div>
+      </section>
+
+      <section
+        class="section wrap workflow-section"
+        id="workflow"
+        aria-labelledby="workflow-title"
+      >
+        <div class="section-heading">
+          <div>
+            <span class="section-kicker">BUILT TO WORK TOGETHER</span>
+            <h2 id="workflow-title">从各自忙碌，<br />到一起推进。</h2>
+          </div>
+          <p>
+            多开几个终端只是开始。<br />让任务、进展和交接串起来，才是协作。
+          </p>
+        </div>
+        <div class="workflow-steps">
+          <article>
+            <div class="step-line">
+              <span>01</span
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h14m-6-6 6 6-6 6" />
+              </svg>
+            </div>
+            <h3>把 Agent 聚到一起</h3>
+            <p>
+              从 Web 新建后台
+              Agent，或接入已有的受管终端。在同一工作台看清谁在做什么。
+            </p>
+            <span class="step-footnote">多 provider · 多会话</span>
+          </article>
+          <article>
+            <div class="step-line">
+              <span>02</span
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h14m-6-6 6 6-6 6" />
+              </svg>
+            </div>
+            <h3>让协作有迹可循</h3>
+            <p>
+              共享任务板、消息与项目事件，用协作锁声明编辑范围，让并行工作有明确的分工。
+            </p>
+            <span class="step-footnote">任务 · 消息 · 协作锁</span>
+          </article>
+          <article>
+            <div class="step-line">
+              <span>03</span
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m5 12 4 4L19 6" />
+              </svg>
+            </div>
+            <h3>让下一棒顺畅接手</h3>
+            <p>
+              把变更摘要、测试结果与注意事项写进交接记录，下一个 Agent
+              能接着往前走。
+            </p>
+            <span class="step-footnote">状态 · 交接 · 续接</span>
+          </article>
+        </div>
+      </section>
+
+      <section
+        class="capability-section"
+        id="capabilities"
+        aria-labelledby="capability-title"
+      >
+        <div class="wrap">
+          <div class="section-heading">
+            <div>
+              <span class="section-kicker">ONE LOCAL WORKBENCH</span>
+              <h2 id="capability-title">
+                协作需要的，<br />都在你的工作台里。
+              </h2>
+            </div>
+            <p>
+              从会话到项目，从浏览器到终端。<br />把分散的信息放回完整的工作流程。
+            </p>
+          </div>
+          <div class="capability-layout">
+            <div class="capability-intro">
+              <div class="terminal-art" aria-hidden="true">
+                <div class="terminal-top">
+                  <span>&gt;_</span><span>YOUR LOCAL WORKSPACE</span><i></i>
+                </div>
+                <div class="terminal-code">
+                  <span class="terminal-muted"># 你的项目，就是协作起点</span
+                  ><br /><span class="terminal-dollar">$</span> hcc web
+                  --local<br /><br /><span class="terminal-muted"
+                    ># 同一份项目状态</span
+                  ><br /><span class="terminal-dollar">$</span> hcc status<br /><span
+                    class="terminal-result"
+                    >peers · tasks · messages<br />locks · handoffs ·
+                    events</span
+                  ><br /><span class="terminal-cursor">_</span>
+                </div>
+                <div class="terminal-bottom">
+                  <span>LOCAL FIRST</span><span>由你掌控</span>
+                </div>
+              </div>
+              <p>
+                协作状态保存在本地项目总线中。<br />模型请求仍由你配置的
+                provider 处理。
+              </p>
+            </div>
+            <div class="capability-list">
+              <article>
+                <span class="feature-number">01 /</span>
+                <div>
+                  <h3>一个界面，管理多个 Agent</h3>
+                  <p>
+                    新建 Claude、Codex 或 DeepSeek Harness 后台
+                    worker，查看结构化对话、工具执行、投递回执与审批。
+                  </p>
+                </div>
+              </article>
+              <article>
+                <span class="feature-number">02 /</span>
+                <div>
+                  <h3>共享上下文，明确分工</h3>
+                  <p>
+                    任务板、消息、事件与交接留在同一项目里。用显式团队计划拆分并行任务，用
+                    advisory lock 协调编辑。
+                  </p>
+                </div>
+              </article>
+              <article>
+                <span class="feature-number">03 /</span>
+                <div>
+                  <h3>浏览器与终端，接着做</h3>
+                  <p>
+                    在 Web 接入 HCC 持有的后台 worker 或受管 tmux
+                    终端，继续同一执行器，也保留本地 CLI 工作方式。
+                  </p>
+                </div>
+              </article>
+              <article>
+                <span class="feature-number">04 /</span>
+                <div>
+                  <h3>项目文件，随手可达</h3>
+                  <p>
+                    预览文本、Markdown、HTML、图片与
+                    PDF；按需上传文件、编辑文本，保存项目启动默认值并切换项目。
+                  </p>
+                </div>
+              </article>
+            </div>
+          </div>
+          <div class="capability-boundary">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 11v6m0-10v1" />
+            </svg>
+            <p>
+              协作锁用于约定编辑范围；桌面 App
+              保留自己的执行器，通过各自的接入方式参与协作。<a
+                href="https://github.com/Dullne/hello-cc/blob/master/docs/README.zh-CN.md"
+                target="_blank"
+                rel="noopener noreferrer"
+                >了解使用边界 <span aria-hidden="true">↗</span></a
+              >
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section
+        class="section wrap quickstart"
+        id="quickstart"
+        aria-labelledby="quickstart-title"
+      >
+        <div class="quickstart-copy">
+          <span class="section-kicker">MAKE ROOM FOR YOUR TEAM</span>
+          <h2 id="quickstart-title">下一个项目，<br />让 Agent 一起上场。</h2>
+          <p>
+            安装 hello-cc，在项目目录启动工作台。<br />从一位 Agent
+            开始，为更多协作留出空间。
+          </p>
+          <a
+            class="text-link"
+            href="https://github.com/Dullne/hello-cc/blob/master/README.zh-CN.md#安装和维护"
+            target="_blank"
+            rel="noopener noreferrer"
+            >阅读完整安装指南
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 12h14m-6-6 6 6-6 6" /></svg
+          ></a>
+          <div class="requirements">
+            <span>Linux / macOS / WSL</span><span>Node.js ≥ 24</span
+            ><span>tmux</span>
+          </div>
+        </div>
+        <div class="install-panel">
+          <div class="install-heading">
+            <span>&gt;_ &nbsp; 快速开始</span><span>Terminal</span>
+          </div>
+          <div class="install-step">
+            <div>
+              <span class="install-number">1</span><span>安装 hello-cc</span
+              ><button
+                class="copy-button"
+                data-copy="install-command"
+                aria-label="复制安装命令"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="8" y="8" width="12" height="12" rx="2" />
+                  <path d="M16 8V4H4v12h4" /></svg
+                ><span>复制</span>
+              </button>
+            </div>
+            <pre><code id="install-command">npm install -g @logicseek/hello-cc</code></pre>
+          </div>
+          <div class="install-step">
+            <div>
+              <span class="install-number">2</span
+              ><span>进入你的项目，启动工作台</span
+              ><button
+                class="copy-button"
+                data-copy="start-command"
+                aria-label="复制启动命令"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="8" y="8" width="12" height="12" rx="2" />
+                  <path d="M16 8V4H4v12h4" /></svg
+                ><span>复制</span>
+              </button>
+            </div>
+            <pre><code id="start-command">cd /path/to/your-project
+hcc web --local</code></pre>
+          </div>
+          <p class="install-note">
+            打开命令输出的地址，即可进入工作台。请先在同一环境安装并登录所需
+            provider。
+          </p>
+        </div>
+      </section>
+
+      <section class="closing-band">
+        <div class="wrap closing-inner">
+          <div>
+            <span class="closing-mark" aria-hidden="true">&gt;_</span>
+            <div>
+              <h2>你的 Agent，你的项目，你的工作方式。</h2>
+              <p>开源的本地协作工作台。欢迎使用，也欢迎一起完善。</p>
+            </div>
+          </div>
+          <a
+            class="button button-secondary"
+            href="https://github.com/Dullne/hello-cc"
+            target="_blank"
+            rel="noopener noreferrer"
+            >在 GitHub 探索
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 17 17 7M7 7h10v10" /></svg
+          ></a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="wrap site-footer">
+      <a class="brand" href="#"
+        ><img src="/assets/site/logo.svg" width="28" height="28" alt="" /><span
+          >hello-cc<span class="brand-dot">.</span></span
+        ></a
+      ><span>让每个 Agent，都成为团队的一部分。</span>
+      <div>
+        <a
+          href="https://github.com/Dullne/hello-cc/blob/master/docs/README.zh-CN.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          >文档</a
+        ><a
+          href="https://github.com/Dullne/hello-cc/blob/master/LICENSE"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Apache-2.0</a
+        ><a
+          href="https://github.com/Dullne/hello-cc/issues"
+          target="_blank"
+          rel="noopener noreferrer"
+          >反馈</a
+        >
+      </div>
+    </footer>
+    <div class="toast" id="copy-status" role="status" aria-live="polite"></div>
+    <dialog
+      class="screenshot-dialog"
+      id="screenshot-dialog"
+      aria-labelledby="screenshot-title"
+    >
+      <div class="dialog-header">
+        <div>
+          <h2 id="screenshot-title">hello-cc 实际控制台</h2>
+          <p>项目 README 中的界面截图，使用演示数据。</p>
+        </div>
+        <button id="close-screenshot" aria-label="关闭控制台截图">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m6 6 12 12M6 18 18 6" />
+          </svg>
+        </button>
+      </div>
+      <img
+        src="/assets/site/web-console.png"
+        alt="hello-cc 控制台：左侧为 Agent 会话，中间展示结构化对话和工具审批，右侧展示项目任务与协作锁。"
+        width="1440"
+        height="1200"
+        loading="lazy"
+      />
+    </dialog>
+  </body>
+</html>

@@ -211,6 +211,21 @@ hcc task done --id 1 --summary "Done"
 
 它应该基于实时 `hcc` 状态回答，而不是泛泛地说“会话隔离”。
 
+## 产品宣传页
+
+运行 `npm run site:preview`，打开 [本地宣传页](http://127.0.0.1:4173/welcome)。
+它独立展示项目能力、协作流程、控制台截图和安装步骤，不启动 HCC runtime、
+安装 hooks 或连接 Agent。可使用 `npm run site:preview -- --port 4174` 指定端口。
+页面预览可在原生 Windows 上运行；hello-cc 工作台本身仍需满足上文的环境要求。
+
+已启动的 `hcc web` 同样提供公开的 `/welcome` 页面。原有 `/` 工作台入口和 API
+认证保持不变，宣传页不读取项目数据。页面源码位于 `assets/site/`，使用原生
+HTML/CSS/JavaScript，不需要前端构建或外部字体服务。
+
+验证：`npm run test:site`。浏览器检查使用 Playwright；如需使用已安装的 Edge，
+设置环境变量 `HCC_SITE_BROWSER_CHANNEL=msedge`。可通过 `HCC_SITE_SCREENSHOTS`
+指定截图输出目录；默认不生成截图文件。
+
 ## 文档
 
 - [文档目录](docs/README.zh-CN.md)：全部用户文档和实现文档入口。

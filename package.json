@@ -25,6 +25,8 @@
     "dsh": "0.2.0-rc.2 || 0.2.1-rc.3"
   },
   "scripts": {
+    "site:preview": "node ./scripts/site-preview.mjs",
+    "test:site": "node --test test/web-landing.test.mjs && node ./scripts/site-checks.mjs",
     "release:notes": "node ./scripts/release-notes.mjs",
     "release:check": "node ./scripts/release-notes.mjs --check",
     "release:artifact:check": "node ./scripts/dsh-package-provenance.mjs --check-release",

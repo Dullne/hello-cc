@@ -252,6 +252,20 @@ What are the other hello-cc sessions doing?
 Attached Claude/Codex sessions should answer from live `hcc` state rather than
 generic session-isolation assumptions.
 
+## Product page
+
+Run `npm run site:preview` and open the [local product page](http://127.0.0.1:4173/welcome).
+This standalone Chinese page presents capabilities, an illustrative coordination workflow,
+the existing console screenshot, and installation steps. It does not start HCC, install hooks,
+or connect to agents. Use `npm run site:preview -- --port 4174` to select another port.
+The static preview also works on native Windows; the actual HCC workbench retains its platform requirements.
+
+The existing `hcc web` service also serves public `/welcome`. The `/` console and API
+authentication are unchanged. Source lives in `assets/site/` and uses plain HTML/CSS/JavaScript
+with no frontend build or external font service. Run `npm run test:site` for route and Playwright
+checks. Set `HCC_SITE_BROWSER_CHANNEL=msedge` to use installed Edge, and optionally set
+`HCC_SITE_SCREENSHOTS` to a screenshot output directory.
+
 ## Documentation
 
 - [Documentation Index](docs/README.md): all user and implementation docs.
