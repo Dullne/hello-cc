@@ -16,9 +16,9 @@ The [validation record](windows-native-validation.md) gives the tested Windows b
 
 Node.js 24 or later is required. The implementation uses the built-in SQLite module and a source-validated Windows native component. Node.js 22 is not part of this support target. A missing or mismatched native component is an error; changing a platform check does not enable safe operation.
 
-## Running a candidate
+## Running 1.2.0
 
-Use a candidate that contains `native/bin/win32-x64/hcc-windows.node`, its manifest, `hcc-shim.exe`, and the launcher manifest. The npm package also carries the native sources needed to verify those manifests. Do not copy just the binary into another checkout.
+Use the 1.2.0 package, which contains `native/bin/win32-x64/hcc-windows.node`, its manifest, `hcc-shim.exe`, and the launcher manifest. The npm package also carries the native sources needed to verify those manifests. Do not copy just the binary into another checkout.
 
 ```powershell
 hcc doctor --environment
@@ -29,11 +29,11 @@ hcc --root 'C:\Projects\My project' web --local
 
 Initialization writes project guidance and private state under the current profile. State binding uses Windows volume, file ID, and creation-time identities. It does not manufacture POSIX user IDs or permission modes. Paths containing spaces and Unicode are supported within the filesystem requirements above.
 
-Automatic self-signed HTTPS (`web --tls`) is outside this candidate's implemented Windows capabilities and returns `WINDOWS_TLS_UNAVAILABLE` before background startup. Use loopback access with `web --local`. An independently configured TLS reverse proxy uses the existing `--trust-proxy` / `--proxy-origin` options; no Windows HTTPS acceptance is claimed here.
+Automatic self-signed HTTPS (`web --tls`) is outside 1.2.0's implemented Windows capabilities and returns `WINDOWS_TLS_UNAVAILABLE` before background startup. Use loopback access with `web --local`. An independently configured TLS reverse proxy uses the existing `--trust-proxy` / `--proxy-origin` options; no Windows HTTPS acceptance is claimed here.
 
 Private state requires a private owner and trustworthy directory ancestry. Other principals may have harmless traversal/read access, but dangerous mutation rights, junctions, unexpected hardlinks, or changed directory identities are refused. A shared temporary directory may therefore be unsuitable even when an ordinary read/write test succeeds. Do not weaken its ACL policy to make a test pass; use an owned private profile directory.
 
-This candidate creates new Windows private state; it does not import an existing project-local `.hello-cc` store. The offline `migrate-state` implementation currently requires POSIX and is not a supported Windows import procedure. If legacy state is detected, preserve the original directory and databases. Existing data needs a separately reviewed migration procedure before Windows use; deleting the old store is not a migration. The candidate refuses automatic fallback to legacy state.
+This release creates new Windows private state; it does not import an existing project-local `.hello-cc` store. The offline `migrate-state` implementation currently requires POSIX and is not a supported Windows import procedure. If legacy state is detected, preserve the original directory and databases. Existing data needs a separately reviewed migration procedure before Windows use; deleting the old store is not a migration. The release refuses automatic fallback to legacy state.
 
 ## Terminals and providers
 
@@ -69,9 +69,9 @@ node --test --test-concurrency=1 test/windows-*.test.mjs
 node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-installed-acceptance.json
 ```
 
-The Windows CI job downloads the exact running Node version's headers/import library, checks their official SHA-256 sums, builds the component and launcher, and runs the Windows tests. Those tests include extracting `npm pack --ignore-scripts` and loading the native API without access to the source checkout. Ignoring lifecycle scripts creates a candidate for validation; it does not bypass release/publish gates for an actual release.
+The Windows CI job downloads the exact running Node version's headers/import library, checks their official SHA-256 sums, builds the component and launcher, and runs the Windows tests. Those tests include extracting `npm pack --ignore-scripts` and loading the native API without access to the source checkout. Ignoring lifecycle scripts creates a validation installation; it does not bypass release/publish gates for an actual release.
 
-The installed acceptance script packs the candidate and installs it into a disposable prefix containing spaces and Chinese characters. It then invokes the installed public CLI for environment checks, project initialization, background Web, native services, and terminal lifecycle. Its Windows 11 acceptance covers Web restart retaining the terminal process, generation and screen, followed by explicit input and termination. It writes a bounded JSON report without credentials and confirms that its owned processes have exited. Hosted CI and other desktop versions still require their own runs.
+The installed acceptance script installs the frozen 1.2.0 archive into a disposable prefix containing spaces and Chinese characters. It then invokes the installed public CLI for environment checks, project initialization, background Web, native services, and terminal lifecycle. Its Windows 11 acceptance covers Web restart retaining the terminal process, generation and screen, followed by explicit input and termination. It writes a bounded JSON report without credentials and confirms that its owned processes have exited. Hosted CI and other desktop versions still require their own runs.
 
 Tests that create runtime state must isolate **both** `HOME` and `USERPROFILE`. Runtime/Web test fixtures also set `HCC_SKIP_SHIM_INSTALL=1`: changing the profile directory does not isolate the current user's registry PATH. PATH-specific tests use a disposable `HKCU\Software\hello-cc\tests\<UUID>` key and clean it up. Tests must not alter real provider account settings or the developer's persistent PATH.
 

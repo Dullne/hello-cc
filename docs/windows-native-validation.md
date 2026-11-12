@@ -24,7 +24,7 @@ PATH installation tests use disposable `HKCU\Software\hello-cc\tests\<UUID>` sub
 | Shared scoped MCP | **18 passed, zero failures, zero skipped** | Actual stdio tools, ownership checks and capability revocation with isolated state. |
 | Linux full unit suite | **2,309 total: 2,127 passed, 182 skipped, zero failures** | Disposable Linux container, Node v24.22.3. Final database/terminal changes were also checked in a focused run: 35 passed, 34 Windows-specific skips, zero failures. This does not establish a macOS result. |
 | Linux integration regression | **All 13 stages passed; `FULL_REGRESSION_OK`, exit 0** | Final implementation with the packaged POSIX helpers. Includes bootstrap, runtime/database workflow, tmux/WebSocket control, shim launch, session recovery, coordination, GC, packaging, identity checks, diagnosis and uninstall. No fixture services/providers remained afterward. |
-| Installed Windows npm candidate | **Final archive passed independent installation and lifecycle acceptance** | Fresh installation into paths containing Chinese characters and spaces; final run completed in 137 seconds. The archive includes the final rebuilt sources and binaries. |
+| Installed Windows npm release archive | **Frozen 1.2.0 archive passed independent installation and lifecycle acceptance** | Fresh installation into paths containing Chinese characters and spaces; final run completed in 137 seconds. The archive includes the final rebuilt sources and binaries. |
 | Source audit | **89 factory modules passed** | Free-identifier audit at the recorded checkpoint; existing scanner exceptions remain explicit. |
 | Browser presentation | **244 passed / one POSIX shell-execution skip** in 245 UI tests; rendered desktop/mobile checks passed | Shipped page/modules in installed Microsoft Edge, with a mocked HTTP/WebSocket contract. This establishes UI behavior, not a real-provider browser session. |
 
@@ -50,7 +50,7 @@ Local working evidence includes `.superpowers/shared-native-fixtures-windows-v2.
 
 ## Installed-package scope
 
-The installed acceptance command packs the candidate, installs it into a disposable prefix and uses only the installed public CLI and installed production modules for the lifecycle checks:
+The installed acceptance command installs the frozen 1.2.0 archive into a disposable prefix and uses only the installed public CLI and installed production modules for the lifecycle checks:
 
 ```powershell
 node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-installed-acceptance.json
@@ -58,7 +58,7 @@ node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-inst
 
 The final run checked environment doctor, project initialization and database doctor, public task creation/claim, local message/inbox, resource lock/release, background Web startup, Web stop/restart retaining terminal PID/generation/screen, controlled input, confirmed terminal Job termination, and native service up/status/down. Cleanup confirmed exit of the authenticated fixture services and their owned provider processes. There was no global installation or real provider account workflow.
 
-The tested archive is `.superpowers/deliverables/hello-cc-windows-native-candidate.tgz`, assembled on Linux to retain executable modes for the existing POSIX helpers. Its SHA-256 is `5e54aa154aa34bb8403d17e502c9214d422add856d1e8746b0a00273b639ba85`. Windows installed acceptance used this exact archive through `--package-input`; the final report is `.superpowers/sdd/2026-11-12-windows-native-support/windows-installed-final.json`. All 339 packaged runtime files and `package.json` matched the final local implementation byte for byte. This validation document is updated after execution; the archive's embedded documentation records its earlier assembly checkpoint.
+The tested release archive is `docs/verification/logicseek-hello-cc-1.2.0.tgz`, assembled on Linux to retain executable modes for the existing POSIX helpers. Its SHA-256 is `f6bd40c96f079b39061d26368d68a8d88010ba14677080e3a638933815d6020d`. Windows installed acceptance used this exact archive through `--package-input`; the final report is `.superpowers/sdd/2026-11-12-windows-native-support/windows-installed-release.json`. All 372 packaged files and `package.json` matched the frozen release manifest byte for byte. The Linux immutable-artifact check also verified the archive digest, file set and executable modes.
 
 All four POSIX helper source hashes, architectures and executable modes passed the package gate. The Windows addon and launcher passed source/binary hash, protocol and PE architecture checks. These static checks do not establish a macOS runtime acceptance result. The package version is `1.2.0`; npm publication and registry readback are recorded separately from this local validation document.
 
@@ -69,7 +69,7 @@ The Windows job in [`.github/workflows/test.yml`](../.github/workflows/test.yml)
 1. `test/windows-*.test.mjs`, including extracted-package checks.
 2. The selected shared UI suites and source audit.
 3. The explicitly listed shared behavior suites below.
-4. The independently installed npm candidate acceptance script.
+4. The independently installed npm release archive acceptance script.
 
 ```powershell
 node --test --test-concurrency=3 test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs
@@ -85,8 +85,8 @@ The complete legacy Windows `node --test test/*.test.mjs` collection has **not**
 - macOS has no current runtime acceptance result for this branch. Linux unit results and static package checks do not substitute.
 - Hosted `windows-latest` CI has not yet provided a result. A Windows Server runner also would not establish every desktop Windows version.
 - Real Claude, Codex and DeepSeek Harness account/model workflows remain separate acceptance work.
-- Windows HTTPS has not been accepted. Candidate examples use loopback HTTP with `web --local`.
+- Windows HTTPS has not been accepted. The 1.2.0 examples use loopback HTTP with `web --local`.
 - Importing legacy project-local `.hello-cc` data is not implemented on Windows. The offline `migrate-state` command still requires POSIX. Preserve the original store and use a separately reviewed migration procedure; this record does not recommend deleting legacy data or claim that Windows `migrate-state` succeeds.
 - ARM64, UNC/network shares and non-NTFS filesystems remain outside the initial implementation boundary.
 
-These are verification limits of the candidate, not a revision of the approved product target.
+These are verification limits of the 1.2.0 release, not a revision of the approved product target.
