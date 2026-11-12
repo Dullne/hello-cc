@@ -11,6 +11,7 @@ provider peer ID 已变更且不会映射旧 ID；受保护接口使用 Runtime 
 
 ## 用户文档
 
+- [Windows 原生支持](windows-native.md)：候选包安装、私有状态、持久终端，以及实测系统和 provider 边界。
 - [用户指南](guide.zh-CN.md)：安装、启动、Web 控制台、协作语义、工作流、稳定
   peer 身份和环境变量行为。
 - [命令参考](commands.zh-CN.md)：公共命令的紧凑清单，以及每组命令的用途。

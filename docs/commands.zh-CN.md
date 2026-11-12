@@ -141,7 +141,10 @@ hcc peer stop PEER
 hcc inject PEER TEXT [--no-enter]
 ```
 
-这些命令创建或接入 tmux-backed 终端，让 Web 控制台可以观察和操作它们。
+这些命令创建或接入受管终端，让 Web 控制台可以观察和操作它们。Linux/macOS
+使用 tmux，Windows 使用独立的持久终端服务。Windows 的 `peer attach` 按受管
+peer 连接；`--pane` 和 `tmux` 命令组仅适用于 POSIX。CLI 输入注入同样受浏览器和
+本地连接共享的控制租约约束。详见 [Windows 指南](windows-native.md)。
 
 `hcc tmux gc --older-than 14` 预览数据库能证明归属的过期会话；添加 `--yes`
 才会删除符合条件的会话，`--peer PEER` 可限定目标。若 tmux 不再提供已退出

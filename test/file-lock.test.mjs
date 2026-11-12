@@ -118,7 +118,7 @@ test('concurrent project registry writers retain both roots', async (t) => {
   `;
   const childOptions = {
     cwd: repoRoot,
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home },
     stdio: ['ignore', 'ignore', 'pipe']
   };
   const childA = spawn(process.execPath, ['--input-type=module', '-e', childSource,
@@ -186,7 +186,7 @@ test('registry writers stay in their acquired canonical domain when HOME is reta
   const oldWriter = spawn(process.execPath, ['--input-type=module', '-e', pausedWriterSource,
     projectsModuleUrl, projectA, ready, release], {
     cwd: repoRoot,
-    env: { ...process.env, HOME: homeAlias },
+    env: { ...process.env, HOME: homeAlias, USERPROFILE: homeAlias },
     stdio: ['ignore', 'ignore', 'pipe']
   });
   t.after(() => {
@@ -199,7 +199,7 @@ test('registry writers stay in their acquired canonical domain when HOME is reta
   const newWriter = spawn(process.execPath, ['--input-type=module', '-e', writerSource,
     projectsModuleUrl, projectB], {
     cwd: repoRoot,
-    env: { ...process.env, HOME: homeB },
+    env: { ...process.env, HOME: homeB, USERPROFILE: homeB },
     stdio: ['ignore', 'ignore', 'pipe']
   });
   t.after(() => {
@@ -235,11 +235,11 @@ test('same root with a different resolved DB updates inside the throttle window'
   fs.mkdirSync(home, { mode: 0o700 });
   const projectRoot = path.join(root, 'project');
   fs.mkdirSync(projectRoot, { recursive: true });
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { registerProject } = await import(`${projectsModuleUrl}?db-update=${Date.now()}`);
 
@@ -264,11 +264,11 @@ test('future registry timestamps and process clock rollback are refreshed immedi
   fs.mkdirSync(projectRoot);
   fs.mkdirSync(registryDir, { recursive: true });
   const canonicalRoot = fs.realpathSync.native(projectRoot);
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   let wallMs = Math.floor(Date.now() / 1000) * 1000 + 500;
   t.mock.method(Date, 'now', () => wallMs);
@@ -311,11 +311,11 @@ test('project activity is nonblocking and retries soon after a busy first write'
   fs.mkdirSync(projectRoot);
   fs.mkdirSync(registryDir, { recursive: true });
   fs.writeFileSync(registryPath, JSON.stringify({ projects: [] }));
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { registerProject, registerProjectActivity } = await import(`${projectsModuleUrl}?activity-busy=${Date.now()}`);
   const holderSource = String.raw`
@@ -369,11 +369,11 @@ test('project activity throttles repeated root and DB writes but tries a DB chan
   const projectAlias = path.join(root, 'project-alias');
   fs.mkdirSync(projectRoot);
   fs.symlinkSync(projectRoot, projectAlias, 'dir');
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { registerProjectActivity } = await import(`${projectsModuleUrl}?activity-cache=${Date.now()}`);
   const registryPath = path.join(home, '.hello-cc', 'projects.json');
@@ -410,11 +410,11 @@ test('real root and symlink alias share one canonical record and DB changes bypa
   fs.mkdirSync(projectRoot, { recursive: true });
   fs.symlinkSync(projectRoot, projectAlias, 'dir');
   const canonicalRoot = fs.realpathSync.native(projectRoot);
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const moduleUrl = `${projectsModuleUrl}?canonical-register=${Date.now()}`;
   const { projectRecord, readProjectRegistry, registerProject } = await import(moduleUrl);
@@ -459,11 +459,11 @@ test('read canonicalizes and deduplicates stored real-root and symlink-alias rec
       }
     ]
   }));
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { readProjectRegistry } = await import(`${projectsModuleUrl}?canonical-read=${Date.now()}`);
 
@@ -486,11 +486,11 @@ test('canonical dedupe keeps the newest valid record independent of input order'
   fs.symlinkSync(projectRoot, aliasA, 'dir');
   fs.symlinkSync(projectRoot, aliasB, 'dir');
   const canonicalRoot = fs.realpathSync.native(projectRoot);
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { writeProjectRegistry } = await import(`${projectsModuleUrl}?newest-dedupe=${Date.now()}`);
   const newer = { root: aliasA, db: path.join(aliasA, 'new.db'), name: 'new', last_seen_at: 200 };
@@ -522,11 +522,11 @@ test('canonical dedupe has an order-independent deterministic tie break', async 
   fs.symlinkSync(projectRoot, aliasA, 'dir');
   fs.symlinkSync(projectRoot, aliasB, 'dir');
   const canonicalRoot = fs.realpathSync.native(projectRoot);
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { writeProjectRegistry } = await import(`${projectsModuleUrl}?tie-dedupe=${Date.now()}`);
   const canonical = {
@@ -583,11 +583,11 @@ test('new alias DB record is not overwritten or refreshed from an older real-roo
       }
     ]
   }));
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { readProjectRegistry, registerProject } = await import(`${projectsModuleUrl}?new-alias=${Date.now()}`);
 
@@ -624,11 +624,11 @@ test('drops a stored DB alias retargeted outside its canonical project root', as
   }));
   fs.unlinkSync(alias);
   fs.symlinkSync(projectB, alias, 'dir');
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { readProjectRegistry } = await import(`${projectsModuleUrl}?db-retarget=${Date.now()}`);
 
@@ -661,7 +661,7 @@ test('concurrent real-root and symlink-alias registration leaves one canonical r
   `;
   const childOptions = {
     cwd: repoRoot,
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home },
     stdio: ['ignore', 'ignore', 'pipe']
   };
   const realChild = spawn(process.execPath, ['--input-type=module', '-e', childSource,
@@ -685,11 +685,11 @@ test('rejects an incoming root that resolves to a non-directory', async (t) => {
   const alias = path.join(root, 'project-alias');
   fs.writeFileSync(file, 'not a directory');
   fs.symlinkSync(file, alias);
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { registerProject } = await import(`${projectsModuleUrl}?non-directory=${Date.now()}`);
 
@@ -706,11 +706,11 @@ test('rejects a root whose filesystem identity changes during canonicalization',
   const projectAlias = path.join(root, 'project-alias');
   fs.mkdirSync(projectRoot);
   fs.symlinkSync(projectRoot, projectAlias, 'dir');
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { registerProject } = await import(`${projectsModuleUrl}?root-drift=${Date.now()}`);
   const originalStat = fs.statSync.bind(fs);
@@ -736,11 +736,11 @@ test('keeps distinct lexical fallbacks for missing legacy roots', async (t) => {
   fs.mkdirSync(home, { mode: 0o700 });
   const missingA = path.join(root, 'missing', 'a');
   const missingB = path.join(root, 'missing', 'b');
-  const savedHome = process.env.HOME;
-  process.env.HOME = home;
+  const savedHome = process.env.HOME; const savedHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedHomeUserProfile;
   });
   const { writeProjectRegistry } = await import(`${projectsModuleUrl}?missing-roots=${Date.now()}`);
 

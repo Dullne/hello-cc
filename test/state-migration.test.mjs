@@ -16,17 +16,17 @@ const hccBin = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
 
 function fixture(t) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-state-migration-'));
-  const previousHome = process.env.HOME;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
   const home = path.join(sandbox, 'home');
   const root = path.join(sandbox, 'project');
   const source = path.join(root, '.hello-cc');
   fs.mkdirSync(home, { mode: 0o700 });
   fs.mkdirSync(root, { mode: 0o700 });
   fs.mkdirSync(source, { mode: 0o700 });
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile;
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
   return { sandbox, home, root, source, destination: () => privateProjectStateDir(root) };

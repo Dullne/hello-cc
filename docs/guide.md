@@ -43,7 +43,21 @@ the supported downgrade contract.
 ### Prerequisites
 
 Install Node.js 24 or newer from the official Node.js packages or a Node
-version manager. Browser-controllable terminals also require `tmux`:
+version manager. On Linux/macOS, browser terminals also require `tmux`.
+Native Windows uses the packaged ConPTY service; follow the separate
+[Windows guide](windows-native.md) for this development version and its tested scope.
+
+After installing a verified Windows candidate, use PowerShell for a local workbench:
+
+```powershell
+hcc doctor --environment
+hcc --root 'C:\Projects\My project' init
+hcc --root 'C:\Projects\My project' web --local
+```
+
+The [Windows validation record](windows-native-validation.md) distinguishes the
+tested Windows 11 environment from unverified Windows 10, HTTPS and provider
+account workflows. The package-manager and tmux examples below apply to Linux/macOS.
 
 ```bash
 # Debian / Ubuntu
@@ -65,7 +79,7 @@ brew install tmux
 
 On Linux, use the distribution package manager, not Homebrew. A root shell can
 omit `sudo`. WSL follows the matching Linux distribution instructions inside
-WSL; native Windows shells are not supported.
+WSL. Native Windows follows the Windows guide instead.
 
 `hcc web` can attempt to install tmux when a supported package manager and
 sufficient privileges are available. Manual installation is the deterministic

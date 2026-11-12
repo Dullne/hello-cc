@@ -80,18 +80,30 @@ LANs, and an authenticated browser may select any existing server directory.
 
 ## Install And Manage
 
-hello-cc supports Linux and macOS on arm64 and x64. Node.js 24 or newer is
-required. `hcc web` requires `tmux`, including when you plan to create background
-Agents from Web. Native Windows shells are not currently supported; use WSL
-and install the dependencies inside it.
-File browsing, previews, status and context-file search refuse native Windows
-with `PROJECT_FILE_READ_UNAVAILABLE` (HTTP 503); there is no pathname-based fallback.
+hello-cc requires Node.js 24 or newer. Linux and macOS support arm64 and x64;
+their Web terminals use `tmux`. This development checkout adds a native
+Windows candidate targeting Windows 10/11 x64 on local NTFS, including CLI, project files, owned
+background Agents and persistent ConPTY terminals. Windows uses an independent
+terminal service and does not require tmux, Git Bash or WSL. Use a candidate
+package containing the matching Windows native components; these changes have
+not yet been published. See [Windows setup and verification](docs/windows-native.md)
+for installation and current boundaries. Local acceptance used Windows 11;
+Windows 10 remains unverified. Exact results and pending gates are in the
+[Windows validation record](docs/windows-native-validation.md).
+
+With a verified Windows candidate installed, start a local workbench from PowerShell:
+
+```powershell
+hcc doctor --environment
+hcc --root 'C:\Projects\My project' init
+hcc --root 'C:\Projects\My project' web --local
+```
 
 Linux has richer process auto-discovery through `/proc`. On macOS, use
 hello-cc shims or `hcc peer start` for reliable tmux-managed terminal sessions.
 
 Install Node.js 24 or newer from the official Node.js packages or a Node
-version manager. Then install `tmux` for your platform:
+version manager. On Linux/macOS, install `tmux` for your platform:
 
 ```bash
 # Debian / Ubuntu

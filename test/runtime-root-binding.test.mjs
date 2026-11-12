@@ -40,7 +40,7 @@ test('a recreated project path cannot read, replace, or clear the old private ru
     assert.deepEqual(fs.readFileSync(pointer), original);
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-    env: { ...process.env, HOME: home, HCC_TEST_REPO: repo, HCC_TEST_ROOT: root },
+    env: { ...process.env, HOME: home, USERPROFILE: home, HCC_TEST_REPO: repo, HCC_TEST_ROOT: root },
     encoding: 'utf8', timeout: 10000
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -168,7 +168,7 @@ test('a project symlink alias cannot redirect a validated runtime operation to a
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     env: {
-      ...process.env, HOME: home, HCC_TEST_REPO: repo,
+      ...process.env, HOME: home, USERPROFILE: home, HCC_TEST_REPO: repo,
       HCC_TEST_PATHS: JSON.stringify({ rootA, rootB, alias }),
       HCC_NO_AUTO_INSTALL_TMUX: '1'
     },

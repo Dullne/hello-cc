@@ -40,7 +40,7 @@ test('shared fixture checks the same four loopback candidates held by the produc
       await assert.rejects(new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen({ host: '127.0.0.1', port, exclusive: true }, resolve);
-      }), { code: 'EADDRINUSE' });
+      }), error => error.code === 'EADDRINUSE' || (process.platform === 'win32' && error.code === 'EACCES'));
       server.close();
     }
   } finally { lease.release(); }
@@ -68,7 +68,7 @@ test('fixture skips a final-candidate silent listener without connecting or stop
 });
 
 test('fixture preserves non-contention bind errors and cleans its rejected directory without retrying', async t => {
-  const mkdtemp = fs.mkdtempSync, denied = Object.assign(new Error('fixture listen denied'), { code: 'EACCES' });
+  const mkdtemp = fs.mkdtempSync, denied = Object.assign(new Error('fixture address unavailable'), { code: 'EADDRNOTAVAIL' });
   let root, calls = 0;
   t.mock.method(fs, 'mkdtempSync', (...args) => { calls++; return root = mkdtemp(...args); });
   t.mock.method(net, 'createServer', () => {
@@ -80,4 +80,23 @@ test('fixture preserves non-contention bind errors and cleans its rejected direc
   await assert.rejects(createNativeFixtureRoot('hcc-fixture-root-test-'), error => error === denied);
   assert.equal(calls, 1);
   assert.equal(fs.existsSync(root), false);
+});
+
+test('Windows fixture retries a reserved port without probing its occupant', { skip: process.platform !== 'win32' }, async t => {
+  const createServer = net.createServer, mkdtemp = fs.mkdtempSync;
+  const roots = [];
+  let attempts = 0;
+  t.mock.method(fs, 'mkdtempSync', (...args) => { const root = mkdtemp(...args); roots.push(root); return root; });
+  t.mock.method(net, 'createServer', (...args) => {
+    if (attempts++ !== 0) return createServer(...args);
+    const server = new EventEmitter();
+    server.listen = () => queueMicrotask(() => server.emit('error', Object.assign(new Error('reserved port'), { code: 'EACCES' })));
+    server.close = callback => callback(Object.assign(new Error('not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+    return server;
+  });
+  const root = await createNativeFixtureRoot('hcc-fixture-reserved-port-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.notEqual(root, roots[0]);
+  assert.equal(fs.existsSync(roots[0]), false);
+  assert.deepEqual(fs.readdirSync(root), []);
 });

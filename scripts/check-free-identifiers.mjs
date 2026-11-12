@@ -330,7 +330,7 @@ const KNOWN_FALSE_POSITIVES = {
 
 let failures = 0;
 for (const file of files) {
-  const rel = path.relative(repoRoot, file);
+  const rel = path.relative(repoRoot, file).split(path.sep).join('/');
   const allow = new Set(KNOWN_FALSE_POSITIVES[rel] || []);
   const { free } = auditFile(file);
   const real = free.filter((n) => !allow.has(n));

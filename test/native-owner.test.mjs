@@ -22,9 +22,10 @@ function fixture(t) {
   const identity = inspectProcessIdentity(process.pid).identity;
   const owners = [];
   const withHome = fn => {
-    const old = process.env.HOME;
-    process.env.HOME = home;
-    try { return fn(); } finally { process.env.HOME = old; }
+    const old = process.env.HOME; const oldUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home; process.env.USERPROFILE = home;
+    try { return fn(); } finally { if (old === undefined) delete process.env.HOME; else process.env.HOME = old;
+    if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile; }
   };
   t.after(() => {
     for (const owner of owners) { try { owner.db.close(); } catch {} }
@@ -142,7 +143,7 @@ test('explicit B generation gets a separate native pointer and owner without tou
 test('inherited native owner markers fail closed for ordinary CLI write commands', t => {
   const f = fixture(t);
   const bin = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
-  const env = { ...process.env, HOME: path.dirname(f.ctx.root), HCC_ROOT: f.ctx.root,
+  const env = { ...process.env, HOME: path.dirname(f.ctx.root), USERPROFILE: path.dirname(f.ctx.root), HCC_ROOT: f.ctx.root,
     HCC_DB: f.ctx.dbPath, HCC_PEER: 'worker',
     HCC_NATIVE_OWNER: 'native:first:worker:00000000-0000-4000-8000-000000000001' };
   for (const args of [
@@ -167,7 +168,7 @@ test('removing the inherited marker does not isolate same-account native worker 
   const paths = f.withHome(() => nativePaths(f.ctx));
   assert.equal(f.withHome(() => readNativeOwnerStatus(f.ctx)).state, 'live');
   const bin = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
-  const env = { ...process.env, HOME: f.home, HCC_ROOT: f.ctx.root,
+  const env = { ...process.env, HOME: f.home, USERPROFILE: f.home, HCC_ROOT: f.ctx.root,
     HCC_DB: f.ctx.dbPath, HCC_PEER: 'worker', NODE_NO_WARNINGS: '1' };
   delete env.HCC_NATIVE_OWNER;
   const result = spawnSync(process.execPath, [bin, 'msg', 'send', '--to', 'other', '--body', 'marker-removed'],

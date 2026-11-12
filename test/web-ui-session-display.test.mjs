@@ -78,6 +78,14 @@ test('unknown provider history remains explicit instead of presenting a runtime 
   assert.doesNotMatch(f.box.innerHTML,/provider session<\/dt><dd>codex:managed-a/i);
 });
 
+test('Windows terminal disclosures use a generic interface label and readable terminal name', () => {
+  const f = fixture(); f.context.sessions[0].type = 'windows-terminal'; f.context.sessions[0].kind = 'shell';
+  f.render(); vm.runInContext('renderActiveSession(sessions[0])', f.context);
+  assert.match(f.box.innerHTML, /<dt>Interface<\/dt><dd>Terminal CLI<\/dd>/);
+  assert.match(f.elements.get('activeIdentity').innerHTML, /<dt>Interface<\/dt><dd>Terminal CLI<\/dd>/);
+  assert.doesNotMatch(f.elements.get('activeIdentity').innerHTML, /Codex interface|windows-terminal/);
+});
+
 test('opening session details and local action controls never selects another executor',()=>{
   const f=fixture();
   for(const card of f.box.cards){

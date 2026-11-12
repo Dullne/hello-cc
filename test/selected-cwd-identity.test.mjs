@@ -13,13 +13,15 @@ test('selected directory identity rejects persistent alias and same-path replace
   const alias = path.join(base, 'selected');
   fs.mkdirSync(original);
   fs.mkdirSync(replacement);
-  fs.symlinkSync(original, alias, 'dir');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  fs.symlinkSync(original, alias, linkType);
   const first = captureSelectedCwdIdentity(alias);
   try {
     assert.equal(first.assertUnchanged(), undefined);
-    assert.equal(first.identity.ino, fs.statSync(original, { bigint: true }).ino.toString());
+    if (process.platform === 'win32') assert.equal(first.identity.platform, 'win32');
+    else assert.equal(first.identity.ino, fs.statSync(original, { bigint: true }).ino.toString());
     fs.unlinkSync(alias);
-    fs.symlinkSync(replacement, alias, 'dir');
+    fs.symlinkSync(replacement, alias, linkType);
     assert.throws(() => first.assertUnchanged(), { code: 'PROJECT_PATH_CHANGED' });
   } finally { first.release(); first.release(); }
 

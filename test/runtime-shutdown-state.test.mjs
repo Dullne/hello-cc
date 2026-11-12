@@ -28,7 +28,7 @@ function isolated(t, body) {
     const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', prelude + body], {
-    env: { ...process.env, HOME: sandbox, NODE_NO_WARNINGS: '1' },
+    env: { ...process.env, HOME: sandbox, USERPROFILE: sandbox, NODE_NO_WARNINGS: '1' },
     encoding: 'utf8', timeout: 20000
   });
   assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);

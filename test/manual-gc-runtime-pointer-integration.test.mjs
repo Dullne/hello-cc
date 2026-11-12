@@ -16,7 +16,7 @@ function runHcc(root, home, args) {
   return execFileSync(process.execPath, [hccBin, '--root', root, ...args], {
     cwd: root,
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, HCC_RUNTIME_URL: '' }
+    env: { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '' }
   });
 }
 

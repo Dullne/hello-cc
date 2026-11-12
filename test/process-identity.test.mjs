@@ -226,6 +226,7 @@ finally:
 
 test('collects the same macOS identity under different caller locales', (t) => {
   t.mock.method(process, 'kill', () => {});
+  const pathKey = Object.keys(process.env).find(key => key.toUpperCase() === 'PATH') || 'PATH';
   const psEnvironments = [];
   const spawnMock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
     if (command === 'sysctl') {
@@ -263,7 +264,7 @@ test('collects the same macOS identity under different caller locales', (t) => {
       assert.equal(environment?.TZ, 'UTC');
       assert.equal(environment?.LC_ALL, 'C');
       assert.equal(environment?.LANG, 'C');
-      assert.equal(environment?.PATH, process.env.PATH);
+      assert.equal(environment?.[pathKey], process.env[pathKey]);
     }
   } finally {
     for (const [key, value] of Object.entries(originalEnvironment)) {

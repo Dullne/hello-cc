@@ -6,24 +6,33 @@ import vm from 'node:vm';
 import { webIndexHtml } from '../lib/web/ui-template.mjs';
 const browserCore = fs.readFileSync(new URL('../lib/web/browser/core.mjs', import.meta.url), 'utf8');
 
-test('terminal menu quotes peer and registration arguments as single shell words', () => {
+function terminalFunctions() {
   const html = browserCore;
   const match = html.match(/function terminalShellQuote[\s\S]*?(?=function formatActionResult)/);
   assert.ok(match, 'terminal action functions appear in the generated page');
-  const { terminalCommandForAction, terminalShellQuote } = vm.runInNewContext(
+  return vm.runInNewContext(
     `${match[0]}\n({ terminalCommandForAction, terminalShellQuote })`
   );
+}
 
+test('terminal menu quotes peer and registration arguments as single shell words', () => {
+  const { terminalCommandForAction, terminalShellQuote } = terminalFunctions();
   const peerId = "peer with spaces'; printf HCC_EXTRA_MARKER";
   const info = { peerId, session: { kind: 'claude code', role: "dev's agent" } };
   const command = terminalCommandForAction('register', info);
   assert.equal(command,
     `hcc register --peer ${terminalShellQuote(peerId)} --kind ${terminalShellQuote('claude code')} --role ${terminalShellQuote("dev's agent")}`);
 
+  assert.equal(terminalCommandForAction('status', info), `hcc status --peer ${terminalShellQuote(peerId)}`);
+});
+
+test('POSIX terminal commands retain literal arguments through the POSIX shell', { skip: process.platform === 'win32' ? 'Windows does not offer POSIX shell-command insertion; rendered Windows controls are covered separately' : false }, () => {
+  const { terminalCommandForAction } = terminalFunctions();
+  const peerId = "peer with spaces'; printf HCC_EXTRA_MARKER";
+  const command = terminalCommandForAction('register', { peerId, session: { kind: 'claude code', role: "dev's agent" } });
   const result = spawnSync('/bin/sh', ['-c',
     `set -- ${command.slice('hcc register '.length)}; printf '%s\\n' "$#" "$2" "$4" "$6"`
   ], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, `6\n${peerId}\nclaude code\ndev's agent\n`);
-  assert.equal(terminalCommandForAction('status', info), `hcc status --peer ${terminalShellQuote(peerId)}`);
 });

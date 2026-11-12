@@ -4,10 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-function candidatePorts(root) {
+function candidatePorts(root, ownershipKey) {
   // Keep the fixture's bind-only availability check aligned with the four
   // deterministic candidates in lib/shared/file-lock.mjs.
-  const key = path.join(root, '.hello-cc', 'native', 'service-owner');
+  const key = ownershipKey ? ownershipKey(root) : path.join(root, '.hello-cc', 'native', 'service-owner');
   const ports = [];
   for (let index = 0; ports.length < 4; index += 1) {
     const input = index === 0 ? key : `hcc-file-lock-port-v1\0${index}\0${key}`;
@@ -20,13 +20,13 @@ function candidatePorts(root) {
 // This removes environmental collisions from fixtures; it does not relax the
 // product's conservative refusal of an unidentified listener. Bind only our
 // candidate ports, never connect to or inspect an existing process.
-export async function createNativeFixtureRoot(prefix, { projectSubdir = '' } = {}) {
+export async function createNativeFixtureRoot(prefix, { projectSubdir = '', ownershipKey } = {}) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
     const listeners = [];
     let failure;
     try {
-      for (const port of candidatePorts(path.join(root, projectSubdir))) {
+      for (const port of candidatePorts(path.join(root, projectSubdir), ownershipKey)) {
         const listener = net.createServer();
         listeners.push(listener);
         await new Promise((resolve, reject) => {
@@ -43,7 +43,7 @@ export async function createNativeFixtureRoot(prefix, { projectSubdir = '' } = {
     }
     if (!failure) return root;
     fs.rmSync(root, { recursive: true, force: true });
-    if (failure.code !== 'EADDRINUSE') throw failure;
+    if (failure.code !== 'EADDRINUSE' && !(process.platform === 'win32' && failure.code === 'EACCES')) throw failure;
   }
   throw new Error('Could not allocate a native test root with four available ownership ports');
 }

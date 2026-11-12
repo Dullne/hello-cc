@@ -103,7 +103,7 @@ async function fixture(t, options = {}) {
     replacementGeneration: 'replacement-fixture-generation', replacementToken: randomBytes(32).toString('hex'),
     ...options };
   fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
-  const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home,
+  const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, USERPROFILE: home,
     NODE_NO_WARNINGS: '1', NO_COLOR: '1', HCC_RUNTIME_URL: '', HCC_LEGACY_FIXTURE_CONFIG: configFile };
   const child = spawn(process.execPath, ['--input-type=module', '-e', legacyRuntimeSource], {
     cwd: root, env, stdio: ['ignore', 'ignore', 'pipe', 'ipc']

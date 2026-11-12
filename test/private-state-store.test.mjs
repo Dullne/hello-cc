@@ -84,7 +84,7 @@ function fixture(t) {
 function invoke(f, action, root = f.root, options = undefined) {
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', childCode], {
     input: JSON.stringify({ action, root, options }),
-    env: { ...process.env, HOME: f.home, HCC_PRIVATE_STATE_MODULE: modulePath,
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, HCC_PRIVATE_STATE_MODULE: modulePath,
       HCC_STATE_MIGRATION_MODULE: migrationModulePath },
     encoding: 'utf8',
     timeout: 10000
@@ -96,7 +96,7 @@ function invoke(f, action, root = f.root, options = undefined) {
 function invokeCli(f, args, command = 'migrate-state') {
   const result = spawnSync(process.execPath,
     [cliPath, '--root', f.root, '--json', command, ...args], {
-      env: { ...process.env, HOME: f.home, NODE_NO_WARNINGS: '1' },
+      env: { ...process.env, HOME: f.home, USERPROFILE: f.home, NODE_NO_WARNINGS: '1' },
       encoding: 'utf8', timeout: 10000
     });
   assert.equal(result.signal, null, result.stderr || result.error?.message);

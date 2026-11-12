@@ -122,7 +122,7 @@ async function fixture(t) {
   fs.writeFileSync(binary, fakeCodexSource, { mode: 0o700 });
   const dbPath = path.join(root, '.hello-cc', 'mesh.db');
   const pointer = path.join(root, '.hello-cc', 'native', 'runtime.json');
-  const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home,
+  const env = { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, USERPROFILE: home,
     NODE_NO_WARNINGS: '1',
     FAKE_CODEX_LOG: traceFile, HCC_RUNTIME_URL: '', NO_COLOR: '1' };
   const processes = new Map();

@@ -59,11 +59,21 @@ unknown 证据获得最长 120 秒宽限。`hcc gc` 默认保留历史，必须�
 
 ## 安装和维护
 
-hello-cc 支持 Linux 和 macOS。需要 Node.js 24 或更新版本；`hcc web` 和受管
-终端需要 `tmux`。发行包包含 macOS/Linux arm64 与 x64 的目录交接 helper。
-当前不支持原生 Windows shell；Windows 用户建议使用 WSL。
-原生 Windows 上的文件浏览、预览、状态和上下文文件搜索会明确返回
-`PROJECT_FILE_READ_UNAVAILABLE`（HTTP 503），不再回退到不安全的路径读取。
+hello-cc 需要 Node.js 24 或更新版本。Linux/macOS 支持 arm64 与 x64，Web 终端
+使用 `tmux`。本开发版本新增面向 Windows 10/11 x64、本地 NTFS 的原生候选实现，覆盖 CLI、
+项目文件操作、受管后台 Agent 和持久 ConPTY 终端。Windows 使用独立终端服务，
+无需 tmux、Git Bash 或 WSL。请使用包含匹配原生组件的候选安装包；这些改动尚未
+发布。安装方法和适用边界见 [Windows 原生支持说明](docs/windows-native.md)。本地验收使用
+Windows 11，Windows 10 尚未验收；准确结果和待完成项目见
+[Windows 验证记录](docs/windows-native-validation.md)。
+
+安装已验证的 Windows 候选包后，在 PowerShell 中启动本机工作台：
+
+```powershell
+hcc doctor --environment
+hcc --root 'C:\Projects\My project' init
+hcc --root 'C:\Projects\My project' web --local
+```
 
 在运行 hello-cc 的同一环境中安装并登录所需 provider。Codex 后台 Agent 需要支持
 App Server 的 Codex CLI；DeepSeek Harness 后台 Agent 需要 DSH ACP runtime；
@@ -73,8 +83,8 @@ Claude 后台 Agent 使用可选的 Claude Agent SDK，hello-cc 不会自动安�
 Linux 可以通过 `/proc` 做更完整的进程自动发现。macOS 上建议通过 hello-cc
 shim 或 `hcc peer start` 启动会话，以获得可靠的 tmux 托管终端。
 
-先通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本，再按
-系统安装 `tmux`：
+先通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本。
+Linux/macOS 再按系统安装 `tmux`：
 
 ```bash
 # Debian / Ubuntu

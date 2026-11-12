@@ -29,7 +29,7 @@ fs.lstatSync = function __gcPatchedLstatSync(value, ...args) {
 export async function load(url, context, nextLoad) {
   const loaded = await nextLoad(url, context);
   if (!url.includes(bufferGcSuffix)) return loaded;
-  const originalSource = String(loaded.source);
+  const originalSource = String(loaded.source).replace(/\r\n/g, '\n');
   const source = originalSource.replace(
     "import fs from 'node:fs';\nimport path from 'node:path';",
     instrumentedImport.trim()

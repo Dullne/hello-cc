@@ -9,6 +9,26 @@ import { readRuntime } from '../lib/runtime/state.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { makeWebToken, normalizeRequestBody } from '../lib/web/runtime.mjs';
 
+test('runtime requests preserve Unicode project and database paths without invalid HTTP headers', async t => {
+  const ctx = { root: path.resolve('项目 空间'), dbPath: path.resolve('配置 用户', 'mesh.db') };
+  const observed = [];
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    observed.push({ project: url.searchParams.get('project'), db: url.searchParams.get('db'), headers: req.headers });
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  const runtime = { base_url: `http://127.0.0.1:${server.address().port}` };
+  assert.deepEqual(await runtimeRequest(ctx, 'POST', '/api/runtime/stop', {}, runtime), { ok: true });
+  assert.equal(observed[0].project, ctx.root); assert.equal(observed[0].db, ctx.dbPath);
+  assert.equal(observed[0].headers['x-hcc-root'], undefined); assert.equal(observed[0].headers['x-hcc-db'], undefined);
+  await runtimeRequest(ctx, 'GET', '/api/runtime?project=explicit&db=selected', null, runtime);
+  assert.equal(observed[1].project, 'explicit'); assert.equal(observed[1].db, 'selected');
+  await runtimeRequest(ctx, 'GET', '/api/runtime?root=&project=&db=', null, runtime);
+  assert.equal(observed[2].project, ctx.root); assert.equal(observed[2].db, ctx.dbPath);
+});
+
 test('runtime deadlines preserve root identity headers and reject a rebound selection before HTTP', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-client-root-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -143,14 +163,14 @@ test('runtime request composes an external abort signal with its deadline', asyn
 });
 
 test('generated web tokens are per-runtime and are not persisted', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-token-'));
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(runtimeHome, { recursive: true, force: true });
   });
-  process.env.HOME = runtimeHome;
+  process.env.HOME = runtimeHome; process.env.USERPROFILE = runtimeHome;
 
   const first = makeWebToken({});
   const second = makeWebToken({});

@@ -9,6 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { createGcCommands } from '../lib/cli/commands/gc.mjs';
 import { observeClockSafetyInTransaction } from '../lib/core/coordination/clock-safety.mjs';
+import { resolveProjectDatabase } from '../lib/runtime/project-path.mjs';
+import { initSchema } from '../lib/db/schema.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hccBin = path.join(repoRoot, 'bin', 'hcc.mjs');
@@ -34,11 +36,15 @@ function createTestRunGc(now = () => nowSec, overrides = {}) {
 const runGc = createTestRunGc();
 
 function fixture(t, name) {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-auto-gc-${name}-`));
+  const sandbox = fs.mkdtempSync(path.join(process.platform === 'win32' ? os.homedir() : os.tmpdir(), `hcc-auto-gc-${name}-`));
+  const originalHome = process.env.HOME, originalProfile = process.env.USERPROFILE;
   let db = null;
   t.after(() => {
-    db?.close();
-    fs.rmSync(sandbox, { recursive: true, force: true });
+    try { db?.close(); fs.rmSync(sandbox, { recursive: true, force: true }); }
+    finally {
+      if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+      if (originalProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalProfile;
+    }
   });
   const root = path.join(sandbox, 'project');
   const testHome = path.join(sandbox, 'home');
@@ -46,12 +52,18 @@ function fixture(t, name) {
   fs.mkdirSync(testHome);
   execFileSync(process.execPath, [hccBin, '--root', root, 'init', '--no-guidance'], {
     cwd: root,
-    env: { ...process.env, HOME: testHome, HCC_RUNTIME_URL: '' }
+    env: { ...process.env, HOME: testHome, USERPROFILE: testHome, HCC_RUNTIME_URL: '' }
   });
 
-  const bufs = path.join(root, '.hello-cc', 'bufs');
+  process.env.HOME = testHome; process.env.USERPROFILE = testHome;
+  const selected = resolveProjectDatabase({ root });
+  const bufs = path.join(selected.stateDir, 'bufs');
   fs.rmSync(bufs, { recursive: true, force: true });
-  db = new DatabaseSync(path.join(root, '.hello-cc', 'mesh.db'), { timeout: 5000 });
+  // Windows SQLite itself prevents renaming its open database directory.
+  // A memory database lets these path-guard fault injections exercise GC's
+  // own checks; actual file-backed database protection is tested separately.
+  db = new DatabaseSync(process.platform === 'win32' ? ':memory:' : selected.db, { timeout: 5000 });
+  if (process.platform === 'win32') initSchema(db);
   db.prepare("DELETE FROM meta WHERE key IN ('clock_grace_until', 'clock_pending_gap')").run();
   db.prepare(`
     INSERT INTO meta(key, value) VALUES ('clock_last_observed_at', ?)
@@ -103,20 +115,21 @@ test('automatic GC accepts a project-root alias with real state directories', (t
   fs.writeFileSync(victim, 'old');
   const oldTime = new Date((nowSec - 15 * 86400) * 1000);
   fs.utimesSync(victim, oldTime, oldTime);
-  fs.symlinkSync(state.root, alias);
+  fs.symlinkSync(state.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
 
   const result = runAutomaticGc({ ...state, root: alias });
 
-  assert.equal(result.buf_files, 1);
+  assert.equal(result.buf_files, process.platform === 'win32' ? 0 : 1);
+  if (process.platform === 'win32') assert.equal(result.deferred_buf_files, 1);
   assert.equal(result.old_events, 1);
-  assert.equal(fs.existsSync(victim), false);
+  assert.equal(fs.existsSync(victim), process.platform === 'win32');
 });
 
 test('automatic GC still rejects an existing buffer-directory symlink', (t) => {
   const state = fixture(t, 'symlink');
   const outside = path.join(path.dirname(state.root), 'outside');
   fs.mkdirSync(outside);
-  fs.symlinkSync(outside, state.bufs);
+  fs.symlinkSync(outside, state.bufs, process.platform === 'win32' ? 'junction' : 'dir');
 
   assert.throws(() => runAutomaticGc(state));
   assert.equal(fs.lstatSync(state.bufs).isSymbolicLink(), true);
@@ -124,7 +137,7 @@ test('automatic GC still rejects an existing buffer-directory symlink', (t) => {
 
 test('automatic GC rejects a buffer directory replaced by a symlink after preflight', (t) => {
   const state = fixture(t, 'preflight-symlink-race');
-  const canonicalBufs = path.join(fs.realpathSync.native(state.root), '.hello-cc', 'bufs');
+  const canonicalBufs = state.bufs;
   const moved = `${state.bufs}.moved`;
   const outside = path.join(path.dirname(state.root), 'outside');
   fs.mkdirSync(state.bufs);
@@ -137,7 +150,7 @@ test('automatic GC rejects a buffer directory replaced by a symlink after prefli
     if (!replaced && path.resolve(String(value)) === canonicalBufs) {
       replaced = true;
       fs.renameSync(state.bufs, moved);
-      fs.symlinkSync(outside, state.bufs);
+      fs.symlinkSync(outside, state.bufs, process.platform === 'win32' ? 'junction' : 'dir');
     }
     return stat;
   };
@@ -167,7 +180,7 @@ test('automatic GC rejects a state-directory symlink without touching external b
   const oldTime = new Date((nowSec - 15 * 86400) * 1000);
   fs.utimesSync(victim, oldTime, oldTime);
   fs.renameSync(stateDirectory, movedStateDirectory);
-  fs.symlinkSync(outsideStateDirectory, stateDirectory);
+  fs.symlinkSync(outsideStateDirectory, stateDirectory, process.platform === 'win32' ? 'junction' : 'dir');
 
   assert.throws(
     () => runAutomaticGc(state),
@@ -189,7 +202,8 @@ test('automatic GC never recreates state removed after buffer lease canonicaliza
     const stat = originalStatSync.call(this, value, ...args);
     if (!stateRemoved && path.resolve(String(value)) === canonicalBufs) {
       stateRemoved = true;
-      fs.rmSync(stateDirectory, { recursive: true, force: true });
+      if (process.platform === 'win32') fs.renameSync(stateDirectory, stateDirectory + '.removed');
+      else fs.rmSync(stateDirectory, { recursive: true, force: true });
     }
     return stat;
   };
@@ -208,7 +222,7 @@ test('automatic GC never recreates state removed after buffer lease canonicaliza
 test('automatic GC distinguishes a vanished state directory from an absent buffer leaf', (t) => {
   const state = fixture(t, 'state-vanishes-before-leaf');
   const stateDirectory = path.dirname(state.bufs);
-  const canonicalStateDirectory = path.join(fs.realpathSync.native(state.root), '.hello-cc');
+  const canonicalStateDirectory = path.dirname(state.bufs);
 
   const originalLstatSync = fs.lstatSync;
   let stateRemoved = false;
@@ -216,7 +230,8 @@ test('automatic GC distinguishes a vanished state directory from an absent buffe
     const stat = originalLstatSync.call(this, value, ...args);
     if (!stateRemoved && path.resolve(String(value)) === canonicalStateDirectory) {
       stateRemoved = true;
-      fs.rmSync(stateDirectory, { recursive: true, force: true });
+      if (process.platform === 'win32') fs.renameSync(stateDirectory, stateDirectory + '.removed');
+      else fs.rmSync(stateDirectory, { recursive: true, force: true });
     }
     return stat;
   };
@@ -256,7 +271,7 @@ test('automatic GC rejects an ancestor replacement during buffer planning', (t) 
     if (!replaced && path.resolve(String(value)) === canonicalBufs) {
       replaced = true;
       fs.renameSync(stateDirectory, movedStateDirectory);
-      fs.symlinkSync(outsideStateDirectory, stateDirectory);
+      fs.symlinkSync(outsideStateDirectory, stateDirectory, process.platform === 'win32' ? 'junction' : 'dir');
     }
     return names;
   };
@@ -285,8 +300,8 @@ test('automatic GC rejects a project-root alias retargeted by initial evidence c
   fs.writeFileSync(victim, 'external');
   const oldTime = new Date((nowSec - 15 * 86400) * 1000);
   fs.utimesSync(victim, oldTime, oldTime);
-  fs.symlinkSync(state.root, alias);
-  const expectedDirectory = path.join(fs.realpathSync.native(state.root), '.hello-cc', 'bufs');
+  fs.symlinkSync(state.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const expectedDirectory = state.bufs;
   let evidenceDirectory;
 
   assert.throws(
@@ -294,7 +309,7 @@ test('automatic GC rejects a project-root alias retargeted by initial evidence c
       collectBufferEvidenceNow(directory) {
         evidenceDirectory = directory;
         fs.unlinkSync(alias);
-        fs.symlinkSync(outsideRoot, alias);
+        fs.symlinkSync(outsideRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
         return emptyBufferEvidence();
       }
     }),
@@ -327,7 +342,7 @@ test('automatic GC guards paths until database history mutation begins', (t) => 
       if (guardedBufferResolutions === 2) {
         replaced = true;
         fs.renameSync(stateDirectory, movedStateDirectory);
-        fs.symlinkSync(outsideStateDirectory, stateDirectory);
+        fs.symlinkSync(outsideStateDirectory, stateDirectory, process.platform === 'win32' ? 'junction' : 'dir');
       }
     }
     return resolved;
@@ -367,7 +382,7 @@ test('automatic GC rechecks paths after the final clock read before history muta
     if (nowCalls === 4) {
       replaced = true;
       fs.renameSync(stateDirectory, movedStateDirectory);
-      fs.symlinkSync(outsideStateDirectory, stateDirectory);
+      fs.symlinkSync(outsideStateDirectory, stateDirectory, process.platform === 'win32' ? 'junction' : 'dir');
     }
     return nowSec;
   });
@@ -469,7 +484,7 @@ test('automatic GC guards the in-buffer clock write after its current-time read'
     if (nowCalls === 2) {
       replaced = true;
       fs.renameSync(stateDirectory, movedStateDirectory);
-      fs.symlinkSync(outsideStateDirectory, stateDirectory);
+      fs.symlinkSync(outsideStateDirectory, stateDirectory, process.platform === 'win32' ? 'junction' : 'dir');
       return nowSec;
     }
     return nowSec - 1;

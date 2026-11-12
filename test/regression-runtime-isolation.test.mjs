@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
-const regressionSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'regression.mjs'), 'utf8');
+const regressionSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'regression.mjs'), 'utf8').replace(/\r\n/g, '\n');
 
 test('tmux GC fixtures stop the runtime before creating bulk synthetic sessions', () => {
   const workflow = regressionSource.match(

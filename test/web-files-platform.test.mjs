@@ -8,10 +8,13 @@ import { listContextFiles } from '../lib/web/context-files.mjs';
 import { saveProjectFile, uploadProjectFile } from '../lib/web/project-file-write.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 
-test('native Windows refuses every file access entry point before filesystem or identity access', async t => {
+test('an unsupported Windows native target refuses file access before filesystem or identity access', async t => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const arch = Object.getOwnPropertyDescriptor(process, 'arch');
   Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' });
   t.after(() => Object.defineProperty(process, 'platform', platform));
+  t.after(() => Object.defineProperty(process, 'arch', arch));
   const accesses = [];
   const forbidden = name => () => { accesses.push(name); throw new Error('Unexpected filesystem access: ' + name); };
   for (const name of ['realpath', 'lstat', 'stat', 'open', 'opendir', 'readFile']) t.mock.method(fsp, name, forbidden(name));
@@ -34,7 +37,7 @@ test('native Windows refuses every file access entry point before filesystem or 
         await assert.rejects(operation(), error => {
           assert.equal(error.code, 'PROJECT_FILE_READ_UNAVAILABLE');
           assert.equal(projectFileErrorStatus(error), 503);
-          assert.match(error.message, /WSL/);
+          assert.match(error.message, /Windows filesystem component is unavailable/);
           assert.ok(!error.message.includes(root));
           return true;
         });
@@ -48,10 +51,13 @@ test('native Windows refuses every file access entry point before filesystem or 
   assert.deepEqual(accesses, []);
 });
 
-test('file and context HTTP handlers expose safe-access refusal as JSON 503', async t => {
+test('file and context HTTP handlers expose an unavailable Windows component as JSON 503', async t => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const arch = Object.getOwnPropertyDescriptor(process, 'arch');
   Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' });
   t.after(() => Object.defineProperty(process, 'platform', platform));
+  t.after(() => Object.defineProperty(process, 'arch', arch));
   const root = 'C:\\private-test-project';
   const { handleWebRequest } = createHttpRoutes({ ctx: { root }, sessions: new Map(), token: 'test-token',
     webAuthMode: () => 'token', cookieSessionOk: () => false,
@@ -66,6 +72,6 @@ test('file and context HTTP handlers expose safe-access refusal as JSON 503', as
     assert.match(headers['Content-Type'], /^application\/json/);
     const value = JSON.parse(body);
     assert.equal(value.ok, false); assert.equal(value.error.code, 'PROJECT_FILE_READ_UNAVAILABLE');
-    assert.match(value.error.message, /WSL/); assert.ok(!body.includes('private-test-project'));
+    assert.match(value.error.message, /Windows filesystem component is unavailable/); assert.ok(!body.includes('private-test-project'));
   }
 });

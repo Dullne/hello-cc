@@ -155,8 +155,12 @@ hcc peer stop PEER
 hcc inject PEER TEXT [--no-enter]
 ```
 
-These commands create or attach tmux-backed terminals that can be viewed and
-controlled from the Web console.
+These commands create or attach managed terminals that can be viewed and
+controlled from the Web console: tmux on Linux/macOS, and the persistent native
+terminal service on Windows. Windows `peer attach` connects by managed peer;
+`--pane` and the `tmux` command group apply to POSIX only. See the
+[Windows guide](windows-native.md). CLI injection respects the same control lease
+as browser and interactive CLI attachments.
 
 `hcc tmux gc --older-than 14` previews database-proven stale sessions; add `--yes`
 to delete eligible sessions, or `--peer PEER` to restrict the plan. If tmux omits

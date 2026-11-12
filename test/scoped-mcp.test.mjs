@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
@@ -16,13 +16,48 @@ import { createScopedMcpConfig, loadScopedMcpBootstrap } from '../lib/mcp/scope.
 import { createScopedMcpTools } from '../lib/mcp/tools.mjs';
 import { serveMcpStdio } from '../lib/mcp/stdio.mjs';
 import { claimNativeOwner } from '../lib/runtime/native/store.mjs';
+import { createNativeTestContext, isolateNativeTestProfile } from './helpers/native-root.mjs';
+import { loadWindowsNative } from '../lib/platform/windows-native.mjs';
 
 const cliPath = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
+const windows = process.platform === 'win32';
+isolateNativeTestProfile();
+
+function setPublicRead(file, enabled) {
+  if (!windows) { fs.chmodSync(file, enabled ? 0o644 : 0o600); return; }
+  const args = enabled ? [file, '/grant', '*S-1-1-0:(R)'] : [file, '/remove:g', '*S-1-1-0'];
+  const result = spawnSync('icacls.exe', args, { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(loadWindowsNative().inspectPathSecurity(file).private, !enabled);
+}
+
+async function stopClient(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit');
+  child.stdin.end();
+  await exited;
+}
+
+function replaceRoot(f, original) {
+  fs.renameSync(f.root, original);
+  fs.mkdirSync(f.root);
+  if (!windows) {
+    fs.mkdirSync(path.join(f.root, '.hello-cc'));
+    fs.copyFileSync(path.join(original, '.hello-cc', 'mesh.db'), f.dbPath);
+  }
+}
+
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-mcp-test-'));
-  fs.mkdirSync(path.join(root, '.hello-cc'));
-  const dbPath = path.join(root, '.hello-cc', 'mesh.db');
-  const db = new DatabaseSync(dbPath); initSchema(db);
+  const children = [];
+  let db, capability;
+  t.after(async () => {
+    for (const child of children) await stopClient(child);
+    try { capability?.dispose(); }
+    finally { db?.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  const { dbPath } = createNativeTestContext(root);
+  db = new DatabaseSync(dbPath); initSchema(db);
   const ownerIdentity = inspectProcessIdentity(process.pid).identity;
   assert.ok(ownerIdentity);
   const peer = 'mcp-worker', executorId = 'executor-scoped-test';
@@ -33,16 +68,17 @@ function fixture(t) {
   db.prepare("INSERT INTO events(type,actor,payload,created_at) VALUES('codex.executor.started',?,?,1)")
     .run(peer, JSON.stringify({ executor_id: executorId }));
   const rootIdentity = captureSelectedCwdSnapshot(root);
-  const capability = createScopedMcpConfig({ root, dbPath, peer, executorId, ownerIdentity, rootIdentity });
+  capability = createScopedMcpConfig({ root, dbPath, peer, executorId, ownerIdentity, rootIdentity });
   assert.equal(capability.config.args[0], fs.realpathSync(cliPath));
-  t.after(() => { capability.dispose(); db.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  return { root, dbPath, db, peer, executorId, capability, ownerIdentity, rootIdentity };
+  return { root, dbPath, db, peer, executorId, capability, ownerIdentity, rootIdentity, children };
 }
 
 async function client(t, f) {
   const config = f.capability.config;
   const child = spawn(config.command, config.args, { cwd: f.root,
-    env: { ...process.env, HOME: f.root, ...config.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    env: { ...process.env, ...(!windows ? { HOME: f.root, USERPROFILE: f.root } : {}),
+      HCC_SKIP_SHIM_INSTALL: '1', ...config.env }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  f.children.push(child);
   let output = '', errors = '', nextId = 0;
   const requests = new Map();
   child.stderr.on('data', bytes => { errors += bytes; });
@@ -60,9 +96,6 @@ async function client(t, f) {
   child.once('exit', code => {
     for (const entry of requests.values()) { clearTimeout(entry.timer); entry.reject(new Error(`MCP exited ${code}: ${errors}`)); }
     requests.clear();
-  });
-  t.after(async () => {
-    if (child.exitCode === null) { const exited = once(child, 'exit'); child.stdin.end(); await exited; }
   });
   async function rpc(method, params = {}) {
     const id = ++nextId;
@@ -157,8 +190,10 @@ test('a bare peer string, foreign root, tampered token and permissive bootstrap 
   const env = f.capability.config.env;
   assert.throws(() => loadScopedMcpBootstrap(ctx, 'other', env), { code: 'MCP_SCOPE_INVALID' });
   assert.throws(() => loadScopedMcpBootstrap(ctx, f.peer, { ...env, HCC_MCP_BOOTSTRAP_TOKEN: 'a'.repeat(43) }), { code: 'MCP_SCOPE_INVALID' });
-  fs.chmodSync(env.HCC_MCP_BOOTSTRAP_PATH, 0o644);
-  assert.throws(() => loadScopedMcpBootstrap(ctx, f.peer, env), { code: 'MCP_SCOPE_INVALID' });
+  try {
+    setPublicRead(env.HCC_MCP_BOOTSTRAP_PATH, true);
+    assert.throws(() => loadScopedMcpBootstrap(ctx, f.peer, env), { code: 'MCP_SCOPE_INVALID' });
+  } finally { setPublicRead(env.HCC_MCP_BOOTSTRAP_PATH, false); }
 });
 
 test('minting rejects a stale original root receipt before issuing a capability', t => {
@@ -171,6 +206,75 @@ test('minting rejects a stale original root receipt before issuing a capability'
   assert.throws(() => createScopedMcpConfig({ root: replacement, dbPath: f.dbPath,
     peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
     rootIdentity: f.rootIdentity }), { code: 'PROJECT_PATH_CHANGED' });
+  if (windows) {
+    for (const invalid of [{ version: 2 }, { fileId: '1' }, { creationTime: '0' }, { volumeSerial: '-1' }]) {
+      assert.throws(() => createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
+        peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
+        rootIdentity: { ...f.rootIdentity, identity: { ...f.rootIdentity.identity, ...invalid } } }),
+      { code: 'MCP_SCOPE_INVALID' });
+    }
+  }
+});
+
+test('Windows scope creation retains its original directory until bootstrap publication', { skip: !windows }, t => {
+  const f = fixture(t), state = path.dirname(f.dbPath);
+  const realpath = fs.realpathSync.native;
+  let attempted = false, renameError, capability;
+  fs.realpathSync.native = function (...args) {
+    const unpublished = fs.readdirSync(state).find(name => /^mcp-[a-f0-9]{32}$/.test(name) &&
+      !fs.existsSync(path.join(state, name, 'scope.json')));
+    if (!attempted && unpublished) {
+      attempted = true;
+      const directory = path.join(state, unpublished), moved = directory + '-moved';
+      try { fs.renameSync(directory, moved); fs.renameSync(moved, directory); }
+      catch (error) { renameError = error; }
+    }
+    return realpath.apply(this, args);
+  };
+  try {
+    capability = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath, peer: f.peer,
+      executorId: f.executorId, ownerIdentity: f.ownerIdentity, rootIdentity: f.rootIdentity });
+    assert.equal(attempted, true, 'probe must run after creation and before publication');
+    assert.ok(['EPERM', 'EBUSY', 'EACCES'].includes(renameError?.code), 'the created scope must remain pinned');
+  } finally { fs.realpathSync.native = realpath; capability?.dispose(); }
+});
+
+test('Windows scope read rejects hard links, public parent ACLs and a junction parent', { skip: !windows }, t => {
+  const f = fixture(t), env = f.capability.config.env, ctx = { root: f.root, dbPath: f.dbPath };
+  const file = env.HCC_MCP_BOOTSTRAP_PATH, directory = path.dirname(file), moved = directory + '-moved';
+  const authority = loadScopedMcpBootstrap(ctx, f.peer, env);
+  const link = path.join(path.dirname(directory), 'bootstrap-hardlink');
+  try {
+    fs.linkSync(file, link);
+    assert.throws(() => authority.assertValid(), { code: 'MCP_SCOPE_INVALID' });
+  } finally { fs.unlinkSync(link); }
+  try {
+    setPublicRead(directory, true);
+    assert.throws(() => loadScopedMcpBootstrap(ctx, f.peer, env), { code: 'MCP_SCOPE_INVALID' });
+  } finally { setPublicRead(directory, false); }
+  fs.renameSync(directory, moved);
+  try {
+    fs.symlinkSync(moved, directory, 'junction');
+    assert.throws(() => authority.assertValid(), { code: 'MCP_SCOPE_INVALID' });
+  } finally { fs.unlinkSync(directory); fs.renameSync(moved, directory); }
+  authority.assertOwnership(f.db);
+});
+
+test('Windows scope disposal refuses a replacement directory and can retry against its original object', { skip: !windows }, t => {
+  const f = fixture(t), directory = path.dirname(f.capability.config.env.HCC_MCP_BOOTSTRAP_PATH);
+  const moved = directory + '-moved';
+  fs.renameSync(directory, moved);
+  try {
+    loadWindowsNative().createPrivateDirectory(directory);
+    const marker = path.join(directory, 'foreign.txt'); fs.writeFileSync(marker, 'keep');
+    assert.throws(() => f.capability.dispose(), { code: 'PROJECT_PATH_CHANGED' });
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'keep');
+    fs.unlinkSync(marker); fs.rmdirSync(directory);
+  } finally {
+    if (!fs.existsSync(directory)) fs.renameSync(moved, directory);
+  }
+  f.capability.dispose(); f.capability.dispose();
+  assert.equal(fs.existsSync(directory), false);
 });
 
 test('legacy capability without a launch root receipt is rejected', t => {
@@ -189,10 +293,8 @@ test('a same-path replacement is rejected on load and before opening the replace
   const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
     f.peer, f.capability.config.env);
   const original = `${f.root}-original`;
-  fs.renameSync(f.root, original);
+  replaceRoot(f, original);
   t.after(() => fs.rmSync(original, { recursive: true, force: true }));
-  fs.mkdirSync(path.join(f.root, '.hello-cc'), { recursive: true });
-  fs.copyFileSync(path.join(original, '.hello-cc', 'mesh.db'), f.dbPath);
   assert.throws(() => loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
     f.peer, f.capability.config.env), { code: 'MCP_SCOPE_INVALID' });
   let connects = 0;
@@ -225,9 +327,7 @@ test('a root swap after call admission still fails before DB connection', async 
     originalAuthority.assertValid();
     if (!checked) {
       checked = true;
-      fs.renameSync(f.root, original);
-      fs.mkdirSync(path.join(f.root, '.hello-cc'), { recursive: true });
-      fs.copyFileSync(path.join(original, '.hello-cc', 'mesh.db'), f.dbPath);
+      replaceRoot(f, original);
     }
   } };
   const tools = createScopedMcpTools({ ctx: { root: f.root, dbPath: f.dbPath }, authority,
@@ -248,10 +348,13 @@ test('the DB helper receives A identity even if a fresh child captured B', async
     fs.rmSync(original, { recursive: true, force: true });
     fs.rmSync(replacement, { recursive: true, force: true });
   });
-  fs.mkdirSync(path.join(replacement, '.hello-cc'));
-  const replacementDb = path.join(replacement, '.hello-cc', 'mesh.db');
-  fs.copyFileSync(f.dbPath, replacementDb);
-  fs.chmodSync(replacementDb, 0o644);
+  if (!windows) {
+    fs.mkdirSync(path.join(replacement, '.hello-cc'));
+    const replacementDb = path.join(replacement, '.hello-cc', 'mesh.db');
+    fs.copyFileSync(f.dbPath, replacementDb);
+    fs.chmodSync(replacementDb, 0o644);
+  }
+  const originalBytes = fs.readFileSync(f.dbPath);
   const replacementSnapshot = captureSelectedCwdSnapshot(replacement);
   const childCtx = { root: f.root, dbPath: f.dbPath, initialRootIdentity: {
     requested: f.root, canonical: f.rootIdentity.canonical, identity: replacementSnapshot.identity } };
@@ -275,20 +378,23 @@ test('the DB helper receives A identity even if a fresh child captured B', async
   const result = await tools.call('hcc_inbox', {});
   assert.equal(result.structuredContent.error.code, 'PROJECT_PATH_CHANGED');
   assert.equal(opened, 0);
-  assert.equal(fs.statSync(f.dbPath).mode & 0o777, 0o644);
+  if (windows) {
+    assert.equal(loadWindowsNative().inspectPathSecurity(f.dbPath).private, true);
+    assert.deepEqual(fs.readFileSync(f.dbPath), originalBytes);
+  } else assert.equal(fs.statSync(f.dbPath).mode & 0o777, 0o644);
 });
 
 test('retargeting an input alias does not revoke the unchanged canonical root', t => {
   const f = fixture(t);
   const alias = `${f.root}-alias`, other = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-mcp-other-'));
   t.after(() => { fs.rmSync(alias, { force: true }); fs.rmSync(other, { recursive: true, force: true }); });
-  fs.symlinkSync(f.root, alias);
+  fs.symlinkSync(f.root, alias, windows ? 'junction' : 'dir');
   const capability = createScopedMcpConfig({ root: f.root, dbPath: f.dbPath,
     peer: f.peer, executorId: f.executorId, ownerIdentity: f.ownerIdentity,
     rootIdentity: captureSelectedCwdSnapshot(alias) });
   t.after(() => capability.dispose());
   fs.unlinkSync(alias);
-  fs.symlinkSync(other, alias);
+  fs.symlinkSync(other, alias, windows ? 'junction' : 'dir');
   const authority = loadScopedMcpBootstrap({ root: f.root, dbPath: f.dbPath },
     f.peer, capability.config.env);
   authority.assertOwnership(f.db);

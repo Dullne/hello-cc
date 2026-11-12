@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { listContextFiles } from '../lib/web/context-files.mjs';
 import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
+import { directoryLink, fileLink } from './helpers/filesystem-links.mjs';
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hcc-context-files-'));
@@ -18,9 +19,9 @@ test('context files stay project-relative and omit symlinks, credentials and gen
   await fs.writeFile(path.join(outside, 'private.txt'), 'not read');
   const files = ['src/App.mjs', 'README.md', '.env', '.env.local', '.git/config', '.hcc/state.json', '.codex/auth.json', '.claude/settings.json', '.dsh/history', '.ssh/id_rsa', '.aws/credentials', 'node_modules/library/a.js', 'dist/a.js', 'build/a.js', 'coverage/a.js', '.next/a.js'];
   for (const file of files) { await fs.mkdir(path.dirname(path.join(root, file)), { recursive: true }); await fs.writeFile(path.join(root, file), 'fixture'); }
-  await fs.symlink(outside, path.join(root, 'linked-directory'));
-  await fs.symlink(path.join(outside, 'private.txt'), path.join(root, 'linked-file'));
-  await fs.symlink(path.join(root, 'src'), path.join(root, 'internal-link'));
+  await directoryLink(outside, path.join(root, 'linked-directory'));
+  await fileLink(t, path.join(outside, 'private.txt'), path.join(root, 'linked-file'));
+  await directoryLink(path.join(root, 'src'), path.join(root, 'internal-link'));
   assert.deepEqual(await listContextFiles(root), { paths: ['README.md', 'src/App.mjs'], truncated: false });
   assert.deepEqual(await listContextFiles(root, 'SRC/app'), { paths: ['src/App.mjs'], truncated: false });
   for (const query of [...files.filter(file => file !== 'README.md' && file !== 'src/App.mjs'), 'linked-directory/private.txt', 'linked-file', 'internal-link/App.mjs']) {
@@ -90,7 +91,7 @@ test('result, entry and elapsed-time budgets report incomplete listings without 
 });
 
 test('context listing never enumerates a rebound project root between checks', async t => {
-  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
+  if (process.platform === 'win32') return t.skip('This injection targets the POSIX worker; Windows retained-handle attacks are covered by windows-native-files.test.mjs');
   const container = await fs.realpath(await fixture(t)), selected = path.join(container, 'selected');
   const replacement = path.join(container, 'replacement'), parked = path.join(container, 'parked');
   const root = path.join(selected, 'stable-parent', 'project');

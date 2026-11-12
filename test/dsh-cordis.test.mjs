@@ -12,9 +12,10 @@ import { ensureDshIntegration, inspectDshIntegration } from '../lib/integrations
 import { initSchema } from '../lib/db/schema.mjs';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-cordis-test-home-'));
-const previousHome = process.env.HOME;
-process.env.HOME = home;
-test.after(() => { process.env.HOME = previousHome; fs.rmSync(home, { recursive: true, force: true }); });
+const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
+process.env.HOME = home; process.env.USERPROFILE = home;
+test.after(() => { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile; fs.rmSync(home, { recursive: true, force: true }); });
 const cleanups = new WeakMap();
 function cleanup(t, fn) {
   if (!cleanups.has(t)) { cleanups.set(t, []); t.after(async () => { for (const action of cleanups.get(t).reverse()) await action(); }); }

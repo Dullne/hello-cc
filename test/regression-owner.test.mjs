@@ -171,7 +171,7 @@ test('fixture down reads the real CLI JSON error channel without exposing stderr
   const result = spawnSync(process.execPath, [path.resolve(import.meta.dirname, '../bin/hcc.mjs'),
     '--root', root, '--json', 'down'], {
     encoding: 'utf8', timeout: 5000,
-    env: { HOME: home, PATH: process.env.PATH, SHELL: '/bin/bash', NODE_NO_WARNINGS: '1' }
+    env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, SHELL: '/bin/bash', NODE_NO_WARNINGS: '1' }
   });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
@@ -340,7 +340,7 @@ test('structured fixture failures use independently captured frames without mult
 test('fixture down cannot fall back from a dead unknown or replaced local owner to a live global runtime', (t) => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-reg-owner-test-'));
   const home = path.join(scratch, 'home'), root = path.join(scratch, 'project');
-  const keys = ['HOME', 'HCC_RUNTIME_LOCAL_ONLY', 'HCC_RUNTIME_URL', 'HCC_RUNTIME_TOKEN'];
+  const keys = ['HOME', 'USERPROFILE', 'HCC_RUNTIME_LOCAL_ONLY', 'HCC_RUNTIME_URL', 'HCC_RUNTIME_TOKEN'];
   const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => {
     for (const key of keys) {
@@ -349,7 +349,7 @@ test('fixture down cannot fall back from a dead unknown or replaced local owner 
     fs.rmSync(scratch, { recursive: true, force: true });
   });
   for (const key of keys) delete process.env[key];
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   // Match the runtime's existing private-state contract using only fixture
   // directories; a permissive pointer must not invalidate this ownership test.
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });

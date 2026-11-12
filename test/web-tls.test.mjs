@@ -49,19 +49,19 @@ async function assertCredentialsStartTls(credentials) {
 test('TLS credential reuse rejects invalid time, SAN, and key evidence', (t) => {
   assert.equal(typeof webTls.tlsCredentialsAreReusable, 'function');
 
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const primaryHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-primary-'));
   const otherHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-other-'));
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(primaryHome, { recursive: true, force: true });
     fs.rmSync(otherHome, { recursive: true, force: true });
   });
 
-  process.env.HOME = primaryHome;
+  process.env.HOME = primaryHome; process.env.USERPROFILE = primaryHome;
   const primary = webTls.ensureSelfSignedCert();
-  process.env.HOME = otherHome;
+  process.env.HOME = otherHome; process.env.USERPROFILE = otherHome;
   const other = webTls.ensureSelfSignedCert();
   const certificate = new X509Certificate(primary.cert);
   const validFromMs = Date.parse(certificate.validFrom);
@@ -101,19 +101,19 @@ test('TLS credential reuse rejects invalid time, SAN, and key evidence', (t) => 
 });
 
 test('ensureSelfSignedCert rotates SAN and key mismatches into usable generations', async (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const primaryHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-rotate-'));
   const otherHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-rotate-key-'));
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(primaryHome, { recursive: true, force: true });
     fs.rmSync(otherHome, { recursive: true, force: true });
   });
 
-  process.env.HOME = otherHome;
+  process.env.HOME = otherHome; process.env.USERPROFILE = otherHome;
   const other = webTls.ensureSelfSignedCert();
-  process.env.HOME = primaryHome;
+  process.env.HOME = primaryHome; process.env.USERPROFILE = primaryHome;
   webTls.ensureSelfSignedCert();
   const initialGeneration = currentGeneration(primaryHome);
 
@@ -136,11 +136,11 @@ test('ensureSelfSignedCert rotates SAN and key mismatches into usable generation
 });
 
 test('preexisting redirected or writable TLS state is never reused or chmoded through a link', async (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const homes = [];
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     for (const home of homes) fs.rmSync(home, { recursive: true, force: true });
   });
   const makeHome = () => {
@@ -149,7 +149,7 @@ test('preexisting redirected or writable TLS state is never reused or chmoded th
     return home;
   };
   const original = makeHome();
-  process.env.HOME = original;
+  process.env.HOME = original; process.env.USERPROFILE = original;
   const trusted = webTls.ensureSelfSignedCert();
   const trustedGeneration = currentGeneration(original);
 
@@ -261,7 +261,7 @@ test('preexisting redirected or writable TLS state is never reused or chmoded th
       const home = makeHome();
       fs.mkdirSync(path.join(home, '.hello-cc'), { mode: 0o700 });
       fs.cpSync(tlsDirectory(original), tlsDirectory(home), { recursive: true });
-      process.env.HOME = home;
+      process.env.HOME = home; process.env.USERPROFILE = home;
       assert.equal(webTls.ensureSelfSignedCert().cert, trusted.cert, 'unmodified generated identity changed');
       const checkExternal = fixture.alter(home, tlsDirectory(home));
       const replacement = webTls.ensureSelfSignedCert();
@@ -274,11 +274,11 @@ test('preexisting redirected or writable TLS state is never reused or chmoded th
 });
 
 test('legacy private TLS pair migrates without rotation, but an unsafe pair does not', async (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const homes = [];
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     for (const home of homes) fs.rmSync(home, { recursive: true, force: true });
   });
   const makeHome = () => {
@@ -289,13 +289,13 @@ test('legacy private TLS pair migrates without rotation, but an unsafe pair does
     return home;
   };
   const sourceHome = makeHome();
-  process.env.HOME = sourceHome;
+  process.env.HOME = sourceHome; process.env.USERPROFILE = sourceHome;
   const source = webTls.ensureSelfSignedCert();
 
   const safeHome = makeHome();
   fs.writeFileSync(path.join(tlsDirectory(safeHome), 'self-signed.key'), source.key, { mode: 0o600 });
   fs.writeFileSync(path.join(tlsDirectory(safeHome), 'self-signed.crt'), source.cert, { mode: 0o600 });
-  process.env.HOME = safeHome;
+  process.env.HOME = safeHome; process.env.USERPROFILE = safeHome;
   const migrated = webTls.ensureSelfSignedCert();
   assert.equal(migrated.cert, source.cert);
   assert.equal(webTls.ensureSelfSignedCert().cert, source.cert);
@@ -307,7 +307,7 @@ test('legacy private TLS pair migrates without rotation, but an unsafe pair does
   fs.chmodSync(outside, 0o644);
   fs.symlinkSync(outside, path.join(tlsDirectory(unsafeHome), 'self-signed.key'));
   fs.writeFileSync(path.join(tlsDirectory(unsafeHome), 'self-signed.crt'), source.cert, { mode: 0o600 });
-  process.env.HOME = unsafeHome;
+  process.env.HOME = unsafeHome; process.env.USERPROFILE = unsafeHome;
   const rotated = webTls.ensureSelfSignedCert();
   assert.notEqual(rotated.cert, source.cert);
   assert.equal(fs.readFileSync(outside, 'utf8'), source.key);
@@ -316,18 +316,18 @@ test('legacy private TLS pair migrates without rotation, but an unsafe pair does
 });
 
 test('preexisting FIFO pointer or key cannot block TLS startup', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const homes = [];
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     for (const home of homes) fs.rmSync(home, { recursive: true, force: true });
   });
   const moduleUrl = new URL('../lib/web/tls.mjs', import.meta.url).href;
   for (const leaf of ['current.json', 'self-signed.key']) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-fifo-'));
     homes.push(home);
-    process.env.HOME = home;
+    process.env.HOME = home; process.env.USERPROFILE = home;
     webTls.ensureSelfSignedCert();
     const oldGeneration = currentGeneration(home);
     const fifoPath = leaf === 'current.json'
@@ -342,7 +342,7 @@ test('preexisting FIFO pointer or key cannot block TLS startup', (t) => {
     assert.equal(mkfifo.status, 0, mkfifo.stderr || mkfifo.error?.message);
     const child = spawnSync(process.execPath, ['--input-type=module', '-e',
       `import { ensureSelfSignedCert } from ${JSON.stringify(moduleUrl)}; ensureSelfSignedCert();`], {
-      env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 5000
+      env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8', timeout: 5000
     });
     assert.equal(child.status, 0, `${leaf}: ${child.error?.message || child.stderr}`);
     assert.notEqual(currentGeneration(home), oldGeneration, `${leaf} was treated as reusable`);
@@ -350,17 +350,17 @@ test('preexisting FIFO pointer or key cannot block TLS startup', (t) => {
 });
 
 test('untrusted generation markers cannot rewrite files outside TLS', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const homes = [];
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     for (const home of homes) fs.rmSync(home, { recursive: true, force: true });
   });
   for (const marker of ['.creating', '.published']) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-marker-'));
     homes.push(home);
-    process.env.HOME = home;
+    process.env.HOME = home; process.env.USERPROFILE = home;
     const initial = webTls.ensureSelfSignedCert();
     const generationDir = path.join(tlsDirectory(home), currentGeneration(home));
     fs.unlinkSync(path.join(generationDir, '.published'));
@@ -376,12 +376,12 @@ test('untrusted generation markers cannot rewrite files outside TLS', (t) => {
 });
 
 test('cleanup keeps a generation when current.json changes during its checked read', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-cleanup-'));
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(home, { recursive: true, force: true });
   });
   const credentials = webTls.ensureSelfSignedCert();
@@ -427,12 +427,12 @@ test('cleanup keeps a generation when current.json changes during its checked re
 });
 
 test('cleanup rechecks a pointer switched just before its deletion guard', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-guard-'));
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(home, { recursive: true, force: true });
   });
   const credentials = webTls.ensureSelfSignedCert();
@@ -474,12 +474,12 @@ test('cleanup rechecks a pointer switched just before its deletion guard', (t) =
 });
 
 test('cleanup retains previous, recent, and active generations but removes stale dead creation', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-web-tls-lifecycle-'));
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(home, { recursive: true, force: true });
   });
   const credentials = webTls.ensureSelfSignedCert();
@@ -514,14 +514,14 @@ test('cleanup retains previous, recent, and active generations but removes stale
 });
 
 test('runtime HTTPS requires normal PKI trust or an explicit CA', async (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const originalRuntimeUrl = process.env.HCC_RUNTIME_URL;
   const originalRuntimeToken = process.env.HCC_RUNTIME_TOKEN;
   const originalRuntimeCa = process.env.HCC_RUNTIME_CA;
   const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-ca-'));
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     if (originalRuntimeUrl === undefined) delete process.env.HCC_RUNTIME_URL;
     else process.env.HCC_RUNTIME_URL = originalRuntimeUrl;
     if (originalRuntimeToken === undefined) delete process.env.HCC_RUNTIME_TOKEN;
@@ -531,7 +531,7 @@ test('runtime HTTPS requires normal PKI trust or an explicit CA', async (t) => {
     fs.rmSync(runtimeHome, { recursive: true, force: true });
   });
 
-  process.env.HOME = runtimeHome;
+  process.env.HOME = runtimeHome; process.env.USERPROFILE = runtimeHome;
   const credentials = webTls.ensureSelfSignedCert();
   const server = https.createServer({ key: credentials.key, cert: credentials.cert }, (_req, res) => res.end('tls-ok'));
   await new Promise((resolve, reject) => {

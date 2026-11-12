@@ -2,6 +2,8 @@
 # NOTE: .github is included — the regression suite reads the release workflow.
 node_modules
 .git
+.superpowers
+.worktrees
 **/.hello-cc
 **/mesh.db*
 **/runtime.json

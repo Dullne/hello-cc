@@ -1,0 +1,7 @@
+# Native manifests hash source bytes. Keep those bytes stable across checkouts.
+bin/*.mjs text eol=lf
+*.sh text eol=lf
+native/windows/** text eol=lf
+native/cwd-handoff/** text eol=lf
+native/bin/win32-x64/*.node -text
+native/bin/win32-x64/*.exe -text

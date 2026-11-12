@@ -28,7 +28,7 @@ function fixture(t) {
         process.exitCode = 1;
       }`;
     const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-      env: { ...process.env, HOME: privateHome, HCC_RECOVERY_PROJECT: root }, encoding: 'utf8'
+      env: { ...process.env, HOME: privateHome, USERPROFILE: privateHome, HCC_RECOVERY_PROJECT: root }, encoding: 'utf8'
     });
     assert.equal(child.error, undefined);
     return { ...JSON.parse(child.stdout.trim()), status: child.status, pid: child.pid };

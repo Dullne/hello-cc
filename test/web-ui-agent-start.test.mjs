@@ -16,7 +16,7 @@ function deferred() {
 const settle = () => new Promise(resolve => setImmediate(resolve));
 function fixture(storage = new Map()) {
   const nodes = new Map(), requests = [], opened = [], refreshes = [], listeners = new Map();
-  let root = '/project-a', sessions = [], refresh = () => Promise.resolve(), consent = false, language = 'en';
+  let root = '/project-a', sessions = [], refresh = () => Promise.resolve(), consent = false, language = 'en', platform = 'linux';
   const node = id => {
     if (nodes.has(id)) return nodes.get(id);
     const element = { id, value:'', checked:false, hidden:false, disabled:false, required:false,
@@ -38,6 +38,8 @@ function fixture(storage = new Map()) {
     hccUi:{ safeGet:key=>storage.get(key),safeSet:(key,value)=>storage.set(key,value) }, hccHandoff: {
     get projectRoot() { return root; },
     get sessions() { return sessions; },
+    get platform() { return platform; },
+    get terminalBackend() { return platform === 'win32' ? 'windows-terminal' : 'tmux'; },
     tr: (key, fallback = '') => UI_TRANSLATIONS[language][key] || fallback || key,
     esc: value => String(value).replace(/[&<>"']/g, character => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[character])),
     api(path, options) { const request = { path, options, ...deferred() }; requests.push(request); return request.promise; },
@@ -52,6 +54,7 @@ function fixture(storage = new Map()) {
   } });
   return { node, requests, opened, refreshes, storage, start:window.hccAgentStart,
     defaults(reader) { window.hccAgentDefaults={read:reader}; },
+    platform(value) { platform = value; window.hccAgentStart.sync(); },
     change(id, value) { node(id).value = value; return node(id).emit('change'); },
     submit: () => node('startForm').emit('submit'),
     project(value) { window.hccAgentStart.reset(); root = value; },
@@ -73,6 +76,39 @@ test('shipped new Agent form exposes all providers and keeps connection modes in
   assert.match(bootstrap, /installAgentStart\(\)/);
   assert.match(bootstrap, /window\.hccAgentStart\?\.reset\(\)/);
   assert.match(bootstrap, /dialog.id === 'startDialog'.*hccAgentStart\?\.closed\(\)/);
+});
+
+test('Windows creation offers its managed terminal and sends explicit transport without tmux or shell strings', async () => {
+  const f = fixture(); f.platform('win32'); f.start.open(); f.change('kind', 'shell');
+  assert.equal(f.node('transport').value, 'windows-terminal');
+  assert.deepEqual(f.node('transport').options.map(option => option.value), ['windows-terminal']);
+  f.node('agentName').value = 'windows-shell';
+  const shell = f.submit();
+  assert.deepEqual(JSON.parse(f.requests.at(-1).options.body), { id: 'windows-shell', kind: 'shell', cwd: '/project-a', transport: 'windows-terminal', mode: 'new' });
+  f.requests.at(-1).resolve({ session: { id: 'windows-shell', type: 'windows-terminal' } }); await shell;
+  f.start.open(); f.change('kind', 'claude');
+  assert.deepEqual(f.node('transport').options.map(option => option.value), ['native', 'windows-terminal']);
+  f.change('transport', 'windows-terminal'); f.change('startMode', 'continue');
+  f.node('agentName').value = 'windows-claude';
+  const claude = f.submit();
+  assert.deepEqual(JSON.parse(f.requests.at(-1).options.body), { id: 'windows-claude', kind: 'claude', cwd: '/project-a', transport: 'windows-terminal', mode: 'continue' });
+  f.requests.at(-1).resolve({ session: { id: 'windows-claude', type: 'windows-terminal' } }); await claude;
+});
+
+test('an unconfirmed Windows terminal create retains its peer and reload discovers it without a second POST', async () => {
+  const storage = new Map(); const f = fixture(storage); f.platform('win32'); f.start.open(); f.change('kind', 'shell');
+  const submitting = f.submit(); const payload = JSON.parse(f.requests.at(-1).options.body);
+  assert.match(payload.id, /^web-[a-f0-9-]{36}$/);
+  assert.equal(JSON.parse(storage.get('hcc.agentCreation:/project-a')).transport, 'windows-terminal');
+  f.requests.at(-1).reject(Object.assign(new Error('Response lost'), { code: 'REQUEST_TIMEOUT' })); await submitting;
+  const reload = fixture(storage); reload.platform('win32'); reload.start.open();
+  await reload.submit(); assert.equal(reload.requests.length, 0); assert.equal(reload.opened.length, 0);
+  reload.setSessions([{ id: 'host-generated-session', peer_id: payload.id, type: 'native', kind: 'shell', status: 'running' }]);
+  await reload.submit(); assert.equal(reload.opened.length, 0, 'a different transport cannot satisfy terminal recovery');
+  reload.setSessions([{ id: 'host-generated-session', peer_id: payload.id, type: 'windows-terminal', kind: 'shell', status: 'running' }]);
+  await reload.submit();
+  assert.equal(reload.requests.length, 0);
+  assert.deepEqual(reload.opened, [{ root: '/project-a', id: 'host-generated-session' }]);
 });
 
 for (const provider of ['codex','claude','dsh']) {

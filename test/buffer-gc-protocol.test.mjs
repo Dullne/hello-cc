@@ -12,6 +12,8 @@ import {
   applyClockSafeBufferPlan,
   createBufferGcPlanStore
 } from '../lib/runtime/buffer-gc-protocol.mjs';
+const posixDeletion = { skip: process.platform === 'win32'
+  ? 'POSIX buffer deletion batches; Windows refuses these plans in windows-buffer-gc.test.mjs' : false };
 
 function tempRoot(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-buffer-protocol-'));
@@ -76,7 +78,7 @@ test('buffer GC tokens are removed by their TTL even without another request', a
   assert.equal(store.pendingCount(), 0);
 });
 
-test('buffer GC applies fixed batches and defers the remainder when grace is extended between batches', (t) => {
+test('buffer GC applies fixed batches and defers the remainder when grace is extended between batches', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -119,7 +121,7 @@ test('buffer GC applies fixed batches and defers the remainder when grace is ext
   db.close();
 });
 
-test('buffer GC marks a drifted would-delete entry incomplete so database apply stays blocked', (t) => {
+test('buffer GC marks a drifted would-delete entry incomplete so database apply stays blocked', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -150,7 +152,7 @@ test('buffer GC marks a drifted would-delete entry incomplete so database apply 
   db.close();
 });
 
-test('buffer GC refreshes owner evidence inside every apply batch', (t) => {
+test('buffer GC refreshes owner evidence inside every apply batch', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -205,7 +207,7 @@ test('buffer GC refreshes owner evidence inside every apply batch', (t) => {
   db.close();
 });
 
-test('buffer GC counts an apply-time unknown entry exactly once', (t) => {
+test('buffer GC counts an apply-time unknown entry exactly once', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -239,7 +241,7 @@ test('buffer GC counts an apply-time unknown entry exactly once', (t) => {
   db.close();
 });
 
-test('clock grace preserves refreshed protected counts and defers only non-protected entries', (t) => {
+test('clock grace preserves refreshed protected counts and defers only non-protected entries', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -278,7 +280,7 @@ test('clock grace preserves refreshed protected counts and defers only non-prote
   db.close();
 });
 
-test('apply-time unknown expiry cutoff opens clock grace after a forward jump', (t) => {
+test('apply-time unknown expiry cutoff opens clock grace after a forward jump', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');
@@ -313,7 +315,7 @@ test('apply-time unknown expiry cutoff opens clock grace after a forward jump', 
   db.close();
 });
 
-test('prepared unknown expiry cutoff survives when its metadata disappears before apply', (t) => {
+test('prepared unknown expiry cutoff survives when its metadata disappears before apply', posixDeletion, (t) => {
   const root = tempRoot(t);
   const directory = path.join(root, 'bufs');
   const dbPath = path.join(root, 'mesh.db');

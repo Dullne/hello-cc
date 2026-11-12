@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "protocolVersion": 1,
+  "napiVersion": 8,
+  "platform": "win32",
+  "arch": "x64",
+  "sourceSha256": "a248e681081aa80d4b4d8a3f1271b3bade66f17d89476ceeff4453bf77c78842",
+  "binarySha256": "e906ebac75ce33dc810953cbbb24d419d96b76890aafea9b14c307f80966a2cf",
+  "buildNodeVersion": "24.22.3"
+}

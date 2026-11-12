@@ -26,7 +26,7 @@ function fixture(t) {
 
 function run(f, args) {
   return spawnSync(process.execPath, [hcc, '--root', f.root, '--json', ...args], {
-    cwd: f.root, env: { ...process.env, HOME: f.home, NODE_NO_WARNINGS: '1' },
+    cwd: f.root, env: { ...process.env, HOME: f.home, USERPROFILE: f.home, NODE_NO_WARNINGS: '1' },
     encoding: 'utf8', timeout: 20000
   });
 }
@@ -298,7 +298,7 @@ test('concurrent private purge waits for migration commit and leaves reset autho
     });
   `;
   const migrant = spawn(process.execPath, ['--input-type=module', '-e', migrationCode], {
-    env: { ...process.env, HOME: f.home, NODE_NO_WARNINGS: '1' },
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, NODE_NO_WARNINGS: '1' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let migrationError = '';
@@ -322,7 +322,7 @@ test('concurrent private purge waits for migration commit and leaves reset autho
       purgePrivateProjectState(${JSON.stringify(f.root)});
     `;
     purge = spawn(process.execPath, ['--input-type=module', '-e', purgeCode], {
-      env: { ...process.env, HOME: f.home, NODE_NO_WARNINGS: '1' },
+      env: { ...process.env, HOME: f.home, USERPROFILE: f.home, NODE_NO_WARNINGS: '1' },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let purgeOutput = '';

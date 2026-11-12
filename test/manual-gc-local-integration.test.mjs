@@ -18,7 +18,7 @@ function runHcc(root, home, args, extraEnv = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       HCC_RUNTIME_URL: '',
       ...extraEnv
     }

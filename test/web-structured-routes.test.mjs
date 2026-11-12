@@ -20,9 +20,13 @@ import { createControlLease } from '../lib/web/control-lease.mjs';
 import { createCodexSessions } from '../lib/web/codex-sessions.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createPtySessions } from '../lib/web/pty-sessions.mjs';
+import { createWindowsSessions } from '../lib/web/windows-sessions.mjs';
 import { createTaskResults } from '../lib/web/task-results.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { createNativeTestContext, isolateNativeTestProfile } from './helpers/native-root.mjs';
+
+isolateNativeTestProfile();
 
 // Production HTTP routing, ownership stores, and native loopback protocol;
 // provider adapters are in-memory fakes, with no CLI, model, or tmux calls.
@@ -57,8 +61,7 @@ async function fixture(t, hooks = {}) {
     if (failures.length) throw new AggregateError(failures, 'Structured route fixture cleanup failed');
     fs.rmSync(root, { recursive: true, force: true });
   });
-  const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
-  fs.mkdirSync(path.dirname(ctx.dbPath));
+  const ctx = createNativeTestContext(root);
   const db = new DatabaseSync(ctx.dbPath);
   cleanups.push(() => db.close());
   initSchema(db); db.exec('PRAGMA journal_mode=WAL');
@@ -107,12 +110,12 @@ async function fixture(t, hooks = {}) {
     }
   });
   cleanups.push(() => service.shutdown());
-  const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: 3000 });
+  const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: process.platform === 'win32' ? 35000 : 3000 });
   const native = createNativeSessions({ sessions, sessionKey: key, connectWebProject: connect,
     broadcast() {}, closeSessionClients, now, addEvent: events.addEvent,
     nativeApi: async (project, method, route, body) => {
       if (method === 'POST') nativePosts.push({ route, body });
-      const result = await nativeRequest(project, method, route, body, { timeoutMs: 3000 });
+      const result = await nativeRequest(project, method, route, body, { timeoutMs: process.platform === 'win32' ? 35000 : 3000 });
       if (route.includes('/state')) { nativeReads.push(route); await onNativeRead?.(); }
       return result;
     }
@@ -150,10 +153,21 @@ async function fixture(t, hooks = {}) {
   const resultService = createTaskResults({ connectWebProject: connect,
     resolveSessionPeerId: (_db, session) => session.peerId, now, addEvent: events.addEvent });
   const ptySpawns = [];
+  const windowsManager = createWindowsSessions({ ctx, sessions, sessionKey: key, connectWebProject: connect,
+    nextProjectSessionId: () => 'windows-' + (++nextId), isStopping: () => false,
+    terminalHostFactory: async () => ({
+      async list() { return []; },
+      async create(input) {
+        ptySpawns.push(input);
+        return { ...input, generation: 'fixture-terminal', hostGeneration: 'fixture-host',
+          pid: 43210, status: 'running', createdAt: now(), capabilities: {} };
+      }
+    }) });
   const ptyManager = createPtySessions({ ctx, sessions, sessionKey: key, connectWebProject: connect,
     nextProjectSessionId: () => 'pty-' + (++nextId), broadcast() {}, closeSessionClients,
     now, ...events, ...peers, ...bindings, refreshPeerIoHeartbeat() {},
     startTmuxManagedSession() { throw new Error('fixture must not operate tmux'); },
+    startWindowsSession: windowsManager.start,
     pty: { spawn(...args) { ptySpawns.push(args); return { pid: 43210, onData() {}, onExit() {}, kill() {}, resize() {} }; } }
   });
   const writes = [];
@@ -221,7 +235,17 @@ test('POST sessions creates and returns each native provider view without termin
   assert.equal(listed.body.sessions.length, 3);
 });
 
-test('Web PTY Codex history launch requires an explicit root-bound thread before spawn', async t => {
+test('Web terminal Codex history launch requires an explicit root-bound thread before spawn', async t => {
+  if (process.platform === 'win32') {
+    const bin = fs.mkdtempSync(path.join(os.homedir(), 'codex-terminal-fixture-'));
+    fs.copyFileSync(process.execPath, path.join(bin, 'codex.exe'));
+    const previousPath = process.env.PATH;
+    process.env.PATH = bin;
+    t.after(() => {
+      if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+      fs.rmSync(bin, { recursive: true, force: true });
+    });
+  }
   const f = await fixture(t);
   for (const input of [
     { mode: 'last' },
@@ -231,8 +255,10 @@ test('Web PTY Codex history launch requires an explicit root-bound thread before
     } }
   ]) {
     const rejected = await f.request('/api/sessions', { backend: 'pty', kind: 'codex', ...input });
-    assert.equal(rejected.status, 409, JSON.stringify(rejected.body));
-    assert.ok(['CODEX_HISTORY_ID_REQUIRED', 'CODEX_HISTORY_UNVERIFIED'].includes(rejected.body.error.code));
+    const requiresLiteralArguments = process.platform === 'win32' && input.command;
+    assert.equal(rejected.status, requiresLiteralArguments ? 400 : 409, JSON.stringify(rejected.body));
+    assert.ok((requiresLiteralArguments ? ['BAD_REQUEST'] : ['CODEX_HISTORY_ID_REQUIRED', 'CODEX_HISTORY_UNVERIFIED'])
+      .includes(rejected.body.error.code), JSON.stringify(rejected.body));
     assert.equal(f.ptySpawns.length, 0, 'history rejection must precede a PTY spawn');
   }
   const source = 'verified-thread';
@@ -245,6 +271,10 @@ test('Web PTY Codex history launch requires an explicit root-bound thread before
     mode: 'resume', resume: source });
   assert.equal(allowed.status, 200, JSON.stringify(allowed.body));
   assert.equal(f.ptySpawns.length, 1);
+  if (process.platform === 'win32') {
+    assert.equal(allowed.body.session.type, 'windows-terminal');
+    assert.deepEqual(f.ptySpawns[0].command, { file: 'codex', args: ['resume', source] });
+  }
 });
 
 

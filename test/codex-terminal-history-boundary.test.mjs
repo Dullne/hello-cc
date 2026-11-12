@@ -14,10 +14,22 @@ import { createPeerCommands } from '../lib/cli/commands/peer.mjs';
 import { parseOpts } from '../lib/cli-args.mjs';
 import { CliError } from '../lib/shared/errors.mjs';
 
+function windowsCodexFixture(t, base) {
+  if (process.platform !== 'win32') return undefined;
+  const bin = path.join(base, 'provider tools'); fs.mkdirSync(bin);
+  // The resolver verifies the executable; the history guard must not launch it.
+  fs.copyFileSync(process.execPath, path.join(bin, 'codex.exe'));
+  const previous = process.env.PATH;
+  process.env.PATH = bin;
+  t.after(() => { if (previous === undefined) delete process.env.PATH; else process.env.PATH = previous; });
+  return process.env;
+}
+
 test('Codex terminal resume and fork require the launch command and original directory identity', t => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-terminal-root-'));
   const root = path.join(base, 'project');
   fs.mkdirSync(root);
+  const env = windowsCodexFixture(t, base);
   const db = new DatabaseSync(path.join(base, 'mesh.db'));
   initSchema(db);
   t.after(() => { db.close(); fs.rmSync(base, { recursive: true, force: true }); });
@@ -26,7 +38,10 @@ test('Codex terminal resume and fork require the launch command and original dir
   recordCodexThreadRoot(db, events.addEvent, 'source-thread', original, 'new');
   const check = (binding, command = binding.command, selected = original) =>
     assertCodexTerminalLaunch(db, binding, { command, root, rootIdentity: selected,
-      cwd: root, cwdIdentity: selected });
+      cwd: root, cwdIdentity: selected, env,
+      // These fixtures use simple known arguments; Windows production uses the
+      // literal descriptor rather than evaluating this audit/display string.
+      ...(process.platform === 'win32' ? { argv: command.split(' ') } : {}) });
 
   const resume = buildCodexCommand('peer', { resume: 'source-thread' });
   const fork = buildCodexCommand('peer', { fork: true, resume: 'source-thread' });
@@ -60,7 +75,7 @@ test('Codex terminal resume and fork require the launch command and original dir
   assert.throws(() => tmuxStart(buildCodexCommand('tmux-peer', { last: true })),
     { code: 'CODEX_HISTORY_ID_REQUIRED' });
   assert.throws(() => tmuxStart(buildCodexCommand('tmux-peer', { resume: 'legacy-thread' })),
-    { code: 'CODEX_HISTORY_UNVERIFIED' });
+    { code: process.platform === 'win32' ? 'CODEX_HISTORY_COMMAND_UNVERIFIED' : 'CODEX_HISTORY_UNVERIFIED' });
   assert.equal(tmuxSessions.size, 0, 'rejected history must not attach or create a pane');
   assert.equal(db.prepare('SELECT count(*) AS n FROM peers').get().n, 0);
 
@@ -75,6 +90,7 @@ test('CLI peer start rejects Codex --last and unverified resume before runtime P
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-codex-cli-root-'));
   const root = path.join(base, 'project');
   fs.mkdirSync(root);
+  windowsCodexFixture(t, base);
   const dbPath = path.join(base, 'mesh.db');
   const db = new DatabaseSync(dbPath); initSchema(db);
   t.after(() => { db.close(); fs.rmSync(base, { recursive: true, force: true }); });

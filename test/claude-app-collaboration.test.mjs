@@ -39,7 +39,7 @@ function scenario(t, body) {
       {...requests.get(sent[index].requestId),status,answer:'test answer',turnId:'turn-'+index});
     ${body}`;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 20000,
-    env: { PATH: process.env.PATH, HOME: privateHome, HCC_APP_TEST_ROOT: root, LANG: 'C.UTF-8' } });
+    env: { PATH: process.env.PATH, HOME: privateHome, USERPROFILE: privateHome, HCC_APP_TEST_ROOT: root, LANG: 'C.UTF-8' } });
   assert.equal(result.status, 0, result.stderr + result.stdout);
 }
 

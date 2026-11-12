@@ -199,19 +199,19 @@ test('child fatal closes its real listener and fd before exiting 1', async (t) =
 });
 
 test('runtime pointer cleanup requires the exact current pid', (t) => {
-  const originalHome = process.env.HOME;
+  const originalHome = process.env.HOME; const originalHomeUserProfile = process.env.USERPROFILE;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-fatal-runtime-home-'));
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-fatal-runtime-root-'));
   const stateDir = path.join(root, '.hello-cc');
   const globalDir = path.join(home, '.hello-cc');
   const projectPointer = path.join(stateDir, 'runtime.json');
   const globalPointer = path.join(globalDir, 'runtime.json');
-  process.env.HOME = home;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(globalDir, { recursive: true });
   t.after(() => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+    if (originalHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = originalHomeUserProfile;
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
   });

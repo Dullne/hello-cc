@@ -12,6 +12,8 @@ import { PROJECT_FILE_LIMITS, listProjectFiles, previewProjectFile, projectConte
   inspectProjectFileStatus, prepareProjectFileParent, verifyProjectFileParent } from '../lib/web/project-files.mjs';
 import { createHttpRoutes } from '../lib/web/http-routes.mjs';
 import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
+import { directoryLink, fileLink } from './helpers/filesystem-links.mjs';
+import { readWindowsProjectFile } from '../lib/platform/windows-project-files.mjs';
 
 async function fixture(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'hcc-project-files-')));
@@ -30,7 +32,7 @@ test('single-level project trees sort directories first, retain build artifacts 
   for (const name of ['dist', 'build', 'src', '.git', '.hello-cc', '.hcc', '.codex', '.claude', '.dsh', '.ssh', '.aws', 'node_modules', '.cache', '.next']) await f.directory(name);
   for (const name of ['z.txt', 'a.txt', '.env', '.env.local', '.env_prod', 'env_prod', 'app.env', '.npmrc', '.netrc', 'client.key', 'client.key.backup', 'credentials.json', 'auth.backup.json', 'auth.json.bak', 'service-account.json', 'terraform.tfstate']) await f.file(name, 'data');
   await f.file('src/main.js', 'hello');
-  await fs.symlink(path.join(f.root, 'src'), path.join(f.root, 'linked-src'));
+  await directoryLink(path.join(f.root, 'src'), path.join(f.root, 'linked-src'));
   await fs.link(path.join(f.root, 'a.txt'), path.join(f.root, 'hardlink.txt'));
   const result = await listProjectFiles(f.root);
   assert.deepEqual(result, { path: '', entries: [
@@ -65,9 +67,9 @@ test('invalid and excluded paths are refused by listing and direct preview', asy
 test('previews do not follow file or parent links and refuse hard links and special files', async t => {
   const f = await fixture(t);
   await f.file('source/file.txt', 'safe data');
-  await fs.symlink(path.join(f.root, 'source'), path.join(f.root, 'parent-link'));
-  await fs.symlink(path.join(f.root, 'source/file.txt'), path.join(f.root, 'file-link.txt'));
-  for (const relative of ['parent-link/file.txt', 'file-link.txt']) await assert.rejects(previewProjectFile(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
+  await directoryLink(path.join(f.root, 'source'), path.join(f.root, 'parent-link'));
+  const linkedFile = await fileLink(t, path.join(f.root, 'source/file.txt'), path.join(f.root, 'file-link.txt'));
+  for (const relative of ['parent-link/file.txt', ...(linkedFile ? ['file-link.txt'] : [])]) await assert.rejects(previewProjectFile(f.root, relative), { code: 'PROJECT_FILE_FORBIDDEN' });
   await assert.rejects(listProjectFiles(f.root, 'parent-link'), { code: 'PROJECT_FILE_FORBIDDEN' });
   await fs.link(path.join(f.root, 'source/file.txt'), path.join(f.root, 'hardlink.txt'));
   await assert.rejects(previewProjectFile(f.root, 'hardlink.txt'), { code: 'PROJECT_FILE_FORBIDDEN' });
@@ -87,7 +89,7 @@ test('text, Markdown, HTML and extensionless project files return data, while SV
     const target = await f.file(name, content), stat = await fs.stat(target, { bigint: true });
     assert.deepEqual(await previewProjectFile(f.root, name), { path: name, name: path.basename(name), size: Buffer.byteLength(content),
       kind, mime, encoding: 'utf8', content, truncated: false, editable: true,
-      revision: projectContentRevision(stat, Buffer.from(content)), contentHash: createHash('sha256').update(content).digest('hex'),
+      revision: projectContentRevision(process.platform === 'win32' ? readWindowsProjectFile(f.root, name).snapshot : stat, Buffer.from(content)), contentHash: createHash('sha256').update(content).digest('hex'),
       bom: false, newline: content.includes('\n') ? 'lf' : 'none' });
   }
 });
@@ -143,7 +145,8 @@ test('editable previews preserve BOM and newlines, while revisions change for me
     assert.equal((await previewProjectFile(f.root, name)).revision, first.revision);
   }
   const target = await f.file('revision.txt', 'same content'), first = await previewProjectFile(f.root, 'revision.txt');
-  await fs.chmod(target, 0o700);
+  if (process.platform === 'win32') await fs.utimes(target, new Date(), new Date(Date.now() + 10000));
+  else await fs.chmod(target, 0o700);
   const changedMode = await previewProjectFile(f.root, 'revision.txt');
   assert.notEqual(changedMode.revision, first.revision); assert.equal(changedMode.contentHash, first.contentHash);
   await fs.rename(target, target + '.old'); await fs.writeFile(target, 'same content');
@@ -173,6 +176,7 @@ test('file status reports only a bounded hash of exact bytes and shares private-
 });
 
 test('status refuses changes during its FD read and releases the file handle', async t => {
+  if (process.platform === 'win32') return t.skip('Targets the POSIX file-descriptor read; Windows file handles deny concurrent data writes');
   const f = await fixture(t), target = await f.file('status.txt', 'first');
   const original = fs.open; let opened;
   fs.open = async (...args) => {
@@ -189,6 +193,7 @@ test('status refuses changes during its FD read and releases the file handle', a
 });
 
 test('prepared parents hold a read descriptor without creating files and reject directory replacement', async t => {
+  if (process.platform === 'win32') return t.skip('POSIX read-descriptor contract; Windows mutation parents intentionally retain a sentinel and prevent replacement');
   const f = await fixture(t); await f.directory('output');
   const prepared = await prepareProjectFileParent(f.root, 'output/new.txt');
   try {
@@ -204,6 +209,7 @@ test('prepared parents hold a read descriptor without creating files and reject 
 });
 
 test('a file replaced between inspection and opening is refused without returning either body', async t => {
+  if (process.platform === 'win32') return t.skip('Targets the POSIX path/open boundary; Windows opens relative to retained native directory handles');
   const f = await fixture(t), target = await f.file('changing.txt', 'first data');
   const original = fs.open;
   fs.open = async (...args) => {
@@ -215,6 +221,7 @@ test('a file replaced between inspection and opening is refused without returnin
 });
 
 test('a file changed during a bounded FD read is refused before publishing the result', async t => {
+  if (process.platform === 'win32') return t.skip('Targets the POSIX file-descriptor read; Windows file handles deny concurrent data writes');
   const f = await fixture(t), target = await f.file('changing.txt', 'first data');
   const original = fs.open;
   fs.open = async (...args) => {
@@ -246,7 +253,7 @@ test('a directory changed before pinned enumeration is refused', async t => {
 });
 
 test('tree listing never enumerates a rebound project root between checks', async t => {
-  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
+  if (process.platform === 'win32') return t.skip('Injects the POSIX directory worker; Windows retained-handle replacement tests run separately');
   const f = await fixture(t), selected = path.join(f.root, 'selected');
   const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
   const root = path.join(selected, 'project');
@@ -277,7 +284,7 @@ test('tree listing never enumerates a rebound project root between checks', asyn
 });
 
 test('tree listing binds its root before the first await without a supplied identity', async t => {
-  if (process.platform === 'win32') return t.skip('Requires the POSIX pinned helper; native Windows file access is refused');
+  if (process.platform === 'win32') return t.skip('Injects the POSIX first-await boundary; Windows native reads bind synchronously');
   const f = await fixture(t), selected = path.join(f.root, 'selected');
   const replacement = path.join(f.root, 'replacement'), parked = path.join(f.root, 'parked');
   const root = path.join(selected, 'stable-parent', 'project');

@@ -118,7 +118,7 @@ test('real broadcast CLI failures use stderr JSON that the fixture can publish s
   const result = spawnSync(process.execPath, [path.resolve(import.meta.dirname, '../bin/hcc.mjs'),
     '--root', root, '--json', 'broadcast'], {
     encoding: 'utf8', timeout: 5000,
-    env: { HOME: home, PATH: process.env.PATH, SHELL: '/bin/bash', NODE_NO_WARNINGS: '1' }
+    env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, SHELL: '/bin/bash', NODE_NO_WARNINGS: '1' }
   });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');

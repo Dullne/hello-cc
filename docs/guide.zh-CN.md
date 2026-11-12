@@ -38,8 +38,21 @@ v1 会把恢复的数据库重新迁移到 schema v7；用旧版本 hello-cc 打
 
 ### 前置依赖
 
-通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本。浏览器可
-控制的终端还需要 `tmux`：
+通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本。Linux/macOS
+的浏览器终端还需要 `tmux`。原生 Windows 使用包内的 ConPTY 服务，本开发版本的
+安装和实测范围见 [Windows 指南](windows-native.md)。
+
+安装已验证的 Windows 候选包后，在 PowerShell 中启动本机工作台：
+
+```powershell
+hcc doctor --environment
+hcc --root 'C:\Projects\My project' init
+hcc --root 'C:\Projects\My project' web --local
+```
+
+[Windows 验证记录](windows-native-validation.md) 区分了已实测的 Windows 11 环境，
+以及尚未验收的 Windows 10、HTTPS 和真实 provider 账号流程。下面的软件包管理器
+与 tmux 示例适用于 Linux/macOS。
 
 ```bash
 # Debian / Ubuntu
@@ -60,8 +73,8 @@ brew install tmux
 ```
 
 Linux 必须使用当前发行版的系统包管理器，而不是 Homebrew。root shell 可以省略
-`sudo`。WSL 用户应在 WSL 内部按对应 Linux 发行版安装；不支持原生 Windows
-shell。
+`sudo`。WSL 用户应在 WSL 内部按对应 Linux 发行版安装；原生 Windows 请使用
+上面的独立指南。
 
 当存在受支持的包管理器且权限足够时，`hcc web` 可以尝试自动安装 tmux。对于
 服务器、容器和非交互式 sudo 环境，手动安装是确定性更高的方式。

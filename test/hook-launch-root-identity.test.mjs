@@ -23,7 +23,7 @@ test('a launch-bound hook does not write to B after A is replaced by B',
     const movedA = path.join(base, 'moved-a');
     for (const dir of [home, a, b]) fs.mkdirSync(dir);
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-    const env = { ...process.env, HOME: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
     const dbPath = (root) => path.join(root, 'custom.db');
     const cli = (root, args, extraEnv = {}, input = '') => spawnSync(process.execPath,
       [hcc, '--root', root, '--db', dbPath(root), '--json', ...args], {
@@ -118,7 +118,7 @@ test('a first-party new Codex hook persists its thread origin once and cannot re
     fs.mkdirSync(home); fs.mkdirSync(root);
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
     const dbPath = path.join(root, 'custom.db');
-    const baseEnv = { ...process.env, HOME: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
+    const baseEnv = { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
     const init = spawnSync(process.execPath, [hcc, '--root', root, '--db', dbPath, 'init', '--no-guidance'],
       { cwd: base, env: baseEnv, encoding: 'utf8', timeout: 10000 });
     assert.equal(init.status, 0, init.stderr || init.stdout);
@@ -156,7 +156,7 @@ test('unmanaged hooks still follow each payload workspace without a launch marke
     const b = path.join(base, 'b');
     for (const dir of [home, a, b]) fs.mkdirSync(dir);
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-    const env = { ...process.env, HOME: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
     for (const [index, root] of [a, b].entries()) {
       const result = spawnSync(process.execPath, [hcc, 'hook', 'SessionStart', '--provider', 'claude'], {
         cwd: base, env: { ...env, HCC_ROOT: '', HCC_DB: '', HCC_PEER: '',

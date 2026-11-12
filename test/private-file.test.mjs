@@ -61,11 +61,11 @@ test('runtime pointers reject redirected or publicly readable old leaves', (t) =
 
 test('global runtime pointer requires the same private leaf checks', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-global-pointer-'));
-  const previousHome = process.env.HOME;
-  process.env.HOME = home;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile;
     fs.rmSync(home, { recursive: true, force: true });
   });
   const pointer = globalRuntimePath();

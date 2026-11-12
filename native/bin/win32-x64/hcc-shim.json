@@ -1,0 +1,7 @@
+{
+  "manifestVersion": 1,
+  "platform": "win32",
+  "arch": "x64",
+  "sourceSha256": "ab7dec0530947a70be4d895b50d0251f131fbad4435f7d7c9464366f81a01a39",
+  "binarySha256": "d5cbb149a05175d90522d2f0643c15085bd1a660c28f93ae8c317b6986cd5d7e"
+}

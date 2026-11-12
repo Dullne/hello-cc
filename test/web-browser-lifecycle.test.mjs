@@ -276,7 +276,7 @@ function reconnectFixture() {
     sessionActionTokens: new Map(), sessionControls: new Map(),
     handoffStore: { uncertain() {} }, window: { hccNative: { render() {} } },
     navigator: { onLine: true }, loggedOut: false,
-    renderHandoff() {}, renderSections() {}, renderActiveSession() {},
+    renderHandoff() {}, renderSections() {}, renderActiveSession() {}, updateTerminalEnvironment() {},
     terminalPinned: () => true, writeTerminalSnapshot() {}, resizeTerm() {},
     connText: label => labels.push(label),
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },

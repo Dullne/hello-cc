@@ -20,20 +20,21 @@ import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
 import { readNativePointer, writeNativePointer, createNativeStore, nativePaths } from '../lib/runtime/native/store.mjs';
 import { acquireFileLock, createFileLockLease, fileLockEndpoint } from '../lib/shared/file-lock.mjs';
-import { createNativeTestRoot } from './helpers/native-root.mjs';
+import { createPrivateNativeTestRoot as createNativeTestRoot, createNativeTestContext, isolateNativeTestProfile } from './helpers/native-root.mjs';
 import { createScopedMcpConfig } from '../lib/mcp/scope.mjs';
+
+isolateNativeTestProfile();
 
 function deferred() { let resolve; let reject; const promise = new Promise((a,b) => { resolve=a; reject=b; }); return {promise,resolve,reject}; }
 async function until(fn) {
-  const end = Date.now() + 2000;
+  const end = Date.now() + (process.platform === 'win32' ? 15000 : 2000);
   while (Date.now() < end) { if (await fn()) return; await delay(10); }
   assert.fail('condition did not become true');
 }
 async function fixture(t, config = {}, serviceOptions = {}, launch = startNativeService) {
   if (typeof serviceOptions === 'function') { launch = serviceOptions; serviceOptions = {}; }
   const root = await createNativeTestRoot('hcc-native-runtime-');
-  const ctx = {root,dbPath:path.join(root,'.hello-cc','mesh.db')};
-  fs.mkdirSync(path.dirname(ctx.dbPath));
+  const ctx = createNativeTestContext(root);
   const inspect = new DatabaseSync(ctx.dbPath); initSchema(inspect); inspect.exec('PRAGMA journal_mode=WAL');
   const events = createEventHelpers();
   const bindings = createPeerBindingStore(events);
@@ -77,7 +78,9 @@ async function fixture(t, config = {}, serviceOptions = {}, launch = startNative
   let service;
   t.after(async()=>{ try { await service?.shutdown(); } finally { inspect.close(); fs.rmSync(root,{recursive:true,force:true}); } });
   service = await launch(ctx,deps,options);
-  const api=(method,route,body)=>nativeRequest(ctx,method,route,body,{timeoutMs:3000});
+  // Windows checks the real private directory/ACL chain at each boundary.
+  // Keep the production request deadline while holding provider gates open.
+  const api=(method,route,body)=>nativeRequest(ctx,method,route,body,{timeoutMs:process.platform === 'win32' ? 35000 : 3000});
   const start=(peer,extra={})=>api('POST','/workers',{peer,provider:'codex',...extra});
   const delivery=async(peer)=>(await api('GET','/deliveries?peer='+peer))[0];
   return {ctx,inspect,deps,adapters,mcpCreations,api,start,delivery,get service(){return service;},
@@ -366,7 +369,7 @@ test('bus sender names and message content cannot impersonate local user origin'
 });
 
 async function ownershipListener(t, ctx, mode) {
-  const target = path.join(ctx.root, '.hello-cc', 'native', 'service-owner');
+  const target = path.join(nativePaths(ctx, { create: true }).dir, 'service-owner');
   const { port } = fileLockEndpoint(target);
   const listener = new Worker(`
     const net = require('node:net');
@@ -447,10 +450,12 @@ test('native ownership initialization cleanup failure preserves errors and provi
   await fixture(t, {}, async (ctx, deps, options) => {
     const publicationFailure = new Error('pointer publication unavailable');
     const closeFailure = new Error('database close temporarily unavailable');
-    const rename = fs.renameSync;
-    const renamed = t.mock.method(fs, 'renameSync', (source, target) => {
-      if (path.basename(target) === 'runtime.json') throw publicationFailure;
-      return rename(source, target);
+    const stringify = JSON.stringify;
+    const publication = t.mock.method(JSON, 'stringify', (value, ...args) => {
+      // The publication layer is platform-specific; fail its common pointer
+      // encoding boundary after the listener and both databases are owned.
+      if (value?.root === ctx.root && value.ownerVersion === 2 && value.token && value.port) throw publicationFailure;
+      return stringify(value, ...args);
     });
     let failClose = true;
     let failure;
@@ -465,12 +470,12 @@ test('native ownership initialization cleanup failure preserves errors and provi
         return error instanceof AggregateError && error.cause === publicationFailure && error.errors[1] === closeFailure;
       });
       assert.equal(typeof failure.retryCleanup, 'function');
-      assert.throws(() => acquireFileLock(path.join(ctx.root, '.hello-cc', 'native', 'service-owner'),
+      assert.throws(() => acquireFileLock(path.join(nativePaths(ctx).dir, 'service-owner'),
         { nonblocking: true }), { code: 'ERR_FILE_LOCK_BUSY' });
     } finally {
       failClose = false;
       failure?.retryCleanup?.();
-      renamed.mock.restore();
+      publication.mock.restore();
     }
     return startNativeService(ctx, deps, options);
   });
@@ -502,7 +507,7 @@ test('native ownership retains the lease when persistence close fails and releas
   try {
     await assert.rejects(f.service.shutdown(), /database close temporarily unavailable/);
     assert.ok(readNativePointer(f.ctx));
-    assert.throws(() => acquireFileLock(path.join(f.ctx.root, '.hello-cc', 'native', 'service-owner'),
+    assert.throws(() => acquireFileLock(path.join(nativePaths(f.ctx).dir, 'service-owner'),
       { nonblocking: true }), { code: 'ERR_FILE_LOCK_BUSY' });
   } finally { failClose = false; }
   await f.restart();
@@ -520,7 +525,10 @@ test('native ownership pointer requires confirmed exit or changed complete proce
     await assert.rejects(startNativeService(ctx, deps, { ...options,
       inspectProcessIdentity: () => ({ state: 'unknown', identity: null }) }), { code: 'NATIVE_RUNTIME_IN_USE' });
     assert.deepEqual(readNativePointer(ctx), previous);
-    writeNativePointer(ctx, { ...previous, processIdentity: { ...current.identity, startToken: 'previous-process-start' } });
+    const previousStartToken = process.platform === 'win32'
+      ? `win32:v1:${BigInt(current.identity.startToken.slice('win32:v1:'.length)) + 1n}`
+      : 'previous-process-start';
+    writeNativePointer(ctx, { ...previous, processIdentity: { ...current.identity, startToken: previousStartToken } });
     return startNativeService(ctx, deps, options);
   });
 });

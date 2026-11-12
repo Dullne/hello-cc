@@ -27,7 +27,7 @@ function runDown({ root, home }, env = {}) {
   return spawnSync(process.execPath, [hccBin, '--root', root, 'down'], {
     cwd: root,
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, HCC_RUNTIME_URL: '', ...env }
+    env: { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '', ...env }
   });
 }
 
@@ -103,7 +103,7 @@ for (const mode of ['normal-response', 'lost-response', 'replacement-pointer']) 
     const observed = inspectProcessIdentity(process.pid);
     if (observed.state !== 'live') { t.skip('complete process identity unavailable'); return; }
     const env = {
-      HOME: state.home,
+      HOME: state.home, USERPROFILE: state.home,
       PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,
       HCC_RUNTIME_LOCAL_ONLY: '1'
     };

@@ -32,7 +32,7 @@ function fixture(t) {
   const env = {
     ...process.env,
     NODE_NO_WARNINGS: '1',
-    HOME: home,
+    HOME: home, USERPROFILE: home,
     HCC_RUNTIME_URL: '',
     HCC_PEER: 'server-inherited-peer',
     HCC_ROOT: foreignRoot,

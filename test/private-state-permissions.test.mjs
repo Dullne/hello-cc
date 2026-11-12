@@ -25,7 +25,7 @@ function fixture(t) {
 }
 
 function cliEnvironment(home, extra = {}) {
-  return { ...process.env, HOME: home, HCC_INTERNAL_WEB_MANAGED_RUN: '0', ...extra };
+  return { ...process.env, HOME: home, USERPROFILE: home, HCC_INTERNAL_WEB_MANAGED_RUN: '0', ...extra };
 }
 
 function runCli(fixture, args) {
@@ -371,11 +371,11 @@ test('a root alias repointed from A to B cannot reopen A private state as an ext
     fs.chmodSync(root, 0o777); // Force private state instead of project-local state.
   }
   fs.symlinkSync(rootA, alias, 'dir');
-  const previousHome = process.env.HOME;
-  process.env.HOME = f.home;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = f.home; process.env.USERPROFILE = f.home;
   t.after(() => {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile;
   });
   const created = createContext({ root: alias }, { cwd: alias, detectRoot: () => alias });
   // Keep a lexical-root context even if CLI context construction later pins

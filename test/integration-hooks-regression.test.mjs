@@ -42,7 +42,7 @@ function callHooks(home, calls) {
   `;
   const run = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     cwd: repoRoot, encoding: 'utf8', timeout: 10_000,
-    env: { ...process.env, HOME: home, HCC_TEST_HOOK_CALLS: JSON.stringify(calls) }
+    env: { ...process.env, HOME: home, USERPROFILE: home, HCC_TEST_HOOK_CALLS: JSON.stringify(calls) }
   });
   assert.equal(run.status, 0, run.stderr);
   return JSON.parse(run.stdout);
@@ -181,7 +181,7 @@ test('missing hook files remain installable', (t) => {
   assert.deepEqual(results.map(result => result.value), [f.claudePath, f.codexPath, true, true]);
   const status = spawnSync(process.execPath, [hccBin, '--json', 'install-hooks', '--status'], {
     cwd: repoRoot, encoding: 'utf8', timeout: 10_000,
-    env: { ...process.env, HOME: f.home }
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home }
   });
   assert.equal(status.status, 0, status.stderr);
   assert.deepEqual(JSON.parse(status.stdout).data, { claude: true, codex: true });
@@ -194,7 +194,7 @@ test('ordinary hooks honor HCC_DB and an explicit CLI database under HCC_ROOT', 
   const envDb = path.join(root, '.hello-cc', 'environment.db');
   const cliDb = path.join(root, '.hello-cc', 'explicit.db');
   const payload = JSON.stringify({ cwd: root, session_id: 'custom-db-session' });
-  const baseEnv = { ...process.env, HOME: f.home, HCC_ROOT: root, HCC_PEER: 'custom-db-peer', HCC_NATIVE_OWNER: '' };
+  const baseEnv = { ...process.env, HOME: f.home, USERPROFILE: f.home, HCC_ROOT: root, HCC_PEER: 'custom-db-peer', HCC_NATIVE_OWNER: '' };
   const run = (args, env) => spawnSync(process.execPath, [hccBin, ...args, 'hook', 'SessionStart'], {
     cwd: root, encoding: 'utf8', input: payload, timeout: 10_000, env: { ...baseEnv, ...env }
   });
@@ -237,7 +237,7 @@ test('ordinary hooks preserve explicit database precedence through a project sym
   const run = spawnSync(process.execPath, [hccBin, '--root', alias, '--db', cliDb, 'hook', 'SessionStart'], {
     cwd: alias, encoding: 'utf8', timeout: 10_000,
     input: JSON.stringify({ cwd: root, session_id: 'alias-db-session' }),
-    env: { ...process.env, HOME: f.home, HCC_ROOT: alias, HCC_DB: envDb,
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, HCC_ROOT: alias, HCC_DB: envDb,
       HCC_PEER: 'alias-db-peer', HCC_NATIVE_OWNER: '' }
   });
   assert.equal(run.status, 0, run.stderr);

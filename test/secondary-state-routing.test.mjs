@@ -83,7 +83,7 @@ function fixture(t) {
 function invoke(f, action) {
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', childCode], {
     input: JSON.stringify({ root: f.root, action }),
-    env: { ...process.env, HOME: f.home, HCC_TEST_REPO: repo },
+    env: { ...process.env, HOME: f.home, USERPROFILE: f.home, HCC_TEST_REPO: repo },
     encoding: 'utf8', timeout: 10000
   });
   assert.equal(child.status, 0, child.stderr || child.error?.message);
@@ -131,7 +131,7 @@ test('ordinary hook delivery creates its database in the private store', (t) => 
   if (process.platform === 'win32') return t.skip('POSIX root permissions required');
   const f = fixture(t);
   const privateState = path.dirname(succeeded(invoke(f, 'guidance-write')));
-  const env = { ...process.env, HOME: f.home };
+  const env = { ...process.env, HOME: f.home, USERPROFILE: f.home };
   for (const name of ['HCC_ROOT', 'HCC_DB', 'HCC_PEER', 'HCC_NATIVE_OWNER']) delete env[name];
   const hook = spawnSync(process.execPath, [path.join(repo, 'bin/hcc.mjs'), '--root', f.root,
     'hook', 'sessionstart', '--provider', 'claude'], {
@@ -146,7 +146,7 @@ test('ordinary hook delivery creates its database in the private store', (t) => 
 test('manual GC sees the selected private buffer directory', (t) => {
   if (process.platform === 'win32') return t.skip('POSIX root permissions required');
   const f = fixture(t);
-  const env = { ...process.env, HOME: f.home };
+  const env = { ...process.env, HOME: f.home, USERPROFILE: f.home };
   for (const name of ['HCC_ROOT', 'HCC_DB', 'HCC_PEER', 'HCC_RUNTIME_URL']) delete env[name];
   const cli = (...args) => spawnSync(process.execPath,
     [path.join(repo, 'bin/hcc.mjs'), '--root', f.root, ...args], {

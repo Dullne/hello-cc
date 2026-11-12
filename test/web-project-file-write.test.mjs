@@ -8,6 +8,7 @@ import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
+import { fileLink } from './helpers/filesystem-links.mjs';
 import { CliError } from '../lib/shared/errors.mjs';
 import { captureSelectedCwdIdentity } from '../lib/process/selected-cwd-identity.mjs';
 import { saveProjectFile, uploadProjectFile } from '../lib/web/project-file-write.mjs';
@@ -45,7 +46,8 @@ test('text save publishes exact UTF-8 BOM/CRLF bytes, preserves permissions and 
   const after = await previewProjectFile(f.root, 'note.md');
   assert.equal(saved.saved, true); assert.equal(saved.revision, after.revision);
   assert.notEqual(saved.revision, preview.revision); assert.equal(saved.contentHash, hash(Buffer.from(content)));
-  assert.deepEqual(await fs.readFile(target), Buffer.from(content)); assert.equal((await fs.stat(target)).mode & 0o777, 0o750);
+  assert.deepEqual(await fs.readFile(target), Buffer.from(content));
+  if (process.platform !== 'win32') assert.equal((await fs.stat(target)).mode & 0o777, 0o750);
   await assert.rejects(saveProjectFile(f.root, { path: 'note.md', revision: preview.revision, content: 'stale' }), { code: 'PROJECT_FILE_CONFLICT' });
   assert.equal(await fs.readFile(target, 'utf8'), content); await noTemporary(f.root);
 });
@@ -75,9 +77,9 @@ test('upload publishes exactly 10 MiB of binary data with status readback and no
 
 test('upload never replaces an existing ordinary file, directory, symlink or hardlink and creates no parents', async t => {
   const f = await fixture(t), target = await f.file('exists.txt', 'keep');
-  await fs.mkdir(path.join(f.root, 'directory')); await fs.symlink('exists.txt', path.join(f.root, 'symlink.txt'));
+  await fs.mkdir(path.join(f.root, 'directory')); const linked = await fileLink(t, target, path.join(f.root, 'symlink.txt'));
   await fs.link(target, path.join(f.root, 'hardlink.txt'));
-  for (const name of ['exists.txt', 'directory', 'symlink.txt', 'hardlink.txt']) {
+  for (const name of ['exists.txt', 'directory', ...(linked ? ['symlink.txt'] : []), 'hardlink.txt']) {
     await assert.rejects(uploadProjectFile(f.root, upload(name, 'changed')), { code: 'PROJECT_FILE_EXISTS' });
   }
   await assert.rejects(uploadProjectFile(f.root, upload('absent/new.txt', 'new')), { code: 'PROJECT_FILE_NOT_FOUND' });
@@ -88,9 +90,9 @@ test('upload never replaces an existing ordinary file, directory, symlink or har
 test('save refuses linked, unsupported and binary targets before replacing any bytes', async t => {
   const f = await fixture(t), ordinary = await f.file('original.txt', 'original');
   const revision = (await previewProjectFile(f.root, 'original.txt')).revision;
-  await fs.symlink('original.txt', path.join(f.root, 'link.txt')); await fs.link(ordinary, path.join(f.root, 'hard.txt'));
+  const linked = await fileLink(t, ordinary, path.join(f.root, 'link.txt')); await fs.link(ordinary, path.join(f.root, 'hard.txt'));
   await f.file('binary.txt', Buffer.from([0, 255, 1])); await f.file('binary.bin', 'text');
-  for (const name of ['original.txt', 'link.txt', 'hard.txt', 'binary.bin']) {
+  for (const name of ['original.txt', ...(linked ? ['link.txt'] : []), 'hard.txt', 'binary.bin']) {
     await assert.rejects(saveProjectFile(f.root, { path: name, revision, content: 'changed' }), { code: 'PROJECT_FILE_FORBIDDEN' });
   }
   await assert.rejects(saveProjectFile(f.root, { path: 'binary.txt', revision, content: 'changed' }), { code: 'PROJECT_FILE_CONFLICT' });
@@ -112,6 +114,7 @@ test('write request validation excludes traversal, sensitive files, unknown keys
 });
 
 test('an external edit before publication conflicts and preserves the external bytes', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; actual Windows stale-byte conflicts run in windows-project-file-io.test.mjs');
   const f = await fixture(t), target = await f.file('note.txt', 'before');
   const revision = (await previewProjectFile(f.root, 'note.txt')).revision;
   await assert.rejects(saveProjectFile(f.root, { path: 'note.txt', revision, content: 'ours' }, {
@@ -121,6 +124,7 @@ test('an external edit before publication conflicts and preserves the external b
 });
 
 test('a file growing after its initial stat is read within the text bound and cannot be saved', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows retained readers deny concurrent data writes');
   const f = await fixture(t), target = await f.file('note.txt', 'before');
   const revision = (await previewProjectFile(f.root, 'note.txt')).revision;
   await assert.rejects(saveProjectFile(f.root, { path: 'note.txt', revision, content: 'ours' }, {
@@ -130,6 +134,7 @@ test('a file growing after its initial stat is read within the text bound and ca
 });
 
 test('temporary path replacement is rejected before publishing the replacement inode', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows publishes and removes the held staging handle directly');
   const f = await fixture(t);
   await assert.rejects(uploadProjectFile(f.root, upload('new.txt', 'good'), {
     spawnProcess: injected(beforePublish, "fs.renameSync(temporary, 'held.txt'); fs.writeFileSync(temporary, 'evil');")
@@ -141,6 +146,7 @@ test('temporary path replacement is rejected before publishing the replacement i
 });
 
 test('a concurrent upload creator wins and is never overwritten', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows native create-only rename is covered separately');
   const f = await fixture(t);
   await assert.rejects(uploadProjectFile(f.root, upload('new.txt', 'ours'), {
     spawnProcess: injected(beforePublish, "fs.writeFileSync(name, 'external', { flag: 'wx' });")
@@ -149,6 +155,7 @@ test('a concurrent upload creator wins and is never overwritten', async t => {
 });
 
 test('post-publication same-size in-place mutations cannot produce a false success receipt', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows retains a handle denying data writes through readback');
   const f = await fixture(t);
   await assert.rejects(uploadProjectFile(f.root, upload('new.txt', 'good'), {
     spawnProcess: injected(afterPublish, "fs.writeFileSync(name, 'evil');")
@@ -158,6 +165,7 @@ test('post-publication same-size in-place mutations cannot produce a false succe
 });
 
 test('post-publication errors and lost responses retain published bytes for explicit status verification', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows has real directory-flush-denial acceptance');
   const f = await fixture(t);
   for (const [name, spawnProcess] of [
     ['error.bin', injected(afterPublish, "throw new Error('injected fsync failure');")],
@@ -171,6 +179,7 @@ test('post-publication errors and lost responses retain published bytes for expl
 });
 
 test('a rebound parent keeps mutations pinned to the original inode and reports an unconfirmed requested path', async t => {
+  if (process.platform === 'win32') return t.skip('Injects the POSIX publication worker; Windows retained parents prevent rename and reparse replacement');
   const f = await fixture(t); await fs.mkdir(path.join(f.root, 'sub'));
   const oldParent = path.join(f.root, 'sub'), movedParent = path.join(f.root, 'moved');
   const code = 'fs.renameSync(' + JSON.stringify(oldParent) + ',' + JSON.stringify(movedParent) + ');' +
@@ -182,7 +191,7 @@ test('a rebound parent keeps mutations pinned to the original inode and reports 
 
 test('a selected root identity rejects replacement before a write and cannot claim success after a pinned-root replacement', async t => {
   const f = await fixture(t);
-  for (const timing of ['before', 'after-pin']) {
+  for (const timing of process.platform === 'win32' ? ['before'] : ['before', 'after-pin']) {
     const root = path.join(f.root, timing), moved = root + '-moved'; await fs.mkdir(root);
     const rootIdentity = captureSelectedCwdIdentity(root);
     try {

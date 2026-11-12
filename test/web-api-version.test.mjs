@@ -116,9 +116,9 @@ test('runtime clients send v2 and probes reject legacy runtime metadata', async 
   );
   assert.equal(await probeRuntime(runtime), false);
 
-  const previousHome = process.env.HOME;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
   const runtimeHome = fs.mkdtempSync(`${os.tmpdir()}/hcc-api-v2-home-`);
-  process.env.HOME = runtimeHome;
+  process.env.HOME = runtimeHome; process.env.USERPROFILE = runtimeHome;
   try {
     writeGlobalRuntime({ ...runtime, pid: process.pid });
     assert.equal(await readHealthyGlobalRuntime(), null);
@@ -126,8 +126,8 @@ test('runtime clients send v2 and probes reject legacy runtime metadata', async 
     runtimeMetadata = { api_version: API_VERSION };
     assert.equal((await readHealthyGlobalRuntime())?.base_url, runtime.base_url);
   } finally {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile;
     fs.rmSync(runtimeHome, { recursive: true, force: true });
   }
 

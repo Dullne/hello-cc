@@ -1,8 +1,10 @@
 # 原生 Windows 支持设计
 
-日期：2026-11-12  
-状态：用户已确认完整原生方案；实施中，尚未实现 Windows 支持  
-基线：`7bf52fce07cb3a6613d2d6311bf014688153e2a3`  
+日期：2026-11-12
+
+状态：Windows 11 原生候选实现、210 项专项测试、最终安装包验收及 Linux 全流程回归已完成。Windows 10、macOS 与真实 provider 账号验收仍须分别完成，当前不能作正式发布支持声明。
+
+基线：`7bf52fce07cb3a6613d2d6311bf014688153e2a3`
 开发分支：`codex/windows-native-support`
 
 ## 目标与验收边界

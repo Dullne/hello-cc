@@ -19,7 +19,7 @@ function tempDirectory(t) {
 test('producer and GC serialize on the same canonical directory lease', (t) => {
   const directory = tempDirectory(t);
   const alias = path.join(path.dirname(directory), `${path.basename(directory)}-alias`);
-  fs.symlinkSync(directory, alias);
+  fs.symlinkSync(directory, alias, process.platform === 'win32' ? 'junction' : 'dir');
   t.after(() => fs.rmSync(alias, { force: true }));
 
   assert.equal(bufferDirectoryLeaseTarget(alias), bufferDirectoryLeaseTarget(directory));

@@ -121,13 +121,13 @@ test('Claude refuses SDK query creation when its selected directory was rebound 
   const selected = path.join(base, 'selected');
   fs.mkdirSync(original);
   fs.mkdirSync(replacement);
-  fs.symlinkSync(original, selected, 'dir');
+  fs.symlinkSync(original, selected, process.platform === 'win32' ? 'junction' : 'dir');
   const sdk = fakeSdk();
   const adapter = createClaudeAdapter({ cwd: selected, query: sdk.query });
   try {
     await adapter.open();
     fs.unlinkSync(selected);
-    fs.symlinkSync(replacement, selected, 'dir');
+    fs.symlinkSync(replacement, selected, process.platform === 'win32' ? 'junction' : 'dir');
     await assert.rejects(adapter.send({ text: 'do not submit' }), { code: 'PROJECT_PATH_CHANGED' });
     assert.equal(sdk.calls, 0);
   } finally { await adapter.close(); }
@@ -537,7 +537,7 @@ test('Claude missing optional SDK gives installation guidance without installing
       assert.match(failure.message, /npm install @anthropic-ai\/claude-agent-sdk/);
       return true;
     });
-    assert.equal(adapter.snapshot().status, 'created');
+    assert.equal(adapter.snapshot().status, process.platform === 'win32' ? 'error' : 'created');
     await adapter.close();
     return;
   }
@@ -590,19 +590,26 @@ test('hosted Claude keeps late permission requests cancelled after interrupt and
 
 async function isolatedDefaultSdk(t, moduleSource) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-claude-resolution-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let adapter;
+  t.after(async () => {
+    await adapter?.close();
+    await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 30, retryDelay: 20 });
+  });
   const installed = path.join(directory, 'hcc'), project = path.join(directory, 'project');
   const base = fileURLToPath(new URL('../lib/', import.meta.url));
-  for (const name of ['integrations/native/claude.mjs', 'integrations/native/interactions.mjs', 'integrations/native/telemetry.mjs', 'integrations/mcp-url-elicitation.mjs', 'process/selected-cwd-identity.mjs', 'core/sessions/hook-root-identity.mjs']) {
-    const target = path.join(installed, 'lib', name); fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.copyFileSync(path.join(base, name), target);
+  fs.cpSync(base, path.join(installed, 'lib'), { recursive: true });
+  if (process.platform === 'win32') {
+    // Reuse the verified native test artifact: Windows retains loaded DLLs
+    // until host exit, so loading a second copy would prevent fixture cleanup.
+    fs.writeFileSync(path.join(installed, 'lib/platform/windows-native.mjs'),
+      `export * from ${JSON.stringify(pathToFileURL(path.join(base, 'platform/windows-native.mjs')).href)};`);
   }
-  fs.cpSync(path.join(base, 'shared'), path.join(installed, 'lib/shared'), { recursive: true });
   const sdk = path.join(project, 'node_modules/@anthropic-ai/claude-agent-sdk');
   fs.mkdirSync(sdk, { recursive: true });
   fs.writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', type: 'module', exports: './sdk.mjs' }));
   fs.writeFileSync(path.join(sdk, 'sdk.mjs'), moduleSource);
-  return { project, adapter: (await import(pathToFileURL(path.join(installed, 'lib/integrations/native/claude.mjs')))).createClaudeAdapter({ cwd: project }) };
+  adapter = (await import(pathToFileURL(path.join(installed, 'lib/integrations/native/claude.mjs')))).createClaudeAdapter({ cwd: project });
+  return { project, adapter };
 }
 
 test('default Claude loader finds the optional SDK in the worker project from a separate HCC installation', async t => {

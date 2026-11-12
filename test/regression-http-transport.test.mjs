@@ -72,7 +72,7 @@ server.listen(0, '127.0.0.1', () => process.send({ port: server.address().port }
 
 async function serverFixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-http-transport-home-'));
-  const env = { HOME: home, PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` };
+  const env = { HOME: home, USERPROFILE: home, PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` };
   const child = spawn(process.execPath, ['--input-type=module', '-e', serverSource], {
     env, stdio: ['ignore', 'ignore', 'ignore', 'ipc']
   });

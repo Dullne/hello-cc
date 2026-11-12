@@ -91,7 +91,7 @@ function releaseFixture(t) {
   const repo = path.join(root, 'repo'), output = path.join(root, 'pack');
   const unpacked = path.join(root, 'unpacked'), home = path.join(root, 'home');
   for (const directory of [repo, output, unpacked, home]) fs.mkdirSync(directory);
-  const env = { ...process.env, HOME: home, GITHUB_REF: '',
+  const env = { ...process.env, HOME: home, USERPROFILE: home, GITHUB_REF: '',
     NPM_CONFIG_CACHE: path.join(root, 'npm-cache'), NPM_CONFIG_USERCONFIG: path.join(home, '.npmrc'),
     GITHUB_OUTPUT: path.join(root, 'github-output') };
   const run = (command, args) => execFileSync(command, args, { cwd: repo, env, encoding: 'utf8' });

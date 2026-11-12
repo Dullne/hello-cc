@@ -12,16 +12,25 @@ on:
       - codex/dsh-stop-confirmation
       - 'codex/local-change-integration-*'
       - 'codex/native-remaining-fixes-*'
+      - 'codex/windows-native-support*'
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  windows-file-access-guard:
-    name: Native Windows file access refusal
+  windows-native:
+    name: Native Windows x64 acceptance
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 60
+    env:
+      # Isolating HOME does not isolate HKCU\Environment. Automatic setup must
+      # never change the runner account's persistent PATH during runtime tests.
+      HCC_SKIP_SHIM_INSTALL: '1'
+      NODE_NO_WARNINGS: '1'
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v5
         with:
@@ -29,9 +38,84 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-      # These focused tests use only Node built-ins. They verify refusal, not
-      # native Windows runtime support; supported Windows operation is in WSL.
-      - run: node --test test/web-files-platform.test.mjs
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare matching Node headers and import library
+        run: |
+          $nodeVersion = node -p "process.version"
+          $nativeToolchain = Join-Path $env:RUNNER_TEMP 'hcc-windows-toolchain'
+          New-Item -ItemType Directory -Path $nativeToolchain -Force | Out-Null
+          $distribution = "https://nodejs.org/dist/$nodeVersion"
+          $headersName = "node-$nodeVersion-headers.tar.gz"
+          Invoke-WebRequest "$distribution/SHASUMS256.txt" -OutFile (Join-Path $nativeToolchain 'SHASUMS256.txt')
+          Invoke-WebRequest "$distribution/$headersName" -OutFile (Join-Path $nativeToolchain $headersName)
+          Invoke-WebRequest "$distribution/win-x64/node.lib" -OutFile (Join-Path $nativeToolchain 'node.lib')
+          $checksums = @{}
+          Get-Content (Join-Path $nativeToolchain 'SHASUMS256.txt') | ForEach-Object {
+            $parts = $_ -split '\s+', 2
+            if ($parts.Length -eq 2) { $checksums[$parts[1].TrimStart('*')] = $parts[0] }
+          }
+          foreach ($entry in @(@{File=$headersName; Distribution=$headersName}, @{File='node.lib'; Distribution='win-x64/node.lib'})) {
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $nativeToolchain $entry.File)).Hash
+            if (!$checksums.ContainsKey($entry.Distribution) -or $actual -ine $checksums[$entry.Distribution]) { throw "Node distribution checksum mismatch: $($entry.File)" }
+          }
+          tar.exe -xf (Join-Path $nativeToolchain $headersName) -C $nativeToolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "HCC_NODE_HEADERS=$(Join-Path $nativeToolchain "node-$nodeVersion\include\node")" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HCC_NODE_LIBRARY=$(Join-Path $nativeToolchain 'node.lib')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build native Windows filesystem, process, terminal, and launcher components
+        run: |
+          node scripts/build-windows-native.mjs --headers "$env:HCC_NODE_HEADERS" --node-lib "$env:HCC_NODE_LIBRARY"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform})"
+          [Environment]::OSVersion.VersionString
+
+      - name: Isolate test profile beneath the runner's owned home
+        run: |
+          $testProfile = Join-Path $env:USERPROFILE ('hcc-windows-test-' + [Guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $testProfile | Out-Null
+          "HOME=$testProfile" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "USERPROFILE=$testProfile" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify actual Windows contracts and extracted npm candidate
+        id: windows_tests
+        run: |
+          node --test --test-concurrency=1 test/windows-*.test.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/hcc-windows-native.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify shared UI behavior and source checks
+        run: |
+          node --test test/web-ui-agent-start.test.mjs test/web-ui-session-display.test.mjs test/web-ui-handoff.test.mjs test/web-ui-terminal-command.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run test:audit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify shared native services, scoped tools, and Web behavior
+        timeout-minutes: 40
+        run: |
+          node --test --test-concurrency=3 test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/hcc-windows-shared.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify an independently installed npm candidate
+        timeout-minutes: 10
+        run: node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-installed-acceptance.json
+
+      - name: Upload Windows acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hcc-windows-native.log
+            ${{ runner.temp }}/hcc-windows-shared.log
+            native/bin/win32-x64/hcc-windows.json
+            native/bin/win32-x64/hcc-shim.json
+            .superpowers/windows-installed-acceptance.json
+          if-no-files-found: warn
+          retention-days: 14
 
   regression:
     name: Regression (${{ matrix.os }})

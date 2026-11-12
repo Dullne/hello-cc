@@ -23,6 +23,7 @@ function writeFile(file, contents, mtimeMs) {
   const timestamp = new Date(mtimeMs);
   fs.utimesSync(file, timestamp, timestamp);
 }
+const windows = process.platform === 'win32';
 
 test('prunes only old dead buffers and reports protected and unknown files', (t) => {
   const directory = tempDirectory(t);
@@ -47,8 +48,8 @@ test('prunes only old dead buffers and reports protected and unknown files', (t)
     dryRun: false
   });
 
-  assert.deepEqual(result, { deleted: 1, protected: 1, deferred: 1 });
-  assert.equal(fs.existsSync(deadFile), false);
+  assert.deepEqual(result, windows ? { deleted: 0, protected: 1, deferred: 2 } : { deleted: 1, protected: 1, deferred: 1 });
+  assert.equal(fs.existsSync(deadFile), windows);
   assert.equal(fs.existsSync(protectedFile), true);
   assert.equal(fs.existsSync(unknownFile), true);
   assert.equal(fs.existsSync(newFile), true);
@@ -83,7 +84,7 @@ test('dry-run and apply produce the same plan without dry-run deletion', (t) => 
 
   assert.deepEqual(dryResult, applyResult);
   assert.equal(fs.existsSync(path.join(dryDirectory, 'dead.out')), true);
-  assert.equal(fs.existsSync(path.join(applyDirectory, 'dead.out')), false);
+  assert.equal(fs.existsSync(path.join(applyDirectory, 'dead.out')), windows);
 });
 
 test('clock cutoffs cover would-delete entries while grace preserves evidence classes', (t) => {
@@ -105,7 +106,7 @@ test('clock cutoffs cover would-delete entries while grace preserves evidence cl
 
   assert.deepEqual(
     bufferPlanGcCutoffs(plan, retentionSec),
-    [Math.floor(oldMs / 1000) + retentionSec]
+    windows ? [] : [Math.floor(oldMs / 1000) + retentionSec]
   );
   assert.deepEqual(deferBufferPlan(plan), { deleted: 0, protected: 1, deferred: 2 });
   assert.equal(fs.existsSync(deleteFile), true);
@@ -138,7 +139,7 @@ test('deduplicates directories and ignores missing or symlinked directory roots'
   const symlinkDirectory = path.join(root, 'linked-bufs');
   fs.mkdirSync(directory);
   fs.mkdirSync(symlinkTarget);
-  fs.symlinkSync(symlinkTarget, symlinkDirectory);
+  fs.symlinkSync(symlinkTarget, symlinkDirectory, windows ? 'junction' : 'dir');
   const cutoffMs = Date.now() - 60_000;
   const deleteFile = path.join(directory, 'delete.out');
   const protectedFile = path.join(directory, 'protected.out');
@@ -153,7 +154,7 @@ test('deduplicates directories and ignores missing or symlinked directory roots'
     protectedPaths: [protectedFile]
   });
   const canonicalDirectory = fs.realpathSync(directory);
-  assert.deepEqual(duplicatePlan.deletePaths, [path.join(canonicalDirectory, 'delete.out')]);
+  assert.deepEqual(windows ? duplicatePlan.unknownPaths : duplicatePlan.deletePaths, [path.join(canonicalDirectory, 'delete.out')]);
   assert.deepEqual(duplicatePlan.protectedPaths, [path.join(canonicalDirectory, 'protected.out')]);
 
   assert.deepEqual(pruneBufferFiles({
@@ -170,7 +171,7 @@ test('canonicalizes ancestor symlink aliases before protection and deduplication
   const aliasRoot = path.join(root, 'alias');
   const directory = path.join(realRoot, 'bufs');
   fs.mkdirSync(directory, { recursive: true });
-  fs.symlinkSync(realRoot, aliasRoot);
+  fs.symlinkSync(realRoot, aliasRoot, windows ? 'junction' : 'dir');
   const cutoffMs = Date.now() - 60_000;
   const protectedFile = path.join(directory, 'active.out');
   writeFile(protectedFile, 'active', cutoffMs - 60_000);
@@ -205,7 +206,7 @@ test('rejects a directory replaced by an external symlink before realpath resolu
     if (!replaced && path.resolve(String(value)) === path.resolve(directory)) {
       replaced = true;
       fs.renameSync(directory, movedDirectory);
-      fs.symlinkSync(outsideDirectory, directory);
+      fs.symlinkSync(outsideDirectory, directory, windows ? 'junction' : 'dir');
     }
     return originalRealpathSync.call(this, value, ...args);
   };
@@ -265,7 +266,7 @@ test('rejects evidence whose parent changes identity during canonicalization', (
     if (!replaced && path.resolve(String(value)) === path.resolve(evidenceDirectory)) {
       replaced = true;
       fs.renameSync(evidenceDirectory, movedEvidenceDirectory);
-      fs.symlinkSync(outsideDirectory, evidenceDirectory);
+      fs.symlinkSync(outsideDirectory, evidenceDirectory, windows ? 'junction' : 'dir');
     }
     return originalRealpathSync.call(this, value, ...args);
   };
@@ -277,11 +278,12 @@ test('rejects evidence whose parent changes identity during canonicalization', (
     protectedPaths: [path.join(evidenceDirectory, 'active.out')]
   });
   assert.deepEqual(plan.protectedPaths, []);
-  assert.deepEqual(plan.deletePaths, [path.join(originalRealpathSync(outsideDirectory), 'active.out')]);
+  assert.deepEqual(windows ? plan.unknownPaths : plan.deletePaths, [path.join(originalRealpathSync(outsideDirectory), 'active.out')]);
   assert.equal(fs.readFileSync(outsideFile, 'utf8'), 'outside');
 });
 
-test('uses lstat, accepts regular files and FIFOs, and never follows symlinks', (t) => {
+test('uses lstat, accepts regular files and FIFOs, and never follows symlinks',
+  { skip: windows ? 'Windows managed terminals use ConPTY streams; legacy buffer files are preserved by windows-buffer-gc.test.mjs' : false }, (t) => {
   const directory = tempDirectory(t);
   const cutoffMs = Date.now() - 60_000;
   const oldMs = cutoffMs - 60_000;
@@ -348,7 +350,7 @@ test('defers when a planned directory is replaced by a symlink', (t) => {
 
   const plan = planBufferFiles({ directories: [directory], cutoffMs });
   fs.renameSync(directory, movedDirectory);
-  fs.symlinkSync(movedDirectory, directory);
+  fs.symlinkSync(movedDirectory, directory, windows ? 'junction' : 'dir');
 
   assert.deepEqual(applyBufferPlan(plan), { deleted: 0, protected: 0, deferred: 1 });
   assert.equal(fs.readFileSync(path.join(movedDirectory, 'candidate.out'), 'utf8'), 'old');

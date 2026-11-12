@@ -63,7 +63,7 @@ const managedTmuxSessions = new Set();
 const env = {
   ...process.env,
   NODE_NO_WARNINGS: '1',
-  HOME: home,
+  HOME: home, USERPROFILE: home,
   PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
   SHELL: '/bin/bash'
 };
@@ -78,6 +78,11 @@ delete env.TMUX_PANE;
 function log(message) {
   currentStage = String(message);
   process.stdout.write(`${message}\n`);
+}
+
+function readSourceText(filename) {
+  // Static source assertions must survive both LF and CRLF checkouts.
+  return fs.readFileSync(filename, 'utf8').replace(/\r\n/g, '\n');
 }
 
 function fail(message, commandResult = null, diagnosticOperation = null) {
@@ -2924,7 +2929,7 @@ printf '\\n'
         cwd: projectRoot,
         env: {
           ...env,
-          HOME: fakeHome,
+          HOME: fakeHome, USERPROFILE: fakeHome,
           HCC_SHIM_ENSURED: '1',
           HCC_SHIM_NO_ATTACH: '1'
         }
@@ -3015,7 +3020,7 @@ async function cookieSessionExpiryWorkflow() {
         backend: 'pty',
         command: 'bash --noprofile --norc',
         env: {
-          HOME: home,
+          HOME: home, USERPROFILE: home,
           PATH: env.PATH,
           SHELL: '/bin/bash'
         }
@@ -3126,7 +3131,7 @@ async function webSecretRedactionWorkflow() {
         kind: 'shell',
         backend: 'pty',
         command: 'bash --noprofile --norc',
-        env: { HOME: home, PATH: env.PATH, SHELL: '/bin/bash' }
+        env: { HOME: home, USERPROFILE: home, PATH: env.PATH, SHELL: '/bin/bash' }
       })
     }, { root });
     if (!create.ok) fail(`redaction PTY create failed with status ${create.status}`);
@@ -4923,7 +4928,8 @@ async function multiProjectWebWorkflow() {
     if (!response.ok || !response.headers.get('content-type')?.includes('javascript')) fail('web ESM asset did not load: ' + asset);
     moduleSources.push(await response.text());
   }
-  const html = pageHtml + '\n' + moduleSources.join('\n');
+  // Layout checks should read the same source after a Windows CRLF checkout.
+  const html = (pageHtml + '\n' + moduleSources.join('\n')).replace(/\r\n/g, '\n');
   const startFormHtml = html.match(/<form\b[^>]*\bid="startForm"[^>]*>[\s\S]*?<\/form>/)?.[0];
   if (!startFormHtml) fail('web form missing simplified session form');
   // A current-directory label in an approval or session details is valid;
@@ -5102,7 +5108,7 @@ async function multiProjectWebWorkflow() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         env: {
-          HOME: home,
+          HOME: home, USERPROFILE: home,
           PATH: env.PATH,
           SHELL: process.env.SHELL || 'bash',
           HCC_FAKE_STAY_ALIVE: '1'
@@ -5208,7 +5214,7 @@ async function multiProjectWebWorkflow() {
     kind: 'shell',
     command: 'bash --noprofile --norc',
     env: {
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       PATH: env.PATH,
       SHELL: process.env.SHELL || 'bash'
     }
@@ -6404,7 +6410,7 @@ async function bufferGcArbitrationWorkflow() {
     const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-home-${status}-${testId}-`));
     let server = null;
     try {
-      const isolatedEnv = { ...env, HOME: isolatedHome };
+      const isolatedEnv = { ...env, HOME: isolatedHome, USERPROFILE: isolatedHome };
       run(process.execPath, [hccBin, '--root', isolatedRoot, 'init', '--no-guidance'], { env: isolatedEnv });
       const directory = path.join(isolatedRoot, '.hello-cc', 'bufs');
       fs.mkdirSync(directory, { recursive: true });
@@ -6433,7 +6439,7 @@ async function bufferGcArbitrationWorkflow() {
   const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-local-${testId}-`));
   const localHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-buffer-gc-local-home-${testId}-`));
   try {
-    const localEnv = { ...env, HOME: localHome };
+    const localEnv = { ...env, HOME: localHome, USERPROFILE: localHome };
     run(process.execPath, [hccBin, '--root', localRoot, 'init', '--no-guidance'], { env: localEnv });
     const directory = path.join(localRoot, '.hello-cc', 'bufs');
     fs.mkdirSync(directory, { recursive: true });
@@ -7007,7 +7013,7 @@ async function downGcPackWorkflow() {
   ]) {
     if (!files.has(file)) fail(`npm package missing ${file}`);
   }
-  const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
+  const packageVersion = JSON.parse(readSourceText(path.join(repoRoot, 'package.json'))).version;
   const releaseCheck = run('npm', ['run', 'release:check']);
   if (!releaseCheck.includes(`release notes ok: ${packageVersion}`)) fail(`release check output wrong:\n${releaseCheck}`);
   const releaseNotes = run('npm', ['run', 'release:notes']);
@@ -7022,12 +7028,12 @@ async function downGcPackWorkflow() {
   if (!githubRelease.ok || !githubRelease.dry_run || githubRelease.repo !== 'Dullne/hello-cc' || githubRelease.tag !== `v${packageVersion}` || githubRelease.body_length < 100) {
     fail(`github release dry run output wrong:\n${JSON.stringify(githubRelease, null, 2)}`);
   }
-  const docsIndex = fs.readFileSync(path.join(repoRoot, 'docs', 'README.md'), 'utf8');
-  const docsIndexZh = fs.readFileSync(path.join(repoRoot, 'docs', 'README.zh-CN.md'), 'utf8');
+  const docsIndex = readSourceText(path.join(repoRoot, 'docs', 'README.md'));
+  const docsIndexZh = readSourceText(path.join(repoRoot, 'docs', 'README.zh-CN.md'));
   if (!docsIndex.includes('github-release.yml') || !docsIndex.includes('workflow_dispatch') || !docsIndexZh.includes('github-release.yml') || !docsIndexZh.includes('workflow_dispatch')) {
     fail('docs index missing GitHub Release publishing command');
   }
-  const workflow = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'github-release.yml'), 'utf8');
+  const workflow = readSourceText(path.join(repoRoot, '.github', 'workflows', 'github-release.yml'));
   for (const expected of [
     'Publish GitHub Release',
     "tags:\n      - 'v*'",
@@ -7082,7 +7088,7 @@ function identityEnforcementWorkflow() {
   const identityHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-reg-identity-home-${testId}-`));
   const identityEnv = {
     ...env,
-    HOME: identityHome,
+    HOME: identityHome, USERPROFILE: identityHome,
     HCC_PEER: 'real-peer'
   };
   delete identityEnv.HCC_ROOT;
@@ -7229,26 +7235,26 @@ async function syntaxAndHelp() {
     run(process.execPath, ['--check', path.join(repoRoot, file)]);
   }
   // bin/hcc.mjs is a thin entry; the CLI composition lives in lib/cli/app.mjs.
-  const hccSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'app.mjs'), 'utf8');
-  const binSource = fs.readFileSync(hccBin, 'utf8');
-  const coordinationStateSource = fs.readFileSync(path.join(repoRoot, 'lib', 'coordination-state.mjs'), 'utf8');
-  const errorsCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'errors.mjs'), 'utf8');
-  const sharedErrorsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shared', 'errors.mjs'), 'utf8');
-  const setupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'setup.mjs'), 'utf8');
-  const shimScriptCompatSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shim-script.mjs'), 'utf8');
-  const integrationHooksSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'), 'utf8');
-  const integrationShimsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'), 'utf8');
-  const integrationShimScriptSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'), 'utf8');
-  const shellPathSource = fs.readFileSync(path.join(repoRoot, 'lib', 'shell-path.mjs'), 'utf8');
-  const webPeerActionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'), 'utf8');
-  const webUiTemplateSource = ['ui-template.mjs', 'browser/core.mjs'].map(name => fs.readFileSync(path.join(repoRoot, 'lib', 'web', name), 'utf8')).join('\n');
-  const tmuxSafetySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'), 'utf8');
+  const hccSource = readSourceText(path.join(repoRoot, 'lib', 'cli', 'app.mjs'));
+  const binSource = readSourceText(hccBin);
+  const coordinationStateSource = readSourceText(path.join(repoRoot, 'lib', 'coordination-state.mjs'));
+  const errorsCompatSource = readSourceText(path.join(repoRoot, 'lib', 'errors.mjs'));
+  const sharedErrorsSource = readSourceText(path.join(repoRoot, 'lib', 'shared', 'errors.mjs'));
+  const setupSource = readSourceText(path.join(repoRoot, 'lib', 'setup.mjs'));
+  const shimScriptCompatSource = readSourceText(path.join(repoRoot, 'lib', 'shim-script.mjs'));
+  const integrationHooksSource = readSourceText(path.join(repoRoot, 'lib', 'integrations', 'hooks.mjs'));
+  const integrationShimsSource = readSourceText(path.join(repoRoot, 'lib', 'integrations', 'shims.mjs'));
+  const integrationShimScriptSource = readSourceText(path.join(repoRoot, 'lib', 'integrations', 'shims', 'script.mjs'));
+  const shellPathSource = readSourceText(path.join(repoRoot, 'lib', 'shell-path.mjs'));
+  const webPeerActionsSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'peer-actions.mjs'));
+  const webUiTemplateSource = ['ui-template.mjs', 'browser/core.mjs'].map(name => readSourceText(path.join(repoRoot, 'lib', 'web', name))).join('\n');
+  const tmuxSafetySource = readSourceText(path.join(repoRoot, 'lib', 'core', 'peers', 'tmux-safety.mjs'));
   // cmdWeb moved whole to lib/web/runtime-main.mjs; subsystem modules extend it
   const cmdWebSource = [
     'runtime-main.mjs', 'project-contexts.mjs', 'external-sessions.mjs',
     'liveness-reaper.mjs', 'buffer-gc-runtime.mjs', 'tmux-sessions.mjs',
     'auto-attach.mjs', 'pty-sessions.mjs', 'http-routes.mjs'
-  ].map((f) => fs.readFileSync(path.join(repoRoot, 'lib', 'web', f), 'utf8')).join('\n');
+  ].map((f) => readSourceText(path.join(repoRoot, 'lib', 'web', f))).join('\n');
   for (const expected of [
     'statusSnapshot: webStatusSnapshot',
     'statusSummary: webStatusSummary',
@@ -7263,25 +7269,27 @@ async function syntaxAndHelp() {
       fail(`cmdWeb project-safe coordination factory wiring missing: ${expected}`);
     }
   }
-  const migrationConnectionSource = fs.readFileSync(path.join(repoRoot, 'lib', 'db', 'connection.mjs'), 'utf8');
+  const migrationConnectionSource = readSourceText(path.join(repoRoot, 'lib', 'db', 'connection.mjs'));
+  const registeredMigrationSource = migrationConnectionSource.slice(
+    migrationConnectionSource.indexOf('function migrateRegisteredProjectDbs(ctx)'));
   for (const expected of [
     'resolved = resolveProjectDatabase({',
     'root: project.root',
     'createStateDir: false',
     'const dbPath = resolved.db',
-    'db = new DatabaseSync(dbPath'
+    'db = retainWindowsDatabase(new DatabaseSync(dbPath'
   ]) {
-    if (!migrationConnectionSource.includes(expected)) {
+    if (!registeredMigrationSource.includes(expected)) {
       fail(`registered migration project-path recheck missing: ${expected}`);
     }
   }
-  if (migrationConnectionSource.indexOf('resolved = resolveProjectDatabase({') >
-      migrationConnectionSource.indexOf('db = new DatabaseSync(dbPath')) {
+  if (registeredMigrationSource.indexOf('resolved = resolveProjectDatabase({') >
+      registeredMigrationSource.indexOf('new DatabaseSync(dbPath')) {
     fail('registered migration opens a sibling database before its project-path recheck');
   }
   // skip the old hccSource-based migration fanout check (code moved to lib/db/connection.mjs)
   const migrationFanoutSource = '';
-  const tmuxStreamSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'), 'utf8');
+  const tmuxStreamSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'tmux-stream.mjs'));
   // Display refresh responsiveness and stale-frame suppression are exercised
   // behaviorally in tmux-display-http/refresh.test.mjs.
   for (const expected of [
@@ -7298,7 +7306,7 @@ async function syntaxAndHelp() {
     if (!cmdWebSource.includes(expected)) fail(`web terminal input refresh support missing: ${expected}`);
   }
   // hccWebProcessMatches/splitProcessArgs/stopOrphanWebRuntimes moved to lib/web/startup.mjs
-  const webStartupSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'startup.mjs'), 'utf8');
+  const webStartupSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'startup.mjs'));
   for (const expected of [
     'function hccWebProcessMatches(',
     'const { global, rest } = splitGlobalArgs(hccArgs);',
@@ -7362,10 +7370,10 @@ async function syntaxAndHelp() {
     fail('web stop kill_tmux still kills tmux by session name without DB-proven guard');
   }
   // tmux GC helpers moved to lib/cli/commands/tmux.mjs
-  const tmuxGcSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'tmux.mjs'), 'utf8');
-  const webAutoAttachSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'auto-attach.mjs'), 'utf8');
-  const webTmuxSessionsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'tmux-sessions.mjs'), 'utf8');
-  const webProjectContextsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'project-contexts.mjs'), 'utf8');
+  const tmuxGcSource = readSourceText(path.join(repoRoot, 'lib', 'cli', 'commands', 'tmux.mjs'));
+  const webAutoAttachSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'auto-attach.mjs'));
+  const webTmuxSessionsSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'tmux-sessions.mjs'));
+  const webProjectContextsSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'project-contexts.mjs'));
   for (const expected of [
     'async function cmdTmux(',
     'async function planTmuxGc(',
@@ -7500,7 +7508,7 @@ async function syntaxAndHelp() {
   if (webUiTemplateSource.includes("sessionRuntimeNote(s) + (s.command || '')")) {
     fail('managed session display still uses command text as the primary runtime identity');
   }
-  const sessionSerializeSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'), 'utf8');
+  const sessionSerializeSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'session-serialize.mjs'));
   for (const expected of [
     'function sessionBindingForSerialize(db, session, peerId)',
     'function serializeBindingSummary(binding, session)',
@@ -7553,7 +7561,7 @@ async function syntaxAndHelp() {
       websocketInputSource.includes('session.actionToken')) {
     fail('terminal WebSocket input must use the shared constant-time token comparator');
   }
-  const webSessionLifecycleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'), 'utf8');
+  const webSessionLifecycleSource = readSourceText(path.join(repoRoot, 'lib', 'web', 'cookie-auth.mjs'));
   for (const expected of [
     'ws.close(4001, reason)',
     "session.expiresAt <= t) closeWebSession(sid, 'session expired')",
@@ -7599,7 +7607,7 @@ async function syntaxAndHelp() {
   ]) {
     if (!webPeerActionsSource.includes(expected)) fail(`web peer action helper missing: ${expected}`);
   }
-  const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
+  const packageVersion = JSON.parse(readSourceText(path.join(repoRoot, 'package.json'))).version;
   const cliVersion = run(process.execPath, [hccBin, '--version']).trim();
   if (cliVersion !== packageVersion) {
     fail(`CLI version ${cliVersion} does not match package.json ${packageVersion}`);
@@ -7624,8 +7632,8 @@ async function syntaxAndHelp() {
   if (releaseScriptRoot !== repoRoot) {
     fail(`release packageRoot resolved ${releaseScriptRoot}, expected ${repoRoot}`);
   }
-  const releaseNotesScriptSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'release-notes.mjs'), 'utf8');
-  const githubReleaseScriptSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'github-release.mjs'), 'utf8');
+  const releaseNotesScriptSource = readSourceText(path.join(repoRoot, 'scripts', 'release-notes.mjs'));
+  const githubReleaseScriptSource = readSourceText(path.join(repoRoot, 'scripts', 'github-release.mjs'));
   if (!releaseNotesScriptSource.includes("../lib/release/package-meta.mjs") ||
       !releaseNotesScriptSource.includes("../lib/release/release-notes.mjs") ||
       !githubReleaseScriptSource.includes("../lib/release/package-meta.mjs") ||
@@ -7710,7 +7718,7 @@ async function syntaxAndHelp() {
   }
   const oldErrorImportPattern = /from ['"](?:\.\.\/lib\/errors|\.\/errors|\.\.\/errors|\.\.\/\.\.\/errors)\.mjs['"]/;
   for (const file of ['bin/hcc.mjs', ...libModuleFiles()]) {
-    const source = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+    const source = readSourceText(path.join(repoRoot, file));
     if (file !== 'lib/errors.mjs' && oldErrorImportPattern.test(source)) {
       fail(`${file} still imports CliError through the old errors module`);
     }
@@ -7853,7 +7861,7 @@ async function syntaxAndHelp() {
   try {
     const noProviderEnv = {
       ...env,
-      HOME: noProviderHome,
+      HOME: noProviderHome, USERPROFILE: noProviderHome,
       PATH: '/usr/bin:/bin',
       SHELL: '/bin/bash'
     };
@@ -7872,7 +7880,7 @@ async function syntaxAndHelp() {
   try {
     const fishEnv = {
       ...env,
-      HOME: fishHome,
+      HOME: fishHome, USERPROFILE: fishHome,
       SHELL: '/usr/bin/fish'
     };
     const fishInstall = run(process.execPath, [hccBin, '--root', root, 'shim', 'install'], { env: fishEnv });
@@ -7889,7 +7897,7 @@ async function syntaxAndHelp() {
   try {
     const missingRcEnv = {
       ...env,
-      HOME: missingRcHome,
+      HOME: missingRcHome, USERPROFILE: missingRcHome,
       SHELL: '/bin/bash'
     };
     const uninstallOutput = run(process.execPath, [hccBin, '--root', root, 'shim', 'uninstall'], { env: missingRcEnv });
@@ -7906,7 +7914,7 @@ async function syntaxAndHelp() {
     fs.writeFileSync(path.join(partialStatusDir, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
     const partialStatusEnv = {
       ...env,
-      HOME: partialStatusHome,
+      HOME: partialStatusHome, USERPROFILE: partialStatusHome,
       SHELL: '/bin/bash'
     };
     const statusOutput = run(process.execPath, [hccBin, '--root', root, 'shim', 'status'], { env: partialStatusEnv });
@@ -7926,7 +7934,7 @@ async function syntaxAndHelp() {
     fs.writeFileSync(path.join(partialShimDir, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
     const partialShimEnv = {
       ...env,
-      HOME: partialShimHome,
+      HOME: partialShimHome, USERPROFILE: partialShimHome,
       SHELL: '/bin/bash'
     };
     run(process.execPath, [hccBin, '--root', partialShimRoot, 'setup', '--quiet'], { env: partialShimEnv });
@@ -7953,7 +7961,7 @@ async function syntaxAndHelp() {
     }));
     const scanEnv = {
       ...env,
-      HOME: scanHome
+      HOME: scanHome, USERPROFILE: scanHome
     };
     const scanOutput = run(process.execPath, [hccBin, '--root', scanRealRoot, 'scan'], { env: scanEnv });
     if (scanOutput.includes('scan-realpath-session') || scanOutput.includes('scan-realpath')) {
@@ -8063,12 +8071,13 @@ async function syntaxAndHelp() {
     if (typeof compatRuntimeState[name] !== 'function') fail(`runtime state compat module missing export: ${name}`);
   }
   const savedRuntimeEnv = {
-    HOME: process.env.HOME,
+    HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE,
     HCC_RUNTIME_URL: process.env.HCC_RUNTIME_URL,
     HCC_RUNTIME_TOKEN: process.env.HCC_RUNTIME_TOKEN
   };
   try {
     process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-state-home-'));
+    process.env.USERPROFILE = process.env.HOME;
     delete process.env.HCC_RUNTIME_URL;
     delete process.env.HCC_RUNTIME_TOKEN;
     const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-runtime-state-root-'));
@@ -9076,8 +9085,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds session launch helper: ${helper}`);
   }
-  const sessionLaunchSource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'sessions', 'launch.mjs'), 'utf8');
-  const compatSessionLaunchSource = fs.readFileSync(path.join(repoRoot, 'lib', 'session-launch.mjs'), 'utf8');
+  const sessionLaunchSource = readSourceText(path.join(repoRoot, 'lib', 'core', 'sessions', 'launch.mjs'));
+  const compatSessionLaunchSource = readSourceText(path.join(repoRoot, 'lib', 'session-launch.mjs'));
   if (sessionLaunchSource.includes("from '../../terminal/") ||
       sessionLaunchSource.includes("from '../terminal/") ||
       sessionLaunchSource.includes('tmuxSessionEnvironmentValue')) {
@@ -9263,8 +9272,8 @@ async function syntaxAndHelp() {
   ]) {
     if (hccSource.includes(helper)) fail(`CLI still embeds provider command helper: ${helper}`);
   }
-  const providerCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'integrations', 'providers.mjs'), 'utf8');
-  const compatProviderCommandsSource = fs.readFileSync(path.join(repoRoot, 'lib', 'provider-commands.mjs'), 'utf8');
+  const providerCommandsSource = readSourceText(path.join(repoRoot, 'lib', 'integrations', 'providers.mjs'));
+  const compatProviderCommandsSource = readSourceText(path.join(repoRoot, 'lib', 'provider-commands.mjs'));
   if (!providerCommandsSource.includes("from '../core/peers/session.mjs'") ||
       providerCommandsSource.includes('function providerSessionPeerId') ||
       providerCommandsSource.includes('function providerSessionParts')) {
@@ -9739,16 +9748,16 @@ async function syntaxAndHelp() {
     fail('peer format module behavior changed');
   }
   for (const [label, source, expectedImport] of [
-    ['peer session', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs'), 'utf8'), "from './format.mjs'"],
-    ['team planning', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs'), 'utf8'), "from '../peers/format.mjs'"],
-    ['peer identity', fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'), 'utf8'), "from './format.mjs'"]
+    ['peer session', readSourceText(path.join(repoRoot, 'lib', 'core', 'peers', 'session.mjs')), "from './format.mjs'"],
+    ['team planning', readSourceText(path.join(repoRoot, 'lib', 'core', 'coordination', 'teams.mjs')), "from '../peers/format.mjs'"],
+    ['peer identity', readSourceText(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs')), "from './format.mjs'"]
   ]) {
     if (!source.includes(expectedImport)) fail(`${label} module does not import peer format helpers`);
     if (source.includes('function sanitizePeerPart') || source.includes('function shortHash')) {
       fail(`${label} module still embeds peer format helpers`);
     }
   }
-  const corePeerIdentitySource = fs.readFileSync(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'), 'utf8');
+  const corePeerIdentitySource = readSourceText(path.join(repoRoot, 'lib', 'core', 'peers', 'identity.mjs'));
   if (corePeerIdentitySource.includes('process.env') ||
       corePeerIdentitySource.includes('spawnSync(') ||
       corePeerIdentitySource.includes('/proc/')) {
@@ -9885,7 +9894,9 @@ async function syntaxAndHelp() {
     if (typeof compatProjectRegistry[name] !== 'function') fail(`project registry compat module missing export: ${name}`);
   }
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+    process.env.USERPROFILE = home;
   try {
     const registryRootA = path.join(root, 'registry-a');
     const registryRootB = path.join(root, 'registry-b');
@@ -9947,6 +9958,8 @@ async function syntaxAndHelp() {
   } finally {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
   }
   for (const helper of [
     'function runtimeBaseUrl',
@@ -10000,7 +10013,7 @@ async function syntaxAndHelp() {
   const expectEqual = (actual, expected, label) => {
     if (actual !== expected) fail(`${label}: expected ${expected}, got ${actual}`);
   };
-  const html = webUiTemplate.webIndexHtml({ nonce: 'regression-template-nonce' });
+  const html = webUiTemplate.webIndexHtml({ nonce: 'regression-template-nonce' }).replace(/\r\n/g, '\n');
   if (!html.includes('<!doctype html>') ||
       !html.includes('<div class="app" data-view="terminal">') ||
       !html.includes('<script src="/assets/xterm.js"></script>') ||
@@ -10110,9 +10123,11 @@ async function syntaxAndHelp() {
   }
   const tlsHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-tls-${testId}-`));
   const savedTlsHome = process.env.HOME;
+  const savedTlsUserProfile = process.env.USERPROFILE;
   let tlsCredentials;
   try {
     process.env.HOME = tlsHome;
+    process.env.USERPROFILE = tlsHome;
     const webTls = await import(path.join(repoRoot, 'lib', 'web', 'tls.mjs'));
     tlsCredentials = webTls.ensureSelfSignedCert();
     const tlsDir = path.join(fs.realpathSync(tlsHome), '.hello-cc', 'tls');
@@ -10200,6 +10215,8 @@ async function syntaxAndHelp() {
   } finally {
     if (savedTlsHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedTlsHome;
+    if (savedTlsUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedTlsUserProfile;
   }
   const tlsProbe = https.createServer({ key: tlsCredentials.key, cert: tlsCredentials.cert }, (req, res) => res.end('tls-ok'));
   try {
@@ -10295,7 +10312,7 @@ async function syntaxAndHelp() {
       !taskHelp.includes('task update --status STATUS')) {
     fail(`task help missing current-task task next semantics:\n${taskHelp}`);
   }
-  const taskModuleSource = fs.readFileSync(path.join(repoRoot, 'lib', 'cli', 'commands', 'task.mjs'), 'utf8');
+  const taskModuleSource = readSourceText(path.join(repoRoot, 'lib', 'cli', 'commands', 'task.mjs'));
   for (const expected of [
     "if (sub === 'dispatch') return taskDispatch",
     'async function taskDispatch(ctx, args)',
@@ -10404,7 +10421,7 @@ function uninstallWorkflow() {
   fs.mkdirSync(uninstallHome, { recursive: true });
   const uninstallEnv = {
     ...env,
-    HOME: uninstallHome,
+    HOME: uninstallHome, USERPROFILE: uninstallHome,
     PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`
   };
 
@@ -10793,7 +10810,7 @@ function cliOnlyClockSafetyWorkflow() {
   log('CLI-only clock safety: live renew, unknown grace, dead cleanup, read-only observers');
   const clockRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-clock-root-${testId}-`));
   const clockHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-clock-home-${testId}-`));
-  const clockEnv = { ...env, HOME: clockHome };
+  const clockEnv = { ...env, HOME: clockHome, USERPROFILE: clockHome };
   for (const key of Object.keys(clockEnv)) {
     if (key.startsWith('HCC_')) delete clockEnv[key];
   }
@@ -10958,7 +10975,7 @@ function gcClockSubjectDriftWorkflow() {
   log('GC clock safety: concurrently introduced expired lock is not swept');
   const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-clock-root-${testId}-`));
   const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-clock-home-${testId}-`));
-  const gcEnv = { ...env, HOME: gcHome };
+  const gcEnv = { ...env, HOME: gcHome, USERPROFILE: gcHome };
   for (const key of Object.keys(gcEnv)) {
     if (key.startsWith('HCC_')) delete gcEnv[key];
   }
@@ -11019,7 +11036,7 @@ function gcOutputConsistencyWorkflow() {
   log('GC output: text and JSON report the same snapshot counts');
   const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-output-root-${testId}-`));
   const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-output-home-${testId}-`));
-  const gcEnv = { ...env, HOME: gcHome };
+  const gcEnv = { ...env, HOME: gcHome, USERPROFILE: gcHome };
   for (const key of Object.keys(gcEnv)) {
     if (key.startsWith('HCC_')) delete gcEnv[key];
   }
@@ -11082,7 +11099,7 @@ function manualGcRetentionContractWorkflow() {
   log('manual GC: explicit history retention and clock-safe age cleanup');
   const gcRoot = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-contract-root-${testId}-`));
   const gcHome = fs.mkdtempSync(path.join(os.tmpdir(), `hcc-gc-contract-home-${testId}-`));
-  const gcEnv = { ...env, HOME: gcHome };
+  const gcEnv = { ...env, HOME: gcHome, USERPROFILE: gcHome };
   for (const key of Object.keys(gcEnv)) {
     if (key.startsWith('HCC_')) delete gcEnv[key];
   }
@@ -11824,6 +11841,11 @@ async function main() {
   cleanup();
   assertNoRegressionTmuxSessionLeak();
   log('FULL_REGRESSION_OK');
+}
+
+if (isRegressionEntry() && process.platform === 'win32') {
+  process.stderr.write('The POSIX regression fixtures cannot run on native Windows: changing HOME does not isolate the account PATH in HKCU. See docs/windows-native.md and run scripts/windows-installed-acceptance.mjs for isolated Windows acceptance.\n');
+  process.exit(1);
 }
 
 if (isRegressionEntry()) main().catch((err) => {

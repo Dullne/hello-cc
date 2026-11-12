@@ -20,7 +20,9 @@ import { createNativeStore, nativePaths, readNativePointer, writeNativePointer }
 import { createAgentDefaults } from '../lib/web/agent-defaults.mjs';
 import { createSessionSerialize } from '../lib/web/session-serialize.mjs';
 import { createSessionSync } from '../lib/web/browser/session-sync.mjs';
-import { createNativeTestRoot } from './helpers/native-root.mjs';
+import { createPrivateNativeTestRoot as createNativeTestRoot, createNativeTestContext, isolateNativeTestProfile } from './helpers/native-root.mjs';
+
+isolateNativeTestProfile();
 
 // Web bridge tests exercise real HTTP and durable SQLite ownership. Native
 // listener admission has dedicated runtime/file-lock tests; keep these fixtures
@@ -46,8 +48,7 @@ function createFixtureOwnership() {
 // provider adapters. No model, account, external terminal, or tmux is invoked.
 async function fixture(t, configuration = {}) {
   const root = await createNativeTestRoot('hcc-web-native-');
-  const ctx = { root, dbPath: path.join(root, '.hello-cc', 'mesh.db') };
-  fs.mkdirSync(path.dirname(ctx.dbPath));
+  const ctx = createNativeTestContext(root);
   const mesh = new DatabaseSync(ctx.dbPath);
   initSchema(mesh);
   mesh.exec('PRAGMA journal_mode=WAL');
@@ -100,7 +101,7 @@ async function fixture(t, configuration = {}) {
     adapters.set(peer, adapter); created.push(adapter); return adapter;
   } };
   let service = await startNativeService(ctx, deps, options);
-  const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: 3000 });
+  const api = (method, route, body) => nativeRequest(ctx, method, route, body, { timeoutMs: process.platform === 'win32' ? 35000 : 3000 });
   const key = (project, id) => project.root + '\0' + id;
   function bridge(nativeApi = nativeRequest, sessions = new Map(), options = {}) {
     const broadcasts = [], closedClients = [];

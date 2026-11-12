@@ -92,7 +92,7 @@ test('CLI-only GC dry-run with the same pending gap keeps the complete meta tabl
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-gc-preview-clock-'));
   const root = path.join(directory, 'project');
   const env = {
-    HOME: path.join(directory, 'home'),
+    HOME: path.join(directory, 'home'), USERPROFILE: path.join(directory, 'home'),
     CODEX_HOME: path.join(directory, 'codex'),
     CLAUDE_CONFIG_DIR: path.join(directory, 'claude'),
     TMPDIR: path.join(directory, 'tmp'),

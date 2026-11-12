@@ -13,6 +13,7 @@ import * as lockModule from '../lib/shared/file-lock.mjs';
 const { withFileLock } = lockModule;
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const lockModuleUrl = pathToFileURL(path.join(repoRoot, 'lib/shared/file-lock.mjs')).href;
+const directoryAliasType = process.platform === 'win32' ? 'junction' : 'dir';
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-socket-lock-'));
@@ -548,7 +549,7 @@ test('derives a fixed endpoint from the canonical target and shares it with alia
   const realParent = path.join(root, 'real');
   const aliasParent = path.join(root, 'alias');
   fs.mkdirSync(realParent);
-  fs.symlinkSync(realParent, aliasParent, 'dir');
+  fs.symlinkSync(realParent, aliasParent, directoryAliasType);
   const realTarget = path.join(realParent, 'registry.json');
   const aliasTarget = path.join(aliasParent, 'registry.json');
   assert.equal(typeof lockModule.fileLockEndpoint, 'function');
@@ -578,7 +579,7 @@ test('passes the fixed canonical target to the callback across alias retargeting
   const firstParent = path.join(root, 'first');
   const aliasParent = path.join(root, 'alias');
   fs.mkdirSync(firstParent);
-  fs.symlinkSync(firstParent, aliasParent, 'dir');
+  fs.symlinkSync(firstParent, aliasParent, directoryAliasType);
   const aliasTarget = path.join(aliasParent, 'registry.json');
   const firstTarget = path.join(firstParent, 'registry.json');
   const canonicalRoot = fs.realpathSync.native(root);
@@ -605,7 +606,7 @@ test('passes the fixed canonical target to the callback across alias retargeting
   const result = withFileLock(aliasTarget, (lockedTarget) => {
     assert.equal(lockedTarget, path.join(fs.realpathSync.native(firstParent), 'registry.json'));
     fs.unlinkSync(aliasParent);
-    fs.symlinkSync(secondParent, aliasParent, 'dir');
+    fs.symlinkSync(secondParent, aliasParent, directoryAliasType);
 
     const directResult = withFileLock(secondTarget, (directTarget) => {
       assert.equal(directTarget, path.join(fs.realpathSync.native(secondParent), 'registry.json'));
@@ -626,7 +627,7 @@ test('a retargeted parent alias remains locked while the new direct target stays
   const firstParent = path.join(root, 'first');
   const aliasParent = path.join(root, 'alias');
   fs.mkdirSync(firstParent);
-  fs.symlinkSync(firstParent, aliasParent, 'dir');
+  fs.symlinkSync(firstParent, aliasParent, directoryAliasType);
   const aliasTarget = path.join(aliasParent, 'registry.json');
   const firstTarget = path.join(firstParent, 'registry.json');
   const occupiedPorts = new Set([
@@ -653,7 +654,7 @@ test('a retargeted parent alias remains locked while the new direct target stays
     (error) => error?.code === 'ERR_FILE_LOCK_BUSY'
   );
   fs.unlinkSync(aliasParent);
-  fs.symlinkSync(secondParent, aliasParent, 'dir');
+  fs.symlinkSync(secondParent, aliasParent, directoryAliasType);
   let aliasContenderRan = false;
   assert.throws(
     () => withFileLock(aliasTarget, () => { aliasContenderRan = true; }, { nonblocking: true }),
@@ -665,7 +666,7 @@ test('a retargeted parent alias remains locked while the new direct target stays
   fs.writeFileSync(holder.release, 'go');
   await waitForExit(holder.child);
   fs.unlinkSync(aliasParent);
-  fs.symlinkSync(firstParent, aliasParent, 'dir');
+  fs.symlinkSync(firstParent, aliasParent, directoryAliasType);
   assert.equal(withFileLock(aliasTarget, () => 'restored', { nonblocking: true }), 'restored');
 });
 
@@ -676,13 +677,13 @@ test('releases and rejects when a parent alias is retargeted during acquisition'
   const aliasParent = path.join(root, 'alias');
   fs.mkdirSync(firstParent);
   fs.mkdirSync(secondParent);
-  fs.symlinkSync(firstParent, aliasParent, 'dir');
+  fs.symlinkSync(firstParent, aliasParent, directoryAliasType);
   let released = false;
   let callbackRan = false;
   const lock = lockModule.createFileLock({
     workerFactory({ state, states }) {
       fs.unlinkSync(aliasParent);
-      fs.symlinkSync(secondParent, aliasParent, 'dir');
+      fs.symlinkSync(secondParent, aliasParent, directoryAliasType);
       Atomics.store(state, 0, states.ACQUIRED);
       return {
         unref() {},

@@ -24,11 +24,11 @@ function fixture(t) {
   fs.mkdirSync(otherRoot);
   fs.chmodSync(otherRoot, 0o777); // Browser may select a root requiring private state.
   fs.symlinkSync(otherRoot, alias, 'dir');
-  const previousHome = process.env.HOME;
-  process.env.HOME = home;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home; process.env.USERPROFILE = home;
   t.after(() => {
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile;
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
   const ctx = contextForProject(root);

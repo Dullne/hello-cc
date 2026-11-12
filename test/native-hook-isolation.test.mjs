@@ -33,20 +33,21 @@ function fixture(t, provider) {
     .run(peer, provider, peer, owner);
   db.prepare("INSERT INTO messages(sender,recipient,body,created_at) VALUES ('human',?,'native-inbox-must-stay-unread',1)").run(peer);
   db.prepare("INSERT INTO locks(resource,base_resource,owner,expires_at,created_at,ttl_sec) VALUES ('src/owned.js','src/owned.js',?,1,1,60)").run(peer);
-  const previousHome = process.env.HOME;
+  const previousHome = process.env.HOME; const previousHomeUserProfile = process.env.USERPROFILE;
   let guard;
   try {
-    process.env.HOME = home;
+    process.env.HOME = home; process.env.USERPROFILE = home;
     guard = claimNativeOwner({ root, dbPath }, { rootIdentity: captureSelectedCwdSnapshot(root),
       identity: inspectProcessIdentity(process.pid).identity, generation: 'test-generation' });
-  } finally { process.env.HOME = previousHome; }
+  } finally { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousHomeUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousHomeUserProfile; }
   t.after(() => {
     if (!guard.lost) guard.release();
     guard.db.close(); db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const env = {
-    ...process.env, HOME: home, HCC_RUNTIME_URL: '',
+    ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '',
     HCC_ROOT: root, HCC_DB: dbPath, HCC_PEER: peer, HCC_NATIVE_OWNER: owner
   };
   const read = (table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => ({ ...row }));

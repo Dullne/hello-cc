@@ -21,7 +21,7 @@ test('a managed hook cannot rebind an initialized A project to replacement B',
     fs.mkdirSync(root);
     fs.mkdirSync(home, { mode: 0o700 });
     t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-    const env = { ...process.env, HOME: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, HCC_RUNTIME_URL: '', NODE_NO_WARNINGS: '1' };
     const cli = (args, extraEnv = env, input = '') => spawnSync(process.execPath,
       [hcc, '--root', root, '--json', ...args], {
         cwd: base, env: extraEnv, input, encoding: 'utf8', timeout: 10000

@@ -174,7 +174,7 @@ test('probe startup writes stay in temporary homes and are cleaned on success an
   const originalConfig = fs.readFileSync(path.join(f.home, 'hooks.json'));
   for (const shouldThrow of [false, true]) {
     const temporaryPaths = [];
-    const report = diagnoseCodex(f.ctx, f.db, options(f, { env: { HOME: originalHome, CODEX_HOME: f.home },
+    const report = diagnoseCodex(f.ctx, f.db, options(f, { env: { HOME: originalHome, USERPROFILE: originalHome, CODEX_HOME: f.home },
       run(_binary, args, config) {
         temporaryPaths.push(config.env.HOME, config.env.CODEX_HOME);
         assert.notEqual(config.env.HOME, originalHome); assert.notEqual(config.env.CODEX_HOME, f.home);

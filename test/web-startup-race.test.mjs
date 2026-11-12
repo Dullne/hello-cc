@@ -52,7 +52,7 @@ test('concurrent web starts converge on one healthy background runtime', {
   const port = await freePort();
   const env = {
     ...process.env,
-    HOME: home,
+    HOME: home, USERPROFILE: home,
     HCC_SKIP_SHIM_INSTALL: '1',
     HCC_NO_AUTO_INSTALL_TMUX: '1'
   };
