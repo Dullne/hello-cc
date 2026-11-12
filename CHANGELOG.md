@@ -17,6 +17,42 @@ the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
 
+## 1.2.0
+
+### Summary
+
+Add native Windows support for the HCC CLI, Web file workflows, background
+agents, and persistent managed terminals. Windows users can run HCC from
+PowerShell or cmd without WSL, Git Bash, or tmux.
+
+### Highlights
+
+- Add a verified Windows x64 native component for private state, handle-relative
+  project files, SQLite/WAL lifetime, process identity, Job Object ownership,
+  ConPTY terminals, and safe atomic publication.
+- Add a per-user terminal host that keeps owned terminals alive across Web
+  restarts and enforces authenticated reconnects, bounded output, generations,
+  and controller epochs.
+- Add Windows hooks, provider shims, literal executable/argument resolution,
+  environment diagnostics, and public CLI task/message/lock workflows for
+  Unicode and space-containing paths.
+- Add Windows database migration backups with native identity receipts,
+  overlapping write/path guards, ACL checks, and confirmed directory flushes.
+- Preserve existing POSIX backends and reject unsupported legacy state imports,
+  ARM64, UNC/network filesystems, non-NTFS paths, and automatic Windows
+  self-signed TLS with explicit diagnostics.
+
+### Validation
+
+The 1.2.0 release passed 210 Windows tests with zero failures or skips on
+Windows 11 x64, local NTFS, and Node.js 24.22.3. Linux passed 2,127 unit tests
+with 182 explicit platform skips and zero failures, followed by all 13 stages
+of the integration regression. The final package was independently installed
+and exercised through task/message/lock operations, Web restart terminal
+reconnect, controlled input, terminal cleanup, and native service lifecycle.
+Windows 10, macOS runtime behavior, hosted CI, and real provider account/model
+workflows require separate acceptance.
+
 ## 1.1.6
 
 ### Summary

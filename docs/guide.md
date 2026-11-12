@@ -45,9 +45,9 @@ the supported downgrade contract.
 Install Node.js 24 or newer from the official Node.js packages or a Node
 version manager. On Linux/macOS, browser terminals also require `tmux`.
 Native Windows uses the packaged ConPTY service; follow the separate
-[Windows guide](windows-native.md) for this development version and its tested scope.
+[Windows guide](windows-native.md) for version 1.2.0 and its tested scope.
 
-After installing a verified Windows candidate, use PowerShell for a local workbench:
+After installing hello-cc 1.2.0 on Windows, use PowerShell for a local workbench:
 
 ```powershell
 hcc doctor --environment

@@ -1,6 +1,6 @@
 # Windows native validation record
 
-This record describes the native Windows development candidate checked on 2026-11-12. It records completed checks separately from unverified environments. It is not a published-release announcement. Setup instructions are in [Native Windows support](windows-native.md), and the implementation checklist is in the [approved plan](superpowers/plans/2026-11-12-windows-native-support.md).
+This record describes the native Windows support released as hello-cc 1.2.0 and checked on 2026-11-12. It records completed checks separately from unverified environments. Setup instructions are in [Native Windows support](windows-native.md), and the implementation checklist is in the [approved plan](superpowers/plans/2026-11-12-windows-native-support.md).
 
 ## Tested environment
 
@@ -60,7 +60,7 @@ The final run checked environment doctor, project initialization and database do
 
 The tested archive is `.superpowers/deliverables/hello-cc-windows-native-candidate.tgz`, assembled on Linux to retain executable modes for the existing POSIX helpers. Its SHA-256 is `5e54aa154aa34bb8403d17e502c9214d422add856d1e8746b0a00273b639ba85`. Windows installed acceptance used this exact archive through `--package-input`; the final report is `.superpowers/sdd/2026-11-12-windows-native-support/windows-installed-final.json`. All 339 packaged runtime files and `package.json` matched the final local implementation byte for byte. This validation document is updated after execution; the archive's embedded documentation records its earlier assembly checkpoint.
 
-All four POSIX helper source hashes, architectures and executable modes passed the package gate. The Windows addon and launcher passed source/binary hash, protocol and PE architecture checks. These static checks do not establish a macOS runtime acceptance result. The package retains version `1.1.6` as a local development candidate; these changes have not been published to npm.
+All four POSIX helper source hashes, architectures and executable modes passed the package gate. The Windows addon and launcher passed source/binary hash, protocol and PE architecture checks. These static checks do not establish a macOS runtime acceptance result. The package version is `1.2.0`; npm publication and registry readback are recorded separately from this local validation document.
 
 ## CI selection and reproduction
 

@@ -1,6 +1,6 @@
 # Native Windows support
 
-This branch implements native Windows operation without WSL, Git Bash, or tmux. It is still a release candidate: local checks, hosted CI, installed-package acceptance, and real-provider account workflows are separate gates. Passing one does not establish the others.
+Version 1.2.0 implements native Windows operation without WSL, Git Bash, or tmux. The tested desktop environment is Windows 11 x64 with Node.js 24 and local NTFS. Windows 10, hosted CI, macOS, and real-provider account workflows remain separate acceptance gates.
 
 The [validation record](windows-native-validation.md) gives the tested Windows build, exact test counts, focused reruns and remaining acceptance work.
 

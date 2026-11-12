@@ -60,14 +60,14 @@ unknown 证据获得最长 120 秒宽限。`hcc gc` 默认保留历史，必须�
 ## 安装和维护
 
 hello-cc 需要 Node.js 24 或更新版本。Linux/macOS 支持 arm64 与 x64，Web 终端
-使用 `tmux`。本开发版本新增面向 Windows 10/11 x64、本地 NTFS 的原生候选实现，覆盖 CLI、
-项目文件操作、受管后台 Agent 和持久 ConPTY 终端。Windows 使用独立终端服务，
-无需 tmux、Git Bash 或 WSL。请使用包含匹配原生组件的候选安装包；这些改动尚未
-发布。安装方法和适用边界见 [Windows 原生支持说明](docs/windows-native.md)。本地验收使用
-Windows 11，Windows 10 尚未验收；准确结果和待完成项目见
+使用 `tmux`。1.2.0 新增面向 Windows 11 x64、本地 NTFS 的原生支持，覆盖 CLI、项目
+文件操作、受管后台 Agent 和持久 ConPTY 终端。Windows 使用独立终端服务，无需 tmux、
+Git Bash 或 WSL。安装方法和适用边界见 [Windows 原生支持说明](docs/windows-native.md)。
+本地验收使用 Windows 11；Windows 10、macOS 运行时、托管 CI 和真实供应商账户流程仍需
+单独验收。准确结果和剩余平台门槛见
 [Windows 验证记录](docs/windows-native-validation.md)。
 
-安装已验证的 Windows 候选包后，在 PowerShell 中启动本机工作台：
+安装 hello-cc 1.2.0 后，在 PowerShell 中启动本机工作台：
 
 ```powershell
 hcc doctor --environment

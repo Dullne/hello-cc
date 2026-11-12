@@ -39,10 +39,10 @@ v1 会把恢复的数据库重新迁移到 schema v7；用旧版本 hello-cc 打
 ### 前置依赖
 
 通过 Node.js 官方软件包或 Node 版本管理器安装 Node.js 24 或更新版本。Linux/macOS
-的浏览器终端还需要 `tmux`。原生 Windows 使用包内的 ConPTY 服务，本开发版本的
-安装和实测范围见 [Windows 指南](windows-native.md)。
+的浏览器终端还需要 `tmux`。原生 Windows 使用包内的 ConPTY 服务；1.2.0 的安装
+和实测范围见 [Windows 指南](windows-native.md)。
 
-安装已验证的 Windows 候选包后，在 PowerShell 中启动本机工作台：
+安装 hello-cc 1.2.0 后，在 PowerShell 中启动本机工作台：
 
 ```powershell
 hcc doctor --environment

@@ -81,17 +81,16 @@ LANs, and an authenticated browser may select any existing server directory.
 ## Install And Manage
 
 hello-cc requires Node.js 24 or newer. Linux and macOS support arm64 and x64;
-their Web terminals use `tmux`. This development checkout adds a native
-Windows candidate targeting Windows 10/11 x64 on local NTFS, including CLI, project files, owned
-background Agents and persistent ConPTY terminals. Windows uses an independent
-terminal service and does not require tmux, Git Bash or WSL. Use a candidate
-package containing the matching Windows native components; these changes have
-not yet been published. See [Windows setup and verification](docs/windows-native.md)
-for installation and current boundaries. Local acceptance used Windows 11;
-Windows 10 remains unverified. Exact results and pending gates are in the
+their Web terminals use `tmux`. Version 1.2.0 adds native Windows support for
+Windows 11 x64 on local NTFS, including CLI, project files, owned background
+Agents and persistent ConPTY terminals. Windows uses an independent terminal
+service and does not require tmux, Git Bash or WSL. See [Windows setup and
+verification](docs/windows-native.md) for installation and current boundaries.
+Local acceptance used Windows 11; Windows 10 remains unverified. Exact results
+and remaining platform gates are in the
 [Windows validation record](docs/windows-native-validation.md).
 
-With a verified Windows candidate installed, start a local workbench from PowerShell:
+With hello-cc 1.2.0 installed on Windows, start a local workbench from PowerShell:
 
 ```powershell
 hcc doctor --environment
