@@ -194,6 +194,16 @@ dispatch` 是显式的一步分发：创建或指定已有任务并分配给目�
 `task running`、`task review`、`task blocked` 和 `task abandoned` 是
 `task update --status STATUS` 的便捷写法。
 
+当分发返回 `injection_reason: "runtime_unavailable"` 时，`--json` 结果和
+`task.dispatched` 事件会包含 `runtime_failure`：失败阶段 `stage`
+（`runtime_lookup` 查找服务、`session_list` 读取会话、`input` 发送输入）、
+错误码 `code`、HTTP 方法 `method`、路由模板 `path`、耗时 `elapsedMs`、
+超时上限 `timeoutMs` 和错误类型 `errorName`。无法取得的证据为 `null`；
+查找服务失败没有 HTTP 路由或超时上限。输入路由统一显示为
+`/api/sessions/:peer/input`，不包含 peer 标识。诊断不记录原始错误、主机地址、
+令牌或消息内容，CI 失败摘要使用相同过滤规则。发送输入后未取得成功响应，
+并不证明输入没有送达；手动重试前应检查会话。分发不会自动重试，也不改变超时上限。
+
 ## 团队
 
 ```text

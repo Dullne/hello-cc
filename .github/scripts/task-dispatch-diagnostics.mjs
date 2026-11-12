@@ -1,5 +1,6 @@
 // CI-only extraction from a bounded log tail. Never publish the failure JSON:
 // it contains task text, messages, peer identifiers and potentially paths.
+import { taskDispatchRuntimeFailure } from '../../lib/cli/task-dispatch-diagnostics.mjs';
 const MAX_LOG_BYTES = 256 * 1024;
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_MARKERS = 16;
@@ -56,13 +57,16 @@ export function taskDispatchFailureDiagnostics(log) {
     const value = parsed.value;
     const session = value.session && typeof value.session === 'object' && !Array.isArray(value.session)
       ? value.session : null;
+    const runtimeFailure = value.injection_reason === 'runtime_unavailable'
+      ? taskDispatchRuntimeFailure(value.runtime_failure) : null;
     const diagnostic = {
       injected: typeof value.injected === 'boolean' ? value.injected : null,
       delivery: allowed(value.delivery, DELIVERY),
       injectionReason: allowed(value.injection_reason, REASON),
       sessionPresent: session !== null,
       sessionKind: allowed(session?.kind, KIND),
-      sessionStatus: allowed(session?.status, STATUS)
+      sessionStatus: allowed(session?.status, STATUS),
+      ...(runtimeFailure ? { runtimeFailure } : {})
     };
     const key = JSON.stringify(diagnostic);
     if (!seen.has(key)) { diagnostics.push(diagnostic); seen.add(key); }

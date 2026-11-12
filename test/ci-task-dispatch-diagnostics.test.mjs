@@ -17,6 +17,10 @@ const summary = {
   injected: false, delivery: 'message-only', injectionReason: 'runtime_unavailable',
   sessionPresent: false, sessionKind: null, sessionStatus: null
 };
+const runtimeFailure = {
+  stage: 'session_list', code: 'RUNTIME_UNREACHABLE', method: 'GET', path: '/api/sessions',
+  elapsedMs: 8004, timeoutMs: 8000, errorName: 'TimeoutError'
+};
 const failure = (value = safeResult, marker = markers[0]) =>
   'Error: ' + marker + '\n' + JSON.stringify(value, null, 2) + '\n    at PRIVATE_STACK_PATH:1:2\n';
 
@@ -90,16 +94,45 @@ test('CI dispatch diagnostics bound input, payloads and duplicate results', () =
   assert.deepEqual(taskDispatchFailureDiagnostics('\u001b[31m' + failure() + '\u001b[0m'), [summary]);
 });
 
+test('runtime failure annotation rejects secrets, forged routes and invalid timings', () => {
+  const supplied = { ...runtimeFailure, method: 'PRIVATE_METHOD', path: '/PRIVATE_PATH?token=PRIVATE_TOKEN',
+    message: 'PRIVATE_MESSAGE', stack: 'PRIVATE_STACK', runtime: 'https://PRIVATE_HOST' };
+  assert.deepEqual(taskDispatchFailureDiagnostics(failure({ ...safeResult, runtime_failure: supplied })),
+    [{ ...summary, runtimeFailure }]);
+  for (const bad of ['PRIVATE_SECRET', -1, 0.5, 1e100, null, true, [], {}]) {
+    const actual = taskDispatchFailureDiagnostics(failure({ ...safeResult, runtime_failure: {
+      ...supplied, elapsedMs: bad, timeoutMs: bad, errorName: bad
+    } }));
+    assert.deepEqual(actual, [{ ...summary, runtimeFailure: {
+      ...runtimeFailure, elapsedMs: null, timeoutMs: null, errorName: null
+    } }]);
+    assert.doesNotMatch(JSON.stringify(actual), /PRIVATE/);
+  }
+  for (const bad of [null, [], 'PRIVATE_SECRET', { ...supplied, stage: 'PRIVATE_STAGE' },
+    { ...supplied, code: 'PRIVATE_CODE' }]) {
+    assert.deepEqual(taskDispatchFailureDiagnostics(failure({ ...safeResult, runtime_failure: bad })), [summary]);
+  }
+  const lookup = taskDispatchFailureDiagnostics(failure({ ...safeResult, runtime_failure: {
+    ...supplied, stage: 'runtime_lookup', code: 'RUNTIME_NOT_RUNNING'
+  } }))[0].runtimeFailure;
+  assert.deepEqual(lookup, { stage: 'runtime_lookup', code: 'RUNTIME_NOT_RUNNING',
+    method: null, path: null, elapsedMs: 8004, timeoutMs: null, errorName: null });
+  const success = taskDispatchFailureDiagnostics(failure({ ...safeResult,
+    injection_reason: 'injected', runtime_failure: supplied }))[0];
+  assert.equal(Object.hasOwn(success, 'runtimeFailure'), false);
+});
+
 test('workflow annotation publishes the exact mock reason and no private failure JSON', t => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-ci-dispatch-diagnostic-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
   fs.writeFileSync(path.join(scratch, 'hcc-regression.log'), failure({ ...safeResult,
+    runtime_failure: { ...runtimeFailure, message: 'PRIVATE_ERROR', token: 'PRIVATE_TOKEN' },
     task: { title: 'PRIVATE_TITLE', body: 'PRIVATE_BODY', id: 'PRIVATE_ID' },
     token: 'PRIVATE_TOKEN', message: 'PRIVATE_MESSAGE', command: 'PRIVATE_COMMAND',
     path: '/PRIVATE_PATH', code: 'PRIVATE_CODE'
   }));
   const repo = path.resolve(import.meta.dirname, '..');
-  const workflow = fs.readFileSync(path.join(repo, '.github/workflows/test.yml'), 'utf8');
+  const workflow = fs.readFileSync(path.join(repo, '.github/workflows/test.yml'), 'utf8').replace(/\r\n/g, '\n');
   const step = workflow.split('      - name: Annotate failed Node tests\n')[1]
     ?.split('      - name: Upload regression log\n')[0];
   const script = step?.match(/          node --input-type=module <<'NODE'\n([\s\S]*?)          NODE\n/)?.[1]
@@ -111,6 +144,6 @@ test('workflow annotation publishes the exact mock reason and no private failure
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^::error title=Regression test failure::/);
-  assert.ok(result.stdout.includes('Task dispatch result: ' + JSON.stringify(summary)));
+  assert.ok(result.stdout.includes('Task dispatch result: ' + JSON.stringify({ ...summary, runtimeFailure })));
   assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE|Different-UID test failure/);
 });

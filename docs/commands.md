@@ -214,6 +214,17 @@ should only proceed under that auditable precondition. The default policy is
 Use `task running`, `task review`, `task blocked`, or `task abandoned` as
 shortcuts for `task update --status STATUS`.
 
+When dispatch returns `injection_reason: "runtime_unavailable"`, its `--json`
+result and `task.dispatched` event include `runtime_failure`. It records the
+failure `stage` (`runtime_lookup`, `session_list`, or `input`), error `code`,
+HTTP `method`, route template `path`, `elapsedMs`, `timeoutMs`, and `errorName`.
+Unavailable evidence is `null`; a lookup failure has no HTTP route or timeout.
+Input routes use `/api/sessions/:peer/input` without the peer identifier. These
+diagnostics exclude raw errors, host addresses, tokens and message contents;
+CI failure annotations use the same filter. A failed input response does not
+prove input was never received. Inspect the session before manually retrying.
+Dispatch does not automatically retry or change its timeout budgets.
+
 ## Teams
 
 ```text
