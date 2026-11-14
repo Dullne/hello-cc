@@ -164,8 +164,10 @@ jobs:
         run: |
           set -euo pipefail
           node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/installed-acceptance.log"
+          import assert from 'node:assert/strict';
           import fs from 'node:fs';
           import path from 'node:path';
+          import { createHash } from 'node:crypto';
           import { spawnSync } from 'node:child_process';
           const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
           const official = path.join(root, 'official');
@@ -178,12 +180,46 @@ jobs:
             PATH: [path.dirname(process.execPath), path.join(official, 'node_modules', '.bin'),
               process.env.PATH || ''].join(path.delimiter) };
           for (const key of ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']) delete env[key];
+          // The selected script imports production modules before it can perform
+          // its own fresh installation. Give that runner its declared dependencies
+          // without installing anything into the untouched provenance baseline.
+          const runnerPrefix = path.join(root, 'acceptance-runner');
+          const bootstrap = spawnSync('npm', ['install', '--prefix', runnerPrefix,
+            '--ignore-scripts', '--omit=dev', '--package-lock=false', '--no-save',
+            '--no-audit', '--no-fund', '--fetch-retries=1', '--fetch-timeout=120000', tarball],
+            { env, stdio: 'inherit', timeout: 300000 });
+          if (bootstrap.error) throw bootstrap.error;
+          assert.equal(bootstrap.status, 0, 'Selected acceptance runner installation must succeed');
+          const runner = path.join(runnerPrefix, 'node_modules', '@logicseek', 'hello-cc');
+          const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          function packageHashes(directory, installedTree = false) {
+            const hashes = {};
+            function visit(relative) {
+              for (const entry of fs.readdirSync(path.join(directory, relative), { withFileTypes: true })) {
+                if (installedTree && !relative && entry.name === 'node_modules') continue;
+                const file = path.join(relative, entry.name);
+                if (entry.isDirectory()) visit(file);
+                else {
+                  assert.ok(entry.isFile(), `Unsupported package entry: ${file}`);
+                  hashes[file] = hash(path.join(directory, file));
+                }
+              }
+            }
+            visit('');
+            return hashes;
+          }
+          const selectedHashes = packageHashes(unpacked);
+          assert.deepEqual(packageHashes(runner, true), selectedHashes,
+            'Acceptance runner files must match the selected package');
+          console.log(JSON.stringify({ check: 'selected acceptance runner provenance',
+            sha256: hash(tarball), fileCount: Object.keys(selectedHashes).length }));
           // Both the script and its source-hash baseline come from the selected
-          // candidate or immutable release, exactly matching the installed tgz.
-          const result = spawnSync(process.execPath, [path.join(unpacked, 'scripts', 'dsh-installed-acceptance.mjs'),
+          // candidate or immutable release. It still performs its own separate
+          // installation and public CLI acceptance from the exact selected tgz.
+          const result = spawnSync(process.execPath, [path.join(runner, 'scripts', 'dsh-installed-acceptance.mjs'),
             official, '--tarball', tarball, '--output-dir', path.join(root, 'evidence', 'installed'),
             '--npm-cache', path.join(root, 'npm-cache'), '--pnpm-store', path.join(root, 'pnpm-store')],
-            { cwd: unpacked, env, stdio: 'inherit' });
+            { cwd: runner, env, stdio: 'inherit' });
           if (result.error) throw result.error;
           process.exitCode = result.status ?? 1;
           NODE
