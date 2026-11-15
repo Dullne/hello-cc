@@ -68,6 +68,8 @@ Installation records owned-file hashes. An altered or unrelated file is not sile
 
 ## Building and testing
 
+`npm test` selects the native Windows verification flow: the same core, UI/source and shared behavior groups used by Windows CI, then the independent installed-package lifecycle. `npm run test:unit` and `npm run test:regression` run those phases separately. The driver isolates HOME and USERPROFILE, disables automatic shim setup, retains bounded per-file diagnostics, and stops after a failed group. This qualifies the selected Windows contracts; the legacy POSIX fixture collection is not silently treated as a Windows pass. Linux and macOS retain their complete unit and thirteen-stage regression flows.
+
 Development builds require the Visual Studio x64 C++ toolchain, Windows SDK, headers for the Node.js version in use, and the corresponding `win-x64/node.lib`:
 
 ```powershell

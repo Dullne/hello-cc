@@ -35,6 +35,7 @@ Complete Windows CLI environment setup, existing-state diagnostics, offline lega
 - Generate and reuse Windows self-signed HTTPS certificates with OpenSSL, private native publication, serialized certificate rotation, and real HTTPS verification. OpenSSL must be available on PATH.
 - Give expensive Windows background discovery scans a completion interval and proportional cooldown so fresh identity checks leave time for Web requests.
 - Close test-owned processes before removing their pinned directories. CI now records each test file and fails bounded hangs with diagnostics; artifact upload uses the current Node 24 action.
+- Route the default npm development tests to the current platform: Windows uses its bounded CI contract groups and isolated installed-package lifecycle, while Linux and macOS keep the full POSIX tests.
 
 Windows 11 x64, Node.js 24+, and local NTFS remain the accepted desktop scope. Windows 10 requires its own acceptance environment; ARM64 and network/non-NTFS storage remain unsupported. Provider authentication and model responses are separate from local runtime checks. See the current Windows follow-up validation record for exact results.
 

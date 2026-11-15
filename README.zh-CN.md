@@ -264,7 +264,9 @@ HTML/CSS/JavaScript，不需要前端构建或外部字体服务。
 npm test
 ```
 
-回归测试会创建临时项目、fake Claude/Codex、临时 tmux session 和临时 Web runtime，覆盖主要流程。
+命令会按当前平台选择验证流程。Linux 和 macOS 运行完整单元测试及十三阶段 POSIX 回归，使用临时项目、模拟提供方、tmux 会话和临时 Web 服务。Windows 运行与 Windows CI 相同的原生及共享行为测试，再执行隔离安装包验收，不会误跑尚未移植的 POSIX 测试，也不需要 tmux。Windows 测试会隔离 HOME 和 USERPROFILE、禁用自动 shim 配置，并保留逐文件失败日志。
+
+也可以分别运行 `npm run test:unit` 和 `npm run test:regression`，选择当前平台对应的测试阶段。原生组件构建要求与验收范围见 [Windows 测试说明](docs/windows-native.md#building-and-testing)。
 
 ## License
 

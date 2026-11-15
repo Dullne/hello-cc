@@ -113,22 +113,20 @@ jobs:
         id: windows_tests
         timeout-minutes: 20
         run: |
-          node .github/scripts/run-bounded-tests.mjs --log-dir "$env:RUNNER_TEMP/hcc-windows-native" 'test/windows-*.test.mjs' test/ci-bounded-tests.test.mjs test/fixture-cleanup.test.mjs test/completion-poller.test.mjs test/doctor-codex.test.mjs
+          node scripts/test-platform.mjs windows-group --group core --log-dir "$env:RUNNER_TEMP/hcc-windows-native"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared UI behavior and source checks
         if: ${{ !cancelled() && steps.windows_profile.outcome == 'success' }}
         run: |
-          node --test test/web-ui-agent-start.test.mjs test/web-ui-session-display.test.mjs test/web-ui-handoff.test.mjs test/web-ui-terminal-command.test.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm run test:audit
+          node scripts/test-platform.mjs windows-group --group ui --log-dir "$env:RUNNER_TEMP/hcc-windows-ui"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared native services, scoped tools, and Web behavior
         if: ${{ !cancelled() && steps.windows_profile.outcome == 'success' }}
         timeout-minutes: 40
         run: |
-          node .github/scripts/run-bounded-tests.mjs --concurrency 3 --file-timeout-ms 2100000 --log-dir "$env:RUNNER_TEMP/hcc-windows-shared" test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs
+          node scripts/test-platform.mjs windows-group --group shared --log-dir "$env:RUNNER_TEMP/hcc-windows-shared"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify an independently installed npm candidate
@@ -143,6 +141,7 @@ jobs:
           name: windows-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/hcc-windows-native/
+            ${{ runner.temp }}/hcc-windows-ui/
             ${{ runner.temp }}/hcc-windows-shared/
             native/bin/win32-x64/hcc-windows.json
             native/bin/win32-x64/hcc-shim.json

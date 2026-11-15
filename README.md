@@ -304,8 +304,17 @@ checks. Set `HCC_SITE_BROWSER_CHANNEL=msedge` to use installed Edge, and optiona
 npm test
 ```
 
-The regression suite uses temporary projects, fake Claude/Codex binaries,
-temporary tmux sessions, and a temporary Web runtime to test the main flows.
+The command selects the platform's verification flow. Linux and macOS run the
+complete unit suite and the thirteen-stage POSIX regression, using temporary
+projects, fake providers, tmux sessions, and a temporary Web runtime. Windows
+runs the same native and shared-behavior test groups as Windows CI, followed by
+the isolated installed-package acceptance. It does not run unported POSIX
+fixtures or require tmux. Windows tests isolate HOME and USERPROFILE, disable
+automatic shim setup, and retain per-file failure logs.
+
+`npm run test:unit` and `npm run test:regression` select the corresponding
+platform phase separately. See the [Windows testing guide](docs/windows-native.md#building-and-testing)
+for native build requirements and validation scope.
 
 ## License
 
