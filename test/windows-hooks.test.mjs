@@ -6,6 +6,29 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { windowsHookCommand, isWindowsHccHookCommand } from '../lib/platform/windows-hook-command.mjs';
 
+test('Windows encoded hooks treat every PowerShell quote character in installation paths literally',
+  { skip: process.platform !== 'win32' }, t => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-hooks-quotes-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    for (const delimiter of ['\u2018', '\u2019', '\u201a', '\u201b']) {
+      const directory = path.join(base, `literal${delimiter};exit 42;${delimiter}path`);
+      fs.mkdirSync(directory);
+      const file = path.join(directory, 'hcc.mjs');
+      fs.writeFileSync(file, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));');
+      const command = windowsHookCommand(file, 'stop');
+      const encoded = command.slice(command.lastIndexOf(' ') + 1);
+      const result = spawnSync(path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+        { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), ['hook', 'stop']);
+      assert.equal(isWindowsHccHookCommand(command), true);
+      const unsafeSource = Buffer.from(encoded, 'base64').toString('utf16le').replaceAll(delimiter + delimiter, delimiter);
+      const unsafe = command.slice(0, command.lastIndexOf(' ') + 1) + Buffer.from(unsafeSource, 'utf16le').toString('base64');
+      assert.equal(isWindowsHccHookCommand(unsafe), false);
+    }
+  });
+
 test('Windows hook install, literal execution, status and uninstall preserve unrelated settings',
   { skip: process.platform !== 'win32' }, t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "hcc-hooks-中文 %!&' "));

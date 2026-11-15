@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 // Two real Web boots, host/session admission, two attachments and stop, plus
 // cleanup. Each operation below also has its own deadline and phase receipt.
-const fixtureBudgetMs = 2 * 30000 + 2 * 20000 + 3 * 10000 + 20000;
+const fixtureBudgetMs = 2 * 30000 + 2 * 20000 + 5 * 10000 + 20000;
 test('Windows Web creates a managed terminal, proxies control and restores it after Web restart',
   { skip: process.platform !== 'win32', timeout: fixtureBudgetMs }, async t => {
     const base = fs.mkdtempSync(path.join(os.homedir(), 'hcc-web-terminal-'));
@@ -35,13 +35,13 @@ test('Windows Web creates a managed terminal, proxies control and restores it af
         {env:{...process.env,HCC_WEB_CHILD:'1'},windowsHide:true,stdio:['ignore','pipe','pipe']});webClosed=once(web,'close');web.stdout.on('data',b=>log+=b);web.stderr.on('data',b=>log+=b);
         for(let i=0;i<250;i++){if(web.exitCode!==null)throw Error('Web exited: '+log);runtime=readRuntimeFile(ctx);if(runtime?.pid===web.pid)return;await delay(30)}throw Error('Web timeout '+log);}
       async function request(method,route,body){const r=await fetch(runtime.base_url+route,{method,signal:AbortSignal.timeout(20000),headers:{authorization:'Bearer '+runtime.token,'content-type':'application/json','x-hcc-api-version':'2'},...(body?{body:JSON.stringify(body)}:{})});const data=await r.json();assert.equal(r.status,200,JSON.stringify(data));return data;}
-      async function attach(id){return bounded('attach browser',10000,async()=>{ws=new WebSocket(runtime.base_url.replace('http:','ws:')+'/ws/terminal/'+id+'?api_version=2',{headers:{authorization:'Bearer '+runtime.token,origin:runtime.base_url}});const frames=[];ws.on('message',b=>frames.push(JSON.parse(b)));ws.on('error',()=>{});await once(ws,'open');while(true){const snapshot=frames.find(x=>x.type==='snapshot');if(snapshot)return{frames,snapshot};if(ws.readyState===WebSocket.CLOSED)throw Error('Browser closed before snapshot');await delay(20)}})}
+      async function attach(id){phase('begin browser attachment');return (async()=>{ws=new WebSocket(runtime.base_url.replace('http:','ws:')+'/ws/terminal/'+id+'?api_version=2',{headers:{authorization:'Bearer '+runtime.token,origin:runtime.base_url}});const frames=[];ws.on('message',b=>frames.push(JSON.parse(b)));ws.on('error',()=>{});await bounded('browser handshake',10000,()=>once(ws,'open'));return bounded('browser snapshot',10000,async()=>{while(true){const snapshot=frames.find(x=>x.type==='snapshot');if(snapshot)return{frames,snapshot};if(ws.readyState===WebSocket.CLOSED)throw Error('Browser closed before snapshot');await delay(20)}})})()}
       try{
         await bounded('start web',30000,start);host=await bounded('ensure terminal host',20000,ensureTerminalHost);
         const state=await request('GET','/api/state');assert.equal(state.terminal_backend,'windows-terminal');
         phase('create terminal');const created=(await request('POST','/api/sessions',{id:'shell-web',kind:'shell',invocation:{file:process.execPath,args:[${JSON.stringify(program)}]}})).session;
         assert.equal(created.type,'windows-terminal');assert.ok(created.pid>0);
-        phase('attach browser');let browser=await attach(created.id);assert.equal(browser.snapshot.control.can_control,true);
+        let browser=await attach(created.id);assert.equal(browser.snapshot.control.can_control,true);
         ws.send(JSON.stringify({type:'input',action_token:browser.snapshot.action_token,epoch:browser.snapshot.control.epoch,data:'重新连接',input_id:'one'}));
         for(let i=0;i<200&&!browser.frames.some(f=>f.type==='input_ack');i++)await delay(20);
         assert.ok(browser.frames.some(f=>f.type==='input_ack'));

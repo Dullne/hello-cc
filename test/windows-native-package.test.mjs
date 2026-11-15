@@ -17,12 +17,14 @@ test('packed Windows component loads using only its extracted package files',
       { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 90000, maxBuffer: 8 * 1024 * 1024 });
     assert.equal(packed.status, 0, packed.stderr || packed.error?.message);
     const metadata = JSON.parse(packed.stdout)[0];
-    const artifact = path.join(temporary, metadata.filename);
     const extract = path.join(temporary, 'extracted installation');
     fs.mkdirSync(extract);
     const tar = path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'tar.exe');
-    const unpacked = spawnSync(tar, ['-xf', artifact, '-C', extract],
-      { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+    // Some Windows tar builds convert argv through the system code page.
+    // Keep the actual package under a Unicode path while passing only relative
+    // archive/extraction names; CreateProcessW preserves its Unicode cwd.
+    const unpacked = spawnSync(tar, ['-xf', metadata.filename, '-C', path.basename(extract)],
+      { cwd: temporary, windowsHide: true, encoding: 'utf8', timeout: 30000 });
     assert.equal(unpacked.status, 0, unpacked.stderr || unpacked.error?.message);
     const installed = path.join(extract, 'package');
     assert.equal(fs.existsSync(path.join(installed, 'native', 'windows', 'addon.cc')), true,

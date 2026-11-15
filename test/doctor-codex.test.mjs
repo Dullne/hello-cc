@@ -9,6 +9,7 @@ import { createDoctorCommand } from '../lib/cli/commands/doctor.mjs';
 import { diagnoseCodex } from '../lib/diagnostics/codex.mjs';
 import { initSchema, readSchemaVersion, DB_SCHEMA_VERSION } from '../lib/db/schema.mjs';
 import { generateShim } from '../lib/integrations/shims/script.mjs';
+import { windowsHookCommand } from '../lib/platform/windows-hook-command.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-doctor-codex-'));
@@ -36,6 +37,19 @@ function capture(operation) {
   console.log = value => values.push(String(value));
   try { return { result: operation(), values }; } finally { console.log = original; }
 }
+
+test('Codex diagnostics recognize generated Windows encoded hooks without executing or exposing them', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t);
+  const command = windowsHookCommand('C:\\Private installation\\bin\\hcc.mjs', 'sessionstart', { shell: 'powershell' });
+  configure(f, command);
+  const report = diagnoseCodex(f.ctx, f.db, options(f));
+  assert.equal(report.hooks.configuration.status, 'present');
+  assert.equal(report.hooks.configuration.matched_events.length, 4);
+  assert.equal(report.hooks.trust, 'unknown');
+  assert.equal(JSON.stringify(report).includes('EncodedCommand'), false);
+  configure(f, command + ' ; Write-Output unrelated');
+  assert.equal(diagnoseCodex(f.ctx, f.db, options(f)).hooks.configuration.status, 'missing');
+});
 
 test('opt-in probes only version/help with bounds and reports advertised startup rather than protocol success', t => {
   const f = fixture(t); configure(f, 'hcc hook --token secret-command-marker');

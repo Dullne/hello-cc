@@ -63,17 +63,22 @@ hello-cc 需要 Node.js 24 或更新版本。Linux/macOS 支持 arm64 与 x64，
 使用 `tmux`。1.2.0 新增面向 Windows 11 x64、本地 NTFS 的原生支持，覆盖 CLI、项目
 文件操作、受管后台 Agent 和持久 ConPTY 终端。Windows 使用独立终端服务，无需 tmux、
 Git Bash 或 WSL。安装方法和适用边界见 [Windows 原生支持说明](docs/windows-native.md)。
-本地验收使用 Windows 11；Windows 10、macOS 运行时、托管 CI 和真实供应商账户流程仍需
-单独验收。准确结果和剩余平台门槛见
-[Windows 验证记录](docs/windows-native-validation.md)。
+本地验收使用 Windows 11；Windows 10 和真实供应商账户流程需要单独验收，托管 CI
+结果与本机桌面验收分别记录。1.2.1 的环境输出、诊断、离线迁移、HTTPS 和后续验证结果见
+[当前 Windows 验证记录](docs/windows-followups-validation.md)。
 
-安装 hello-cc 1.2.0 后，在 PowerShell 中启动本机工作台：
+安装 hello-cc 后，在以当前用户打开的普通 PowerShell 窗口中启动本机工作台：
 
 ```powershell
 hcc doctor --environment
 hcc --root 'C:\Projects\My project' init
 hcc --root 'C:\Projects\My project' web --local
 ```
+
+请使用普通用户终端；管理员终端仍需单独验证。提升权限后的 Windows 进程可能把新文件
+及 SQLite 辅助文件的默认所有者设为 Administrators 组，HCC 会拒绝这种私有状态。
+改用普通终端后先运行 `hcc doctor --environment`；已经产生所有者或权限问题的文件仍需
+明确检查和修复，HCC 不会自动修改其权限。CI 的测试进程设置不改变这一用户使用边界。
 
 在运行 hello-cc 的同一环境中安装并登录所需 provider。Codex 后台 Agent 需要支持
 App Server 的 Codex CLI；DeepSeek Harness 后台 Agent 需要 DSH ACP runtime；

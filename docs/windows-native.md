@@ -2,19 +2,22 @@
 
 Version 1.2.1 implements native Windows operation without WSL, Git Bash, or tmux. The tested desktop environment is Windows 11 x64 with Node.js 24 and local NTFS. Windows 10 and real-provider account workflows require separate acceptance evidence. Hosted CI and desktop Windows are recorded independently.
 
-The [current follow-up record](windows-followups-validation.md) and [1.2.0 validation record](windows-native-validation.md) gives the tested Windows build, exact test counts, focused reruns and remaining acceptance work.
+The [current follow-up record](windows-followups-validation.md) and [1.2.0 validation record](windows-native-validation.md) give the tested Windows build, exact test counts, focused reruns and remaining acceptance work.
 
 ## Requirements and validation scope
 
 | Environment | Status |
 | --- | --- |
 | Windows 11 x64, local NTFS, Node.js 24 | Local development and targeted acceptance environment. Native filesystem, process ownership, private state, SQLite, launcher, hook, and terminal checks exercise real Windows objects. |
+| Ordinary signed-in user terminal | Accepted local launch context. Newly created private files must belong to that user. Elevated administrator terminals require separate qualification. |
 | Windows 10 22H2 x64 | Intended target. Requires its own acceptance run before a support claim; Windows 11 or Windows Server results do not substitute. |
 | GitHub Actions `windows-latest` | Native build and focused Windows acceptance job. This is a hosted Windows Server environment, not evidence for every desktop Windows version. |
 | ARM64, UNC/network shares, non-NTFS filesystems | Outside the initial support boundary; commands must explain the unsupported condition. |
 | Linux and macOS | Existing POSIX backends and regression jobs remain in place. |
 
 Node.js 24 or later is required. The implementation uses the built-in SQLite module and a source-validated Windows native component. Node.js 22 is not part of this support target. A missing or mismatched native component is an error; changing a platform check does not enable safe operation.
+
+Run HCC from an ordinary PowerShell or cmd window opened as your signed-in user. An elevated administrator token can assign new files to the Administrators group by default, including files and SQLite sidecars inside an otherwise private directory. HCC requires the current user to own private state and rejects that mismatch. Open an ordinary terminal and run `hcc doctor --environment` before retrying. Existing files with a different owner still require explicit review and repair; changing terminals does not repair them, and HCC does not silently change their ownership.
 
 ## Running 1.2.1
 
@@ -31,7 +34,7 @@ Initialization writes project guidance and private state under the current profi
 
 Automatic self-signed HTTPS (`web --tls`) uses OpenSSL from PATH and private Windows certificate storage. The key remains in private storage and the certificate is reused across restarts. Parallel starts and renewals serialize publication. Browsers still require a one-time trust decision for a self-signed certificate. `web --local` offers loopback HTTP; a configured TLS reverse proxy can use `--trust-proxy` / `--proxy-origin`.
 
-Private state requires a private owner and trustworthy directory ancestry. Other principals may have harmless traversal/read access, but dangerous mutation rights, junctions, unexpected hardlinks, or changed directory identities are refused. A shared temporary directory may therefore be unsuitable even when an ordinary read/write test succeeds. Do not weaken its ACL policy to make a test pass; use an owned private profile directory.
+Private state requires current-user ownership, restricted access, and trustworthy directory ancestry. Ancestor directories may allow harmless traversal/read access to other principals; private-state entries have stricter access requirements. Dangerous mutation rights, junctions, unexpected hardlinks, or changed directory identities are refused. A shared temporary directory may therefore be unsuitable even when an ordinary read/write test succeeds. Do not weaken its ACL policy to make a test pass; use an owned private profile directory.
 
 Windows supports explicit offline import with `hcc --root "C:\Projects\My project" migrate-state --offline --yes`. Stop all writers and back up the original `.hello-cc` directory first. The source and files must have private current-user ACLs; HCC does not silently repair permissions. Migration preserves source bytes, snapshots SQLite databases, rejects active or uncertain owners, and records destination progress for safe retry. An interrupted migration cannot become an empty fresh project. DSH artifacts are retained for explicit re-setup. A crash before the progress receipt or during final publication requires manual recovery: preserve the incomplete private destination and legacy source; never delete or fabricate a binding marker. Copy-phase interruptions with a matching receipt can retry automatically.
 
@@ -70,6 +73,8 @@ node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-inst
 ```
 
 The Windows CI job downloads the exact running Node version's headers/import library, checks their official SHA-256 sums, builds the component and launcher, and runs the Windows tests. Those tests include extracting `npm pack --ignore-scripts` and loading the native API without access to the source checkout. Ignoring lifecycle scripts creates a validation installation; it does not bypass release/publish gates for an actual release.
+
+Hosted CI records its test shell's user and default-owner identities. If they differ, the CI wrapper changes only that shell's default owner to its existing user identity, verifies the result, and then starts the test step. A separate probe checks new private files and SQLite sidecars. This does not change existing ACLs, token privileges, or machine settings, and does not qualify elevated end-user terminals. Hosted results remain pending until that run's receipts and tests succeed.
 
 The installed acceptance script installs the selected package archive into a disposable prefix containing spaces and Chinese characters. It then invokes the installed public CLI for environment checks, project initialization, background Web, native services, and terminal lifecycle. Its Windows 11 acceptance covers Web restart retaining the terminal process, generation and screen, followed by explicit input and termination. It writes a bounded JSON report without credentials and confirms that its owned processes have exited. Hosted CI and other desktop versions still require their own runs.
 

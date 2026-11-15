@@ -30,7 +30,7 @@ jobs:
       NODE_NO_WARNINGS: '1'
     defaults:
       run:
-        shell: pwsh
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .github/scripts/windows-test-shell.ps1 {0}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -88,12 +88,25 @@ jobs:
           node -p "JSON.stringify({node:process.version,arch:process.arch,platform:process.platform})"
           [Environment]::OSVersion.VersionString
 
+      - name: Verify private-file ownership under the test process token
+        run: node .github/scripts/windows-token-owner-probe.mjs
+
       - name: Isolate test profile beneath the runner's owned home
         run: |
           $testProfile = Join-Path $env:USERPROFILE ('hcc-windows-test-' + [Guid]::NewGuid().ToString())
           New-Item -ItemType Directory -Path $testProfile | Out-Null
+          # Hosted runners can expose TEMP through the RUNNER~1 short alias.
+          # Native leases retain the expanded path, so give every fixture the
+          # same canonical spelling without weakening selected-cwd checks.
+          $env:HCC_TEST_PROFILE = $testProfile
+          $testProfile = node -p "require('node:fs').realpathSync.native(process.env.HCC_TEST_PROFILE)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testTemp = Join-Path $testProfile 'tmp'
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
           "HOME=$testProfile" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "USERPROFILE=$testProfile" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Verify actual Windows contracts and extracted npm candidate
         id: windows_tests
@@ -130,6 +143,7 @@ jobs:
             native/bin/win32-x64/hcc-windows.json
             native/bin/win32-x64/hcc-shim.json
             ${{ runner.temp }}/hcc-windows-installed-acceptance.json
+            ${{ runner.temp }}/hcc-windows-token-owner/
           if-no-files-found: warn
           retention-days: 14
 

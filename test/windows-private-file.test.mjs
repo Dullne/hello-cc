@@ -7,7 +7,9 @@ import test from 'node:test';
 import { loadWindowsNative } from '../lib/platform/windows-native.mjs';
 import { readPrivateTextFile, openPrivateAppendFile } from '../lib/runtime/private-file.mjs';
 import * as privateFiles from '../lib/runtime/private-file.mjs';
-import { listWindowsPrivateDirectory } from '../lib/platform/windows-private-state.mjs';
+import { listWindowsPrivateDirectory, withWindowsPrivateScope, withWindowsPrivateDirectory,
+  inspectWindowsHomeAncestry, inspectWindowsPrivateDirectory, readWindowsPrivateFile
+} from '../lib/platform/windows-private-state.mjs';
 
 const windows = process.platform === 'win32';
 function fixture(t) {
@@ -94,4 +96,47 @@ test('Windows log rotation refuses active log owners and untrusted backups witho
     assert.throws(() => privateFiles.rotatePrivateAppendResource(file, resource, 5), { code: 'PROJECT_PATH_FORBIDDEN' });
     assert.equal(fs.readFileSync(file, 'utf8'), 'oversize'); assert.equal(fs.readFileSync(file + '.1', 'utf8'), 'old backup');
   } finally { other?.close(); resource?.close(); }
+});
+
+function grantPublicRead(file) {
+  const result = spawnSync('icacls.exe', [file, '/grant', '*S-1-1-0:(R)'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+test('reused Windows private scopes reject file ACL drift and new hard links between reads', { skip: !windows }, t => {
+  const { base, directory } = fixture(t), file = path.join(directory, 'data');
+  fs.writeFileSync(file, 'retained');
+  withWindowsPrivateScope(() => {
+    assert.equal(readWindowsPrivateFile(file).toString(), 'retained');
+    const alias = path.join(base, 'alias'); fs.linkSync(file, alias);
+    assert.throws(() => readWindowsPrivateFile(file)); fs.unlinkSync(alias);
+    assert.equal(readWindowsPrivateFile(file).toString(), 'retained');
+    grantPublicRead(file);
+    assert.throws(() => readWindowsPrivateFile(file), { code: 'PROJECT_PATH_FORBIDDEN' });
+  });
+  assert.deepEqual(fs.readdirSync(directory), ['data']);
+});
+
+test('reused Windows private scopes check parent ACL freshness on every read', { skip: !windows }, t => {
+  const { directory } = fixture(t), file = path.join(directory, 'data'); fs.writeFileSync(file, 'retained');
+  withWindowsPrivateScope(() => {
+    readWindowsPrivateFile(file); grantPublicRead(directory);
+    assert.throws(() => readWindowsPrivateFile(file), { code: 'PROJECT_PATH_FORBIDDEN' });
+  });
+  assert.deepEqual(fs.readdirSync(directory), ['data']);
+});
+
+test('a Windows scope admitted for public-read ancestry still enforces a later private-leaf requirement', { skip: !windows }, t => {
+  const { directory } = fixture(t); grantPublicRead(directory);
+  withWindowsPrivateScope(() => {
+    assert.equal(inspectWindowsHomeAncestry(directory), true);
+    assert.throws(() => inspectWindowsPrivateDirectory(directory), { code: 'PROJECT_PATH_FORBIDDEN' });
+  });
+  assert.deepEqual(fs.readdirSync(directory), []);
+});
+
+test('Windows private operations reject ACL drift inside their callback before returning', { skip: !windows }, t => {
+  const { directory } = fixture(t);
+  assert.throws(() => withWindowsPrivateDirectory(directory, () => grantPublicRead(directory)), { code: 'PROJECT_PATH_FORBIDDEN' });
+  assert.deepEqual(fs.readdirSync(directory), []);
 });

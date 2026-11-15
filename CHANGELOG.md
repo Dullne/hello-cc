@@ -10,6 +10,7 @@ Complete Windows CLI environment setup, existing-state diagnostics, offline lega
 
 - Emit PowerShell assignments by default on Windows; `env` and `join` support explicit `--shell powershell|cmd|posix` with safe literal handling and unchanged JSON output.
 - Inspect existing private state without opening SQLite. Unsafe ACLs, junctions, hardlinks, unexpected entries, and incomplete inspection prevent a misleading ready result.
+- Recognize installed Windows encoded hooks in Codex diagnostics and preserve PowerShell smart quotes literally in hook installation paths, without executing diagnostic input.
 - Import offline legacy Windows state through retained native handles and private destination storage. Preserve source bytes, snapshot SQLite, reject live or uncertain writers, and resume only receipt-bound interrupted migrations.
 - Generate and reuse Windows self-signed HTTPS certificates with OpenSSL, private native publication, serialized certificate rotation, and real HTTPS verification. OpenSSL must be available on PATH.
 - Give expensive Windows background discovery scans a completion interval and proportional cooldown so fresh identity checks leave time for Web requests.

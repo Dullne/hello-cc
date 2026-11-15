@@ -1,11 +1,12 @@
 // Install and exercise the actual Windows package without real provider accounts.
-// Production imports below are resolved only from the disposable installed copy.
+// All tested production APIs resolve from the disposable installed copy. The
+// source checkout provides only the outer process-ownership harness.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { runWindowsAcceptanceCommand as run } from './windows-acceptance-process.mjs';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -24,34 +25,6 @@ for (let i = 0; i < args.length; i += 2) {
 assert.equal(process.platform, 'win32', 'Windows installed acceptance requires native Windows');
 assert.ok(Number(process.versions.node.split('.')[0]) >= 24, 'Windows installed acceptance requires Node 24+');
 
-async function run(file, argv, { cwd, env = process.env, timeoutMs = 120000, stage }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(file, argv, { cwd, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', failed = false;
-    const timer = setTimeout(() => { failed = true; child.kill(); reject(new Error(`${stage}: command deadline exceeded`)); }, timeoutMs);
-    const append = key => bytes => {
-      if (key === 'out') stdout += bytes; else stderr += bytes;
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > 4 * 1024 * 1024) {
-        failed = true; child.kill(); reject(new Error(`${stage}: excessive command output`));
-      }
-    };
-    child.stdout.on('data', append('out')); child.stderr.on('data', append('err'));
-    child.once('error', error => { failed = true; clearTimeout(timer); reject(new Error(`${stage}: ${error.code || 'spawn failed'}`)); });
-    child.once('close', code => {
-      clearTimeout(timer); if (failed) return;
-      if (code !== 0) {
-        let diagnostic, acceptanceMessage;
-        try {
-          const parsed = JSON.parse(stderr.trim() || stdout.trim());
-          diagnostic = parsed.error?.code || parsed.code;
-          if (parsed.success === false && typeof parsed.message === 'string') acceptanceMessage = parsed.message.slice(0, 500);
-        } catch {}
-        reject(Object.assign(new Error(`${stage}: command exited ${code}${diagnostic ? ` (${diagnostic})` : ''}${acceptanceMessage ? `: ${acceptanceMessage}` : ''}`), { stage, exitCode: code }));
-      } else resolve(stdout);
-    });
-  });
-}
-
 async function installedChecks(installed, root) {
   const fromInstalled = name => import(pathToFileURL(path.join(installed, name)).href);
   const [{ projectDbPath }, { readRuntimeFile }, { ensureTerminalHost }, { inspectProcessIdentity, compareProcessIdentity },
@@ -60,7 +33,7 @@ async function installedChecks(installed, root) {
     fromInstalled('lib/process/identity.mjs'), fromInstalled('lib/runtime/native/store.mjs'), fromInstalled('lib/runtime/native/client.mjs')
   ]);
   const entry = path.join(installed, 'bin', 'hcc.mjs'), WebSocket = createRequire(entry)('ws');
-  const cli = (argv, stage) => run(process.execPath, [entry, '--root', root, '--json', ...argv], { cwd: root, stage, timeoutMs: 45000 });
+  const cli = (argv, stage) => run(process.execPath, [entry, '--root', root, '--json', ...argv], { cwd: root, stage, timeoutMs: 45000, ownProcessTree: false });
   const jsonCli = async (argv, stage) => JSON.parse(await cli(argv, stage)).data;
   const checks = [], identities = [], ctx = { root, dbPath: projectDbPath(root) };
   let runtime, host, socket, native;
@@ -224,7 +197,7 @@ if (options.has('--installed-root')) {
     // CLI stdout and service pointers may contain credentials. Emit only the
     // bounded acceptance stage and typed error, never captured raw output.
     console.error(JSON.stringify({ success: false, code: error.code || 'ACCEPTANCE_FAILED', message: error.message }));
-    process.exitCode = 1;
+    process.exitCode = 1; if (error.cleanupUnconfirmed) process.exit(1);
   }
 } else {
   const repo = fileURLToPath(new URL('..', import.meta.url));
@@ -280,5 +253,5 @@ if (options.has('--installed-root')) {
     fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(report, null, 2) + '\n');
     console.log(JSON.stringify(report, null, 2));
   }
-  if (failure) process.exitCode = 1;
+  if (failure) { process.exitCode = 1; if (failure.cleanupUnconfirmed) process.exit(1); }
 }

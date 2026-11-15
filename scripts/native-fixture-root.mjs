@@ -24,10 +24,17 @@ export async function createNativeFixtureRoot(prefix, { projectSubdir = '', owne
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
     const listeners = [];
+    // Concurrent fixtures can collide with this availability probe. Identify
+    // it in a separate namespace so the product can distinguish this temporary
+    // listener from an older runtime that cannot provide any identity banner.
+    const probeIdentity = createHash('sha256').update(`hcc-fixture-preflight-v1\0${root}`).digest('hex');
     let failure;
     try {
       for (const port of candidatePorts(path.join(root, projectSubdir), ownershipKey)) {
-        const listener = net.createServer();
+        const listener = net.createServer(socket => {
+          socket.on('error', () => {});
+          socket.end(`HCC_FILE_LOCK_V1 ${probeIdentity}\n`);
+        });
         listeners.push(listener);
         await new Promise((resolve, reject) => {
           listener.once('error', reject);

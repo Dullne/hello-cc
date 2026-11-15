@@ -8,11 +8,12 @@ import { assertPinnedSessionLaunchAllowed, preparePinnedCwdLaunch, spawnPinnedCw
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
 import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { createCodexAppServer } from '../lib/web/codex-app-server.mjs';
+import { registerCleanup } from './helpers/fixture-cleanup.mjs';
 
 const windows = { skip: process.platform !== 'win32', timeout: 10000 };
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-win-pinned-'));
-  t.after(() => fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 }));
+  registerCleanup(t, () => fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 }));
   const cwd = path.join(root, 'selected'); fs.mkdirSync(cwd);
   return { root, cwd };
 }
@@ -33,7 +34,7 @@ test('Windows pinned launch binds the selected identity and preserves literal pr
   const child = spawnPinnedCwdProcess(process.execPath, ['-e',
     'console.log(JSON.stringify({cwd:process.cwd(),args:process.argv.slice(1)}))', ...args],
   { cwd, expectedIdentity, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   const output = collect(child.stdout); child.stderr.resume(); child.stdin.end();
   assert.deepEqual(await once(child, 'close'), [0, null]);
   assert.deepEqual(JSON.parse(output()), { cwd, args });
@@ -43,13 +44,13 @@ test('Windows pinned launch binds the selected identity and preserves literal pr
 test('Windows prepared launch is a one-use native capability and cannot become an ordinary spawn recipe', windows, async t => {
   const { cwd } = fixture(t);
   const binding = preparePinnedCwdLaunch(cwd, process.execPath, ['-e', 'process.exit(0)']);
-  t.after(() => binding.release());
+  registerCleanup(t, () => binding.release());
   assert.equal(binding.platform, 'win32');
   assert.equal(binding.identity.platform, 'win32');
   assert.throws(() => binding.command, { code: 'WINDOWS_PINNED_SPAWN_REQUIRED' });
   assert.throws(() => fs.renameSync(cwd, cwd + '-moved'));
   const child = binding.spawnOwned();
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   binding.release(); // Native controller independently retains its lease.
   assert.throws(() => binding.spawnOwned(), { code: 'PROJECT_PATH_CHANGED' });
   child.stdout.resume(); child.stderr.resume(); child.stdin.end();
@@ -95,7 +96,7 @@ test('Windows JSONRPC resolves a Node provider and closes its owned process afte
     setInterval(()=>{},1000);`);
   const rpc = new JsonRpcProcess({ binary: file, args: ['%!& "中文'], cwd,
     expectedIdentity: captureSelectedCwdSnapshot(cwd), closeEofGraceMs: 20, closeKillTimeoutMs: 1000 });
-  t.after(() => rpc.close());
+  registerCleanup(t, () => rpc.close());
   await rpc.start();
   assert.deepEqual(await rpc.request('echo'), { cwd, args: ['%!& "中文'] });
   await rpc.close();
@@ -110,7 +111,7 @@ test('Windows JSONRPC cleanup rejects an unconfirmed native Job observation', wi
     closeEofGraceMs: 10, closeKillTimeoutMs: 100 });
   await rpc.start();
   const native = rpc.child._controller;
-  t.after(() => native.close());
+  registerCleanup(t, () => native.close());
   rpc.child._controller = {
     poll() { throw new Error('injected observation failure'); },
     terminate() { native.terminate(); }, close() { native.close(); }
@@ -127,7 +128,7 @@ test('Windows Codex AppServer uses resolved provider transport and confirmed own
     setInterval(()=>{},1000);`);
   const server = createCodexAppServer({ cwd, expectedCwdIdentity: captureSelectedCwdSnapshot(cwd),
     env: { ...process.env, PATH: cwd, PATHEXT: '.MJS' }, requestTimeoutMs: 2000, closeTimeoutMs: 50 });
-  t.after(() => server.close());
+  registerCleanup(t, () => server.close());
   assert.deepEqual(await server.initialize(), { userAgent: 'fake-windows-provider' });
   assert.equal(server.snapshot().status, 'ready');
   const pid = server.snapshot().pid;
