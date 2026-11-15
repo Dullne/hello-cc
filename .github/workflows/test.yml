@@ -92,6 +92,7 @@ jobs:
         run: node .github/scripts/windows-token-owner-probe.mjs
 
       - name: Isolate test profile beneath the runner's owned home
+        id: windows_profile
         run: |
           $testProfile = Join-Path $env:USERPROFILE ('hcc-windows-test-' + [Guid]::NewGuid().ToString())
           New-Item -ItemType Directory -Path $testProfile | Out-Null
@@ -116,6 +117,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared UI behavior and source checks
+        if: ${{ !cancelled() && steps.windows_profile.outcome == 'success' }}
         run: |
           node --test test/web-ui-agent-start.test.mjs test/web-ui-session-display.test.mjs test/web-ui-handoff.test.mjs test/web-ui-terminal-command.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -123,12 +125,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared native services, scoped tools, and Web behavior
+        if: ${{ !cancelled() && steps.windows_profile.outcome == 'success' }}
         timeout-minutes: 40
         run: |
           node .github/scripts/run-bounded-tests.mjs --concurrency 3 --file-timeout-ms 2100000 --log-dir "$env:RUNNER_TEMP/hcc-windows-shared" test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify an independently installed npm candidate
+        if: ${{ !cancelled() && steps.windows_profile.outcome == 'success' }}
         timeout-minutes: 10
         run: node scripts/windows-installed-acceptance.mjs --output "$env:RUNNER_TEMP/hcc-windows-installed-acceptance.json"
 

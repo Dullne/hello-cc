@@ -62,6 +62,28 @@ test('Windows offline migration preserves WAL rows, large database history and s
   assert.throws(() => migrateLegacyProjectState(f.root, offline), { code: 'STATE_MIGRATION_EXISTS' });
 });
 
+test('Windows offline migration preserves SQLite state when scratch and destination paths exceed MAX_PATH', windows, t => {
+  const f = fixture(t);
+  const home = path.join(f.home, 'p'.repeat(Math.max(16, 190 - f.home.length - 1)));
+  fs.mkdirSync(home);
+  process.env.HOME = process.env.USERPROFILE = home;
+  const source = path.join(f.source, 'mesh.db');
+  seed(source, "CREATE TABLE messages(body TEXT); INSERT INTO messages VALUES('long-path history');");
+  const before = inventory(f.source);
+  assert.ok(path.join(f.destination(), 'mesh.db').length > 260);
+  const result = migrateLegacyProjectState(f.root, offline);
+  assert.equal(result.stateDir, f.destination());
+  assert.equal(result.databases, 1);
+  const target = path.join(result.stateDir, 'mesh.db');
+  const db = new DatabaseSync(path.toNamespacedPath(target), { readOnly: true });
+  try { assert.equal(db.prepare('SELECT body FROM messages').get().body, 'long-path history'); }
+  finally { db.close(); }
+  assert.equal(loadWindowsNative().inspectPathSecurity(target).private, true);
+  assert.equal(inspectPrivateProjectAuthority(f.root), 'migrated');
+  assert.equal(result.stateDir.startsWith('\\\\?\\'), false, 'stored state paths keep their canonical ordinary spelling');
+  assert.deepEqual(inventory(f.source), before);
+});
+
 test('Windows migration requires explicit confirmation and refuses a live source writer or process pointer', windows, t => {
   const f = fixture(t), file = path.join(f.source, 'log'); fs.writeFileSync(file, 'original');
   assert.throws(() => migrateLegacyProjectState(f.root), { code: 'STATE_MIGRATION_OFFLINE_REQUIRED' });

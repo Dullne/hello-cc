@@ -41,6 +41,31 @@ test('Windows security inspection refuses junctions without changing their targe
     assert.deepEqual(fs.readdirSync(target), []);
   });
 
+test('Windows native private directory creation and inspection support long ordinary local paths',
+  { skip: process.platform !== 'win32' }, t => {
+    const root = fs.mkdtempSync(path.join(os.homedir(), 'hcc-long-security-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const native = loadWindowsNative();
+    const parent = path.join(root, 'p'.repeat(Math.max(8, 240 - root.length - 1)));
+    native.createPrivateDirectory(parent);
+    const directory = path.join(parent, 'long-private-directory-name');
+    assert.ok(directory.length > 260);
+    native.createPrivateDirectory(directory);
+    const security = native.inspectPathSecurity(directory);
+    assert.equal(security.private, true);
+    assert.equal(security.ownerSid, security.userSid);
+    assert.equal(security.protectedDacl, true);
+    const file = path.join(directory, 'file.txt'); fs.writeFileSync(file, 'private');
+    assert.equal(native.inspectPathSecurity(file).private, true);
+    assert.throws(() => native.inspectPathSecurity(path.toNamespacedPath(file)), { code: 'WINDOWS_PATH_INVALID' });
+    assert.throws(() => native.createPrivateDirectory(path.toNamespacedPath(path.join(directory, 'untrusted'))), { code: 'WINDOWS_PATH_INVALID' });
+    assert.equal(fs.existsSync(path.join(directory, 'untrusted')), false);
+    const junction = path.join(parent, 'long-junction-directory-name');
+    fs.symlinkSync(directory, junction, 'junction');
+    try { assert.throws(() => native.inspectPathSecurity(junction), { code: 'WINDOWS_REPARSE_FORBIDDEN' }); }
+    finally { fs.unlinkSync(junction); }
+  });
+
 test('Windows security boundary rejects aliases, invalid names and excess arguments before mutation',
   { skip: process.platform !== 'win32' }, t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-security-input-'));

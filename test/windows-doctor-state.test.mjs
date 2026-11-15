@@ -72,6 +72,24 @@ test('Windows environment diagnosis accepts private existing state without openi
   assert.deepEqual(fs.readdirSync(projects), ['mesh.db']);
 });
 
+test('Windows environment diagnosis accepts private state files beyond MAX_PATH without changing them', windows, t => {
+  const f = fixture(t);
+  f.native.createPrivateDirectory(f.state);
+  const directory = path.join(f.state, 'd'.repeat(Math.max(8, 245 - f.state.length - 1)));
+  fs.mkdirSync(directory);
+  const file = path.join(directory, 'long-private-state-file.db');
+  assert.ok(file.length > 260);
+  fs.writeFileSync(file, 'long private file without SQLite content');
+  const before = fs.statSync(file);
+  const report = f.diagnose();
+  assert.equal(report.ready, true);
+  assert.equal(report.status, 0);
+  assert.equal(report.permissions.state.status, 'trusted');
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'long private file without SQLite content');
+  assert.deepEqual(fs.readdirSync(directory), [path.basename(file)]);
+});
+
 test('Windows environment diagnosis rejects junction state and leaves the target untouched', windows, t => {
   const f = fixture(t); const target = path.join(f.home, 'target');
   f.native.createPrivateDirectory(target);

@@ -12,6 +12,8 @@ Complete Windows CLI environment setup, existing-state diagnostics, offline lega
 - Inspect existing private state without opening SQLite. Unsafe ACLs, junctions, hardlinks, unexpected entries, and incomplete inspection prevent a misleading ready result.
 - Recognize installed Windows encoded hooks in Codex diagnostics and preserve PowerShell smart quotes literally in hook installation paths, without executing diagnostic input.
 - Import offline legacy Windows state through retained native handles and private destination storage. Preserve source bytes, snapshot SQLite, reject live or uncertain writers, and resume only receipt-bound interrupted migrations.
+- Use Windows extended filenames at SQLite and native security API boundaries so deep private-state paths support database connections, WAL history, migration snapshots, and permission diagnosis while retaining the original path checks.
+- Start programs from long executable paths and report unsupported working directories before creating a process. Windows managed process, service, and terminal launches require a working-directory path of at most 258 UTF-16 code units; the error directs users to a shorter project path.
 - Generate and reuse Windows self-signed HTTPS certificates with OpenSSL, private native publication, serialized certificate rotation, and real HTTPS verification. OpenSSL must be available on PATH.
 - Give expensive Windows background discovery scans a completion interval and proportional cooldown so fresh identity checks leave time for Web requests.
 - Close test-owned processes before removing their pinned directories. CI now records each test file and fails bounded hangs with diagnostics; artifact upload uses the current Node 24 action.

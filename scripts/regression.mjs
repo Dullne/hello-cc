@@ -7277,14 +7277,14 @@ async function syntaxAndHelp() {
     'root: project.root',
     'createStateDir: false',
     'const dbPath = resolved.db',
-    'db = retainWindowsDatabase(new DatabaseSync(dbPath'
+    'db = retainWindowsDatabase(new DatabaseSync(sqliteDatabasePath(dbPath)'
   ]) {
     if (!registeredMigrationSource.includes(expected)) {
       fail(`registered migration project-path recheck missing: ${expected}`);
     }
   }
   if (registeredMigrationSource.indexOf('resolved = resolveProjectDatabase({') >
-      registeredMigrationSource.indexOf('new DatabaseSync(dbPath')) {
+      registeredMigrationSource.indexOf('new DatabaseSync(sqliteDatabasePath(dbPath)')) {
     fail('registered migration opens a sibling database before its project-path recheck');
   }
   // skip the old hccSource-based migration fanout check (code moved to lib/db/connection.mjs)

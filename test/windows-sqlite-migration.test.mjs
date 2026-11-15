@@ -61,7 +61,7 @@ test('a Windows private database upgrades an older schema only after a verified 
   finally { db.close(); }
   const backups = fs.readdirSync(f.directory).filter(name => name.endsWith('.bak'));
   assert.equal(backups.length, 1);
-  const backup = new DatabaseSync(path.join(f.directory, backups[0]), { readOnly: true });
+  const backup = new DatabaseSync(path.toNamespacedPath(path.join(f.directory, backups[0])), { readOnly: true });
   try {
     assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 6);
     assert.equal(backup.prepare("SELECT value FROM meta WHERE key='backup-proof'").get().value, 'original');
@@ -94,9 +94,38 @@ test('Windows migration backups preserve databases larger than the project-file 
   const file = path.join(f.directory, name);
   assert.ok(fs.statSync(file).size > 10 * 1024 * 1024);
   assert.equal(loadWindowsNative().inspectPathSecurity(file).private, true);
-  const backup = new DatabaseSync(file, { readOnly: true });
+  const backup = new DatabaseSync(path.toNamespacedPath(file), { readOnly: true });
   try { assert.equal(backup.prepare('SELECT length(bytes) AS n FROM large_payload').get().n, 12582912); }
   finally { backup.close(); }
+});
+
+test('Windows migration backs up a short database path when the generated staging and backup paths exceed MAX_PATH', windows, t => {
+  const base = fs.mkdtempSync(path.join(os.homedir(), 'hcc-long-backup-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const directory = path.join(base, 'd'.repeat(Math.max(8, 225 - base.length - 1)));
+  loadWindowsNative().createPrivateDirectory(directory);
+  const file = path.join(directory, 'mesh.db');
+  assert.ok(file.length < 260, 'the source database must remain below MAX_PATH');
+  assert.ok(path.join(directory, '.mesh.db.migration-backup-' + '0'.repeat(32) + '.tmp').length > 260);
+  const db = new DatabaseSync(file);
+  let backupPath;
+  try {
+    initSchema(db); legacy(db);
+    db.exec("INSERT INTO meta(key,value) VALUES('long-path-proof','original');");
+    backupPath = ensureMigrationBackup(db, file, 6, 7);
+    assert.ok(backupPath.length > 260);
+    assert.equal(readSchemaVersion(db), 6, 'taking a backup must not mutate the source schema');
+  } finally { db.close(); }
+  const backup = new DatabaseSync(path.toNamespacedPath(backupPath), { readOnly: true });
+  try {
+    assert.equal(readSchemaVersion(backup), 6);
+    assert.equal(backup.prepare("SELECT value FROM meta WHERE key='long-path-proof'").get().value, 'original');
+    assert.equal(backup.prepare('PRAGMA quick_check').get().quick_check, 'ok');
+  } finally { backup.close(); }
+  assert.equal(loadWindowsNative().inspectPathSecurity(backupPath).private, true);
+  assert.deepEqual(fs.readdirSync(directory).sort(), [path.basename(backupPath), 'mesh.db'].sort());
+  fs.renameSync(directory, directory + '-moved');
+  fs.renameSync(directory + '-moved', directory);
 });
 
 test('Windows backup publication preserves collisions and rotates only checked old backup objects', windows, t => {
@@ -170,7 +199,7 @@ test('Windows backup keeps verified bytes immutable until publication while allo
     const backupPath = ensureMigrationBackup(db, f.dbPath, 6, 7, {
       verifySnapshot(file) {
         staged = file;
-        const snapshot = new DatabaseSync(file, { readOnly: true });
+        const snapshot = new DatabaseSync(path.toNamespacedPath(file), { readOnly: true });
         try { assert.equal(snapshot.prepare('PRAGMA quick_check').get().quick_check, 'ok'); }
         finally { snapshot.close(); }
       },
@@ -180,7 +209,7 @@ test('Windows backup keeps verified bytes immutable until publication while allo
       }
     });
     assert.ok(['EBUSY', 'EPERM', 'EACCES'].includes(blocked?.code), 'in-place writes must stay blocked after verification');
-    const snapshot = new DatabaseSync(backupPath, { readOnly: true });
+    const snapshot = new DatabaseSync(path.toNamespacedPath(backupPath), { readOnly: true });
     try { assert.equal(snapshot.prepare('PRAGMA quick_check').get().quick_check, 'ok'); }
     finally { snapshot.close(); }
   } finally { db.close(); }

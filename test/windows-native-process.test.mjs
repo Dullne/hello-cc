@@ -75,6 +75,54 @@ test('owned Windows process preserves literal argv, Unicode cwd and explicit env
   assert.deepEqual(JSON.parse(output()), { args, cwd, value: 'literal 中文 %!&' });
 });
 
+test('owned Windows launch reaches a long executable with literal arguments from an ordinary cwd', windows, async t => {
+  const { spawnWindowsOwnedProcess } = await api();
+  const { root } = fixture(t);
+  const directory = path.join(root, 'deep-' + 'a'.repeat(140), '中文-' + 'b'.repeat(120));
+  fs.mkdirSync(directory, { recursive: true });
+  assert.ok(directory.length > 280);
+  const launcher = path.join(directory, 'long-launcher.exe');
+  fs.copyFileSync(new URL('../native/bin/win32-x64/hcc-shim.exe', import.meta.url), launcher);
+  fs.writeFileSync(launcher + '.nodepath', Buffer.from('\ufeff' + process.execPath, 'utf16le'));
+  fs.writeFileSync(launcher + '.mjs', `import fs from 'node:fs';
+    fs.writeFileSync('relative-proof.txt','selected directory');
+    console.log(JSON.stringify({cwd:fs.realpathSync.native(process.cwd()),args:process.argv.slice(2)}));`);
+  const args = ['', '中文 %!& $()', 'tail\\'];
+  const child = spawnWindowsOwnedProcess(launcher, args, { cwd: root });
+  registerCleanup(t, () => child.close());
+  const output = collect(child.stdout), errors = collect(child.stderr);
+  const closed = once(child, 'close'); child.stdin.end();
+  assert.deepEqual(await closed, [0, null], errors().toString());
+  assert.deepEqual(JSON.parse(output()), { cwd: fs.realpathSync.native(root), args });
+  assert.equal(fs.readFileSync(path.join(root, 'relative-proof.txt'), 'utf8'), 'selected directory');
+});
+
+test('owned Windows cwd limit counts UTF-16 units and trailing separators before user code runs', windows, async t => {
+  const { spawnWindowsOwnedProcess } = await api();
+  const { root } = fixture(t);
+  for (const length of [258, 259]) {
+    const cwd = path.join(root, '界🚀' + 'd'.repeat(length - root.length - 4));
+    assert.equal(cwd.length, length);
+    fs.mkdirSync(cwd);
+    const marker = path.join(root, `executed-${length}`);
+    const args = ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`];
+    if (length === 258) {
+      const child = spawnWindowsOwnedProcess(process.execPath, args, { cwd });
+      registerCleanup(t, () => child.close());
+      child.stdout.resume(); child.stderr.resume(); child.stdin.end();
+      assert.deepEqual(await once(child, 'close'), [0, null]);
+      assert.equal(fs.readFileSync(marker, 'utf8'), 'ran');
+      fs.unlinkSync(marker);
+      assert.throws(() => spawnWindowsOwnedProcess(process.execPath, args, { cwd: cwd + '\\' }),
+        { code: 'WINDOWS_PROCESS_CWD_TOO_LONG' });
+    } else {
+      assert.throws(() => spawnWindowsOwnedProcess(process.execPath, args, { cwd }),
+        { code: 'WINDOWS_PROCESS_CWD_TOO_LONG' });
+    }
+    assert.equal(fs.existsSync(marker), false, 'refused launches must not execute child code');
+  }
+});
+
 test('stdin is streamed with backpressure, binary bytes and EOF preserved', windows, async t => {
   const { spawnWindowsOwnedProcess } = await api();
   const { cwd, put } = fixture(t);

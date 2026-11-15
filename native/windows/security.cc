@@ -130,8 +130,12 @@ napi_value InspectHandle(napi_env env, HANDLE handle) {
 napi_value Inspect(napi_env env, napi_callback_info info) {
   try {
     const auto name = Path(env, info);
+    // Path has already rejected caller-supplied device/UNC paths and aliases.
+    // Extend only this internal Win32 spelling so ordinary paths over MAX_PATH
+    // select the same object as the handle-relative filesystem operations.
+    const auto filename = L"\\\\?\\" + name;
     Handle handle;
-    handle.value = CreateFileW(name.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+    handle.value = CreateFileW(filename.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle.value == INVALID_HANDLE_VALUE) throw WinFailure("WINDOWS_SECURITY_UNAVAILABLE", "Cannot open path security");
@@ -200,11 +204,12 @@ napi_value Create(napi_env env, napi_callback_info info) {
   try {
     const auto name = Path(env, info);
     if (name.size() <= 3) throw WinFailure("WINDOWS_PATH_INVALID", "A private directory cannot be a volume root");
+    const auto filename = L"\\\\?\\" + name;
     PSECURITY_DESCRIPTOR descriptor = WindowsPrivateSecurityDescriptor();
     Local owned;
     owned.value = descriptor;
     SECURITY_ATTRIBUTES security{ sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE };
-    if (!CreateDirectoryW(name.c_str(), &security)) {
+    if (!CreateDirectoryW(filename.c_str(), &security)) {
       const auto error = GetLastError();
       throw WinFailure(error == ERROR_ALREADY_EXISTS ? "WINDOWS_PATH_EXISTS" : "WINDOWS_SECURITY_UNAVAILABLE",
         "Cannot create private Windows directory");

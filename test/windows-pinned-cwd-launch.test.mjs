@@ -4,8 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { assertPinnedSessionLaunchAllowed, preparePinnedCwdLaunch, spawnPinnedCwdProcess, spawnPinnedCwdPty } from '../lib/process/pinned-cwd.mjs';
 import { captureSelectedCwdSnapshot } from '../lib/process/selected-cwd-identity.mjs';
+import { captureDirectory } from '../lib/platform/windows-filesystem.mjs';
+import { loadWindowsNative } from '../lib/platform/windows-native.mjs';
+import { spawnWindowsServiceHost } from '../lib/platform/windows-service-host.mjs';
+import { publicCliFailure } from '../lib/shared/errors.mjs';
 import { JsonRpcProcess } from '../lib/integrations/native/jsonrpc.mjs';
 import { createCodexAppServer } from '../lib/web/codex-app-server.mjs';
 import { registerCleanup } from './helpers/fixture-cleanup.mjs';
@@ -39,6 +44,39 @@ test('Windows pinned launch binds the selected identity and preserves literal pr
   assert.deepEqual(await once(child, 'close'), [0, null]);
   assert.deepEqual(JSON.parse(output()), { cwd, args });
   assert.deepEqual(fs.readdirSync(cwd), []);
+});
+
+test('Windows process, terminal and service launches reject deep cwd before user code and release their pins', windows, t => {
+  const { root } = fixture(t);
+  const cwd = path.join(root, 'a'.repeat(145), 'b'.repeat(130));
+  fs.mkdirSync(cwd, { recursive: true });
+  assert.ok(cwd.length > 280);
+  const expectedIdentity = captureSelectedCwdSnapshot(cwd);
+  const code = 'require("node:fs").writeFileSync("UNEXPECTED_EXECUTION","ran")';
+  const refused = error => {
+    assert.equal(error.code, 'WINDOWS_PROCESS_CWD_TOO_LONG');
+    assert.match(error.message, /at most 258.*Choose a shorter project directory/);
+    return true;
+  };
+  const publiclyRefused = error => {
+    refused(error);
+    assert.equal(publicCliFailure(error)?.error, error, 'CLI and Web must retain the actionable path-length message');
+    return true;
+  };
+  assert.throws(() => spawnPinnedCwdProcess(process.execPath, ['-e', code], { cwd, expectedIdentity }), publiclyRefused);
+  const binding = preparePinnedCwdLaunch(cwd, process.execPath, ['-e', code], { expectedIdentity });
+  try { assert.throws(() => binding.spawnPty(), publiclyRefused); }
+  finally { binding.release(); }
+  const serviceLease = captureDirectory(cwd);
+  try {
+    const hostEntry = fileURLToPath(new URL('../bin/windows-terminal-host.mjs', import.meta.url));
+    assert.throws(() => spawnWindowsServiceHost(process.execPath, [hostEntry, '--state-dir', cwd],
+      { cwd, lease: serviceLease }), publiclyRefused);
+    assert.throws(() => loadWindowsNative().startDetachedHost({ file: process.execPath, args: ['-e', code],
+      cwd, env: process.env, lease: serviceLease }), refused);
+  } finally { serviceLease.close(); }
+  assert.deepEqual(fs.readdirSync(cwd), [], 'rejection must neither execute user code nor leave a pin sentinel');
+  fs.renameSync(cwd, cwd + '-moved');
 });
 
 test('Windows prepared launch is a one-use native capability and cannot become an ordinary spawn recipe', windows, async t => {

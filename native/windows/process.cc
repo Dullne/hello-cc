@@ -23,9 +23,10 @@ const napi_type_tag kControllerTag{0x40ae97bf8d724938ULL, 0x9a8b465605319ae1ULL}
 
 class Failure : public std::runtime_error {
  public:
-  explicit Failure(const char* message, DWORD error = ERROR_INVALID_PARAMETER)
-      : std::runtime_error(message), error(error) {}
+  explicit Failure(const char* message, DWORD error = ERROR_INVALID_PARAMETER, const char* code = "WINDOWS_PROCESS_ERROR")
+      : std::runtime_error(message), error(error), code(code) {}
   DWORD error;
+  const char* code;
 };
 void Check(napi_status status) { if (status != napi_ok) throw Failure("Node-API process operation failed"); }
 void WinCheck(BOOL ok, const char* message) { if (!ok) throw Failure(message, GetLastError()); }
@@ -47,7 +48,7 @@ napi_value Throw(napi_env env, const std::exception& error) {
   if (pending) return nullptr;
   napi_value result, code, message;
   const auto* failure = dynamic_cast<const Failure*>(&error);
-  if (napi_create_string_utf8(env, "WINDOWS_PROCESS_ERROR", NAPI_AUTO_LENGTH, &code) == napi_ok &&
+  if (napi_create_string_utf8(env, failure ? failure->code : "WINDOWS_PROCESS_ERROR", NAPI_AUTO_LENGTH, &code) == napi_ok &&
       napi_create_string_utf8(env, error.what(), NAPI_AUTO_LENGTH, &message) == napi_ok &&
       napi_create_error(env, code, message, &result) == napi_ok) {
     napi_value nativeError;
@@ -96,6 +97,14 @@ napi_value Property(napi_env env, napi_value object, const char* key) {
 bool Absolute(const std::wstring& value) {
   return value.size() >= 3 && ((value[1] == L':' && (value[2] == L'\\' || value[2] == L'/')) ||
     (value[0] == L'\\' && value[1] == L'\\'));
+}
+std::wstring ProcessApiPath(napi_env env, napi_value argument, const std::wstring& value) {
+  if (value.size() < MAX_PATH - 2 ||
+      !((value[0] >= L'A' && value[0] <= L'Z') || (value[0] >= L'a' && value[0] <= L'z')) || value[1] != L':') return value;
+  // Extended spelling disables Win32 path normalization. Apply the existing
+  // strict local-path policy before adding it, and keep the original spelling
+  // for argv and selected-directory identity comparisons.
+  return L"\\\\?\\" + WindowsPathArgument(env, argument);
 }
 std::wstring Quote(const std::wstring& value) {
   std::wstring result = L"\"";
@@ -497,6 +506,12 @@ napi_value StartProcess(napi_env env, napi_callback_info info, bool serviceHost,
     const std::wstring file = Wide(env, Property(env, args[0], "file"));
     const std::wstring cwd = Wide(env, Property(env, args[0], "cwd"));
     if (!Absolute(file) || !Absolute(cwd)) throw Failure("Owned process executable and cwd must be absolute");
+    // CreateProcessW still reserves space for a separator and the terminator,
+    // even for an extended path. Do not substitute an 8.3 alias for a selection.
+    if (cwd.size() > MAX_PATH - 2) throw Failure(
+      "Windows process launch requires a working-directory path of at most 258 UTF-16 code units, including any trailing separator. Choose a shorter project directory; private database paths may be longer.",
+      ERROR_FILENAME_EXCED_RANGE, "WINDOWS_PROCESS_CWD_TOO_LONG");
+    const std::wstring apiFile = ProcessApiPath(env, Property(env, args[0], "file"), file);
     bool extraHandles = false;
     Check(napi_has_named_property(env, args[0], "inheritHandles", &extraHandles));
     if (extraHandles) throw Failure("Arbitrary process handle inheritance is unsupported");
@@ -631,7 +646,7 @@ napi_value StartProcess(napi_env env, napi_callback_info info, bool serviceHost,
     PROCESS_INFORMATION information{};
     const DWORD creationFlags = (terminal ? 0 : CREATE_NO_WINDOW) | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT |
       (serviceHost ? 0 : CREATE_SUSPENDED);
-    WinCheck(CreateProcessW(file.c_str(), command.data(), nullptr, nullptr, TRUE, creationFlags,
+    WinCheck(CreateProcessW(apiFile.c_str(), command.data(), nullptr, nullptr, TRUE, creationFlags,
       environment.data(), cwd.c_str(), &startup.StartupInfo, &information), "Owned process creation failed");
     controller->process.reset(information.hProcess);
     controller->primaryThread.reset(information.hThread);
