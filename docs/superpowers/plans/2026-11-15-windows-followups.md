@@ -10,7 +10,7 @@
 
 - [x] CLI and diagnosis: reproduce POSIX-only env output and state-ACL false readiness; add explicit PowerShell/cmd/POSIX formats, platform defaults, safe quoting and platform-specific help; inspect existing state ACL without creating state; test malformed paths and missing state.
 - [x] Legacy migration: inspect the existing POSIX migration contract and actual legacy layout without changing it; implement a Windows offline migration using native source identity/read protection, private destination staging, SQLite integrity validation, retained backup/source, publication fencing and retry behavior; add adversarial and real database tests. Root applies the validated command to the real legacy project only after backups and offline checks.
-- [ ] Windows CI: obtain available failure evidence, identify the stalled test/stage, reproduce locally where possible, correct the underlying lifetime/fixture problem and add bounded per-test evidence; retain all required assertions. Update obsolete artifact actions after checking their current requirements.
+- [x] Windows CI: obtain available failure evidence, identify the stalled test/stage, reproduce locally where possible, correct the underlying lifetime/fixture problem and add bounded per-test evidence; retain all required assertions. Update obsolete artifact actions after checking their current requirements.
 - [x] Windows TLS: add a platform-specific implementation with private key storage and stable certificate reuse/rotation, using the existing Windows primitives; validate certificate/key pairing, SANs, permissions and actual HTTPS. Preserve POSIX behavior.
 - [ ] Local setup: back up provider config, user PATH and HCC state; install correct guidance/hooks/shims from the reviewed package; validate normal PowerShell/cmd resolution and real provider auth/status, then one bounded harmless model task per available account.
 - [x] Optional DSH and supported-platform record: inspect the supported DSH distribution and native platform compatibility, install/verify where supported; report missing account/hardware gates explicitly. Windows 10/ARM64/network filesystem acceptance cannot be inferred from this Windows 11 x64 machine.
@@ -19,3 +19,7 @@
 ## Evidence rules
 
 Record real command exit codes and timestamps. A simulated provider proves process behavior, not real account integration. Cloud timeout must be resolved or remain an explicit incomplete gate; increasing a timeout alone is not proof. Existing registered projects and old state remain recoverable throughout migration.
+
+## Final release checkpoint
+
+Commit `8815f72` passed all three hosted Test jobs. The frozen 1.2.1 archive passed all publication checks, exact Windows installed lifecycle, and actual global file-hash verification. Real Codex hook context delivery passed after correcting its PowerShell invocation and reviewing the four hook trust definitions. Remaining account gates are explicit: npm terminal authentication is expired, and Claude's configured local relay is offline with the routing decision still pending. These account conditions do not erase the passing local or hosted results and must not be described as completed model/publication acceptance.
