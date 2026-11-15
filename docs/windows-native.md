@@ -54,6 +54,8 @@ The advanced POSIX shortcut that inserts an `hcc` shell command into an arbitrar
 
 Windows hooks invoke an explicit system PowerShell executable and an encoded, generated program. User/provider arguments do not become shell syntax. Installation and removal recognize the generated ownership form and preserve unrelated configuration.
 
+Codex separately reviews hook trust. Open `/hooks` in Codex and review the installed HCC commands before approving them; untrusted commands are skipped even when enabled. HCC setup installs configuration, while `hcc doctor --codex` reports that configuration and recorded project invocations. Its version and help probes use the same Windows provider installation selected by HCC and isolated temporary homes. They do not approve hooks or establish model receipt of injected context.
+
 The `claude` and `codex` launchers live in the private `%USERPROFILE%\.hcc-shims` directory. Each native `.exe` forwards the original argument vector and standard streams to its adjacent JavaScript dispatcher. Utility commands such as help, login, and noninteractive execution pass through to the real provider. An interactive invocation in an initialized project routes through the managed HCC CLI. Resolution excludes HCC's own launchers, including indirect paths back into the shim directory.
 
 ```powershell
@@ -76,7 +78,7 @@ node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-inst
 
 The Windows CI job downloads the exact running Node version's headers/import library, checks their official SHA-256 sums, builds the component and launcher, and runs the Windows tests. Those tests include extracting `npm pack --ignore-scripts` and loading the native API without access to the source checkout. Ignoring lifecycle scripts creates a validation installation; it does not bypass release/publish gates for an actual release.
 
-Hosted CI records its test shell's user and default-owner identities. If they differ, the CI wrapper changes only that shell's default owner to its existing user identity, verifies the result, and then starts the test step. A separate probe checks new private files and SQLite sidecars. This does not change existing ACLs, token privileges, or machine settings, and does not qualify elevated end-user terminals. Hosted results remain pending until that run's receipts and tests succeed.
+Hosted CI records its test shell's user and default-owner identities. If they differ, the CI wrapper changes only that shell's default owner to its existing user identity, verifies the result, and then starts the test step. A separate probe checks new private files and SQLite sidecars. The follow-up hosted runs confirmed this normalization and passed the five file-ownership probes. This does not change existing ACLs, token privileges, or machine settings, and does not qualify elevated end-user terminals. The validation record reports each run's remaining test outcomes separately.
 
 The installed acceptance script installs the selected package archive into a disposable prefix containing spaces and Chinese characters. It then invokes the installed public CLI for environment checks, project initialization, background Web, native services, and terminal lifecycle. Its Windows 11 acceptance covers Web restart retaining the terminal process, generation and screen, followed by explicit input and termination. It writes a bounded JSON report without credentials and confirms that its owned processes have exited. Hosted CI and other desktop versions still require their own runs.
 

@@ -113,7 +113,7 @@ jobs:
         id: windows_tests
         timeout-minutes: 20
         run: |
-          node .github/scripts/run-bounded-tests.mjs --log-dir "$env:RUNNER_TEMP/hcc-windows-native" 'test/windows-*.test.mjs' test/ci-bounded-tests.test.mjs test/fixture-cleanup.test.mjs test/completion-poller.test.mjs
+          node .github/scripts/run-bounded-tests.mjs --log-dir "$env:RUNNER_TEMP/hcc-windows-native" 'test/windows-*.test.mjs' test/ci-bounded-tests.test.mjs test/fixture-cleanup.test.mjs test/completion-poller.test.mjs test/doctor-codex.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared UI behavior and source checks

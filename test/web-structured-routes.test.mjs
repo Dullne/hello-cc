@@ -89,7 +89,7 @@ async function fixture(t, hooks = {}) {
     adapterFactory: async (provider, options) => {
       await hooks.beforeNativeAdapter?.(provider, options);
       const peer = options.env.HCC_PEER;
-      const state = { provider, status: 'idle', sessionId: 'session-' + peer, turnId: null,
+      const state = { provider, status: 'idle', sessionId: hooks.nativeSessionId || 'session-' + peer, turnId: null,
         executorId: options.executorId, pendingApprovals: [], capabilities: { send: true, resume: true, interrupt: true, close: true, approvals: true } };
       const adapter = { capabilities: state.capabilities, state, sent: [], interrupts: [], closed: 0,
         snapshot: () => structuredClone(state), async open(input) {
@@ -536,19 +536,25 @@ test('legacy PTY creation cannot replace a disconnected native worker with the s
   const before = { ...f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(source.id) };
   source.status = 'disconnected';
   const rejected = await f.request('/api/sessions', { ...controller, id: source.id, kind: 'codex',
-    backend: 'pty', command: 'fake-codex-command', force: true });
+    backend: 'pty', ...(process.platform === 'win32'
+      ? { invocation: { file: process.execPath, args: [] } }
+      : { command: 'fake-codex-command' }), force: true });
   assert.equal(rejected.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, 'STRUCTURED_SESSION_NO_TERMINAL');
   assert.equal(f.ptySpawns.length, 0);
   assert.deepEqual({ ...f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(source.id) }, before);
 });
 
 test('legacy PTY creation cannot adopt an unscanned native provider thread through a new peer alias', async t => {
-  const f = await fixture(t), source = await f.nativeSession();
+  const nativeSessionId = '1d066ec1-0c1f-467a-93ae-740bf548e848';
+  const f = await fixture(t, { nativeSessionId }), source = await f.nativeSession();
   f.sessions.clear();
   const before = { ...f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(source.id) };
   const rejected = await f.request('/api/sessions', { id: 'new-alias', kind: 'codex', backend: 'pty', force: true,
-    command: 'fake-codex-command', binding: { provider: 'codex', provider_session_id: 'session-native-a' } });
+    ...(process.platform === 'win32' ? { mode: 'resume', resume: nativeSessionId }
+      : { command: 'fake-codex-command', binding: { provider: 'codex', provider_session_id: nativeSessionId } }) });
   assert.equal(rejected.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, 'STRUCTURED_SESSION_NO_TERMINAL');
   assert.equal(f.ptySpawns.length, 0);
   assert.deepEqual({ ...f.db.prepare('SELECT * FROM peer_bindings WHERE peer=?').get(source.id) }, before);
 });

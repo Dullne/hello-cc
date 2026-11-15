@@ -14,6 +14,8 @@ import { windowsHookCommand } from '../lib/platform/windows-hook-command.mjs';
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-doctor-codex-'));
   const home = path.join(root, 'codex-home'); fs.mkdirSync(home);
+  // Mocked probes still resolve a deterministic installation on Windows.
+  if (process.platform === 'win32') fs.writeFileSync(path.join(root, 'codex.exe'), '');
   const ctx = { root, dbPath: path.join(root, 'mesh.db'), json: true };
   const db = new DatabaseSync(ctx.dbPath); initSchema(db);
   t.after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -26,10 +28,13 @@ function configure(f, command = 'hcc hook', events = ['SessionStart', 'UserPromp
 }
 
 function options(f, overrides = {}) {
-  return { env: { CODEX_HOME: f.home, HCC_SHIM_NO_ATTACH: '0', API_KEY: 'secret-environment-marker' },
+  const { env, ...rest } = overrides;
+  return { env: { CODEX_HOME: f.home, HCC_SHIM_NO_ATTACH: '0', API_KEY: 'secret-environment-marker',
+      PATH: f.root, PATHEXT: '.EXE', ...env },
     homedir: () => { throw new Error('CODEX_HOME should take precedence'); },
     run: (_binary, args) => ({ status: 0, stdout: args[0] === '--version' ? 'codex-cli 0.144.6\n'
-      : 'Usage: codex app-server [OPTIONS]\n --listen <URL> supported values: stdio://\n' }), ...overrides };
+      : 'Usage: codex app-server [OPTIONS]\n --listen <URL> supported values: stdio://\n' }),
+    ...rest };
 }
 
 function capture(operation) {
@@ -68,7 +73,8 @@ test('opt-in probes only version/help with bounds and reports advertised startup
     assert.deepEqual(config.stdio, ['ignore', 'pipe', 'ignore']);
     return opt.run(binary, args, config);
   } });
-  assert.deepEqual(calls, [{ binary: 'codex', args: ['--version'] }, { binary: 'codex', args: ['app-server', '--help'] }]);
+  const binary = process.platform === 'win32' ? path.join(f.root, 'codex.exe') : 'codex';
+  assert.deepEqual(calls, [{ binary, args: ['--version'] }, { binary, args: ['app-server', '--help'] }]);
   assert.equal(report.installed.status, 'present'); assert.equal(report.version.value, '0.144.6');
   assert.equal(report.app_server.status, 'advertised');
   assert.deepEqual(report.app_server.startup_arguments, ['--listen', 'stdio://']);
@@ -206,4 +212,80 @@ test('probe startup writes stay in temporary homes and are cleaned on success an
     assert.deepEqual(fs.readdirSync(f.home), ['hooks.json']);
     assert.deepEqual(fs.readFileSync(path.join(f.home, 'hooks.json')), originalConfig);
   }
+});
+
+test('Windows Codex diagnostics probe the selected npm installation before a later executable and skip HCC wrappers', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t); configure(f);
+  fs.unlinkSync(path.join(f.root, 'codex.exe'));
+  const originalHome = path.join(f.root, 'original-home'); fs.mkdirSync(originalHome);
+  const shimBin = path.join(originalHome, '.hcc-shims'); fs.mkdirSync(shimBin);
+  fs.writeFileSync(path.join(shimBin, 'codex.cmd'), '@rem hello-cc shim\r\n');
+  const npmBin = path.join(f.root, 'npm installation'); fs.mkdirSync(npmBin);
+  const entry = path.join(npmBin, 'node_modules', '@example', 'codex', 'bin', 'codex.cjs');
+  fs.mkdirSync(path.dirname(entry), { recursive: true });
+  const receipt = path.join(f.root, 'probe-receipts.jsonl');
+  fs.writeFileSync(entry, `const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(receipt)}, JSON.stringify({ args, home: process.env.HOME, profile: process.env.USERPROFILE, codexHome: process.env.CODEX_HOME }) + '\\n');
+fs.writeFileSync(path.join(process.env.HOME, 'startup-cache'), 'isolated');
+fs.writeFileSync(path.join(process.env.CODEX_HOME, 'startup-cache'), 'isolated');
+if (JSON.stringify(args) === '["--version"]') console.log('codex-cli 0.167.0');
+else if (JSON.stringify(args) === '["app-server","--help"]') console.log('Usage: codex app-server [OPTIONS]\\n --listen <URL> stdio://');
+else process.exitCode = 90;
+`);
+  fs.writeFileSync(path.join(npmBin, 'codex.cmd'), '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n' +
+    'IF EXIST "%dp0%\\node.exe" (\r\nSET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\nSET "_prog=node"\r\nSET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n' +
+    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@example\\codex\\bin\\codex.cjs" %*\r\n');
+  const laterBin = path.join(f.root, 'later executable'); fs.mkdirSync(laterBin);
+  // A real executable which bare spawn('codex') can select after ignoring .cmd.
+  fs.copyFileSync(process.execPath, path.join(laterBin, 'codex.exe'));
+  const before = { hooks: fs.readFileSync(path.join(f.home, 'hooks.json')), db: fs.readFileSync(f.ctx.dbPath) };
+  const calls = [];
+  const report = diagnoseCodex(f.ctx, f.db, { env: { ...process.env, HOME: originalHome, USERPROFILE: originalHome,
+    CODEX_HOME: f.home, PATH: [shimBin, npmBin, laterBin].join(path.delimiter), PATHEXT: '.EXE;.CMD' },
+    run(binary, args, config) {
+      calls.push({ binary, args });
+      assert.equal(config.shell, false);
+      assert.equal(config.env.HCC_SHIM_NO_ATTACH, '1');
+      assert.equal(config.env.HCC_SHIM_ENSURED, '1');
+      return spawnSync(binary, args, { ...config, timeout: 10_000 });
+    } });
+  assert.equal(report.version.value, '0.167.0');
+  assert.deepEqual(report.app_server.startup_arguments, ['--listen', 'stdio://']);
+  assert.deepEqual(calls, [
+    { binary: process.execPath, args: [entry, '--version'] },
+    { binary: process.execPath, args: [entry, 'app-server', '--help'] }
+  ]);
+  const receipts = fs.readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(receipts.map(value => value.args), [['--version'], ['app-server', '--help']]);
+  for (const value of receipts) {
+    assert.notEqual(value.home, originalHome); assert.notEqual(value.codexHome, f.home);
+    assert.equal(value.profile, value.home);
+    assert.equal(fs.existsSync(value.home), false); assert.equal(fs.existsSync(value.codexHome), false);
+  }
+  assert.deepEqual(fs.readdirSync(originalHome), ['.hcc-shims']);
+  assert.deepEqual(fs.readdirSync(f.home), ['hooks.json']);
+  assert.deepEqual(fs.readFileSync(path.join(f.home, 'hooks.json')), before.hooks);
+  assert.deepEqual(fs.readFileSync(f.ctx.dbPath), before.db);
+  assert.equal(report.inference_called, false);
+});
+
+test('Windows Codex diagnostic resolution failures stay bounded and never execute unsupported wrappers', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t);
+  const bin = path.join(f.root, 'probe-bin'); fs.mkdirSync(bin);
+  let calls = 0;
+  const opt = options(f, { env: { PATH: bin, PATHEXT: '.CMD;.EXE' },
+    run() { calls++; throw new Error('must not execute'); } });
+  const missing = diagnoseCodex(f.ctx, f.db, opt);
+  assert.equal(missing.installed.status, 'missing');
+  assert.equal(missing.version.reason, 'not_found');
+  fs.writeFileSync(path.join(bin, 'codex.cmd'), '@echo secret-wrapper-marker\r\n');
+  fs.writeFileSync(path.join(bin, 'codex.exe'), '');
+  const unsupported = diagnoseCodex(f.ctx, f.db, opt);
+  assert.equal(unsupported.installed.status, 'unknown');
+  assert.equal(unsupported.version.reason, 'probe_failed');
+  assert.equal(unsupported.app_server.reason, 'probe_failed');
+  assert.equal(JSON.stringify(unsupported).includes('secret-'), false);
+  assert.equal(calls, 0);
 });

@@ -1,25 +1,5 @@
 # Changelog
 
-## 1.2.1
-
-### Summary
-
-Complete Windows CLI environment setup, existing-state diagnostics, offline legacy migration, and automatic HTTPS. Improve Windows acceptance cleanup and expose bounded per-file CI failures.
-
-### Highlights
-
-- Emit PowerShell assignments by default on Windows; `env` and `join` support explicit `--shell powershell|cmd|posix` with safe literal handling and unchanged JSON output.
-- Inspect existing private state without opening SQLite. Unsafe ACLs, junctions, hardlinks, unexpected entries, and incomplete inspection prevent a misleading ready result.
-- Recognize installed Windows encoded hooks in Codex diagnostics and preserve PowerShell smart quotes literally in hook installation paths, without executing diagnostic input.
-- Import offline legacy Windows state through retained native handles and private destination storage. Preserve source bytes, snapshot SQLite, reject live or uncertain writers, and resume only receipt-bound interrupted migrations.
-- Use Windows extended filenames at SQLite and native security API boundaries so deep private-state paths support database connections, WAL history, migration snapshots, and permission diagnosis while retaining the original path checks.
-- Start programs from long executable paths and report unsupported working directories before creating a process. Windows managed process, service, and terminal launches require a working-directory path of at most 258 UTF-16 code units; the error directs users to a shorter project path.
-- Generate and reuse Windows self-signed HTTPS certificates with OpenSSL, private native publication, serialized certificate rotation, and real HTTPS verification. OpenSSL must be available on PATH.
-- Give expensive Windows background discovery scans a completion interval and proportional cooldown so fresh identity checks leave time for Web requests.
-- Close test-owned processes before removing their pinned directories. CI now records each test file and fails bounded hangs with diagnostics; artifact upload uses the current Node 24 action.
-
-Windows 11 x64, Node.js 24+, and local NTFS remain the accepted desktop scope. Windows 10 requires its own acceptance environment; ARM64 and network/non-NTFS storage remain unsupported. Provider authentication and model responses are separate from local runtime checks. See the current Windows follow-up validation record for exact results.
-
 This project keeps one changelog file. Add one section per release, with the
 newest version first. Do not create a new changelog file for every release.
 
@@ -36,6 +16,27 @@ Pushing a `v*` tag runs the GitHub Release workflow, which creates or updates
 the release description from the current changelog section. Use
 `npm run release:github` with `GH_TOKEN` or `GITHUB_TOKEN` only for local
 backfills.
+
+## 1.2.1
+
+### Summary
+
+Complete Windows CLI environment setup, existing-state diagnostics, offline legacy migration, and automatic HTTPS. Improve Windows acceptance cleanup and expose bounded per-file CI failures.
+
+### Highlights
+
+- Emit PowerShell assignments by default on Windows; `env` and `join` support explicit `--shell powershell|cmd|posix` with safe literal handling and unchanged JSON output.
+- Inspect existing private state without opening SQLite. Unsafe ACLs, junctions, hardlinks, unexpected entries, and incomplete inspection prevent a misleading ready result.
+- Recognize installed Windows encoded hooks in Codex diagnostics, probe the same Codex installation HCC launches, and preserve PowerShell smart quotes literally in hook installation paths, without executing diagnostic input.
+- Prevent Windows terminals from replacing native workers through either their peer or provider-session identity. Check conflicts before contacting the terminal host, before process creation, and again when publishing the binding so concurrent changes preserve the existing worker.
+- Import offline legacy Windows state through retained native handles and private destination storage. Preserve source bytes, snapshot SQLite, reject live or uncertain writers, and resume only receipt-bound interrupted migrations.
+- Use Windows extended filenames at SQLite and native security API boundaries so deep private-state paths support database connections, WAL history, migration snapshots, and permission diagnosis while retaining the original path checks.
+- Start programs from long executable paths and report unsupported working directories before creating a process. Windows managed process, service, and terminal launches require a working-directory path of at most 258 UTF-16 code units; the error directs users to a shorter project path.
+- Generate and reuse Windows self-signed HTTPS certificates with OpenSSL, private native publication, serialized certificate rotation, and real HTTPS verification. OpenSSL must be available on PATH.
+- Give expensive Windows background discovery scans a completion interval and proportional cooldown so fresh identity checks leave time for Web requests.
+- Close test-owned processes before removing their pinned directories. CI now records each test file and fails bounded hangs with diagnostics; artifact upload uses the current Node 24 action.
+
+Windows 11 x64, Node.js 24+, and local NTFS remain the accepted desktop scope. Windows 10 requires its own acceptance environment; ARM64 and network/non-NTFS storage remain unsupported. Provider authentication and model responses are separate from local runtime checks. See the current Windows follow-up validation record for exact results.
 
 ## 1.2.0
 
