@@ -42,7 +42,8 @@ test('Windows hook install, literal execution, status and uninstall preserve unr
     for (const [directory, file] of [['.claude', 'settings.json'], ['.codex', 'hooks.json']]) {
       fs.mkdirSync(path.join(home, directory));
       fs.writeFileSync(path.join(home, directory, file), JSON.stringify({ keep: 42,
-        hooks: { SessionStart: [{ hooks: [unrelated] }] } }));
+        hooks: { SessionStart: [{ hooks: [unrelated,
+          ...(directory === '.codex' ? [{ type: 'command', command: windowsHookCommand(fake, 'sessionstart') }] : [])] }] } }));
     }
     const api = new URL('../lib/integrations/hooks.mjs', import.meta.url).href;
     const env = { ...process.env, HOME: home, USERPROFILE: home, HCC_NATIVE_OWNER: '' };
@@ -71,10 +72,11 @@ test('Windows hook install, literal execution, status and uninstall preserve unr
       const command = handlers[1].command;
       assert.match(command, /WindowsPowerShell\\v1\.0\\powershell\.exe['"] -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
       if (file.includes('.claude')) assert.equal(handlers[1].shell, 'powershell');
-      const claude = file.includes('.claude');
-      const result = spawnSync(claude ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : process.env.ComSpec || 'cmd.exe',
-        claude ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command] : ['/d', '/s', '/c', `"${command}"`], {
-        input, env, cwd: root, encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: !claude, timeout: 15000
+      // Codex uses its resolved Windows PowerShell shell for the full hook
+      // command. Executing only EncodedCommand would miss outer quoting errors.
+      const result = spawnSync(path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+        input, env, cwd: root, encoding: 'utf8', windowsHide: true, timeout: 15000
       });
       assert.equal(result.status, 0, result.stderr || result.error?.message);
       assert.deepEqual(JSON.parse(result.stdout), { args: ['hook', 'sessionstart'], input });

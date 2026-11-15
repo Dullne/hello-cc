@@ -52,7 +52,7 @@ The advanced POSIX shortcut that inserts an `hcc` shell command into an arbitrar
 
 ## Hooks, launchers, and PATH
 
-Windows hooks invoke an explicit system PowerShell executable and an encoded, generated program. User/provider arguments do not become shell syntax. Installation and removal recognize the generated ownership form and preserve unrelated configuration.
+Windows hooks invoke an explicit system PowerShell executable and an encoded, generated program. Both the outer command and encoded program use PowerShell syntax: Codex's normal Windows shell selection is PowerShell regardless of whether Codex was launched from PowerShell or cmd. Explicit custom execution-environment shells require separate hook compatibility verification. User/provider arguments do not become shell syntax. Installation and removal recognize both the earlier cmd form and the corrected PowerShell ownership form, preserving unrelated configuration.
 
 Codex separately reviews hook trust. Open `/hooks` in Codex and review the installed HCC commands before approving them; untrusted commands are skipped even when enabled. HCC setup installs configuration, while `hcc doctor --codex` reports that configuration and recorded project invocations. Its version and help probes use the same Windows provider installation selected by HCC and isolated temporary homes. They do not approve hooks or establish model receipt of injected context.
 
