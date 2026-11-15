@@ -70,6 +70,10 @@ jobs:
         with:
           node-version: 24
 
+      - name: Verify bounded read-only native stop confirmation
+        timeout-minutes: 2
+        run: node --test --test-timeout=15000 .github/scripts/dsh-native-stop-postcheck.test.mjs
+
       - name: Pin npm packaging version
         run: npm install --global npm@11.17.0 --no-audit --no-fund
 
@@ -224,9 +228,33 @@ jobs:
           process.exitCode = result.status ?? 1;
           NODE
 
+      - name: Confirm the installed native runtime stopped
+        id: native_stop_postconfirmation
+        if: steps.acceptance.outcome == 'success'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE' 2>&1 | tee "$HCC_DSH_ACCEPTANCE_ROOT/evidence/native-stop-confirmation.log"
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const root = process.env.HCC_DSH_ACCEPTANCE_ROOT;
+          const { tarball } = JSON.parse(fs.readFileSync(path.join(root, 'candidate.json')));
+          // Preserve the immutable script's immediate /down sample and add
+          // independent confirmation for that exact installed generation.
+          const result = spawnSync(process.execPath, [path.resolve('.github/scripts/dsh-native-stop-postcheck.mjs'),
+            '--receipt', path.join(root, 'evidence', 'installed', 'dsh-installed-receipt.json'),
+            '--selected-package', path.join(root, 'unpacked', 'package'), '--tarball', tarball,
+            '--output', path.join(root, 'evidence', 'native-stop-confirmation.json')],
+            { env: process.env, stdio: 'inherit', timeout: 45000 });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
       - name: Verify idle inbox wakeup with the installed selected package and official runtime
         id: inbox_wakeup
-        if: steps.acceptance.outcome == 'success'
+        if: steps.acceptance.outcome == 'success' && steps.native_stop_postconfirmation.outcome == 'success'
         timeout-minutes: 10
         shell: bash
         run: |
@@ -333,6 +361,7 @@ jobs:
           HCC_ACCEPTANCE_TARGET: ${{ steps.package.outputs.acceptanceTarget }}
           HCC_INSTALL_OUTCOME: ${{ steps.install.outcome }}
           HCC_ACCEPTANCE_OUTCOME: ${{ steps.acceptance.outcome }}
+          HCC_NATIVE_STOP_POSTCONFIRMATION_OUTCOME: ${{ steps.native_stop_postconfirmation.outcome }}
           HCC_APPROVAL_LAYERS_OUTCOME: ${{ steps.approval_layers.outcome }}
           HCC_INBOX_WAKEUP_OUTCOME: ${{ steps.inbox_wakeup.outcome }}
         run: |
@@ -350,6 +379,7 @@ jobs:
             acceptanceTarget: process.env.HCC_ACCEPTANCE_TARGET || null,
             officialInstall: process.env.HCC_INSTALL_OUTCOME,
             installedAcceptance: process.env.HCC_ACCEPTANCE_OUTCOME,
+            nativeStopPostconfirmation: process.env.HCC_NATIVE_STOP_POSTCONFIRMATION_OUTCOME,
             candidateApprovalLayers: process.env.HCC_APPROVAL_LAYERS_OUTCOME,
             inboxWakeup: process.env.HCC_INBOX_WAKEUP_OUTCOME,
             modelCallsRequested: false, npmPublicationRequested: false,
