@@ -1,3 +1,4 @@
+import { registerCleanup, cleanupChild } from './helpers/fixture-cleanup.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,7 +13,7 @@ const windows = { skip: process.platform !== 'win32', timeout: 15000 };
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-owned-process-'));
-  t.after(async () => {
+  registerCleanup(t, async () => {
     assert.equal(path.dirname(root), os.tmpdir());
     assert.ok(path.basename(root).startsWith('hcc-owned-process-'));
     await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
@@ -38,7 +39,7 @@ async function attributeAttacker(t, directory, target) {
   const probe = fileURLToPath(new URL('./helpers/windows-file-probe.ps1', import.meta.url));
   const child = spawn(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', probe,
     '-Path', directory, '-Target', target, '-WaitForSignal'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  cleanupChild(t, child);
   const output = collect(child.stdout), errors = collect(child.stderr);
   const completed = once(child, 'close');
   let ready = false;
@@ -62,7 +63,7 @@ test('owned Windows process preserves literal argv, Unicode cwd and explicit env
   const args = ['', '中文 空格', 'a"b', "single'quote", '%!^&|<>()', 'tail\\', 'space \\', '--flag', '$(noop)', 'line\r\nbreak', '\\\\"quote'];
   const child = spawnWindowsOwnedProcess(process.execPath, [file, ...args], { cwd,
     env: { ...process.env, HCC_TEST_VALUE: 'literal 中文 %!&' } });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   const output = collect(child.stdout);
   const errors = collect(child.stderr);
   const closed = once(child, 'close');
@@ -79,7 +80,7 @@ test('stdin is streamed with backpressure, binary bytes and EOF preserved', wind
   const { cwd, put } = fixture(t);
   const file = put('echo.mjs', 'process.stdin.pipe(process.stdout); process.stdin.on("end",()=>process.stderr.write("eof"));');
   const child = spawnWindowsOwnedProcess(process.execPath, [file], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   const output = collect(child.stdout), errors = collect(child.stderr);
   const closed = once(child, 'close');
   const input = Buffer.alloc(300000);
@@ -97,7 +98,7 @@ test('root exit precedes close until inherited output and descendants finish', w
     const child=spawn(process.execPath,['-e','setTimeout(()=>process.stdout.write("late-output"),350)'],{stdio:['ignore',1,2],detached:true});
     child.unref(); process.exit(7);`);
   const child = spawnWindowsOwnedProcess(process.execPath, [file], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   const output = collect(child.stdout);
   child.stderr.resume();
   const events = [];
@@ -119,7 +120,7 @@ test('terminating the owned Job stops the child and grandchild without PID looku
     const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
     process.stdout.write(child.pid+'\\n'); setInterval(()=>{},1000);`);
   const child = spawnWindowsOwnedProcess(process.execPath, [file], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   child.stderr.resume();
   const [data] = await once(child.stdout, 'data');
   const descendant = Number(String(data).trim());
@@ -135,7 +136,7 @@ test('silent children can close before producing any output', windows, async t =
   const { spawnWindowsOwnedProcess } = await api();
   const { cwd } = fixture(t);
   const child = spawnWindowsOwnedProcess(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   child.stdout.resume(); child.stderr.resume();
   await child.close();
   assert.ok(child.exitCode !== null);
@@ -145,7 +146,7 @@ test('close drains discarded output and follows readable end events', windows, a
   const { spawnWindowsOwnedProcess } = await api();
   const { cwd } = fixture(t);
   const child = spawnWindowsOwnedProcess(process.execPath, ['-e', 'process.stdout.write("done");'], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   let stdoutEnded = false, stderrEnded = false;
   child.stdout.on('end', () => { stdoutEnded = true; });
   child.stderr.on('end', () => { stderrEnded = true; });
@@ -155,7 +156,7 @@ test('close drains discarded output and follows readable end events', windows, a
   assert.equal(stderrEnded, true);
   const abandoned = spawnWindowsOwnedProcess(process.execPath,
     ['-e', 'setInterval(()=>process.stdout.write(Buffer.alloc(65536)),1)'], { cwd });
-  t.after(() => abandoned.close());
+  registerCleanup(t, () => abandoned.close());
   abandoned.stdout.destroy(); abandoned.stderr.destroy();
   await abandoned.close();
 });
@@ -166,7 +167,7 @@ test('native stdin queue stays bounded when the child never reads and cancellati
   const { cwd } = fixture(t);
   const controller = native.startOwnedProcess({ file: process.execPath,
     args: ['-e', 'setInterval(()=>{},1000)'], cwd, env: process.env });
-  t.after(() => controller.close());
+  registerCleanup(t, () => controller.close());
   const data = Buffer.alloc(64 * 1024, 1);
   assert.throws(() => controller.writeStdin(Buffer.alloc(65537)));
   assert.throws(() => controller.readStdout(65537));
@@ -196,7 +197,7 @@ test('invalid executable fails synchronously and a later launch remains usable',
   for (let i = 0; i < 8; i++) assert.throws(() => spawnWindowsOwnedProcess(path.join(cwd, 'missing.exe'), [], { cwd }),
     error => error.code === 'WINDOWS_PROCESS_ERROR');
   const child = spawnWindowsOwnedProcess(process.execPath, ['-e', 'process.exit(0)'], { cwd });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   child.stdout.resume(); child.stderr.resume();
   assert.deepEqual(await once(child, 'close'), [0, null]);
 });
@@ -214,7 +215,7 @@ test('exiting the native host closes its Job and kills the still-running descend
       process.stdout.write(JSON.stringify({root:child.pid,descendant:Number(String(data).trim())}),()=>process.exit(0));
     });`);
   const owner = spawn(process.execPath, [host], { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  t.after(() => { if (owner.exitCode === null) owner.kill(); });
+  cleanupChild(t, owner);
   const output = collect(owner.stdout), errors = collect(owner.stderr);
   assert.deepEqual(await once(owner, 'close'), [0, null]);
   assert.equal(errors().length, 0);
@@ -234,7 +235,7 @@ test('native launch rejects malformed strings, duplicate environment keys and bo
       error => error.code === 'WINDOWS_PROCESS_ERROR');
   }
   const controller = native.startOwnedProcess(options);
-  t.after(() => controller.close());
+  registerCleanup(t, () => controller.close());
   if (typeof native.captureDirectory === 'function') {
     const lease = native.captureDirectory(cwd);
     try { assert.throws(() => controller.poll.call(lease), error => error.code === 'WINDOWS_PROCESS_ERROR'); }
@@ -259,7 +260,7 @@ test('native process entry points reject extra arguments and unknown option fiel
     assert.throws(() => { accidentallyCreated = native.startOwnedProcess({ ...options, unsupported: true }); });
   } finally { accidentallyCreated?.close(); }
   const controller = native.startOwnedProcess(options);
-  t.after(() => controller.close());
+  registerCleanup(t, () => controller.close());
   for (const name of ['poll', 'terminate', 'close', 'closeStdin', 'resume']) {
     assert.throws(() => controller[name]('extra'), name);
   }
@@ -277,7 +278,7 @@ test('observation failure never turns close into a confirmed successful terminat
   const child = spawnWindowsOwnedProcess(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { cwd });
   child.on('error', () => {});
   const real = child._controller;
-  t.after(() => real.close());
+  registerCleanup(t, () => real.close());
   // Fault only the native observation boundary; real Job termination and
   // handle cleanup remain active so this fixture cannot orphan its process.
   child._controller = {
@@ -301,7 +302,7 @@ test('a suspended root owns its opaque directory pins and runs only after explic
       args: ['-e', 'require("node:fs").writeFileSync("executed.json",JSON.stringify({cwd:process.cwd()}));'],
       cwd, env: process.env, lease, suspended: true });
   } finally { lease.close(); }
-  t.after(() => controller.close());
+  registerCleanup(t, () => controller.close());
   await sleep(80);
   assert.equal(fs.existsSync(marker), false);
   assert.equal(controller.poll().suspended, true);
@@ -326,7 +327,7 @@ test('suspended root cannot execute user code after the owning host exits', wind
       cwd:${JSON.stringify(cwd)},env:process.env,lease,suspended:true});
     process.stdout.write(String(child.pid),()=>process.exit(0));`);
   const owner = spawn(process.execPath, [host], { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  t.after(() => { if (owner.exitCode === null) owner.kill(); });
+  cleanupChild(t, owner);
   const output = collect(owner.stdout), errors = collect(owner.stderr);
   assert.deepEqual(await once(owner, 'close'), [0, null]);
   assert.equal(errors().length, 0);
@@ -350,7 +351,7 @@ test('attribute-only reparse attacks cannot redirect a suspended or initialized 
       args: ['-e', 'process.stdout.write(process.cwd());setInterval(()=>{},1000)'],
       cwd, env: process.env, lease, suspended: true });
     lease.close();
-    t.after(() => controller.close());
+    registerCleanup(t, () => controller.close());
     assert.deepEqual(await beforeCapture(), { win32Error: 145 });
     const afterCapture = await attributeAttacker(t, cwd, target);
     controller.resume();
@@ -392,7 +393,7 @@ test('owner death racing root resume permits only original-directory entry or no
       process.stdout.write(String(child.pid)+'\\n');
       process.stdin.once('data',()=>{child.resume();process.exit(0)});`);
     const owner = spawn(process.execPath, [host], { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    t.after(() => { if (owner.exitCode === null) owner.kill(); });
+    cleanupChild(t, owner);
     const errors = collect(owner.stderr);
     const ownerClosed = once(owner, 'close');
     const [data] = await once(owner.stdout, 'data');

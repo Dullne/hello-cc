@@ -13,7 +13,7 @@ authenticated selection of any existing server directory are accepted risks.
 
 ## User Docs
 
-- [Native Windows](windows-native.md): candidate installation, private state,
+- [Native Windows](windows-native.md): installation, private state,
   persistent terminals, build instructions and tested platform/provider boundaries.
 - [User Guide](guide.md): install, start, Web console, coordination semantics,
   workflow, stable peer identity, and environment behavior.

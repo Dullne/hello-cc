@@ -47,7 +47,7 @@ jobs:
         run: node scripts/web-acceptance-diagnostics.mjs --output-dir "$HCC_WEB_ACCEPTANCE_OUTPUT" --source-outcome "$HCC_SOURCE_ACCEPTANCE_OUTCOME" --installed-outcome "$HCC_INSTALLED_ACCEPTANCE_OUTCOME"
       - name: Upload screenshots, source hashes and receipts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: web-workbench-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hcc-web-workbench/

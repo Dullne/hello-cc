@@ -62,7 +62,7 @@ jobs:
             node:24-alpine node --test test/native-cwd-handoff.test.mjs
       - name: Preserve executable mode in build artifact
         run: tar -czf cwd-handoff-${{ matrix.target }}.tar.gz native/bin/${{ matrix.target }}/hcc-cwd-handoff
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: cwd-handoff-${{ matrix.target }}
           path: cwd-handoff-${{ matrix.target }}.tar.gz
@@ -91,7 +91,7 @@ jobs:
           done
       - name: Verify binary formats and npm tarball contents
         run: npm run release:native:pack
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: native-npm-package
           path: logicseek-hello-cc-*.tgz

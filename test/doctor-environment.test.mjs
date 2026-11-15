@@ -7,13 +7,19 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const cli = fileURLToPath(new URL('../bin/hcc.mjs', import.meta.url));
+function isolatedEnv(t) {
+  const home = fs.mkdtempSync(path.join(os.homedir(), 'hcc-environment-home-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  return { ...process.env, HOME: home, USERPROFILE: home, HCC_SKIP_SHIM_INSTALL: '1',
+    HCC_ROOT: '', HCC_DB: '', HCC_NATIVE_OWNER: '' };
+}
 
 test('environment doctor works before project initialization without creating state', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-environment-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const result = spawnSync(process.execPath, [cli, '--root', root, '--json', 'doctor', '--environment'], {
     encoding: 'utf8', timeout: 15000, windowsHide: true,
-    env: { ...process.env, HCC_ROOT: '', HCC_DB: '', HCC_NATIVE_OWNER: '' }
+    env: isolatedEnv(t)
   });
   assert.ok(result.stdout.trim(), result.stderr);
   const output = JSON.parse(result.stdout);
@@ -35,28 +41,28 @@ test('environment doctor refuses database-only options instead of silently skipp
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const result = spawnSync(process.execPath, [cli, '--root', root, '--json', 'doctor', '--environment', '--codex'], {
     encoding: 'utf8', timeout: 15000, windowsHide: true,
-    env: { ...process.env, HCC_ROOT: '', HCC_DB: '', HCC_NATIVE_OWNER: '' }
+    env: isolatedEnv(t)
   });
   assert.equal(result.status, 1);
   assert.equal(JSON.parse(result.stderr.trim()).error.code, 'BAD_ARGS');
   assert.deepEqual(fs.readdirSync(root), []);
 });
 
-test('environment doctor remains usable when SQLite is unavailable', () => {
+test('environment doctor remains usable when SQLite is unavailable', t => {
   const result = spawnSync(process.execPath,
     ['--no-experimental-sqlite', cli, '--json', 'doctor', '--environment'], {
       encoding: 'utf8', timeout: 15000, windowsHide: true,
-      env: { ...process.env, HCC_NATIVE_OWNER: '' }
+      env: isolatedEnv(t)
     });
   assert.ok(result.stdout.trim(), result.stderr);
   assert.equal(JSON.parse(result.stdout).data.database_checked, false);
 });
 
-test('environment doctor help is available without SQLite or environment readiness', () => {
+test('environment doctor help is available without SQLite or environment readiness', t => {
   const result = spawnSync(process.execPath,
     ['--no-experimental-sqlite', cli, 'doctor', '--environment', '--help'], {
       encoding: 'utf8', timeout: 15000, windowsHide: true,
-      env: { ...process.env, HCC_NATIVE_OWNER: '' }
+      env: isolatedEnv(t)
     });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /doctor --environment/);

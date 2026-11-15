@@ -1,5 +1,7 @@
 # Windows native validation record
 
+For changes after 1.2.0, including the hosted CI result, Windows TLS and offline migration, see the [current follow-up record](windows-followups-validation.md). The dated results below remain the original release evidence.
+
 This record describes the native Windows support released as hello-cc 1.2.0 and checked on 2026-11-12. It records completed checks separately from unverified environments. Setup instructions are in [Native Windows support](windows-native.md), and the implementation checklist is in the [approved plan](superpowers/plans/2026-11-12-windows-native-support.md).
 
 ## Tested environment

@@ -359,7 +359,7 @@ jobs:
 
       - name: Upload platform receipt and acceptance logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dsh-acceptance-${{ steps.package.outputs.mode || 'unprepared' }}-${{ matrix.os }}-${{ matrix.harness }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.HCC_DSH_ACCEPTANCE_ROOT }}/evidence/

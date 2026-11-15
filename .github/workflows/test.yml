@@ -42,6 +42,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Resolve OpenSSL for actual HTTPS acceptance
+        run: |
+          $openssl = Get-Command openssl.exe -ErrorAction SilentlyContinue
+          if (!$openssl) {
+            $git = (Get-Command git.exe -ErrorAction Stop).Source
+            $gitRoot = Split-Path (Split-Path $git)
+            $candidate = Join-Path $gitRoot 'usr\bin\openssl.exe'
+            if (!(Test-Path -LiteralPath $candidate)) { throw 'OpenSSL is required for Windows HTTPS acceptance' }
+            $directory = Split-Path $candidate
+            $directory | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            $env:PATH = "$directory;$env:PATH"
+          }
+          openssl version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Prepare matching Node headers and import library
         run: |
           $nodeVersion = node -p "process.version"
@@ -82,8 +97,9 @@ jobs:
 
       - name: Verify actual Windows contracts and extracted npm candidate
         id: windows_tests
+        timeout-minutes: 20
         run: |
-          node --test --test-concurrency=1 test/windows-*.test.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/hcc-windows-native.log"
+          node .github/scripts/run-bounded-tests.mjs --log-dir "$env:RUNNER_TEMP/hcc-windows-native" 'test/windows-*.test.mjs' test/ci-bounded-tests.test.mjs test/fixture-cleanup.test.mjs test/completion-poller.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify shared UI behavior and source checks
@@ -96,24 +112,24 @@ jobs:
       - name: Verify shared native services, scoped tools, and Web behavior
         timeout-minutes: 40
         run: |
-          node --test --test-concurrency=3 test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/hcc-windows-shared.log"
+          node .github/scripts/run-bounded-tests.mjs --concurrency 3 --file-timeout-ms 2100000 --log-dir "$env:RUNNER_TEMP/hcc-windows-shared" test/native-runtime.test.mjs test/web-native-sessions.test.mjs test/web-structured-routes.test.mjs test/scoped-mcp.test.mjs test/native-fixture-root.test.mjs test/codex-terminal-history-boundary.test.mjs test/web-browser-lifecycle.test.mjs test/web-files-platform.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify an independently installed npm candidate
         timeout-minutes: 10
-        run: node scripts/windows-installed-acceptance.mjs --output .superpowers/windows-installed-acceptance.json
+        run: node scripts/windows-installed-acceptance.mjs --output "$env:RUNNER_TEMP/hcc-windows-installed-acceptance.json"
 
       - name: Upload Windows acceptance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/hcc-windows-native.log
-            ${{ runner.temp }}/hcc-windows-shared.log
+            ${{ runner.temp }}/hcc-windows-native/
+            ${{ runner.temp }}/hcc-windows-shared/
             native/bin/win32-x64/hcc-windows.json
             native/bin/win32-x64/hcc-shim.json
-            .superpowers/windows-installed-acceptance.json
+            ${{ runner.temp }}/hcc-windows-installed-acceptance.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -239,7 +255,7 @@ jobs:
 
       - name: Upload regression log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: regression-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

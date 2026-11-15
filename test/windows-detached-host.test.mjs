@@ -1,3 +1,4 @@
+import { registerCleanup, cleanupChild } from './helpers/fixture-cleanup.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 const windows = { skip: process.platform !== 'win32', timeout: 10000 };
 function fixture(t) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hcc-detached-host-'));
-  t.after(() => fs.promises.rm(cwd, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 }));
+  registerCleanup(t, () => fs.promises.rm(cwd, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 }));
   return cwd;
 }
 
@@ -26,7 +27,7 @@ test('detached service root requires an opaque pinned lease and handle-based can
   try { assert.throws(() => { unexpected = native.startDetachedHost({ ...options, lease, suspended: true }); }, { code: 'WINDOWS_PROCESS_ERROR' }); }
   finally { unexpected?.close(); }
   const child = native.startDetachedHost({ ...options, lease }); lease.close();
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   assert.equal(child.poll().exited, false);
   assert.throws(() => fs.renameSync(cwd, cwd + '-moved'));
   child.terminate();
@@ -39,12 +40,12 @@ test('only service controllers can detach and no lease or Job owner is silently 
   const cwd = fixture(t), native = loadWindowsNative();
   assert.equal(typeof native.startDetachedHost, 'function');
   const owned = native.startOwnedProcess({ file: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], cwd, env: process.env });
-  t.after(() => owned.close());
+  registerCleanup(t, () => owned.close());
   assert.throws(() => owned.detach(), { code: 'WINDOWS_PROCESS_ERROR' });
   const lease = native.captureDirectory(cwd);
   const host = native.startDetachedHost({ file: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'], cwd,
     env: process.env, lease }); lease.close();
-  t.after(() => host.close());
+  registerCleanup(t, () => host.close());
   assert.throws(() => host.detach('extra'), { code: 'WINDOWS_PROCESS_ERROR' });
   host.terminate(); owned.terminate();
   for (let i = 0; i < 100 && (!host.poll().exited || !owned.poll().exited); i++) await sleep(10);
@@ -63,7 +64,7 @@ test('a detached service survives launcher exit and retains its original cwd pin
     const child=native.startDetachedHost({file:process.execPath,args:['-e',${JSON.stringify(service)}],cwd:${JSON.stringify(cwd)},env:process.env,lease});
     lease.close();process.stdout.write(String(child.pid),()=>{child.detach();process.exit(0)});`);
   const owner = spawn(process.execPath, [host], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  t.after(() => { if (owner.exitCode === null) owner.kill(); });
+  cleanupChild(t, owner);
   let output = '', errors = '';
   owner.stdout.on('data', data => { output += data; }); owner.stderr.on('data', data => { errors += data; });
   assert.deepEqual(await once(owner, 'close'), [0, null], errors);
@@ -88,7 +89,7 @@ test('service stdout and stderr retain the same private append capability after 
   const child = native.startDetachedHost({ file: process.execPath, args: ['-e',
     'setTimeout(()=>{process.stdout.write("stdout\\n");process.stderr.write("stderr\\n")},100);'],
   cwd, env: process.env, lease, log });
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   lease.close(); log.close(); parent.close(); logDirectory.close();
   assert.throws(() => fs.renameSync(logs, logs + '-moved'));
   assert.throws(() => fs.renameSync(path.join(logs, 'service.log'), path.join(logs, 'moved.log')));
@@ -132,7 +133,7 @@ test('trusted HCC entry runs with retained private logging and refuses premature
   const { openPrivateAppendResource } = await import('../lib/runtime/private-file.mjs');
   const { captureSelectedCwdSnapshot } = await import('../lib/process/selected-cwd-identity.mjs');
   const base = fs.mkdtempSync(path.join(os.homedir(), 'hcc-service-entry-'));
-  t.after(() => fs.promises.rm(base, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 }));
+  registerCleanup(t, () => fs.promises.rm(base, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 }));
   const cwd = path.join(base, 'project'), home = path.join(base, 'profile'), logs = path.join(base, 'logs');
   fs.mkdirSync(cwd); fs.mkdirSync(home); loadWindowsNative().createPrivateDirectory(logs);
   const logPath = path.join(logs, 'web.log'), log = openPrivateAppendResource(logPath);
@@ -143,7 +144,7 @@ test('trusted HCC entry runs with retained private logging and refuses premature
       { cwd, env: { ...process.env, USERPROFILE: home, HOME: home, HCC_WEB_CHILD: '1' }, log,
         expectedIdentity: captureSelectedCwdSnapshot(cwd) });
   } finally { log.close(); }
-  t.after(() => child.close());
+  registerCleanup(t, () => child.close());
   assert.throws(() => child.unref(), { code: 'WINDOWS_SERVICE_HANDOFF_REQUIRED' });
   assert.deepEqual(await once(child, 'close'), [0, null]);
   assert.match(fs.readFileSync(logPath, 'utf8'), /hello-cc|hcc/);
