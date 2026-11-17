@@ -14,8 +14,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: hello-cc-release
+  cancel-in-progress: false
+
 jobs:
   github-release:
+    if: github.repository == 'Dullne/hello-cc' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
 
     steps:
@@ -36,13 +41,19 @@ jobs:
       - name: Resolve version
         id: release
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
+            VERSION="${REQUESTED_VERSION}"
           else
             VERSION="${GITHUB_REF_NAME}"
           fi
           VERSION="${VERSION#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version" >&2
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Validate release notes
@@ -58,3 +69,48 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run release:github -- --version "${{ steps.release.outputs.version }}"
+
+  npm-publish:
+    name: Publish verified archive to npm
+    needs: github-release
+    if: github.repository == 'Dullne/hello-cc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      HCC_SKIP_SHIM_INSTALL: '1'
+
+    steps:
+      - name: Checkout selected revision
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node for npm trusted publishing
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Pin verified npm packaging version
+        run: npm install --global npm@11.17.0 --ignore-scripts --no-audit --no-fund
+
+      - name: Check publication guards
+        run: node --test .github/scripts/npm-trusted-publish.test.mjs
+
+      - name: Select and verify immutable release archive
+        id: package
+        run: node .github/scripts/npm-trusted-publish.mjs prepare
+
+      - name: Install validation dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate release notes, frozen content and native artifacts
+        run: npm run prepublishOnly
+
+      - name: Publish with GitHub identity and verify npm readback
+        run: node .github/scripts/npm-trusted-publish.mjs publish
