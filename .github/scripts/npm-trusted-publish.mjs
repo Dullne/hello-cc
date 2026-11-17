@@ -54,22 +54,32 @@ export function prepare({ root = process.cwd(), env = process.env } = {}) {
   return artifact;
 }
 
-async function registryState(artifact, { fetchImpl = fetch, pause = delay } = {}) {
+function remaining(deadline, now) {
+  const milliseconds = deadline - now();
+  if (milliseconds <= 0) throw Object.assign(new Error('Registry readback deadline exceeded'), { code: 'NPM_READBACK_DEADLINE' });
+  return milliseconds;
+}
+
+async function registryState(artifact, { fetchImpl = fetch, pause = delay, now = () => performance.now(), deadline = Infinity } = {}) {
   let response;
   for (let attempt = 0; attempt < 3; attempt++) {
+    const requestMs = Math.ceil(Math.min(10000, remaining(deadline, now)));
     try {
       response = await fetchImpl(`${registry}/@logicseek%2fhello-cc/${artifact.version}`, {
-        headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(10000)
+        headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(requestMs)
       });
       break;
     } catch {
-      if (attempt === 2) throw new Error('Official npm registry could not be reached; publication is not authorized');
-      await pause(1000);
+      const rest = remaining(deadline, now);
+      if (attempt === 2) throw new Error('Official npm registry could not be reached; registry status is unconfirmed');
+      await pause(Math.min(1000, rest));
     }
   }
+  remaining(deadline, now);
   if (response.status === 404) { await response.body?.cancel(); return false; }
-  assert.equal(response.status, 200, `Official npm registry returned HTTP ${response.status}; refusing publication`);
+  assert.equal(response.status, 200, `Official npm registry returned HTTP ${response.status}; cannot confirm the frozen version`);
   const published = await response.json();
+  remaining(deadline, now);
   assert.equal(published.name, name, 'Registry package identity mismatch');
   assert.equal(published.version, artifact.version, 'Registry version identity mismatch');
   assert.equal(published.dist?.integrity, artifact.integrity, 'Published version has different or missing integrity; never overwrite it');
@@ -78,12 +88,24 @@ async function registryState(artifact, { fetchImpl = fetch, pause = delay } = {}
 }
 
 export async function verify(artifact, options = {}) {
-  const pause = options.pause || delay;
-  for (let attempt = 0; attempt < 12; attempt++) {
-    if (await registryState(artifact, options)) return { verified: true, version: artifact.version, integrity: artifact.integrity };
-    if (attempt < 11) await pause(2000);
+  const pause = options.pause || delay, now = options.now || (() => performance.now());
+  const deadline = now() + 10 * 60_000;
+  try {
+    while (now() < deadline) {
+      if (await registryState(artifact, { ...options, now, deadline })) {
+        (options.log || console.log)(`npm registry confirmed ${name}@${artifact.version} with the frozen checksums.`);
+        return { verified: true, version: artifact.version, integrity: artifact.integrity };
+      }
+      await pause(Math.min(10000, remaining(deadline, now)));
+    }
+  } catch (error) {
+    const deadlineAbort = now() >= deadline && ['AbortError', 'TimeoutError'].includes(error.name);
+    if (error.code !== 'NPM_READBACK_DEADLINE' && !deadlineAbort) throw error;
   }
-  throw new Error('Published version did not appear with the frozen checksums within the readback limit');
+  const message = options.uploadAccepted
+    ? 'npm upload accepted, but registry confirmation is still pending after the readback deadline. No upload was retried; use verify to check again.'
+    : 'Registry confirmation is still pending after the readback deadline. This verification did not upload a package.';
+  throw Object.assign(new Error(message), { code: 'NPM_REGISTRY_CONFIRMATION_PENDING', uploadAccepted: options.uploadAccepted === true });
 }
 
 export async function publish(artifact, options = {}) {
@@ -93,7 +115,8 @@ export async function publish(artifact, options = {}) {
   // stored token, whoami precondition, lifecycle script or repack is involved.
   (options.execute || execFileSync)('npm', ['publish', artifact.tarball, '--access', 'public', '--tag', artifact.tag,
     '--ignore-scripts', '--registry', registry], { cwd: artifact.root, stdio: 'inherit', timeout: 120000, shell: false });
-  return { published: true, ...await verify(artifact, options) };
+  (options.log || console.log)(`npm upload accepted for ${name}@${artifact.version}; registry confirmation pending.`);
+  return { published: true, ...await verify(artifact, { ...options, uploadAccepted: true }) };
 }
 
 async function main() {

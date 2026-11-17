@@ -47,6 +47,31 @@ matches is an idempotent success, while a different existing archive is an error
 After upload, registry readback must match the same archive. `npm whoami` is not
 used: it does not test OIDC publishing authorization.
 
+npm can accept an upload before the public version endpoint becomes available.
+The helper records upload acceptance separately and waits up to ten minutes for
+matching registry metadata, polling every ten seconds. Every network request and
+retry is limited by the remaining deadline. A timeout reports that confirmation
+is pending; it does not request another login or automatically upload the package
+again. A checksum conflict, malformed metadata, or a non-404 HTTP error still
+fails immediately. The job has twenty minutes for validation, upload and this
+bounded readback.
+
+The first trusted publication, run `44119229398`, reported npm upload acceptance
+and a processing notice, then failed because the original readback used only
+twelve attempts two seconds apart. Its failed record is preserved. The corrected
+wait does not retroactively mark that workflow successful; registry visibility
+and archive integrity are verified independently.
+
+On 2026-11-18 (Asia/Shanghai), independent official-registry readback confirmed
+both version `1.2.1` and the `latest` tag. The downloaded archive is 2,371,532 bytes
+and all three digests match the frozen manifest, including SHA-256
+`50d0a5d240830db8b96595e29baf7f96dc0a2c02d36d5d0355908a6b84227583`.
+The registry's SLSA provenance payload identifies workflow `github-release.yml`,
+commit `e97e11f19e957869137af23b36c221f137caf337`, and run `44119229398`, attempt 1;
+its subject digest matches the archive. The transparency-log index is
+`3948535052`, matching the upload log. These are metadata and downloaded-byte
+checks, not a separate cryptographic verification of the Sigstore bundle.
+
 ## References
 
 - [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/)
@@ -55,4 +80,7 @@ used: it does not test OIDC publishing authorization.
 
 Preparation and local checks do not establish that the npm account authorization
 has been saved or that 1.2.1 has been published. Those require the account action
-and a successful workflow with registry readback.
+and an accepted authenticated upload with matching registry readback. A workflow
+can fail during its later confirmation even after npm has accepted the upload;
+that failed workflow and the subsequent public-registry verification are separate
+pieces of evidence.
