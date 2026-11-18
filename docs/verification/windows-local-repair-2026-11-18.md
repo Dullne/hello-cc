@@ -70,6 +70,10 @@ Validation used Windows 11 x64, local NTFS and Node 24.22.3.
   described above; its original run was deliberately stopped before additional
   edits. All 12 observed processes in that owned test tree exited. This is not
   a claim that the complete shared suite passed.
+  The later [native validation follow-up](windows-native-validation-2026-11-18.md)
+  completed all eight shared files (220 passing tests) on the optimized source
+  and installed the accepted local build `1.2.2-local.20261118.3`; the interrupted
+  run described here remains preserved as historical evidence.
 - The final private-file suite passed all 16 tests. Independent private-file,
   native-security and native-file review tests passed all 28 tests.
 - The delayed-readiness background test failed against the original startup
