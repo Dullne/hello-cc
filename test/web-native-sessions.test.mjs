@@ -13,6 +13,7 @@ import { createPeerBindingStore } from '../lib/db/stores/peers.mjs';
 import { createMessageStore } from '../lib/core/coordination/messages.mjs';
 import { startNativeService } from '../lib/runtime/native/service.mjs';
 import { nativeRequest } from '../lib/runtime/native/client.mjs';
+import { createNativeLauncher } from '../lib/runtime/native/launcher.mjs';
 import { createNativeSessions } from '../lib/web/native-sessions.mjs';
 import { createClaudeAdapter } from '../lib/integrations/native/claude.mjs';
 import { createCodexAdapter } from '../lib/integrations/native/codex.mjs';
@@ -169,9 +170,6 @@ async function withRuntimeStandIn(f, { version, replaceStatusRead } = {}, run) {
     response.setHeader('content-type', 'application/json');
     if (!authorized) { response.writeHead(401); response.end(JSON.stringify({ ok: false, error: { code: 'NATIVE_UNAUTHORIZED' } })); return; }
     if (request.method === 'GET' && request.url === '/status') {
-      if (++statusReads === replaceStatusRead) {
-        replaceOwnedNativePointer(f.ctx, { ...original, port: server.address().port, generation: 'web-policy-successor-runtime' });
-      }
       response.end(JSON.stringify({ ok: true, data: status }));
       return;
     }
@@ -180,7 +178,16 @@ async function withRuntimeStandIn(f, { version, replaceStatusRead } = {}, run) {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   replaceOwnedNativePointer(f.ctx, { ...original, port: server.address().port, generation: status.generation });
-  try { await run(requests); }
+  const nativeApi = async (ctx, method, route, body, options) => {
+    const value = await nativeRequest(ctx, method, route, body, options);
+    // Publish after the response completes so Windows private-file validation
+    // cannot consume the HTTP deadline while arranging the ownership race.
+    if (method === 'GET' && route === '/status' && ++statusReads === replaceStatusRead) {
+      replaceOwnedNativePointer(ctx, { ...original, port: server.address().port, generation: 'web-policy-successor-runtime' });
+    }
+    return value;
+  };
+  try { await run(requests, nativeApi); }
   finally {
     replaceOwnedNativePointer(f.ctx, original);
     await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
@@ -209,19 +216,21 @@ for (const restore of [false, true]) {
   });
 
   test(`Web Codex ${restore ? 'restore' : 'creation'} rejects a replaced runtime before sending its mutation`, async t => {
-    const f = await fixture(t), web = f.bridge();
+    const f = await fixture(t);
     let saved;
     if (restore) {
       await f.start('a', { sandbox: 'read-only' });
       await f.api('POST', '/close', { peer: 'a' });
-      saved = (await web.listNativeHistory(f.ctx)).workers[0];
+      saved = (await f.bridge().listNativeHistory(f.ctx)).workers[0];
     }
-    await withRuntimeStandIn(f, { version: 1, replaceStatusRead: restore ? 2 : 1 }, async requests => {
+    await withRuntimeStandIn(f, { version: 1, replaceStatusRead: restore ? 2 : 1 }, async (requests, nativeApi) => {
+      const web = f.bridge(nativeApi, new Map(), { ensureRuntime: createNativeLauncher({ request: nativeApi }) });
       const operation = restore
         ? web.resumeNativeSession(f.ctx, 'a', { owner: saved.owner, sessionId: saved.sessionId, confirmed: true })
         : web.startNativeSession({ projectCtx: f.ctx, transport: 'native', kind: 'codex', id: 'a' });
       await assert.rejects(operation, { code: 'NATIVE_OWNER_CHANGED' });
       assert.equal(readNativePointer(f.ctx).generation, 'web-policy-successor-runtime');
+      assert.equal(requests.length, restore ? 3 : 1);
       assert.ok(requests.every(request => request.method === 'GET' && request.route === '/status' && request.authorized));
       assert.equal(web.session(), undefined);
       assert.equal(f.created.length, restore ? 1 : 0);

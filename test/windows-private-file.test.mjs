@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import test from 'node:test';
 import { loadWindowsNative } from '../lib/platform/windows-native.mjs';
 import { readPrivateTextFile, openPrivateAppendFile } from '../lib/runtime/private-file.mjs';
@@ -18,6 +19,140 @@ function fixture(t) {
   const directory = path.join(base, 'private'); loadWindowsNative().createPrivateDirectory(directory);
   return { base, directory };
 }
+
+// Use the publisher's actual Windows access/share flags. The handle is held
+// until the reader signals it, then released by another process during the read.
+async function heldPublisher(file, { makePublic = '', deleteOnClose = false } = {}) {
+  const source = `
+    $ErrorActionPreference = 'Stop'
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PublisherHandle {
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+}
+'@
+    $flags = if ($env:HCC_TEST_DELETE_ON_CLOSE -eq '1') { 0x04000000 } else { 0 }
+    $held = [PublisherHandle]::CreateFileW($env:HCC_TEST_PUBLISH_FILE, [Convert]::ToUInt32('C0070000', 16), 1, [IntPtr]::Zero, 3, $flags, [IntPtr]::Zero)
+    if ($held.IsInvalid) { throw ('CreateFileW failed: ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+    try {
+      [Console]::Out.WriteLine('ready'); [Console]::Out.Flush()
+      if ([Console]::ReadLine() -ne 'release') { throw 'Missing release signal' }
+      [Threading.Thread]::Sleep(100)
+      if ($env:HCC_TEST_PUBLIC_PATH) {
+        & icacls.exe $env:HCC_TEST_PUBLIC_PATH /grant '*S-1-1-0:(R)' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'ACL mutation failed' }
+      }
+    } finally { $held.Dispose() }
+  `;
+  const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const child = spawn(executable, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')], {
+    windowsHide: true, timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, HCC_TEST_PUBLISH_FILE: file, HCC_TEST_PUBLIC_PATH: makePublic, HCC_TEST_DELETE_ON_CLOSE: deleteOnClose ? '1' : '0' }
+  });
+  const completed = once(child, 'close'); let errors = '';
+  child.stderr.on('data', chunk => { errors += chunk; });
+  try {
+    await Promise.race([
+      once(child.stdout, 'data').then(([chunk]) => assert.equal(chunk.toString().trim(), 'ready')),
+      completed.then(() => { throw new Error(errors || 'Publisher exited before opening the file'); })
+    ]);
+  } catch (error) {
+    if (child.exitCode === null) child.kill();
+    await completed.catch(() => {});
+    throw error;
+  }
+  return {
+    release() { child.stdin.end('release\n'); },
+    async closed() { assert.deepEqual(await completed, [0, null], errors); }
+  };
+}
+
+test('private Windows reads wait for a published file writer to release its handle', { skip: !windows }, async t => {
+  const { directory } = fixture(t), file = path.join(directory, 'runtime.json');
+  fs.writeFileSync(file, '{"pid":123}\n');
+  const publisher = await heldPublisher(file);
+  publisher.release();
+  try { assert.equal(readWindowsPrivateFile(file).toString(), '{"pid":123}\n'); }
+  finally { await publisher.closed(); }
+});
+
+test('private Windows reads bound sharing contention and preserve the original refusal', { skip: !windows }, async t => {
+  const { directory } = fixture(t), file = path.join(directory, 'runtime.json');
+  fs.writeFileSync(file, 'private');
+  const publisher = await heldPublisher(file), start = performance.now();
+  try {
+    assert.throws(() => readWindowsPrivateFile(file), error => error.code === 'PROJECT_FILE_FORBIDDEN' && error.win32Error === 32);
+    assert.ok(performance.now() - start < 1500, 'Persistent sharing contention must remain bounded');
+  } finally { publisher.release(); await publisher.closed(); }
+});
+
+for (const target of ['file', 'parent']) {
+  test(`private Windows reads reject ${target} ACL drift while waiting for publication`, { skip: !windows }, async t => {
+    const { directory } = fixture(t), file = path.join(directory, 'runtime.json');
+    fs.writeFileSync(file, 'private');
+    const publisher = await heldPublisher(file, { makePublic: target === 'file' ? file : directory });
+    publisher.release();
+    try { withWindowsPrivateScope(() => assert.throws(() => readWindowsPrivateFile(file), { code: 'PROJECT_PATH_FORBIDDEN' })); }
+    finally { await publisher.closed(); }
+  });
+}
+
+test('private Windows reads preserve missing-file semantics after sharing contention ends', { skip: !windows }, async t => {
+  const { directory } = fixture(t), file = path.join(directory, 'runtime.json');
+  fs.writeFileSync(file, 'private');
+  const publisher = await heldPublisher(file, { deleteOnClose: true });
+  publisher.release();
+  try {
+    assert.equal(readWindowsPrivateFile(file, { missing: true }), null);
+    assert.throws(() => readWindowsPrivateFile(file), { code: 'PROJECT_FILE_NOT_FOUND' });
+  } finally { await publisher.closed(); }
+});
+
+test('private Windows readers admit real native publications while the writer is finishing', { skip: !windows, timeout: 20000 }, async t => {
+  const { directory } = fixture(t), sleep = new Int32Array(new SharedArrayBuffer(4));
+  const source = `
+    import { captureDirectory } from ${JSON.stringify(new URL('../lib/platform/windows-filesystem.mjs', import.meta.url).href)};
+    const lease = captureDirectory(process.env.HCC_TEST_PUBLISH_DIRECTORY), parent = lease.openDirectory('');
+    const stop = () => { parent.close(); lease.close(); process.disconnect(); };
+    process.on('message', index => {
+      if (index === -1) { stop(); return; }
+      try { parent.publish('runtime-' + index + '.json', Buffer.alloc(8 * 1024 * 1024, 97), { operation: 'create', private: true }); }
+      catch (error) { console.error(error); process.exitCode = 1; stop(); }
+    });
+    process.send('ready');
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    windowsHide: true, timeout: 18000, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    env: { ...process.env, HCC_TEST_PUBLISH_DIRECTORY: directory }
+  });
+  const completed = once(child, 'close'); completed.catch(() => {}); let errors = '';
+  child.stderr.on('data', chunk => { errors += chunk; });
+  try {
+    await Promise.race([
+      once(child, 'message').then(([message]) => assert.equal(message, 'ready')),
+      completed.then(() => { throw new Error(errors || 'Native publisher exited before readiness'); })
+    ]);
+    for (let index = 0; index < 12; index++) {
+      child.send(index);
+      const file = path.join(directory, `runtime-${index}.json`), deadline = performance.now() + 10000;
+      let bytes;
+      // Large files extend the native post-rename byte verification window;
+      // these are the real native writer and real private reader, without hooks.
+      do {
+        bytes = readWindowsPrivateFile(file, { maxBytes: 10 * 1024 * 1024, missing: true });
+        if (!bytes) Atomics.wait(sleep, 0, 0, 1);
+      } while (!bytes && performance.now() < deadline);
+      assert.equal(bytes?.length, 8 * 1024 * 1024);
+      assert.equal(bytes[0], 97); assert.equal(bytes.at(-1), 97);
+    }
+  } finally {
+    if (child.connected) child.send(-1);
+    assert.deepEqual(await completed, [0, null], errors);
+  }
+});
 
 test('private Windows reads use a held single-link object with its own ACL and size bound', { skip: !windows }, t => {
   const { directory } = fixture(t); const file = path.join(directory, '中文 file.txt');
